@@ -23,33 +23,47 @@ uintptr_t lume_uart_base(void)
 
 int lume_uart_getc(void)
 {
-    if(*uart_fr & (1u<<4))return -LUME_EAGAIN;
-    uint32_t v=*uart_dr;
-    if(v&0xf00)return -LUME_EIO;
-    return (int)(v&255);
+    if (*uart_fr & (1u << 4))
+        return -LUME_EAGAIN;
+    uint32_t v = *uart_dr;
+    if (v & 0xf00)
+        return -LUME_EIO;
+    return (int)(v & 255);
 }
+
 /* The USB keyboard remains usable without the serial adapter. A host must
  * explicitly enable UART input after each boot; pre-handshake data is ignored. */
 int lume_console_getc(void)
 {
-    int c=lume_usb_getc();if(c>=0)return c;
-    if(*uart_fr & (1u<<4))return -LUME_EAGAIN;
-    uint32_t word=*uart_dr;
-    if(word&0xf00)*(volatile uint32_t *)(uintptr_t)(UART_BASE+4)=0;
-    bool enabled=input.enabled;
-    c=lume_uart_input_feed(&input,word);
-    if(!enabled && input.enabled)lume_puts("LUME UART INPUT ENABLED\n");
+    int c = lume_usb_getc();
+    if (c >= 0)
+        return c;
+    if (*uart_fr & (1u << 4))
+        return -LUME_EAGAIN;
+    uint32_t word = *uart_dr;
+    if (word & 0xf00)
+        *(volatile uint32_t *)(uintptr_t)(UART_BASE + 4) = 0;
+    bool enabled = input.enabled;
+    c = lume_uart_input_feed(&input, word);
+    if (!enabled && input.enabled)
+        lume_puts("LUME UART INPUT ENABLED\n");
     return c;
 }
+
 void lume_uart_input_stats(void)
 {
-    lume_value("UART_INPUT_ENABLED",input.enabled);
-    lume_value("UART_INPUT_BYTES",input.bytes);
-    lume_value("UART_INPUT_ERRORS",input.errors);
+    lume_value("UART_INPUT_ENABLED", input.enabled);
+    lume_value("UART_INPUT_BYTES", input.bytes);
+    lume_value("UART_INPUT_ERRORS", input.errors);
 }
+
 /* The boot assembly uses lume_putc before BSS initialization. Only the VFS
  * console, entered after kernel initialization, may inspect display state. */
-void lume_console_putc(char c) {lume_display_putc(c);lume_putc(c);}
+void lume_console_putc(char c)
+{
+    lume_display_putc(c);
+    lume_putc(c);
+}
 
 void lume_putc(char c)
 {

@@ -6,7 +6,14 @@
 unsigned lume_net_begin(void);
 void lume_net_end(unsigned);
 #else
-static inline unsigned lume_net_begin(void){return 0;}
-static inline void lume_net_end(unsigned token){(void)token;}
+static inline unsigned lume_net_begin(void)
+{
+    return 0;
+}
+
+static inline void lume_net_end(unsigned token)
+{
+    (void)token;
+}
 #endif
 #endif

@@ -23,23 +23,24 @@
 #include "mbedtls/platform_util.h"
 
 /** The selected feature is not available. */
-#define MBEDTLS_ERR_MD_FEATURE_UNAVAILABLE                -0x5080
+#define MBEDTLS_ERR_MD_FEATURE_UNAVAILABLE -0x5080
 /** Bad input parameters to function. */
-#define MBEDTLS_ERR_MD_BAD_INPUT_DATA                     -0x5100
+#define MBEDTLS_ERR_MD_BAD_INPUT_DATA -0x5100
 /** Failed to allocate memory. */
-#define MBEDTLS_ERR_MD_ALLOC_FAILED                       -0x5180
+#define MBEDTLS_ERR_MD_ALLOC_FAILED -0x5180
 /** Opening or reading of file failed. */
-#define MBEDTLS_ERR_MD_FILE_IO_ERROR                      -0x5200
+#define MBEDTLS_ERR_MD_FILE_IO_ERROR -0x5200
 
 /* MBEDTLS_ERR_MD_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** MD hardware accelerator failed. */
-#define MBEDTLS_ERR_MD_HW_ACCEL_FAILED                    -0x5280
+#define MBEDTLS_ERR_MD_HW_ACCEL_FAILED -0x5280
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-/**
+    /**
  * \brief     Supported message digests.
  *
  * \warning   MD2, MD4, MD5 and SHA-1 are considered weak message digests and
@@ -47,51 +48,53 @@ extern "C" {
  *            stronger message digests instead.
  *
  */
-typedef enum {
-    MBEDTLS_MD_NONE=0,    /**< None. */
-    MBEDTLS_MD_MD2,       /**< The MD2 message digest. */
-    MBEDTLS_MD_MD4,       /**< The MD4 message digest. */
-    MBEDTLS_MD_MD5,       /**< The MD5 message digest. */
-    MBEDTLS_MD_SHA1,      /**< The SHA-1 message digest. */
-    MBEDTLS_MD_SHA224,    /**< The SHA-224 message digest. */
-    MBEDTLS_MD_SHA256,    /**< The SHA-256 message digest. */
-    MBEDTLS_MD_SHA384,    /**< The SHA-384 message digest. */
-    MBEDTLS_MD_SHA512,    /**< The SHA-512 message digest. */
-    MBEDTLS_MD_RIPEMD160, /**< The RIPEMD-160 message digest. */
-} mbedtls_md_type_t;
+    typedef enum
+    {
+        MBEDTLS_MD_NONE = 0,  /**< None. */
+        MBEDTLS_MD_MD2,       /**< The MD2 message digest. */
+        MBEDTLS_MD_MD4,       /**< The MD4 message digest. */
+        MBEDTLS_MD_MD5,       /**< The MD5 message digest. */
+        MBEDTLS_MD_SHA1,      /**< The SHA-1 message digest. */
+        MBEDTLS_MD_SHA224,    /**< The SHA-224 message digest. */
+        MBEDTLS_MD_SHA256,    /**< The SHA-256 message digest. */
+        MBEDTLS_MD_SHA384,    /**< The SHA-384 message digest. */
+        MBEDTLS_MD_SHA512,    /**< The SHA-512 message digest. */
+        MBEDTLS_MD_RIPEMD160, /**< The RIPEMD-160 message digest. */
+    } mbedtls_md_type_t;
 
 #if defined(MBEDTLS_SHA512_C)
-#define MBEDTLS_MD_MAX_SIZE         64  /* longest known is SHA512 */
+#define MBEDTLS_MD_MAX_SIZE 64 /* longest known is SHA512 */
 #else
-#define MBEDTLS_MD_MAX_SIZE         32  /* longest known is SHA256 or less */
+#define MBEDTLS_MD_MAX_SIZE 32 /* longest known is SHA256 or less */
 #endif
 
 #if defined(MBEDTLS_SHA512_C)
-#define MBEDTLS_MD_MAX_BLOCK_SIZE         128
+#define MBEDTLS_MD_MAX_BLOCK_SIZE 128
 #else
-#define MBEDTLS_MD_MAX_BLOCK_SIZE         64
+#define MBEDTLS_MD_MAX_BLOCK_SIZE 64
 #endif
 
-/**
+    /**
  * Opaque struct defined in md_internal.h.
  */
-typedef struct mbedtls_md_info_t mbedtls_md_info_t;
+    typedef struct mbedtls_md_info_t mbedtls_md_info_t;
 
-/**
+    /**
  * The generic message-digest context.
  */
-typedef struct mbedtls_md_context_t {
-    /** Information about the associated message digest. */
-    const mbedtls_md_info_t *md_info;
+    typedef struct mbedtls_md_context_t
+    {
+        /** Information about the associated message digest. */
+        const mbedtls_md_info_t *md_info;
 
-    /** The digest-specific context. */
-    void *md_ctx;
+        /** The digest-specific context. */
+        void *md_ctx;
 
-    /** The HMAC part of the context. */
-    void *hmac_ctx;
-} mbedtls_md_context_t;
+        /** The HMAC part of the context. */
+        void *hmac_ctx;
+    } mbedtls_md_context_t;
 
-/**
+    /**
  * \brief           This function returns the list of digests supported by the
  *                  generic digest module.
  *
@@ -102,9 +105,9 @@ typedef struct mbedtls_md_context_t {
  *                  message-digest enumeration #mbedtls_md_type_t.
  *                  The last entry is 0.
  */
-const int *mbedtls_md_list(void);
+    const int *mbedtls_md_list(void);
 
-/**
+    /**
  * \brief           This function returns the message-digest information
  *                  associated with the given digest name.
  *
@@ -113,9 +116,9 @@ const int *mbedtls_md_list(void);
  * \return          The message-digest information associated with \p md_name.
  * \return          NULL if the associated message-digest information is not found.
  */
-const mbedtls_md_info_t *mbedtls_md_info_from_string(const char *md_name);
+    const mbedtls_md_info_t *mbedtls_md_info_from_string(const char *md_name);
 
-/**
+    /**
  * \brief           This function returns the message-digest information
  *                  associated with the given digest type.
  *
@@ -124,9 +127,9 @@ const mbedtls_md_info_t *mbedtls_md_info_from_string(const char *md_name);
  * \return          The message-digest information associated with \p md_type.
  * \return          NULL if the associated message-digest information is not found.
  */
-const mbedtls_md_info_t *mbedtls_md_info_from_type(mbedtls_md_type_t md_type);
+    const mbedtls_md_info_t *mbedtls_md_info_from_type(mbedtls_md_type_t md_type);
 
-/**
+    /**
  * \brief           This function initializes a message-digest context without
  *                  binding it to a particular message-digest algorithm.
  *
@@ -134,9 +137,9 @@ const mbedtls_md_info_t *mbedtls_md_info_from_type(mbedtls_md_type_t md_type);
  *                  context for mbedtls_md_setup() for binding it to a
  *                  message-digest algorithm.
  */
-void mbedtls_md_init(mbedtls_md_context_t *ctx);
+    void mbedtls_md_init(mbedtls_md_context_t *ctx);
 
-/**
+    /**
  * \brief           This function clears the internal structure of \p ctx and
  *                  frees any embedded internal structure, but does not free
  *                  \p ctx itself.
@@ -149,15 +152,15 @@ void mbedtls_md_init(mbedtls_md_context_t *ctx);
  *                  You must not call this function if you have not called
  *                  mbedtls_md_init().
  */
-void mbedtls_md_free(mbedtls_md_context_t *ctx);
+    void mbedtls_md_free(mbedtls_md_context_t *ctx);
 
 #if !defined(MBEDTLS_DEPRECATED_REMOVED)
 #if defined(MBEDTLS_DEPRECATED_WARNING)
-#define MBEDTLS_DEPRECATED    __attribute__((deprecated))
+#define MBEDTLS_DEPRECATED __attribute__((deprecated))
 #else
 #define MBEDTLS_DEPRECATED
 #endif
-/**
+    /**
  * \brief           This function selects the message digest algorithm to use,
  *                  and allocates internal structures.
  *
@@ -175,12 +178,12 @@ void mbedtls_md_free(mbedtls_md_context_t *ctx);
  *                  failure.
  * \return          #MBEDTLS_ERR_MD_ALLOC_FAILED on memory-allocation failure.
  */
-int mbedtls_md_init_ctx(mbedtls_md_context_t *ctx,
-                        const mbedtls_md_info_t *md_info) MBEDTLS_DEPRECATED;
+    int mbedtls_md_init_ctx(mbedtls_md_context_t *ctx,
+                            const mbedtls_md_info_t *md_info) MBEDTLS_DEPRECATED;
 #undef MBEDTLS_DEPRECATED
 #endif /* MBEDTLS_DEPRECATED_REMOVED */
 
-/**
+    /**
  * \brief           This function selects the message digest algorithm to use,
  *                  and allocates internal structures.
  *
@@ -199,10 +202,10 @@ int mbedtls_md_init_ctx(mbedtls_md_context_t *ctx,
  *                  failure.
  * \return          #MBEDTLS_ERR_MD_ALLOC_FAILED on memory-allocation failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_setup(mbedtls_md_context_t *ctx, const mbedtls_md_info_t *md_info, int hmac);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_setup(mbedtls_md_context_t *ctx, const mbedtls_md_info_t *md_info, int hmac);
 
-/**
+    /**
  * \brief           This function clones the state of a message-digest
  *                  context.
  *
@@ -221,11 +224,10 @@ int mbedtls_md_setup(mbedtls_md_context_t *ctx, const mbedtls_md_info_t *md_info
  * \return          \c 0 on success.
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_clone(mbedtls_md_context_t *dst,
-                     const mbedtls_md_context_t *src);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_clone(mbedtls_md_context_t *dst, const mbedtls_md_context_t *src);
 
-/**
+    /**
  * \brief           This function extracts the message-digest size from the
  *                  message-digest information structure.
  *
@@ -234,9 +236,9 @@ int mbedtls_md_clone(mbedtls_md_context_t *dst,
  *
  * \return          The size of the message-digest output in Bytes.
  */
-unsigned char mbedtls_md_get_size(const mbedtls_md_info_t *md_info);
+    unsigned char mbedtls_md_get_size(const mbedtls_md_info_t *md_info);
 
-/**
+    /**
  * \brief           This function extracts the message-digest type from the
  *                  message-digest information structure.
  *
@@ -245,9 +247,9 @@ unsigned char mbedtls_md_get_size(const mbedtls_md_info_t *md_info);
  *
  * \return          The type of the message digest.
  */
-mbedtls_md_type_t mbedtls_md_get_type(const mbedtls_md_info_t *md_info);
+    mbedtls_md_type_t mbedtls_md_get_type(const mbedtls_md_info_t *md_info);
 
-/**
+    /**
  * \brief           This function extracts the message-digest name from the
  *                  message-digest information structure.
  *
@@ -256,9 +258,9 @@ mbedtls_md_type_t mbedtls_md_get_type(const mbedtls_md_info_t *md_info);
  *
  * \return          The name of the message digest.
  */
-const char *mbedtls_md_get_name(const mbedtls_md_info_t *md_info);
+    const char *mbedtls_md_get_name(const mbedtls_md_info_t *md_info);
 
-/**
+    /**
  * \brief           This function starts a message-digest computation.
  *
  *                  You must call this function after setting up the context
@@ -271,10 +273,10 @@ const char *mbedtls_md_get_name(const mbedtls_md_info_t *md_info);
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_starts(mbedtls_md_context_t *ctx);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_starts(mbedtls_md_context_t *ctx);
 
-/**
+    /**
  * \brief           This function feeds an input buffer into an ongoing
  *                  message-digest computation.
  *
@@ -290,10 +292,10 @@ int mbedtls_md_starts(mbedtls_md_context_t *ctx);
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_update(mbedtls_md_context_t *ctx, const unsigned char *input, size_t ilen);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_update(mbedtls_md_context_t *ctx, const unsigned char *input, size_t ilen);
 
-/**
+    /**
  * \brief           This function finishes the digest operation,
  *                  and writes the result to the output buffer.
  *
@@ -311,10 +313,10 @@ int mbedtls_md_update(mbedtls_md_context_t *ctx, const unsigned char *input, siz
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_finish(mbedtls_md_context_t *ctx, unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_finish(mbedtls_md_context_t *ctx, unsigned char *output);
 
-/**
+    /**
  * \brief          This function calculates the message-digest of a buffer,
  *                 with respect to a configurable message-digest algorithm
  *                 in a single call.
@@ -332,12 +334,12 @@ int mbedtls_md_finish(mbedtls_md_context_t *ctx, unsigned char *output);
  * \return         #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                 failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md(const mbedtls_md_info_t *md_info, const unsigned char *input, size_t ilen,
-               unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md(const mbedtls_md_info_t *md_info, const unsigned char *input, size_t ilen,
+                   unsigned char *output);
 
 #if defined(MBEDTLS_FS_IO)
-/**
+    /**
  * \brief          This function calculates the message-digest checksum
  *                 result of the contents of the provided file.
  *
@@ -354,12 +356,11 @@ int mbedtls_md(const mbedtls_md_info_t *md_info, const unsigned char *input, siz
  *                 the file pointed by \p path.
  * \return         #MBEDTLS_ERR_MD_BAD_INPUT_DATA if \p md_info was NULL.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_file(const mbedtls_md_info_t *md_info, const char *path,
-                    unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_file(const mbedtls_md_info_t *md_info, const char *path, unsigned char *output);
 #endif /* MBEDTLS_FS_IO */
 
-/**
+    /**
  * \brief           This function sets the HMAC key and prepares to
  *                  authenticate a new message.
  *
@@ -377,11 +378,10 @@ int mbedtls_md_file(const mbedtls_md_info_t *md_info, const char *path,
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_hmac_starts(mbedtls_md_context_t *ctx, const unsigned char *key,
-                           size_t keylen);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_hmac_starts(mbedtls_md_context_t *ctx, const unsigned char *key, size_t keylen);
 
-/**
+    /**
  * \brief           This function feeds an input buffer into an ongoing HMAC
  *                  computation.
  *
@@ -400,11 +400,10 @@ int mbedtls_md_hmac_starts(mbedtls_md_context_t *ctx, const unsigned char *key,
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_hmac_update(mbedtls_md_context_t *ctx, const unsigned char *input,
-                           size_t ilen);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_hmac_update(mbedtls_md_context_t *ctx, const unsigned char *input, size_t ilen);
 
-/**
+    /**
  * \brief           This function finishes the HMAC operation, and writes
  *                  the result to the output buffer.
  *
@@ -422,10 +421,10 @@ int mbedtls_md_hmac_update(mbedtls_md_context_t *ctx, const unsigned char *input
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_hmac_finish(mbedtls_md_context_t *ctx, unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_hmac_finish(mbedtls_md_context_t *ctx, unsigned char *output);
 
-/**
+    /**
  * \brief           This function prepares to authenticate a new message with
  *                  the same key as the previous HMAC operation.
  *
@@ -440,10 +439,10 @@ int mbedtls_md_hmac_finish(mbedtls_md_context_t *ctx, unsigned char *output);
  * \return          #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                  failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_hmac_reset(mbedtls_md_context_t *ctx);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_hmac_reset(mbedtls_md_context_t *ctx);
 
-/**
+    /**
  * \brief          This function calculates the full generic HMAC
  *                 on the input buffer with the provided key.
  *
@@ -465,14 +464,13 @@ int mbedtls_md_hmac_reset(mbedtls_md_context_t *ctx);
  * \return         #MBEDTLS_ERR_MD_BAD_INPUT_DATA on parameter-verification
  *                 failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_hmac(const mbedtls_md_info_t *md_info, const unsigned char *key, size_t keylen,
-                    const unsigned char *input, size_t ilen,
-                    unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_hmac(const mbedtls_md_info_t *md_info, const unsigned char *key, size_t keylen,
+                        const unsigned char *input, size_t ilen, unsigned char *output);
 
-/* Internal use */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_md_process(mbedtls_md_context_t *ctx, const unsigned char *data);
+    /* Internal use */
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_md_process(mbedtls_md_context_t *ctx, const unsigned char *data);
 
 #ifdef __cplusplus
 }

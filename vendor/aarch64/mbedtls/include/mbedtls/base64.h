@@ -19,15 +19,16 @@
 #include <stddef.h>
 
 /** Output buffer too small. */
-#define MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL               -0x002A
+#define MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL -0x002A
 /** Invalid character in input. */
-#define MBEDTLS_ERR_BASE64_INVALID_CHARACTER              -0x002C
+#define MBEDTLS_ERR_BASE64_INVALID_CHARACTER -0x002C
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-/**
+    /**
  * \brief          Encode a buffer into base64 format
  *
  * \param dst      destination buffer
@@ -46,10 +47,10 @@ extern "C" {
  * \note           Call this function with dlen = 0 to obtain the
  *                 required buffer size in *olen
  */
-int mbedtls_base64_encode(unsigned char *dst, size_t dlen, size_t *olen,
-                          const unsigned char *src, size_t slen);
+    int mbedtls_base64_encode(unsigned char *dst, size_t dlen, size_t *olen,
+                              const unsigned char *src, size_t slen);
 
-/**
+    /**
  * \brief          Decode a base64-formatted buffer
  *
  * \param dst      destination buffer (can be NULL for checking size)
@@ -66,16 +67,16 @@ int mbedtls_base64_encode(unsigned char *dst, size_t dlen, size_t *olen,
  * \note           Call this function with *dst = NULL or dlen = 0 to obtain
  *                 the required buffer size in *olen
  */
-int mbedtls_base64_decode(unsigned char *dst, size_t dlen, size_t *olen,
-                          const unsigned char *src, size_t slen);
+    int mbedtls_base64_decode(unsigned char *dst, size_t dlen, size_t *olen,
+                              const unsigned char *src, size_t slen);
 
 #if defined(MBEDTLS_SELF_TEST)
-/**
+    /**
  * \brief          Checkup routine
  *
  * \return         0 if successful, or 1 if the test failed
  */
-int mbedtls_base64_self_test(int verbose);
+    int mbedtls_base64_self_test(int verbose);
 
 #endif /* MBEDTLS_SELF_TEST */
 

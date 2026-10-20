@@ -8,16 +8,45 @@ extern void uart_hal_write32(uintptr_t, uint32_t);
 extern void uart_hal_write8(uintptr_t, unsigned char);
 extern uint32_t uart_hal_counter(void);
 extern unsigned uart_hal_core(void);
-static uint32_t publish_read(volatile uint32_t *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
-static void publish_write(volatile uint32_t *p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+
+static uint32_t publish_read(volatile uint32_t *p)
+{
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static void publish_write(volatile uint32_t *p, uint32_t v)
+{
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
 #else
 extern uint32_t lume_perf_counter(void);
 extern unsigned core_id(void);
-static uint32_t uart_hal_read32(uintptr_t p) { return *(volatile uint32_t *)p; }
-static void uart_hal_write32(uintptr_t p, uint32_t v) { *(volatile uint32_t *)p = v; }
-static void uart_hal_write8(uintptr_t p, unsigned char v) { *(volatile unsigned char *)p = v; }
-static uint32_t uart_hal_counter(void) { return lume_perf_counter(); }
-static unsigned uart_hal_core(void) { return core_id(); }
+
+static uint32_t uart_hal_read32(uintptr_t p)
+{
+    return *(volatile uint32_t *)p;
+}
+
+static void uart_hal_write32(uintptr_t p, uint32_t v)
+{
+    *(volatile uint32_t *)p = v;
+}
+
+static void uart_hal_write8(uintptr_t p, unsigned char v)
+{
+    *(volatile unsigned char *)p = v;
+}
+
+static uint32_t uart_hal_counter(void)
+{
+    return lume_perf_counter();
+}
+
+static unsigned uart_hal_core(void)
+{
+    return core_id();
+}
+
 /* X32 has no data cache/store buffer: a natural aligned32-bit RAM access
  * completes on the shared bus before the next instruction. Compiler barriers
  * plus this architectural ordering implement publication, not volatile alone. */
@@ -27,6 +56,7 @@ static uint32_t publish_read(volatile uint32_t *p)
     __asm__ volatile("" ::: "memory");
     return v;
 }
+
 static void publish_write(volatile uint32_t *p, uint32_t v)
 {
     __asm__ volatile("" ::: "memory");
@@ -34,12 +64,14 @@ static void publish_write(volatile uint32_t *p, uint32_t v)
 }
 #endif
 extern uint32_t x32_cas(volatile uint32_t *, uint32_t, uint32_t);
+
 enum
 {
     FREE = 0,
     WRITING = 1,
     READY = 2
 };
+
 struct request
 {
     volatile uint32_t state;
@@ -55,6 +87,7 @@ static unsigned lock_owner;
 static uint32_t last_error_counts, last_progress_ms, last_hw_count, last_fifo_bytes;
 static unsigned stalled, watch_started;
 static struct uart_queue_stats stats;
+
 static int acquire(void)
 {
     if (publish_read(&emergency) || x32_cas(&uart_lock, 0, 1))
@@ -62,13 +95,25 @@ static int acquire(void)
     lock_owner = uart_hal_core() + 1;
     return 1;
 }
+
 static void release(void)
 {
     lock_owner = 0;
     publish_write(&uart_lock, 0);
 }
-static void irqs(void) { uart_hal_write32(BASE + 20u, publish_read(&emergency) ? 0u : ((queued && !stalled) ? 1u : 0u) | (paused_rx ? 0u : 2u)); }
-int uart_queue_active(void) { return active; }
+
+static void irqs(void)
+{
+    uart_hal_write32(BASE + 20u, publish_read(&emergency)
+                                     ? 0u
+                                     : ((queued && !stalled) ? 1u : 0u) | (paused_rx ? 0u : 2u));
+}
+
+int uart_queue_active(void)
+{
+    return active;
+}
+
 int uart_queue_start(void)
 {
     /* CONTROL reads are defined and return zero on the legacy bus. Never
@@ -93,12 +138,14 @@ int uart_queue_start(void)
     stats.active = 1;
     for (unsigned i = 0; i < UART_REQUESTS; i++)
         publish_write(&requests[i].state, FREE);
-    put_at = take_at = queued = rx_put = rx_take = rx_count = paused_rx = stalled = watch_started = 0;
+    put_at = take_at = queued = rx_put = rx_take = rx_count = paused_rx = stalled = watch_started =
+        0;
     last_error_counts = uart_hal_read32(BASE + 24u);
     active = 1;
     irqs();
     return 0;
 }
+
 int uart_queue_submit(const unsigned char *data, unsigned n)
 {
     if (!active)
@@ -143,6 +190,7 @@ int uart_queue_submit(const unsigned char *data, unsigned n)
     publish_write(&r->state, READY);
     return (int)n;
 }
+
 int uart_queue_service_ready(void)
 {
     if (!active || publish_read(&emergency) || publish_read(&uart_lock))
@@ -154,6 +202,7 @@ int uart_queue_service_ready(void)
     uint32_t ready = uart_hal_read32(BASE + 4u);
     return !!((ready & 14u) || (publish_read(&queued) && (ready & 1u)));
 }
+
 int uart_queue_service(void)
 {
     if (!uart_queue_service_ready() || !acquire())
@@ -238,6 +287,7 @@ int uart_queue_service(void)
     release();
     return (sent ? 1 : 0) | (received ? 2 : 0) | (freed ? 4 : 0);
 }
+
 int uart_queue_read(void)
 {
     if (!active)
@@ -260,17 +310,18 @@ int uart_queue_read(void)
     release();
     return (int)c;
 }
+
 int uart_queue_drain(void)
 {
     if (!active)
         return -95;
     if (!acquire())
         return -11;
-    int result = stalled ? -5 : !queued && (uart_hal_read32(BASE + 4u) & 16u) ? 0
-                                                                              : -11;
+    int result = stalled ? -5 : !queued && (uart_hal_read32(BASE + 4u) & 16u) ? 0 : -11;
     release();
     return result;
 }
+
 void uart_queue_tick(uint32_t now)
 {
     if (!active || !acquire())
@@ -301,6 +352,7 @@ void uart_queue_tick(uint32_t now)
     irqs();
     release();
 }
+
 int uart_queue_snapshot(struct uart_queue_stats *out)
 {
     if (!out)
@@ -318,6 +370,7 @@ int uart_queue_snapshot(struct uart_queue_stats *out)
     release();
     return 0;
 }
+
 void uart_queue_emergency(const char *message)
 {
     unsigned mine = uart_hal_core() + 1;

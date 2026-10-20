@@ -29,48 +29,49 @@
 
 #include <stdint.h>
 
-#define MBEDTLS_GCM_ENCRYPT     1
-#define MBEDTLS_GCM_DECRYPT     0
+#define MBEDTLS_GCM_ENCRYPT 1
+#define MBEDTLS_GCM_DECRYPT 0
 
 /** Authenticated decryption failed. */
-#define MBEDTLS_ERR_GCM_AUTH_FAILED                       -0x0012
+#define MBEDTLS_ERR_GCM_AUTH_FAILED -0x0012
 
 /* MBEDTLS_ERR_GCM_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** GCM hardware accelerator failed. */
-#define MBEDTLS_ERR_GCM_HW_ACCEL_FAILED                   -0x0013
+#define MBEDTLS_ERR_GCM_HW_ACCEL_FAILED -0x0013
 
 /** Bad input parameters to function. */
-#define MBEDTLS_ERR_GCM_BAD_INPUT                         -0x0014
+#define MBEDTLS_ERR_GCM_BAD_INPUT -0x0014
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 #if !defined(MBEDTLS_GCM_ALT)
 
-/**
+    /**
  * \brief          The GCM context structure.
  */
-typedef struct mbedtls_gcm_context {
-    mbedtls_cipher_context_t cipher_ctx;  /*!< The cipher context used. */
-    uint64_t HL[16];                      /*!< Precalculated HTable low. */
-    uint64_t HH[16];                      /*!< Precalculated HTable high. */
-    uint64_t len;                         /*!< The total length of the encrypted data. */
-    uint64_t add_len;                     /*!< The total length of the additional data. */
-    unsigned char base_ectr[16];          /*!< The first ECTR for tag. */
-    unsigned char y[16];                  /*!< The Y working value. */
-    unsigned char buf[16];                /*!< The buf working value. */
-    int mode;                             /*!< The operation to perform:
+    typedef struct mbedtls_gcm_context
+    {
+        mbedtls_cipher_context_t cipher_ctx; /*!< The cipher context used. */
+        uint64_t HL[16];                     /*!< Precalculated HTable low. */
+        uint64_t HH[16];                     /*!< Precalculated HTable high. */
+        uint64_t len;                        /*!< The total length of the encrypted data. */
+        uint64_t add_len;                    /*!< The total length of the additional data. */
+        unsigned char base_ectr[16];         /*!< The first ECTR for tag. */
+        unsigned char y[16];                 /*!< The Y working value. */
+        unsigned char buf[16];               /*!< The buf working value. */
+        int mode;                            /*!< The operation to perform:
                                            #MBEDTLS_GCM_ENCRYPT or
                                            #MBEDTLS_GCM_DECRYPT. */
-}
-mbedtls_gcm_context;
+    } mbedtls_gcm_context;
 
-#else  /* !MBEDTLS_GCM_ALT */
+#else /* !MBEDTLS_GCM_ALT */
 #include "gcm_alt.h"
 #endif /* !MBEDTLS_GCM_ALT */
 
-/**
+    /**
  * \brief           This function initializes the specified GCM context,
  *                  to make references valid, and prepares the context
  *                  for mbedtls_gcm_setkey() or mbedtls_gcm_free().
@@ -81,9 +82,9 @@ mbedtls_gcm_context;
  *
  * \param ctx       The GCM context to initialize. This must not be \c NULL.
  */
-void mbedtls_gcm_init(mbedtls_gcm_context *ctx);
+    void mbedtls_gcm_init(mbedtls_gcm_context *ctx);
 
-/**
+    /**
  * \brief           This function associates a GCM context with a
  *                  cipher algorithm and a key.
  *
@@ -99,12 +100,10 @@ void mbedtls_gcm_init(mbedtls_gcm_context *ctx);
  * \return          \c 0 on success.
  * \return          A cipher-specific error code on failure.
  */
-int mbedtls_gcm_setkey(mbedtls_gcm_context *ctx,
-                       mbedtls_cipher_id_t cipher,
-                       const unsigned char *key,
-                       unsigned int keybits);
+    int mbedtls_gcm_setkey(mbedtls_gcm_context *ctx, mbedtls_cipher_id_t cipher,
+                           const unsigned char *key, unsigned int keybits);
 
-/**
+    /**
  * \brief           This function performs GCM encryption or decryption of a buffer.
  *
  * \note            The output buffer \p output can be the same as the input
@@ -154,19 +153,12 @@ int mbedtls_gcm_setkey(mbedtls_gcm_context *ctx,
  *                  not valid or a cipher-specific error code if the encryption
  *                  or decryption failed.
  */
-int mbedtls_gcm_crypt_and_tag(mbedtls_gcm_context *ctx,
-                              int mode,
-                              size_t length,
-                              const unsigned char *iv,
-                              size_t iv_len,
-                              const unsigned char *add,
-                              size_t add_len,
-                              const unsigned char *input,
-                              unsigned char *output,
-                              size_t tag_len,
-                              unsigned char *tag);
+    int mbedtls_gcm_crypt_and_tag(mbedtls_gcm_context *ctx, int mode, size_t length,
+                                  const unsigned char *iv, size_t iv_len, const unsigned char *add,
+                                  size_t add_len, const unsigned char *input, unsigned char *output,
+                                  size_t tag_len, unsigned char *tag);
 
-/**
+    /**
  * \brief           This function performs a GCM authenticated decryption of a
  *                  buffer.
  *
@@ -201,18 +193,12 @@ int mbedtls_gcm_crypt_and_tag(mbedtls_gcm_context *ctx,
  *                  not valid or a cipher-specific error code if the decryption
  *                  failed.
  */
-int mbedtls_gcm_auth_decrypt(mbedtls_gcm_context *ctx,
-                             size_t length,
-                             const unsigned char *iv,
-                             size_t iv_len,
-                             const unsigned char *add,
-                             size_t add_len,
-                             const unsigned char *tag,
-                             size_t tag_len,
-                             const unsigned char *input,
-                             unsigned char *output);
+    int mbedtls_gcm_auth_decrypt(mbedtls_gcm_context *ctx, size_t length, const unsigned char *iv,
+                                 size_t iv_len, const unsigned char *add, size_t add_len,
+                                 const unsigned char *tag, size_t tag_len,
+                                 const unsigned char *input, unsigned char *output);
 
-/**
+    /**
  * \brief           This function starts a GCM encryption or decryption
  *                  operation.
  *
@@ -229,14 +215,10 @@ int mbedtls_gcm_auth_decrypt(mbedtls_gcm_context *ctx,
  *
  * \return          \c 0 on success.
  */
-int mbedtls_gcm_starts(mbedtls_gcm_context *ctx,
-                       int mode,
-                       const unsigned char *iv,
-                       size_t iv_len,
-                       const unsigned char *add,
-                       size_t add_len);
+    int mbedtls_gcm_starts(mbedtls_gcm_context *ctx, int mode, const unsigned char *iv,
+                           size_t iv_len, const unsigned char *add, size_t add_len);
 
-/**
+    /**
  * \brief           This function feeds an input buffer into an ongoing GCM
  *                  encryption or decryption operation.
  *
@@ -263,12 +245,10 @@ int mbedtls_gcm_starts(mbedtls_gcm_context *ctx,
  * \return         \c 0 on success.
  * \return         #MBEDTLS_ERR_GCM_BAD_INPUT on failure.
  */
-int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
-                       size_t length,
-                       const unsigned char *input,
-                       unsigned char *output);
+    int mbedtls_gcm_update(mbedtls_gcm_context *ctx, size_t length, const unsigned char *input,
+                           unsigned char *output);
 
-/**
+    /**
  * \brief           This function finishes the GCM operation and generates
  *                  the authentication tag.
  *
@@ -284,34 +264,31 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
  * \return          \c 0 on success.
  * \return          #MBEDTLS_ERR_GCM_BAD_INPUT on failure.
  */
-int mbedtls_gcm_finish(mbedtls_gcm_context *ctx,
-                       unsigned char *tag,
-                       size_t tag_len);
+    int mbedtls_gcm_finish(mbedtls_gcm_context *ctx, unsigned char *tag, size_t tag_len);
 
-/**
+    /**
  * \brief           This function clears a GCM context and the underlying
  *                  cipher sub-context.
  *
  * \param ctx       The GCM context to clear. If this is \c NULL, the call has
  *                  no effect. Otherwise, this must be initialized.
  */
-void mbedtls_gcm_free(mbedtls_gcm_context *ctx);
+    void mbedtls_gcm_free(mbedtls_gcm_context *ctx);
 
 #if defined(MBEDTLS_SELF_TEST)
 
-/**
+    /**
  * \brief          The GCM checkup routine.
  *
  * \return         \c 0 on success.
  * \return         \c 1 on failure.
  */
-int mbedtls_gcm_self_test(int verbose);
+    int mbedtls_gcm_self_test(int verbose);
 
 #endif /* MBEDTLS_SELF_TEST */
 
 #ifdef __cplusplus
 }
 #endif
-
 
 #endif /* gcm.h */

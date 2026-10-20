@@ -1,4 +1,5 @@
 #include <stddef.h>
+
 int memcmp(const void *av, const void *bv, size_t n)
 {
     const unsigned char *a = av, *b = bv;
@@ -11,6 +12,7 @@ int memcmp(const void *av, const void *bv, size_t n)
     }
     return 0;
 }
+
 char *strchr(const char *s, int c)
 {
     do

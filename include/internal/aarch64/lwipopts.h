@@ -19,7 +19,7 @@
 #define LWIP_DEBUG 0
 #define LWIP_NETIF_HOSTNAME 1
 #define MEM_ALIGNMENT 8
-#define MEM_SIZE (48*1024)
+#define MEM_SIZE (48 * 1024)
 #define PBUF_POOL_SIZE 16
 #define PBUF_POOL_BUFSIZE 1536
 #define MEMP_NUM_TCP_PCB 4
@@ -28,8 +28,8 @@
 #define MEMP_NUM_UDP_PCB 6
 #define MEMP_NUM_RAW_PCB 2
 #define TCP_MSS 1460
-#define TCP_WND (4*TCP_MSS)
-#define TCP_SND_BUF (4*TCP_MSS)
+#define TCP_WND (4 * TCP_MSS)
+#define TCP_SND_BUF (4 * TCP_MSS)
 #define DNS_TABLE_SIZE 4
 #define DNS_MAX_NAME_LENGTH 128
 #define IP_REASSEMBLY 0

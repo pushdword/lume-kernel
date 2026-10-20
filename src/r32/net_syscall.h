@@ -9,15 +9,15 @@
 #include "network.h"
 #include "net_gate.h"
 
-static int32_t lume_net_dispatch(unsigned owner, unsigned uid, uint32_t operation,
-                                 uint32_t pointer, uint32_t bytes, unsigned char *data)
+static int32_t lume_net_dispatch(unsigned owner, unsigned uid, uint32_t operation, uint32_t pointer,
+                                 uint32_t bytes, unsigned char *data)
 {
     if (bytes != sizeof(struct lume_net_request))
         return -LUME_NET_EINVAL;
     if (operation < LUME_NET_INFO || operation > LUME_NET_POLL)
         return -LUME_NET_EINVAL;
-    if ((pointer & 3u) || pointer > UINT32_MAX - bytes ||
-        !user_range(owner, pointer, bytes, 0) || !user_range(owner, pointer, bytes, 1))
+    if ((pointer & 3u) || pointer > UINT32_MAX - bytes || !user_range(owner, pointer, bytes, 0) ||
+        !user_range(owner, pointer, bytes, 1))
         return -LUME_NET_EFAULT;
     struct lume_net_request request;
     user_copy_from(owner, &request, pointer, sizeof request);
@@ -25,15 +25,20 @@ static int32_t lume_net_dispatch(unsigned owner, unsigned uid, uint32_t operatio
         return -LUME_NET_EINVAL;
     if (operation == LUME_NET_CONFIG && uid)
         return -LUME_NET_EACCES;
-    if (operation == LUME_NET_SOCKET && request.protocol != LUME_NET_TCP && request.protocol != LUME_NET_UDP)
+    if (operation == LUME_NET_SOCKET && request.protocol != LUME_NET_TCP &&
+        request.protocol != LUME_NET_UDP)
         return -LUME_NET_EOPNOTSUPP;
-    if ((operation == LUME_NET_BIND || operation == LUME_NET_CONNECT || operation == LUME_NET_SENDTO) &&
+    if ((operation == LUME_NET_BIND || operation == LUME_NET_CONNECT ||
+         operation == LUME_NET_SENDTO) &&
         (request.port > 65535u || (operation != LUME_NET_BIND && !request.port)))
         return -LUME_NET_EINVAL;
-    if (operation == LUME_NET_POLL && (request.events & ~(LUME_NET_POLLIN | LUME_NET_POLLOUT | LUME_NET_POLLLISTEN)))
+    if (operation == LUME_NET_POLL &&
+        (request.events & ~(LUME_NET_POLLIN | LUME_NET_POLLOUT | LUME_NET_POLLLISTEN)))
         return -LUME_NET_EINVAL;
-    unsigned input = operation == LUME_NET_CONFIG || operation == LUME_NET_SEND || operation == LUME_NET_SENDTO;
-    unsigned output = operation == LUME_NET_INFO || operation == LUME_NET_RECV || operation == LUME_NET_RECVFROM;
+    unsigned input =
+        operation == LUME_NET_CONFIG || operation == LUME_NET_SEND || operation == LUME_NET_SENDTO;
+    unsigned output =
+        operation == LUME_NET_INFO || operation == LUME_NET_RECV || operation == LUME_NET_RECVFROM;
     uint32_t buffer = request.buffer, length = request.length;
     if (input || output)
     {
@@ -62,8 +67,9 @@ static int32_t lume_net_dispatch(unsigned owner, unsigned uid, uint32_t operatio
         unsigned char *to = (unsigned char *)&configuration;
         for (unsigned i = 0; i < sizeof configuration; i++)
             to[i] = data[i];
-        if (configuration.version != LUME_NET_VERSION || configuration.bytes != sizeof configuration ||
-            configuration.flags || configuration.reserved[0] || configuration.reserved[1])
+        if (configuration.version != LUME_NET_VERSION ||
+            configuration.bytes != sizeof configuration || configuration.flags ||
+            configuration.reserved[0] || configuration.reserved[1])
             return -LUME_NET_EINVAL;
     }
     unsigned token = lume_net_begin();
@@ -71,14 +77,17 @@ static int32_t lume_net_dispatch(unsigned owner, unsigned uid, uint32_t operatio
     lume_net_end(token);
     if (result < 0)
         return result;
-    if (operation == LUME_NET_SEND || operation == LUME_NET_RECV || operation == LUME_NET_SENDTO || operation == LUME_NET_RECVFROM)
+    if (operation == LUME_NET_SEND || operation == LUME_NET_RECV || operation == LUME_NET_SENDTO ||
+        operation == LUME_NET_RECVFROM)
     {
         if ((uint32_t)result > length)
             return -LUME_NET_EIO;
     }
     else if (operation == LUME_NET_POLL)
     {
-        if (result > 1 || (request.events & ~(LUME_NET_POLLIN | LUME_NET_POLLOUT | LUME_NET_POLLERR | LUME_NET_POLLHUP | LUME_NET_POLLLISTEN)))
+        if (result > 1 ||
+            (request.events & ~(LUME_NET_POLLIN | LUME_NET_POLLOUT | LUME_NET_POLLERR |
+                                LUME_NET_POLLHUP | LUME_NET_POLLLISTEN)))
             return -LUME_NET_EIO;
     }
     else if (operation != LUME_NET_SOCKET && operation != LUME_NET_ACCEPT && result)

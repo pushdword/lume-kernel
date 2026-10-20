@@ -3,21 +3,34 @@
 #ifndef LUME_CONSOLE_HOST_TEST
 #include "uart_queue.h"
 #else
-static int uart_queue_active(void) { return 0; }
-static int uart_queue_read(void) { return -11; }
+static int uart_queue_active(void)
+{
+    return 0;
+}
+
+static int uart_queue_read(void)
+{
+    return -11;
+}
 #endif
-static unsigned char kernel_logs[MAX_PROCESSES+2][4096];
-static unsigned kernel_log_sizes[MAX_PROCESSES+2];
+static unsigned char kernel_logs[MAX_PROCESSES + 2][4096];
+static unsigned kernel_log_sizes[MAX_PROCESSES + 2];
+
 static unsigned log_core(void)
 {
 #ifdef LUME_CONSOLE_HOST_TEST
     return 0;
 #else
     unsigned core = core_id();
-    return current[core]>=0?(unsigned)current[core]:MAX_PROCESSES+core;
+    return current[core] >= 0 ? (unsigned)current[core] : MAX_PROCESSES + core;
 #endif
 }
-unsigned console_kernel_size(void) { return kernel_log_sizes[log_core()]; }
+
+unsigned console_kernel_size(void)
+{
+    return kernel_log_sizes[log_core()];
+}
+
 unsigned console_kernel_take(unsigned char *out, unsigned capacity)
 {
     unsigned core = log_core();
@@ -31,15 +44,18 @@ unsigned console_kernel_take(unsigned char *out, unsigned capacity)
     kernel_log_sizes[core] = 0;
     return n;
 }
-static unsigned video, extended, keyboard, last_present, cursor_visible, cursor_at, cursor_cell, focus;
+
+static unsigned video, extended, keyboard, last_present, cursor_visible, cursor_at, cursor_cell,
+    focus;
 static unsigned position[2], available[2];
 static struct terminal screen[2];
 /* Input remains under queue_lock; it never touches a live renderer. */
-static unsigned render_active,input_focus,cached_geometry[2];
+static unsigned render_active, input_focus, cached_geometry[2];
 static struct keymap layout[2];
 static unsigned char pending[2][16];
 static volatile uint32_t *const cells = (volatile uint32_t *)0xf0010100u;
 static volatile uint32_t *const kbd = (volatile uint32_t *)0xf0005000u;
+
 static void cursor_hide(void)
 {
     if (cursor_visible)
@@ -48,6 +64,7 @@ static void cursor_hide(void)
         cursor_visible = 0;
     }
 }
+
 static void cursor_show(void)
 {
     struct terminal *t = &screen[focus];
@@ -58,6 +75,7 @@ static void cursor_show(void)
     terminal_mmio_write(cells + cursor_at, cursor_cell ^ 0x7700u);
     cursor_visible = 1;
 }
+
 static void begin_write(unsigned tty)
 {
     struct terminal *t = &screen[tty];
@@ -69,6 +87,7 @@ static void begin_write(unsigned tty)
     }
     terminal_begin(t);
 }
+
 static void end_write(unsigned tty)
 {
     struct terminal *t = &screen[tty];
@@ -89,18 +108,32 @@ static void end_write(unsigned tty)
     }
     t->watch_active = 0;
 }
-void console_render_begin(void){render_active=1;}
-void console_render_end(void){
-    render_active=0;
-    for(unsigned i=0;i<2;i++)cached_geometry[i]=(screen[i].rows<<16)|screen[i].columns;
-    if(video&&focus!=input_focus){cursor_hide();focus=input_focus;cursor_show();}
+
+void console_render_begin(void)
+{
+    render_active = 1;
 }
+
+void console_render_end(void)
+{
+    render_active = 0;
+    for (unsigned i = 0; i < 2; i++)
+        cached_geometry[i] = (screen[i].rows << 16) | screen[i].columns;
+    if (video && focus != input_focus)
+    {
+        cursor_hide();
+        focus = input_focus;
+        cursor_show();
+    }
+}
+
 static void panes_start(unsigned columns, unsigned rows)
 {
     unsigned first = rows / 2;
     terminal_start(&screen[0], cells, columns, first);
     terminal_start(&screen[1], cells + columns * first, columns, rows - first);
 }
+
 void console_start(void)
 {
     unsigned id = *(volatile uint32_t *)0xf0010000u;
@@ -128,6 +161,7 @@ void console_start(void)
     if (keyboard)
         kbd[3] = 3;
 }
+
 static void uart(unsigned c)
 {
     unsigned budget = 1000000;
@@ -138,6 +172,7 @@ static void uart(unsigned c)
     }
     *(volatile unsigned char *)0xf0000000u = (unsigned char)c;
 }
+
 static void emit(unsigned tty, unsigned c)
 {
     if (!tty)
@@ -149,6 +184,7 @@ static void emit(unsigned tty, unsigned c)
     if (video)
         terminal_byte(&screen[tty], c);
 }
+
 void kputc(unsigned c)
 {
     if (uart_queue_active())
@@ -166,6 +202,7 @@ void kputc(unsigned c)
     if (video)
         end_write(0);
 }
+
 void console_write_tty(unsigned tty, const unsigned char *bytes, unsigned n)
 {
     if (tty > 1)
@@ -186,7 +223,12 @@ void console_write_tty(unsigned tty, const unsigned char *bytes, unsigned n)
             uart(bytes[i]);
         }
 }
-void console_write(const unsigned char *bytes, unsigned n) { console_write_tty(0, bytes, n); }
+
+void console_write(const unsigned char *bytes, unsigned n)
+{
+    console_write_tty(0, bytes, n);
+}
+
 static void append_input(unsigned tty, const unsigned char *bytes, unsigned n)
 {
     unsigned left = available[tty] - position[tty];
@@ -200,13 +242,15 @@ static void append_input(unsigned tty, const unsigned char *bytes, unsigned n)
             pending[tty][available[tty]++] = bytes[i];
     }
 }
+
 static void fill_input(void)
 {
     if (available[0] - position[0] < sizeof pending[0])
     {
         if (uart_queue_active())
         {
-            for (unsigned n = 0; n < sizeof pending[0] && available[0] - position[0] < sizeof pending[0]; n++)
+            for (unsigned n = 0;
+                 n < sizeof pending[0] && available[0] - position[0] < sizeof pending[0]; n++)
             {
                 int c = uart_queue_read();
                 if (c < 0)
@@ -247,7 +291,12 @@ static void fill_input(void)
         if (video && (mods & 4u) && (usage == 0x3a || usage == 0x3b))
         {
             input_focus = usage - 0x3a;
-            if(!render_active){cursor_hide();focus=input_focus;cursor_show();}
+            if (!render_active)
+            {
+                cursor_hide();
+                focus = input_focus;
+                cursor_show();
+            }
             continue;
         }
         unsigned char bytes[16];
@@ -256,6 +305,7 @@ static void fill_input(void)
             append_input(input_focus, bytes, n);
     }
 }
+
 int console_ready_tty(unsigned tty)
 {
     if (tty > 1)
@@ -263,23 +313,48 @@ int console_ready_tty(unsigned tty)
     fill_input();
     return position[tty] < available[tty];
 }
-int console_getchar_tty(unsigned tty) { return console_ready_tty(tty) ? pending[tty][position[tty]++] : -11; }
-int console_ready(void) { return console_ready_tty(0); }
-int console_getchar(void) { return console_getchar_tty(0); }
-unsigned console_geometry_tty(unsigned tty) { return video && tty < 2 ? cached_geometry[tty] : (24u << 16) | 80u; }
-unsigned console_geometry(void) { return console_geometry_tty(0); }
-unsigned console_tty_supported(unsigned tty) { return tty == 0 || (tty == 1 && video); }
+
+int console_getchar_tty(unsigned tty)
+{
+    return console_ready_tty(tty) ? pending[tty][position[tty]++] : -11;
+}
+
+int console_ready(void)
+{
+    return console_ready_tty(0);
+}
+
+int console_getchar(void)
+{
+    return console_getchar_tty(0);
+}
+
+unsigned console_geometry_tty(unsigned tty)
+{
+    return video && tty < 2 ? cached_geometry[tty] : (24u << 16) | 80u;
+}
+
+unsigned console_geometry(void)
+{
+    return console_geometry_tty(0);
+}
+
+unsigned console_tty_supported(unsigned tty)
+{
+    return tty == 0 || (tty == 1 && video);
+}
+
 int console_video(unsigned action, unsigned value, const unsigned char *font)
 {
     if (action == 0)
-        return extended ? 3 : video ? 1
-                                    : 0; /* Supported modes; EDID unavailable. */
+        return extended ? 3 : video ? 1 : 0; /* Supported modes; EDID unavailable. */
     if (action >= 3 && action <= 5)
     {
         if (!video)
             return -95;
-        return (int)*(volatile uint32_t *)(uintptr_t)(action == 3 ? 0xf0010014u : action == 4 ? 0xf001000cu
-                                                                                              : 0xf0010004u);
+        return (int)*(volatile uint32_t *)(uintptr_t)(action == 3   ? 0xf0010014u
+                                                      : action == 4 ? 0xf001000cu
+                                                                    : 0xf0010004u);
     }
     if (!extended)
         return -95;
@@ -299,12 +374,14 @@ int console_video(unsigned action, unsigned value, const unsigned char *font)
         for (unsigned i = 0; i < 1024; i++)
         {
             const unsigned char *p = font + i * 4;
-            ram[i] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            ram[i] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                     ((uint32_t)p[3] << 24);
         }
         return 0;
     }
     return -22;
 }
+
 void kputs(const char *s)
 {
     if (uart_queue_active())
@@ -320,6 +397,7 @@ void kputs(const char *s)
     if (video)
         end_write(0);
 }
+
 void knumber(uint32_t n)
 {
     char b[10];
@@ -332,6 +410,7 @@ void knumber(uint32_t n)
     while (i)
         kputc((unsigned)b[--i]);
 }
+
 void khex(uint32_t n)
 {
     for (unsigned s = 32; s;)

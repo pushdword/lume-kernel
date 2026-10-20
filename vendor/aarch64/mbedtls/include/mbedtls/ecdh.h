@@ -34,107 +34,113 @@
 #endif
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-/**
+    /**
  * Defines the source of the imported EC key.
  */
-typedef enum {
-    MBEDTLS_ECDH_OURS,   /**< Our key. */
-    MBEDTLS_ECDH_THEIRS, /**< The key of the peer. */
-} mbedtls_ecdh_side;
+    typedef enum
+    {
+        MBEDTLS_ECDH_OURS,   /**< Our key. */
+        MBEDTLS_ECDH_THEIRS, /**< The key of the peer. */
+    } mbedtls_ecdh_side;
 
 #if !defined(MBEDTLS_ECDH_LEGACY_CONTEXT)
-/**
+    /**
  * Defines the ECDH implementation used.
  *
  * Later versions of the library may add new variants, therefore users should
  * not make any assumptions about them.
  */
-typedef enum {
-    MBEDTLS_ECDH_VARIANT_NONE = 0,   /*!< Implementation not defined. */
-    MBEDTLS_ECDH_VARIANT_MBEDTLS_2_0,/*!< The default Mbed TLS implementation */
+    typedef enum
+    {
+        MBEDTLS_ECDH_VARIANT_NONE = 0,    /*!< Implementation not defined. */
+        MBEDTLS_ECDH_VARIANT_MBEDTLS_2_0, /*!< The default Mbed TLS implementation */
 #if defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
-    MBEDTLS_ECDH_VARIANT_EVEREST     /*!< Everest implementation */
+        MBEDTLS_ECDH_VARIANT_EVEREST /*!< Everest implementation */
 #endif
-} mbedtls_ecdh_variant;
+    } mbedtls_ecdh_variant;
 
-/**
+    /**
  * The context used by the default ECDH implementation.
  *
  * Later versions might change the structure of this context, therefore users
  * should not make any assumptions about the structure of
  * mbedtls_ecdh_context_mbed.
  */
-typedef struct mbedtls_ecdh_context_mbed {
-    mbedtls_ecp_group grp;   /*!< The elliptic curve used. */
-    mbedtls_mpi d;           /*!< The private key. */
-    mbedtls_ecp_point Q;     /*!< The public key. */
-    mbedtls_ecp_point Qp;    /*!< The value of the public key of the peer. */
-    mbedtls_mpi z;           /*!< The shared secret. */
+    typedef struct mbedtls_ecdh_context_mbed
+    {
+        mbedtls_ecp_group grp; /*!< The elliptic curve used. */
+        mbedtls_mpi d;         /*!< The private key. */
+        mbedtls_ecp_point Q;   /*!< The public key. */
+        mbedtls_ecp_point Qp;  /*!< The value of the public key of the peer. */
+        mbedtls_mpi z;         /*!< The shared secret. */
 #if defined(MBEDTLS_ECP_RESTARTABLE)
-    mbedtls_ecp_restart_ctx rs; /*!< The restart context for EC computations. */
+        mbedtls_ecp_restart_ctx rs; /*!< The restart context for EC computations. */
 #endif
-} mbedtls_ecdh_context_mbed;
+    } mbedtls_ecdh_context_mbed;
 #endif
 
-/**
+    /**
  *
  * \warning         Performing multiple operations concurrently on the same
  *                  ECDSA context is not supported; objects of this type
  *                  should not be shared between multiple threads.
  * \brief           The ECDH context structure.
  */
-typedef struct mbedtls_ecdh_context {
+    typedef struct mbedtls_ecdh_context
+    {
 #if defined(MBEDTLS_ECDH_LEGACY_CONTEXT)
-    mbedtls_ecp_group grp;   /*!< The elliptic curve used. */
-    mbedtls_mpi d;           /*!< The private key. */
-    mbedtls_ecp_point Q;     /*!< The public key. */
-    mbedtls_ecp_point Qp;    /*!< The value of the public key of the peer. */
-    mbedtls_mpi z;           /*!< The shared secret. */
-    int point_format;        /*!< The format of point export in TLS messages. */
-    mbedtls_ecp_point Vi;    /*!< The blinding value. */
-    mbedtls_ecp_point Vf;    /*!< The unblinding value. */
-    mbedtls_mpi _d;          /*!< The previous \p d. */
+        mbedtls_ecp_group grp; /*!< The elliptic curve used. */
+        mbedtls_mpi d;         /*!< The private key. */
+        mbedtls_ecp_point Q;   /*!< The public key. */
+        mbedtls_ecp_point Qp;  /*!< The value of the public key of the peer. */
+        mbedtls_mpi z;         /*!< The shared secret. */
+        int point_format;      /*!< The format of point export in TLS messages. */
+        mbedtls_ecp_point Vi;  /*!< The blinding value. */
+        mbedtls_ecp_point Vf;  /*!< The unblinding value. */
+        mbedtls_mpi _d;        /*!< The previous \p d. */
 #if defined(MBEDTLS_ECP_RESTARTABLE)
-    int restart_enabled;        /*!< The flag for restartable mode. */
-    mbedtls_ecp_restart_ctx rs; /*!< The restart context for EC computations. */
-#endif /* MBEDTLS_ECP_RESTARTABLE */
+        int restart_enabled;        /*!< The flag for restartable mode. */
+        mbedtls_ecp_restart_ctx rs; /*!< The restart context for EC computations. */
+#endif                              /* MBEDTLS_ECP_RESTARTABLE */
 #else
-    uint8_t point_format;       /*!< The format of point export in TLS messages
+    uint8_t point_format;        /*!< The format of point export in TLS messages
                                    as defined in RFC 4492. */
-    mbedtls_ecp_group_id grp_id;/*!< The elliptic curve used. */
-    mbedtls_ecdh_variant var;   /*!< The ECDH implementation/structure used. */
-    union {
-        mbedtls_ecdh_context_mbed   mbed_ecdh;
+    mbedtls_ecp_group_id grp_id; /*!< The elliptic curve used. */
+    mbedtls_ecdh_variant var;    /*!< The ECDH implementation/structure used. */
+
+    union
+    {
+        mbedtls_ecdh_context_mbed mbed_ecdh;
 #if defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
         mbedtls_ecdh_context_everest everest_ecdh;
 #endif
-    } ctx;                      /*!< Implementation-specific context. The
+    } ctx; /*!< Implementation-specific context. The
                                    context in use is specified by the \c var
                                    field. */
 #if defined(MBEDTLS_ECP_RESTARTABLE)
-    uint8_t restart_enabled;    /*!< The flag for restartable mode. Functions of
+    uint8_t restart_enabled; /*!< The flag for restartable mode. Functions of
                                    an alternative implementation not supporting
                                    restartable mode must return
                                    MBEDTLS_ERR_PLATFORM_FEATURE_UNSUPPORTED error
                                    if this flag is set. */
 #endif /* MBEDTLS_ECP_RESTARTABLE */
 #endif /* MBEDTLS_ECDH_LEGACY_CONTEXT */
-}
-mbedtls_ecdh_context;
+    } mbedtls_ecdh_context;
 
-/**
+    /**
  * \brief          Check whether a given group can be used for ECDH.
  *
  * \param gid      The ECP group ID to check.
  *
  * \return         \c 1 if the group can be used, \c 0 otherwise
  */
-int mbedtls_ecdh_can_do(mbedtls_ecp_group_id gid);
+    int mbedtls_ecdh_can_do(mbedtls_ecp_group_id gid);
 
-/**
+    /**
  * \brief           This function generates an ECDH keypair on an elliptic
  *                  curve.
  *
@@ -159,11 +165,10 @@ int mbedtls_ecdh_can_do(mbedtls_ecp_group_id gid);
  * \return          Another \c MBEDTLS_ERR_ECP_XXX or
  *                  \c MBEDTLS_MPI_XXX error code on failure.
  */
-int mbedtls_ecdh_gen_public(mbedtls_ecp_group *grp, mbedtls_mpi *d, mbedtls_ecp_point *Q,
-                            int (*f_rng)(void *, unsigned char *, size_t),
-                            void *p_rng);
+    int mbedtls_ecdh_gen_public(mbedtls_ecp_group *grp, mbedtls_mpi *d, mbedtls_ecp_point *Q,
+                                int (*f_rng)(void *, unsigned char *, size_t), void *p_rng);
 
-/**
+    /**
  * \brief           This function computes the shared secret.
  *
  *                  This function performs the second of two core computations
@@ -197,19 +202,18 @@ int mbedtls_ecdh_gen_public(mbedtls_ecp_group *grp, mbedtls_mpi *d, mbedtls_ecp_
  * \return          Another \c MBEDTLS_ERR_ECP_XXX or
  *                  \c MBEDTLS_MPI_XXX error code on failure.
  */
-int mbedtls_ecdh_compute_shared(mbedtls_ecp_group *grp, mbedtls_mpi *z,
-                                const mbedtls_ecp_point *Q, const mbedtls_mpi *d,
-                                int (*f_rng)(void *, unsigned char *, size_t),
-                                void *p_rng);
+    int mbedtls_ecdh_compute_shared(mbedtls_ecp_group *grp, mbedtls_mpi *z,
+                                    const mbedtls_ecp_point *Q, const mbedtls_mpi *d,
+                                    int (*f_rng)(void *, unsigned char *, size_t), void *p_rng);
 
-/**
+    /**
  * \brief           This function initializes an ECDH context.
  *
  * \param ctx       The ECDH context to initialize. This must not be \c NULL.
  */
-void mbedtls_ecdh_init(mbedtls_ecdh_context *ctx);
+    void mbedtls_ecdh_init(mbedtls_ecdh_context *ctx);
 
-/**
+    /**
  * \brief           This function sets up the ECDH context with the information
  *                  given.
  *
@@ -225,19 +229,18 @@ void mbedtls_ecdh_init(mbedtls_ecdh_context *ctx);
  *
  * \return          \c 0 on success.
  */
-int mbedtls_ecdh_setup(mbedtls_ecdh_context *ctx,
-                       mbedtls_ecp_group_id grp_id);
+    int mbedtls_ecdh_setup(mbedtls_ecdh_context *ctx, mbedtls_ecp_group_id grp_id);
 
-/**
+    /**
  * \brief           This function frees a context.
  *
  * \param ctx       The context to free. This may be \c NULL, in which
  *                  case this function does nothing. If it is not \c NULL,
  *                  it must point to an initialized ECDH context.
  */
-void mbedtls_ecdh_free(mbedtls_ecdh_context *ctx);
+    void mbedtls_ecdh_free(mbedtls_ecdh_context *ctx);
 
-/**
+    /**
  * \brief           This function generates an EC key pair and exports its
  *                  in the format used in a TLS ServerKeyExchange handshake
  *                  message.
@@ -262,12 +265,11 @@ void mbedtls_ecdh_free(mbedtls_ecdh_context *ctx);
  *                  operations was reached: see \c mbedtls_ecp_set_max_ops().
  * \return          Another \c MBEDTLS_ERR_ECP_XXX error code on failure.
  */
-int mbedtls_ecdh_make_params(mbedtls_ecdh_context *ctx, size_t *olen,
-                             unsigned char *buf, size_t blen,
-                             int (*f_rng)(void *, unsigned char *, size_t),
-                             void *p_rng);
+    int mbedtls_ecdh_make_params(mbedtls_ecdh_context *ctx, size_t *olen, unsigned char *buf,
+                                 size_t blen, int (*f_rng)(void *, unsigned char *, size_t),
+                                 void *p_rng);
 
-/**
+    /**
  * \brief           This function parses the ECDHE parameters in a
  *                  TLS ServerKeyExchange handshake message.
  *
@@ -291,11 +293,10 @@ int mbedtls_ecdh_make_params(mbedtls_ecdh_context *ctx, size_t *olen,
  * \return          An \c MBEDTLS_ERR_ECP_XXX error code on failure.
  *
  */
-int mbedtls_ecdh_read_params(mbedtls_ecdh_context *ctx,
-                             const unsigned char **buf,
-                             const unsigned char *end);
+    int mbedtls_ecdh_read_params(mbedtls_ecdh_context *ctx, const unsigned char **buf,
+                                 const unsigned char *end);
 
-/**
+    /**
  * \brief           This function sets up an ECDH context from an EC key.
  *
  *                  It is used by clients and servers in place of the
@@ -314,11 +315,10 @@ int mbedtls_ecdh_read_params(mbedtls_ecdh_context *ctx,
  * \return          Another \c MBEDTLS_ERR_ECP_XXX error code on failure.
  *
  */
-int mbedtls_ecdh_get_params(mbedtls_ecdh_context *ctx,
-                            const mbedtls_ecp_keypair *key,
-                            mbedtls_ecdh_side side);
+    int mbedtls_ecdh_get_params(mbedtls_ecdh_context *ctx, const mbedtls_ecp_keypair *key,
+                                mbedtls_ecdh_side side);
 
-/**
+    /**
  * \brief           This function generates a public key and exports it
  *                  as a TLS ClientKeyExchange payload.
  *
@@ -344,12 +344,11 @@ int mbedtls_ecdh_get_params(mbedtls_ecdh_context *ctx,
  *                  operations was reached: see \c mbedtls_ecp_set_max_ops().
  * \return          Another \c MBEDTLS_ERR_ECP_XXX error code on failure.
  */
-int mbedtls_ecdh_make_public(mbedtls_ecdh_context *ctx, size_t *olen,
-                             unsigned char *buf, size_t blen,
-                             int (*f_rng)(void *, unsigned char *, size_t),
-                             void *p_rng);
+    int mbedtls_ecdh_make_public(mbedtls_ecdh_context *ctx, size_t *olen, unsigned char *buf,
+                                 size_t blen, int (*f_rng)(void *, unsigned char *, size_t),
+                                 void *p_rng);
 
-/**
+    /**
  * \brief       This function parses and processes the ECDHE payload of a
  *              TLS ClientKeyExchange message.
  *
@@ -368,10 +367,9 @@ int mbedtls_ecdh_make_public(mbedtls_ecdh_context *ctx, size_t *olen,
  * \return      \c 0 on success.
  * \return      An \c MBEDTLS_ERR_ECP_XXX error code on failure.
  */
-int mbedtls_ecdh_read_public(mbedtls_ecdh_context *ctx,
-                             const unsigned char *buf, size_t blen);
+    int mbedtls_ecdh_read_public(mbedtls_ecdh_context *ctx, const unsigned char *buf, size_t blen);
 
-/**
+    /**
  * \brief           This function derives and exports the shared secret.
  *
  *                  This is the last function used by both TLS client
@@ -401,13 +399,12 @@ int mbedtls_ecdh_read_public(mbedtls_ecdh_context *ctx,
  *                  operations was reached: see \c mbedtls_ecp_set_max_ops().
  * \return          Another \c MBEDTLS_ERR_ECP_XXX error code on failure.
  */
-int mbedtls_ecdh_calc_secret(mbedtls_ecdh_context *ctx, size_t *olen,
-                             unsigned char *buf, size_t blen,
-                             int (*f_rng)(void *, unsigned char *, size_t),
-                             void *p_rng);
+    int mbedtls_ecdh_calc_secret(mbedtls_ecdh_context *ctx, size_t *olen, unsigned char *buf,
+                                 size_t blen, int (*f_rng)(void *, unsigned char *, size_t),
+                                 void *p_rng);
 
 #if defined(MBEDTLS_ECP_RESTARTABLE)
-/**
+    /**
  * \brief           This function enables restartable EC computations for this
  *                  context.  (Default: disabled.)
  *
@@ -419,7 +416,7 @@ int mbedtls_ecdh_calc_secret(mbedtls_ecdh_context *ctx, size_t *olen,
  *
  * \param ctx       The ECDH context to use. This must be initialized.
  */
-void mbedtls_ecdh_enable_restart(mbedtls_ecdh_context *ctx);
+    void mbedtls_ecdh_enable_restart(mbedtls_ecdh_context *ctx);
 #endif /* MBEDTLS_ECP_RESTARTABLE */
 
 #ifdef __cplusplus

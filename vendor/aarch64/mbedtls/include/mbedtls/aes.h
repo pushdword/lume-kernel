@@ -39,47 +39,48 @@
 #include <stdint.h>
 
 /* padlock.c and aesni.c rely on these values! */
-#define MBEDTLS_AES_ENCRYPT     1 /**< AES encryption. */
-#define MBEDTLS_AES_DECRYPT     0 /**< AES decryption. */
+#define MBEDTLS_AES_ENCRYPT 1 /**< AES encryption. */
+#define MBEDTLS_AES_DECRYPT 0 /**< AES decryption. */
 
 /* Error codes in range 0x0020-0x0022 */
 /** Invalid key length. */
-#define MBEDTLS_ERR_AES_INVALID_KEY_LENGTH                -0x0020
+#define MBEDTLS_ERR_AES_INVALID_KEY_LENGTH -0x0020
 /** Invalid data input length. */
-#define MBEDTLS_ERR_AES_INVALID_INPUT_LENGTH              -0x0022
+#define MBEDTLS_ERR_AES_INVALID_INPUT_LENGTH -0x0022
 
 /* Error codes in range 0x0021-0x0025 */
 /** Invalid input data. */
-#define MBEDTLS_ERR_AES_BAD_INPUT_DATA                    -0x0021
+#define MBEDTLS_ERR_AES_BAD_INPUT_DATA -0x0021
 
 /* MBEDTLS_ERR_AES_FEATURE_UNAVAILABLE is deprecated and should not be used. */
 /** Feature not available. For example, an unsupported AES key size. */
-#define MBEDTLS_ERR_AES_FEATURE_UNAVAILABLE               -0x0023
+#define MBEDTLS_ERR_AES_FEATURE_UNAVAILABLE -0x0023
 
 /* MBEDTLS_ERR_AES_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** AES hardware accelerator failed. */
-#define MBEDTLS_ERR_AES_HW_ACCEL_FAILED                   -0x0025
+#define MBEDTLS_ERR_AES_HW_ACCEL_FAILED -0x0025
 
-#if (defined(__ARMCC_VERSION) || defined(_MSC_VER)) && \
-    !defined(inline) && !defined(__cplusplus)
+#if (defined(__ARMCC_VERSION) || defined(_MSC_VER)) && !defined(inline) && !defined(__cplusplus)
 #define inline __inline
 #endif
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 #if !defined(MBEDTLS_AES_ALT)
-// Regular implementation
-//
+    // Regular implementation
+    //
 
-/**
+    /**
  * \brief The AES context-type definition.
  */
-typedef struct mbedtls_aes_context {
-    int nr;                     /*!< The number of rounds. */
-    uint32_t *rk;               /*!< AES round keys. */
-    uint32_t buf[68];           /*!< Unaligned data buffer. This buffer can
+    typedef struct mbedtls_aes_context
+    {
+        int nr;           /*!< The number of rounds. */
+        uint32_t *rk;     /*!< AES round keys. */
+        uint32_t buf[68]; /*!< Unaligned data buffer. This buffer can
                                      hold 32 extra Bytes, which can be used for
                                      one of the following purposes:
                                      <ul><li>Alignment if VIA padlock is
@@ -87,26 +88,26 @@ typedef struct mbedtls_aes_context {
                                      <li>Simplifying key expansion in the 256-bit
                                          case by generating an extra round key.
                                          </li></ul> */
-}
-mbedtls_aes_context;
+    } mbedtls_aes_context;
 
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
-/**
+    /**
  * \brief The AES XTS context-type definition.
  */
-typedef struct mbedtls_aes_xts_context {
-    mbedtls_aes_context crypt; /*!< The AES context to use for AES block
+    typedef struct mbedtls_aes_xts_context
+    {
+        mbedtls_aes_context crypt; /*!< The AES context to use for AES block
                                         encryption or decryption. */
-    mbedtls_aes_context tweak; /*!< The AES context used for tweak
+        mbedtls_aes_context tweak; /*!< The AES context used for tweak
                                         computation. */
-} mbedtls_aes_xts_context;
+    } mbedtls_aes_xts_context;
 #endif /* MBEDTLS_CIPHER_MODE_XTS */
 
-#else  /* MBEDTLS_AES_ALT */
+#else /* MBEDTLS_AES_ALT */
 #include "aes_alt.h"
 #endif /* MBEDTLS_AES_ALT */
 
-/**
+    /**
  * \brief          This function initializes the specified AES context.
  *
  *                 It must be the first API called before using
@@ -114,19 +115,19 @@ typedef struct mbedtls_aes_xts_context {
  *
  * \param ctx      The AES context to initialize. This must not be \c NULL.
  */
-void mbedtls_aes_init(mbedtls_aes_context *ctx);
+    void mbedtls_aes_init(mbedtls_aes_context *ctx);
 
-/**
+    /**
  * \brief          This function releases and clears the specified AES context.
  *
  * \param ctx      The AES context to clear.
  *                 If this is \c NULL, this function does nothing.
  *                 Otherwise, the context must have been at least initialized.
  */
-void mbedtls_aes_free(mbedtls_aes_context *ctx);
+    void mbedtls_aes_free(mbedtls_aes_context *ctx);
 
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
-/**
+    /**
  * \brief          This function initializes the specified AES XTS context.
  *
  *                 It must be the first API called before using
@@ -134,19 +135,19 @@ void mbedtls_aes_free(mbedtls_aes_context *ctx);
  *
  * \param ctx      The AES XTS context to initialize. This must not be \c NULL.
  */
-void mbedtls_aes_xts_init(mbedtls_aes_xts_context *ctx);
+    void mbedtls_aes_xts_init(mbedtls_aes_xts_context *ctx);
 
-/**
+    /**
  * \brief          This function releases and clears the specified AES XTS context.
  *
  * \param ctx      The AES XTS context to clear.
  *                 If this is \c NULL, this function does nothing.
  *                 Otherwise, the context must have been at least initialized.
  */
-void mbedtls_aes_xts_free(mbedtls_aes_xts_context *ctx);
+    void mbedtls_aes_xts_free(mbedtls_aes_xts_context *ctx);
 #endif /* MBEDTLS_CIPHER_MODE_XTS */
 
-/**
+    /**
  * \brief          This function sets the encryption key.
  *
  * \param ctx      The AES context to which the key should be bound.
@@ -161,11 +162,11 @@ void mbedtls_aes_xts_free(mbedtls_aes_xts_context *ctx);
  * \return         \c 0 on success.
  * \return         #MBEDTLS_ERR_AES_INVALID_KEY_LENGTH on failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key,
-                           unsigned int keybits);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key,
+                               unsigned int keybits);
 
-/**
+    /**
  * \brief          This function sets the decryption key.
  *
  * \param ctx      The AES context to which the key should be bound.
@@ -180,12 +181,12 @@ int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key,
  * \return         \c 0 on success.
  * \return         #MBEDTLS_ERR_AES_INVALID_KEY_LENGTH on failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_setkey_dec(mbedtls_aes_context *ctx, const unsigned char *key,
-                           unsigned int keybits);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_setkey_dec(mbedtls_aes_context *ctx, const unsigned char *key,
+                               unsigned int keybits);
 
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
-/**
+    /**
  * \brief          This function prepares an XTS context for encryption and
  *                 sets the encryption key.
  *
@@ -201,12 +202,11 @@ int mbedtls_aes_setkey_dec(mbedtls_aes_context *ctx, const unsigned char *key,
  * \return         \c 0 on success.
  * \return         #MBEDTLS_ERR_AES_INVALID_KEY_LENGTH on failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_xts_setkey_enc(mbedtls_aes_xts_context *ctx,
-                               const unsigned char *key,
-                               unsigned int keybits);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_xts_setkey_enc(mbedtls_aes_xts_context *ctx, const unsigned char *key,
+                                   unsigned int keybits);
 
-/**
+    /**
  * \brief          This function prepares an XTS context for decryption and
  *                 sets the decryption key.
  *
@@ -222,13 +222,12 @@ int mbedtls_aes_xts_setkey_enc(mbedtls_aes_xts_context *ctx,
  * \return         \c 0 on success.
  * \return         #MBEDTLS_ERR_AES_INVALID_KEY_LENGTH on failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_xts_setkey_dec(mbedtls_aes_xts_context *ctx,
-                               const unsigned char *key,
-                               unsigned int keybits);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_xts_setkey_dec(mbedtls_aes_xts_context *ctx, const unsigned char *key,
+                                   unsigned int keybits);
 #endif /* MBEDTLS_CIPHER_MODE_XTS */
 
-/**
+    /**
  * \brief          This function performs an AES single-block encryption or
  *                 decryption operation.
  *
@@ -251,14 +250,12 @@ int mbedtls_aes_xts_setkey_dec(mbedtls_aes_xts_context *ctx,
 
  * \return         \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx,
-                          int mode,
-                          const unsigned char input[16],
-                          unsigned char output[16]);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx, int mode, const unsigned char input[16],
+                              unsigned char output[16]);
 
 #if defined(MBEDTLS_CIPHER_MODE_CBC)
-/**
+    /**
  * \brief  This function performs an AES-CBC encryption or decryption operation
  *         on full blocks.
  *
@@ -299,17 +296,14 @@ int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx,
  * \return         #MBEDTLS_ERR_AES_INVALID_INPUT_LENGTH
  *                 on failure.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_cbc(mbedtls_aes_context *ctx,
-                          int mode,
-                          size_t length,
-                          unsigned char iv[16],
-                          const unsigned char *input,
-                          unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_cbc(mbedtls_aes_context *ctx, int mode, size_t length,
+                              unsigned char iv[16], const unsigned char *input,
+                              unsigned char *output);
 #endif /* MBEDTLS_CIPHER_MODE_CBC */
 
 #if defined(MBEDTLS_CIPHER_MODE_XTS)
-/**
+    /**
  * \brief      This function performs an AES-XTS encryption or decryption
  *             operation for an entire XTS data unit.
  *
@@ -344,17 +338,14 @@ int mbedtls_aes_crypt_cbc(mbedtls_aes_context *ctx,
  *                     smaller than an AES block in size (16 Bytes) or if \p
  *                     length is larger than 2^20 blocks (16 MiB).
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_xts(mbedtls_aes_xts_context *ctx,
-                          int mode,
-                          size_t length,
-                          const unsigned char data_unit[16],
-                          const unsigned char *input,
-                          unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_xts(mbedtls_aes_xts_context *ctx, int mode, size_t length,
+                              const unsigned char data_unit[16], const unsigned char *input,
+                              unsigned char *output);
 #endif /* MBEDTLS_CIPHER_MODE_XTS */
 
 #if defined(MBEDTLS_CIPHER_MODE_CFB)
-/**
+    /**
  * \brief This function performs an AES-CFB128 encryption or decryption
  *        operation.
  *
@@ -393,16 +384,12 @@ int mbedtls_aes_crypt_xts(mbedtls_aes_xts_context *ctx,
  *
  * \return         \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_cfb128(mbedtls_aes_context *ctx,
-                             int mode,
-                             size_t length,
-                             size_t *iv_off,
-                             unsigned char iv[16],
-                             const unsigned char *input,
-                             unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_cfb128(mbedtls_aes_context *ctx, int mode, size_t length, size_t *iv_off,
+                                 unsigned char iv[16], const unsigned char *input,
+                                 unsigned char *output);
 
-/**
+    /**
  * \brief This function performs an AES-CFB8 encryption or decryption
  *        operation.
  *
@@ -438,17 +425,14 @@ int mbedtls_aes_crypt_cfb128(mbedtls_aes_context *ctx,
  *
  * \return         \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_cfb8(mbedtls_aes_context *ctx,
-                           int mode,
-                           size_t length,
-                           unsigned char iv[16],
-                           const unsigned char *input,
-                           unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_cfb8(mbedtls_aes_context *ctx, int mode, size_t length,
+                               unsigned char iv[16], const unsigned char *input,
+                               unsigned char *output);
 #endif /*MBEDTLS_CIPHER_MODE_CFB */
 
 #if defined(MBEDTLS_CIPHER_MODE_OFB)
-/**
+    /**
  * \brief       This function performs an AES-OFB (Output Feedback Mode)
  *              encryption or decryption operation.
  *
@@ -493,18 +477,15 @@ int mbedtls_aes_crypt_cfb8(mbedtls_aes_context *ctx,
  *
  * \return         \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_ofb(mbedtls_aes_context *ctx,
-                          size_t length,
-                          size_t *iv_off,
-                          unsigned char iv[16],
-                          const unsigned char *input,
-                          unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_ofb(mbedtls_aes_context *ctx, size_t length, size_t *iv_off,
+                              unsigned char iv[16], const unsigned char *input,
+                              unsigned char *output);
 
 #endif /* MBEDTLS_CIPHER_MODE_OFB */
 
 #if defined(MBEDTLS_CIPHER_MODE_CTR)
-/**
+    /**
  * \brief      This function performs an AES-CTR encryption or decryption
  *             operation.
  *
@@ -576,17 +557,13 @@ int mbedtls_aes_crypt_ofb(mbedtls_aes_context *ctx,
  *
  * \return                 \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_aes_crypt_ctr(mbedtls_aes_context *ctx,
-                          size_t length,
-                          size_t *nc_off,
-                          unsigned char nonce_counter[16],
-                          unsigned char stream_block[16],
-                          const unsigned char *input,
-                          unsigned char *output);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_aes_crypt_ctr(mbedtls_aes_context *ctx, size_t length, size_t *nc_off,
+                              unsigned char nonce_counter[16], unsigned char stream_block[16],
+                              const unsigned char *input, unsigned char *output);
 #endif /* MBEDTLS_CIPHER_MODE_CTR */
 
-/**
+    /**
  * \brief           Internal AES block encryption function. This is only
  *                  exposed to allow overriding it using
  *                  \c MBEDTLS_AES_ENCRYPT_ALT.
@@ -597,12 +574,11 @@ int mbedtls_aes_crypt_ctr(mbedtls_aes_context *ctx,
  *
  * \return          \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_internal_aes_encrypt(mbedtls_aes_context *ctx,
-                                 const unsigned char input[16],
-                                 unsigned char output[16]);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_internal_aes_encrypt(mbedtls_aes_context *ctx, const unsigned char input[16],
+                                     unsigned char output[16]);
 
-/**
+    /**
  * \brief           Internal AES block decryption function. This is only
  *                  exposed to allow overriding it using see
  *                  \c MBEDTLS_AES_DECRYPT_ALT.
@@ -613,18 +589,17 @@ int mbedtls_internal_aes_encrypt(mbedtls_aes_context *ctx,
  *
  * \return          \c 0 on success.
  */
-MBEDTLS_CHECK_RETURN_TYPICAL
-int mbedtls_internal_aes_decrypt(mbedtls_aes_context *ctx,
-                                 const unsigned char input[16],
-                                 unsigned char output[16]);
+    MBEDTLS_CHECK_RETURN_TYPICAL
+    int mbedtls_internal_aes_decrypt(mbedtls_aes_context *ctx, const unsigned char input[16],
+                                     unsigned char output[16]);
 
 #if !defined(MBEDTLS_DEPRECATED_REMOVED)
 #if defined(MBEDTLS_DEPRECATED_WARNING)
-#define MBEDTLS_DEPRECATED      __attribute__((deprecated))
+#define MBEDTLS_DEPRECATED __attribute__((deprecated))
 #else
 #define MBEDTLS_DEPRECATED
 #endif
-/**
+    /**
  * \brief           Deprecated internal AES block encryption function
  *                  without return value.
  *
@@ -634,11 +609,11 @@ int mbedtls_internal_aes_decrypt(mbedtls_aes_context *ctx,
  * \param input     Plaintext block.
  * \param output    Output (ciphertext) block.
  */
-MBEDTLS_DEPRECATED void mbedtls_aes_encrypt(mbedtls_aes_context *ctx,
-                                            const unsigned char input[16],
-                                            unsigned char output[16]);
+    MBEDTLS_DEPRECATED void mbedtls_aes_encrypt(mbedtls_aes_context *ctx,
+                                                const unsigned char input[16],
+                                                unsigned char output[16]);
 
-/**
+    /**
  * \brief           Deprecated internal AES block decryption function
  *                  without return value.
  *
@@ -648,23 +623,22 @@ MBEDTLS_DEPRECATED void mbedtls_aes_encrypt(mbedtls_aes_context *ctx,
  * \param input     Ciphertext block.
  * \param output    Output (plaintext) block.
  */
-MBEDTLS_DEPRECATED void mbedtls_aes_decrypt(mbedtls_aes_context *ctx,
-                                            const unsigned char input[16],
-                                            unsigned char output[16]);
+    MBEDTLS_DEPRECATED void mbedtls_aes_decrypt(mbedtls_aes_context *ctx,
+                                                const unsigned char input[16],
+                                                unsigned char output[16]);
 
 #undef MBEDTLS_DEPRECATED
 #endif /* !MBEDTLS_DEPRECATED_REMOVED */
 
-
 #if defined(MBEDTLS_SELF_TEST)
-/**
+    /**
  * \brief          Checkup routine.
  *
  * \return         \c 0 on success.
  * \return         \c 1 on failure.
  */
-MBEDTLS_CHECK_RETURN_CRITICAL
-int mbedtls_aes_self_test(int verbose);
+    MBEDTLS_CHECK_RETURN_CRITICAL
+    int mbedtls_aes_self_test(int verbose);
 
 #endif /* MBEDTLS_SELF_TEST */
 

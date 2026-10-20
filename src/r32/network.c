@@ -28,8 +28,15 @@ extern uint32_t uptime_ms;
 extern uint32_t lume_net_mmio_read(uintptr_t address);
 extern void lume_net_mmio_write(uintptr_t address, uint32_t value);
 #else
-static uint32_t lume_net_mmio_read(uintptr_t p) { return *(volatile uint32_t *)p; }
-static void lume_net_mmio_write(uintptr_t p, uint32_t v) { *(volatile uint32_t *)p = v; }
+static uint32_t lume_net_mmio_read(uintptr_t p)
+{
+    return *(volatile uint32_t *)p;
+}
+
+static void lume_net_mmio_write(uintptr_t p, uint32_t v)
+{
+    *(volatile uint32_t *)p = v;
+}
 #endif
 
 enum
@@ -45,6 +52,7 @@ enum
     PEER_CLOSED,
     FAILED
 };
+
 struct socket_state
 {
     unsigned used, owner, protocol, hardware, phase, port;
@@ -57,17 +65,37 @@ struct socket_state
     unsigned peer_port;
 };
 static struct socket_state sockets[SOCKETS];
-static struct lume_net_config configuration = {
-    LUME_NET_VERSION, sizeof(struct lume_net_config), {2, 0x58, 0x32, 0x25, 3, 0x17}, {0, 0}, {0, 0, 0, 0}, {255, 255, 255, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, 0};
+static struct lume_net_config configuration = {LUME_NET_VERSION,
+                                               sizeof(struct lume_net_config),
+                                               {2, 0x58, 0x32, 0x25, 3, 0x17},
+                                               {0, 0},
+                                               {0, 0, 0, 0},
+                                               {255, 255, 255, 0},
+                                               {0, 0, 0, 0},
+                                               {0, 0, 0, 0},
+                                               0};
 static unsigned ready, spi_hz, raw_blocks;
 
-static int zero_ip(const unsigned char p[4]) { return !(p[0] | p[1] | p[2] | p[3]); }
+static int zero_ip(const unsigned char p[4])
+{
+    return !(p[0] | p[1] | p[2] | p[3]);
+}
+
 static int local_peer(const unsigned char p[4])
 {
     return p[0] == 172 && p[1] == 30 && p[2] == 1 && p[3] && p[3] != 255;
 }
-static int broadcast(const unsigned char p[4]) { return p[0] == 255 && p[1] == 255 && p[2] == 255 && p[3] == 255; }
-static unsigned block(const struct socket_state *s) { return 1u + 4u * s->hardware; }
+
+static int broadcast(const unsigned char p[4])
+{
+    return p[0] == 255 && p[1] == 255 && p[2] == 255 && p[3] == 255;
+}
+
+static unsigned block(const struct socket_state *s)
+{
+    return 1u + 4u * s->hardware;
+}
+
 static inline int byte_done(void)
 {
     unsigned budget = BYTE_POLLS;
@@ -80,11 +108,13 @@ static inline int byte_done(void)
     }
     return 1;
 }
+
 static int header_byte(unsigned byte)
 {
     lume_net_mmio_write(BASE + 8, byte);
     return byte_done();
 }
+
 /* The raw engine consumes exactly payload bytes; SD CRC framing is disabled
  * in the PMOD instance. Keep CS asserted over the W5500 header and all blocks. */
 static int raw_payload(unsigned char *out, const unsigned char *in, unsigned n)
@@ -100,12 +130,14 @@ static int raw_payload(unsigned char *out, const unsigned char *in, unsigned n)
             for (unsigned i = 0; i < take; i += 4u)
             {
                 unsigned bytes = take - i;
-                if (bytes > 4u) bytes = 4u;
+                if (bytes > 4u)
+                    bytes = 4u;
                 uint32_t word = 0;
                 if (bytes == 4u && !((uintptr_t)(in + i) & 3u))
                     word = *(const net_alias_word *)(const void *)(in + i);
-                else for (unsigned j = 0; j < bytes; j++)
-                    word |= (uint32_t)in[i + j] << (8u * j);
+                else
+                    for (unsigned j = 0; j < bytes; j++)
+                        word |= (uint32_t)in[i + j] << (8u * j);
                 lume_net_mmio_write(BASE + 44, word);
             }
             lume_net_mmio_write(BASE + 40, 0x40000000u | take);
@@ -126,21 +158,26 @@ static int raw_payload(unsigned char *out, const unsigned char *in, unsigned n)
                 {
                     uint32_t word = lume_net_mmio_read(BASE + 44);
                     unsigned bytes = take - received;
-                    if (bytes > 4u) bytes = 4u;
+                    if (bytes > 4u)
+                        bytes = 4u;
                     if (out && bytes == 4u && !((uintptr_t)(out + received) & 3u))
                     {
                         *(net_alias_word *)(void *)(out + received) = word;
                         received += 4u;
                     }
-                    else for (unsigned j = 0; j < bytes; j++)
-                    {
-                        if (out) out[received] = (unsigned char)(word >> (8u * j));
-                        received++;
-                    }
+                    else
+                        for (unsigned j = 0; j < bytes; j++)
+                        {
+                            if (out)
+                                out[received] = (unsigned char)(word >> (8u * j));
+                            received++;
+                        }
                 }
-                if (!(budget & 127u)) io_clock_checkpoint();
+                if (!(budget & 127u))
+                    io_clock_checkpoint();
             }
-            if (received != take) return 0;
+            if (received != take)
+                return 0;
         }
         unsigned done = 0;
         for (unsigned budget = RAW_POLLS; budget; budget--)
@@ -148,26 +185,34 @@ static int raw_payload(unsigned char *out, const unsigned char *in, unsigned n)
             status = lume_net_mmio_read(BASE + 12);
             if (status & 8u)
             {
-                if ((status & 1u) || ((status >> 8) & 255u)) return 0;
+                if ((status & 1u) || ((status >> 8) & 255u))
+                    return 0;
                 done = 1;
                 break;
             }
-            if (!(budget & 127u)) io_clock_checkpoint();
+            if (!(budget & 127u))
+                io_clock_checkpoint();
         }
-        if (!done) return 0;
-        if (in) in += take;
-        if (out) out += take;
+        if (!done)
+            return 0;
+        if (in)
+            in += take;
+        if (out)
+            out += take;
         n -= take;
         io_clock_checkpoint();
     }
     return 1;
 }
-static int access_bytes(unsigned b, unsigned address, unsigned char *out, const unsigned char *in, unsigned n)
+
+static int access_bytes(unsigned b, unsigned address, unsigned char *out, const unsigned char *in,
+                        unsigned n)
 {
     if (!n || n > LUME_NET_IO_MAX || b > 31 || address > 65535)
         return 0;
     lume_net_mmio_write(BASE + 4, 0);
-    int ok = header_byte(address >> 8) && header_byte(address & 255) && header_byte((b << 3) | (in ? 4u : 0));
+    int ok = header_byte(address >> 8) && header_byte(address & 255) &&
+             header_byte((b << 3) | (in ? 4u : 0));
     if (ok && raw_blocks && n >= 16u)
         ok = raw_payload(out, in, n);
     else if (ok && in)
@@ -210,26 +255,31 @@ static int access_bytes(unsigned b, unsigned address, unsigned char *out, const 
         lume_net_mmio_write(BASE + 20, 1);
     return ok;
 }
+
 static int get(unsigned b, unsigned a)
 {
     unsigned char v;
     return access_bytes(b, a, &v, 0, 1) ? v : -1;
 }
+
 static int put(unsigned b, unsigned a, unsigned v)
 {
     unsigned char c = (unsigned char)v;
     return access_bytes(b, a, 0, &c, 1);
 }
+
 static int get_word(unsigned b, unsigned a)
 {
     unsigned char v[2];
     return access_bytes(b, a, v, 0, 2) ? (int)((unsigned)v[0] * 256u + v[1]) : -1;
 }
+
 static int put_word(unsigned b, unsigned a, unsigned v)
 {
     unsigned char bytes[2] = {(unsigned char)(v >> 8), (unsigned char)v};
     return access_bytes(b, a, 0, bytes, 2);
 }
+
 static int stable_word(unsigned b, unsigned a, unsigned *value)
 {
     int old = get_word(b, a);
@@ -249,6 +299,7 @@ static int stable_word(unsigned b, unsigned a, unsigned *value)
     }
     return -LUME_NET_EAGAIN;
 }
+
 static int command(unsigned b, unsigned value)
 {
     if (!put(b, 1, value))
@@ -265,6 +316,7 @@ static int command(unsigned b, unsigned value)
     }
     return 0;
 }
+
 static int write_configuration(const struct lume_net_config *c)
 {
     if (!access_bytes(0, 9, 0, c->mac, 6) || !access_bytes(0, 15, 0, c->address, 4) ||
@@ -274,10 +326,12 @@ static int write_configuration(const struct lume_net_config *c)
     const unsigned char *expected[] = {c->mac, c->address, c->netmask, c->gateway};
     const unsigned addresses[] = {9, 15, 5, 1}, sizes[] = {6, 4, 4, 4};
     for (unsigned i = 0; i < 4; ++i)
-        if (!access_bytes(0, addresses[i], actual, 0, sizes[i]) || memcmp(actual, expected[i], sizes[i]))
+        if (!access_bytes(0, addresses[i], actual, 0, sizes[i]) ||
+            memcmp(actual, expected[i], sizes[i]))
             return 0;
     return 1;
 }
+
 static int ensure(void)
 {
     if (ready)
@@ -310,12 +364,14 @@ static int ensure(void)
     ready = 1;
     return 0;
 }
+
 static int handle(unsigned owner, int h)
 {
     if (h < 1 || h > (int)SOCKETS || !sockets[h - 1].used || sockets[h - 1].owner != owner)
         return -1;
     return h - 1;
 }
+
 static int free_slot(void)
 {
     for (unsigned i = 0; i < SOCKETS; ++i)
@@ -323,6 +379,7 @@ static int free_slot(void)
             return (int)i;
     return -1;
 }
+
 static unsigned free_hardware(void)
 {
     for (unsigned h = 0; h < SOCKETS; ++h)
@@ -336,6 +393,7 @@ static unsigned free_hardware(void)
     }
     return SOCKETS;
 }
+
 static unsigned used(void)
 {
     unsigned n = 0;
@@ -343,13 +401,16 @@ static unsigned used(void)
         n += sockets[i].used != 0;
     return n;
 }
+
 static int port_used(const struct socket_state *s, unsigned port)
 {
     for (unsigned i = 0; i < SOCKETS; ++i)
-        if (&sockets[i] != s && sockets[i].used && sockets[i].protocol == s->protocol && sockets[i].port == port)
+        if (&sockets[i] != s && sockets[i].used && sockets[i].protocol == s->protocol &&
+            sockets[i].port == port)
             return 1;
     return 0;
 }
+
 static unsigned ephemeral(const struct socket_state *s)
 {
     for (unsigned p = 49152; p < 49216; ++p)
@@ -357,13 +418,16 @@ static unsigned ephemeral(const struct socket_state *s)
             return p;
     return 0;
 }
+
 static int open_hardware(struct socket_state *s)
 {
     unsigned b = block(s);
     /* Sn_MR.ND (bit5) requests immediate ACK for TCP; UDP keeps mode2.
      * WIZnet W5500 datasheet1.0.9, socket mode register, page44. */
-    return command(b, 0x10) && put(b, 0, s->protocol == LUME_NET_TCP ? 0x21 : 2) && put_word(b, 4, s->port) && put(b, 2, 255) && command(b, 1);
+    return command(b, 0x10) && put(b, 0, s->protocol == LUME_NET_TCP ? 0x21 : 2) &&
+           put_word(b, 4, s->port) && put(b, 2, 255) && command(b, 1);
 }
+
 static int begin_listen(struct socket_state *s)
 {
     if (!open_hardware(s))
@@ -372,6 +436,7 @@ static int begin_listen(struct socket_state *s)
     s->started = uptime_ms;
     return 0;
 }
+
 static int fail(struct socket_state *s, int error)
 {
     s->error = error;
@@ -379,6 +444,7 @@ static int fail(struct socket_state *s, int error)
     s->pending = 0;
     return -error;
 }
+
 static int service(struct socket_state *s)
 {
     if (s->phase == FAILED)
@@ -433,13 +499,15 @@ static int service(struct socket_state *s)
     }
     else if (s->phase == CONNECTING && (status == 0x17 || status == 0x1c))
         s->phase = CONNECTED;
-    if ((s->phase == UDP_OPENING || s->phase == LISTEN_OPENING || s->phase == CONNECT_OPENING || s->phase == CONNECTING) &&
+    if ((s->phase == UDP_OPENING || s->phase == LISTEN_OPENING || s->phase == CONNECT_OPENING ||
+         s->phase == CONNECTING) &&
         (uint32_t)(uptime_ms - s->started) >= CONNECT_MS)
         return fail(s, LUME_NET_ETIMEDOUT);
     if (s->phase == CONNECTED && status == 0)
         s->phase = PEER_CLOSED;
     return status;
 }
+
 static int send_data(struct socket_state *s, unsigned char *data, unsigned length)
 {
     if (s->pending)
@@ -461,7 +529,8 @@ static int send_data(struct socket_state *s, unsigned char *data, unsigned lengt
     if (pointer < 0 || rd < 0)
         return -LUME_NET_EIO;
     if (!put(b, 2, 0x18) || !access_bytes(b + 1, (unsigned)pointer, 0, data, length) ||
-        !put_word(b, 0x24, ((unsigned)pointer + length) & 65535u) || !command(b, s->send_command ? s->send_command : 0x20))
+        !put_word(b, 0x24, ((unsigned)pointer + length) & 65535u) ||
+        !command(b, s->send_command ? s->send_command : 0x20))
         return -LUME_NET_EIO;
     if (!s->send_command)
         s->send_command = 0x20;
@@ -471,6 +540,7 @@ static int send_data(struct socket_state *s, unsigned char *data, unsigned lengt
     s->tx_length = length;
     return (int)length;
 }
+
 static int receive_data(struct socket_state *s, struct lume_net_request *r, unsigned char *data)
 {
     unsigned available, b = block(s);
@@ -505,9 +575,9 @@ static int receive_data(struct socket_state *s, struct lume_net_request *r, unsi
         advance = bytes + 8;
         unsigned peer_port = (unsigned)h[4] * 256u + h[5];
         int permitted = local_peer(h);
-        int error = !permitted ? LUME_NET_EACCES : bytes > count ? LUME_NET_EMSGSIZE
-                                                                 : 0;
-        if (!error && bytes && !access_bytes(b + 2, ((unsigned)pointer + 8u) & 65535u, data, 0, bytes))
+        int error = !permitted ? LUME_NET_EACCES : bytes > count ? LUME_NET_EMSGSIZE : 0;
+        if (!error && bytes &&
+            !access_bytes(b + 2, ((unsigned)pointer + 8u) & 65535u, data, 0, bytes))
             return -LUME_NET_EIO;
         if (!put_word(b, 0x28, ((unsigned)pointer + advance) & 65535u) || !command(b, 0x40))
             return -LUME_NET_EIO;
@@ -526,10 +596,12 @@ static int receive_data(struct socket_state *s, struct lume_net_request *r, unsi
     }
     if (count > available)
         count = available;
-    if (!access_bytes(b + 2, (unsigned)pointer, data, 0, count) || !put_word(b, 0x28, ((unsigned)pointer + count) & 65535u) || !command(b, 0x40))
+    if (!access_bytes(b + 2, (unsigned)pointer, data, 0, count) ||
+        !put_word(b, 0x28, ((unsigned)pointer + count) & 65535u) || !command(b, 0x40))
         return -LUME_NET_EIO;
     return (int)count;
 }
+
 static int accept_connection(struct socket_state *listener, struct lume_net_request *r, int status)
 {
     if (status != 0x17 && status != 0x1c)
@@ -564,9 +636,11 @@ static int accept_connection(struct socket_state *listener, struct lume_net_requ
     r->port = (unsigned)port;
     return next + 1;
 }
+
 int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, unsigned char *data)
 {
-    if (owner >= 8 || !r || !data || r->version != LUME_NET_VERSION || r->bytes != sizeof *r || r->flags)
+    if (owner >= 8 || !r || !data || r->version != LUME_NET_VERSION || r->bytes != sizeof *r ||
+        r->flags)
         return -LUME_NET_EINVAL;
     if (op < LUME_NET_INFO || op > LUME_NET_POLL)
         return -LUME_NET_ENOSYS;
@@ -586,7 +660,8 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
             int phy = get(0, 0x2e);
             if (phy >= 0)
             {
-                info.flags = LUME_NET_READY | (phy & 1 ? LUME_NET_LINK : 0) | (!zero_ip(configuration.address) ? LUME_NET_CONFIGURED : 0);
+                info.flags = LUME_NET_READY | (phy & 1 ? LUME_NET_LINK : 0) |
+                             (!zero_ip(configuration.address) ? LUME_NET_CONFIGURED : 0);
             }
         }
         if (r->length != sizeof info)
@@ -602,11 +677,13 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
             return -LUME_NET_EINVAL;
         struct lume_net_config c;
         memcpy(&c, data, sizeof c);
-        if (c.version != LUME_NET_VERSION || c.bytes != sizeof c || c.flags || c.reserved[0] || c.reserved[1] || (c.mac[0] & 1) ||
+        if (c.version != LUME_NET_VERSION || c.bytes != sizeof c || c.flags || c.reserved[0] ||
+            c.reserved[1] || (c.mac[0] & 1) ||
             !(c.mac[0] | c.mac[1] | c.mac[2] | c.mac[3] | c.mac[4] | c.mac[5]))
             return -LUME_NET_EINVAL;
-        int mask_ok = (c.netmask[0] == 255 && c.netmask[1] == 255 && c.netmask[2] == 255 && !c.netmask[3]) ||
-                      (zero_ip(c.address) && zero_ip(c.netmask));
+        int mask_ok =
+            (c.netmask[0] == 255 && c.netmask[1] == 255 && c.netmask[2] == 255 && !c.netmask[3]) ||
+            (zero_ip(c.address) && zero_ip(c.netmask));
         if ((!zero_ip(c.address) && !local_peer(c.address)) || !mask_ok ||
             (!zero_ip(c.gateway) && !local_peer(c.gateway)))
             return -LUME_NET_EACCES;
@@ -634,8 +711,10 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
             }
             return 0;
         }
-        int same = !memcmp(c.mac, configuration.mac, 6) && !memcmp(c.address, configuration.address, 4) &&
-                   !memcmp(c.netmask, configuration.netmask, 4) && !memcmp(c.gateway, configuration.gateway, 4);
+        int same = !memcmp(c.mac, configuration.mac, 6) &&
+                   !memcmp(c.address, configuration.address, 4) &&
+                   !memcmp(c.netmask, configuration.netmask, 4) &&
+                   !memcmp(c.gateway, configuration.gateway, 4);
         for (unsigned i = 0; i < SOCKETS; ++i)
             if (sockets[i].used && sockets[i].protocol == LUME_NET_TCP)
             {
@@ -691,7 +770,8 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
             int status = service(s);
             if (status >= 0 && s->pending)
                 return -LUME_NET_EAGAIN;
-            if (status >= 0 && s->protocol == LUME_NET_TCP && (status == 0x17 || status == 0x1c || (s->disconnect_sent && status != 0)))
+            if (status >= 0 && s->protocol == LUME_NET_TCP &&
+                (status == 0x17 || status == 0x1c || (s->disconnect_sent && status != 0)))
             {
                 if (!s->disconnect_sent)
                 {
@@ -749,7 +829,8 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
         return status;
     if (op == LUME_NET_BIND)
     {
-        if (s->phase != CREATED || !r->port || r->port > 65535 || (!zero_ip(r->address) && memcmp(r->address, configuration.address, 4)))
+        if (s->phase != CREATED || !r->port || r->port > 65535 ||
+            (!zero_ip(r->address) && memcmp(r->address, configuration.address, 4)))
             return -LUME_NET_EINVAL;
         if (port_used(s, r->port))
             return -LUME_NET_EADDRINUSE;
@@ -864,6 +945,7 @@ int32_t lume_net_call(unsigned owner, unsigned op, struct lume_net_request *r, u
     }
     return -LUME_NET_EOPNOTSUPP;
 }
+
 void lume_net_process_exit(unsigned owner)
 {
     for (unsigned i = 0; i < SOCKETS; ++i)

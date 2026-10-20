@@ -5,6 +5,9 @@
 #ifdef LUME_KERNEL_PERF
 int lume_fs_acquire(void);
 #else
-static inline int lume_fs_acquire(void){return 1;}
+static inline int lume_fs_acquire(void)
+{
+    return 1;
+}
 #endif
 #endif

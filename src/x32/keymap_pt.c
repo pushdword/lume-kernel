@@ -1,6 +1,7 @@
 /* Portuguese (Portugal), ISO USB keyboard. UTF-8 text, ANSI navigation.
  * Layout policy lives in the OS; KBD1 supplies usage+modifiers unchanged. */
 #include "terminal.h"
+
 static unsigned utf8(unsigned c, unsigned char *out)
 {
     if (c < 128)
@@ -19,10 +20,15 @@ static unsigned utf8(unsigned c, unsigned char *out)
     out[2] = (unsigned char)(0x80 | (c & 63));
     return 3;
 }
+
 static unsigned compose(unsigned accent, unsigned c)
 {
     static const unsigned vowels[5] = {'a', 'e', 'i', 'o', 'u'};
-    static const unsigned map[5][5] = {{0xe1, 0xe9, 0xed, 0xf3, 0xfa}, {0xe0, 0xe8, 0xec, 0xf2, 0xf9}, {0xe2, 0xea, 0xee, 0xf4, 0xfb}, {0xe3, 0, 0, 0xf5, 0}, {0xe4, 0xeb, 0xef, 0xf6, 0xfc}};
+    static const unsigned map[5][5] = {{0xe1, 0xe9, 0xed, 0xf3, 0xfa},
+                                       {0xe0, 0xe8, 0xec, 0xf2, 0xf9},
+                                       {0xe2, 0xea, 0xee, 0xf4, 0xfb},
+                                       {0xe3, 0, 0, 0xf5, 0},
+                                       {0xe4, 0xeb, 0xef, 0xf6, 0xfc}};
     unsigned upper = c >= 'A' && c <= 'Z', low = upper ? c + 32 : c;
     if (accent == 4 && low == 'n')
         return upper ? 0xd1 : 0xf1;
@@ -31,9 +37,11 @@ static unsigned compose(unsigned accent, unsigned c)
             return map[accent - 1][i] - (upper ? 32 : 0);
     return 0;
 }
+
 unsigned keymap_pt(struct keymap *s, unsigned usage, unsigned mods, unsigned char out[16])
 {
-    unsigned shift = !!(mods & 0x22), altgr = !!(mods & 0x40), ctrl = !!(mods & 0x11), c = 0, dead = 0;
+    unsigned shift = !!(mods & 0x22), altgr = !!(mods & 0x40), ctrl = !!(mods & 0x11), c = 0,
+             dead = 0;
     if (usage == 0x39)
     {
         s->caps ^= 1;
@@ -46,8 +54,7 @@ unsigned keymap_pt(struct keymap *s, unsigned usage, unsigned mods, unsigned cha
         static const unsigned normal[10] = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'};
         static const unsigned shifted[10] = {'!', '"', '#', '$', '%', '&', '/', '(', ')', '='};
         static const unsigned alternate[10] = {0, '@', 0, 0, 0, 0, '{', '[', ']', '}'};
-        c = (altgr ? alternate : shift ? shifted
-                                       : normal)[usage - 0x1e];
+        c = (altgr ? alternate : shift ? shifted : normal)[usage - 0x1e];
     }
     else
         switch (usage)
@@ -136,7 +143,9 @@ unsigned keymap_pt(struct keymap *s, unsigned usage, unsigned mods, unsigned cha
         c = 0x20ac;
     if (usage >= 0x3a && usage <= 0x45)
     {
-        static const char *const keys[] = {"\033OP", "\033OQ", "\033OR", "\033OS", "\033[15~", "\033[17~", "\033[18~", "\033[19~", "\033[20~", "\033[21~", "\033[23~", "\033[24~"};
+        static const char *const keys[] = {"\033OP",   "\033OQ",   "\033OR",   "\033OS",
+                                           "\033[15~", "\033[17~", "\033[18~", "\033[19~",
+                                           "\033[20~", "\033[21~", "\033[23~", "\033[24~"};
         const char *p = keys[usage - 0x3a];
         unsigned n = 0;
         while (*p)
@@ -145,7 +154,8 @@ unsigned keymap_pt(struct keymap *s, unsigned usage, unsigned mods, unsigned cha
     }
     if (usage >= 0x49 && usage <= 0x52)
     {
-        static const char *const seq[] = {"\033[2~", "\033[H", "\033[5~", "\033[3~", "\033[F", "\033[6~", "\033[C", "\033[D", "\033[B", "\033[A"};
+        static const char *const seq[] = {"\033[2~", "\033[H", "\033[5~", "\033[3~", "\033[F",
+                                          "\033[6~", "\033[C", "\033[D",  "\033[B",  "\033[A"};
         const char *p = seq[usage - 0x49];
         unsigned n = 0;
         while (*p)

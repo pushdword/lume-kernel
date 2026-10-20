@@ -24,7 +24,8 @@
 #endif /* MBEDTLS_HAVE_TIME_DATE */
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 #if defined(MBEDTLS_CHECK_PARAMS)
@@ -48,10 +49,9 @@ extern "C" {
 #define MBEDTLS_PARAM_FAILED_ALT
 
 #else /* MBEDTLS_PARAM_FAILED */
-#define MBEDTLS_PARAM_FAILED(cond) \
-    mbedtls_param_failed( #cond, __FILE__, __LINE__)
+#define MBEDTLS_PARAM_FAILED(cond) mbedtls_param_failed(#cond, __FILE__, __LINE__)
 
-/**
+    /**
  * \brief       User supplied callback function for parameter validation failure.
  *              See #MBEDTLS_CHECK_PARAMS for context.
  *
@@ -66,36 +66,42 @@ extern "C" {
  * \param file  The file where the assertion failed.
  * \param line  The line in the file where the assertion failed.
  */
-void mbedtls_param_failed(const char *failure_condition,
-                          const char *file,
-                          int line);
+    void mbedtls_param_failed(const char *failure_condition, const char *file, int line);
 #endif /* MBEDTLS_PARAM_FAILED */
 
 /* Internal macro meant to be called only from within the library. */
-#define MBEDTLS_INTERNAL_VALIDATE_RET(cond, ret)  \
-    do {                                            \
-        if (!(cond))                               \
-        {                                           \
-            MBEDTLS_PARAM_FAILED(cond);           \
-            return ret;                          \
-        }                                           \
+#define MBEDTLS_INTERNAL_VALIDATE_RET(cond, ret)                                                   \
+    do                                                                                             \
+    {                                                                                              \
+        if (!(cond))                                                                               \
+        {                                                                                          \
+            MBEDTLS_PARAM_FAILED(cond);                                                            \
+            return ret;                                                                            \
+        }                                                                                          \
     } while (0)
 
 /* Internal macro meant to be called only from within the library. */
-#define MBEDTLS_INTERNAL_VALIDATE(cond)           \
-    do {                                            \
-        if (!(cond))                               \
-        {                                           \
-            MBEDTLS_PARAM_FAILED(cond);           \
-            return;                                 \
-        }                                           \
+#define MBEDTLS_INTERNAL_VALIDATE(cond)                                                            \
+    do                                                                                             \
+    {                                                                                              \
+        if (!(cond))                                                                               \
+        {                                                                                          \
+            MBEDTLS_PARAM_FAILED(cond);                                                            \
+            return;                                                                                \
+        }                                                                                          \
     } while (0)
 
 #else /* MBEDTLS_CHECK_PARAMS */
 
 /* Internal macros meant to be called only from within the library. */
-#define MBEDTLS_INTERNAL_VALIDATE_RET(cond, ret)  do { } while (0)
-#define MBEDTLS_INTERNAL_VALIDATE(cond)           do { } while (0)
+#define MBEDTLS_INTERNAL_VALIDATE_RET(cond, ret)                                                   \
+    do                                                                                             \
+    {                                                                                              \
+    } while (0)
+#define MBEDTLS_INTERNAL_VALIDATE(cond)                                                            \
+    do                                                                                             \
+    {                                                                                              \
+    } while (0)
 
 #endif /* MBEDTLS_CHECK_PARAMS */
 
@@ -107,12 +113,10 @@ void mbedtls_param_failed(const char *failure_condition,
  * it, too. We might want to move all these definitions here at
  * some point for uniformity. */
 #define MBEDTLS_DEPRECATED __attribute__((deprecated))
-MBEDTLS_DEPRECATED typedef char const *mbedtls_deprecated_string_constant_t;
-#define MBEDTLS_DEPRECATED_STRING_CONSTANT(VAL)       \
-    ((mbedtls_deprecated_string_constant_t) (VAL))
-MBEDTLS_DEPRECATED typedef int mbedtls_deprecated_numeric_constant_t;
-#define MBEDTLS_DEPRECATED_NUMERIC_CONSTANT(VAL)       \
-    ((mbedtls_deprecated_numeric_constant_t) (VAL))
+    MBEDTLS_DEPRECATED typedef char const *mbedtls_deprecated_string_constant_t;
+#define MBEDTLS_DEPRECATED_STRING_CONSTANT(VAL) ((mbedtls_deprecated_string_constant_t)(VAL))
+    MBEDTLS_DEPRECATED typedef int mbedtls_deprecated_numeric_constant_t;
+#define MBEDTLS_DEPRECATED_NUMERIC_CONSTANT(VAL) ((mbedtls_deprecated_numeric_constant_t)(VAL))
 #undef MBEDTLS_DEPRECATED
 #else /* MBEDTLS_DEPRECATED_WARNING */
 #define MBEDTLS_DEPRECATED_STRING_CONSTANT(VAL) VAL
@@ -206,7 +210,7 @@ MBEDTLS_DEPRECATED typedef int mbedtls_deprecated_numeric_constant_t;
  * https://stackoverflow.com/questions/40576003/ignoring-warning-wunused-result
  * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66425#c34
  */
-#define MBEDTLS_IGNORE_RETURN(result) ((void) !(result))
+#define MBEDTLS_IGNORE_RETURN(result) ((void)!(result))
 #endif
 
 /* If the following macro is defined, the library is being built by the test
@@ -214,7 +218,7 @@ MBEDTLS_DEPRECATED typedef int mbedtls_deprecated_numeric_constant_t;
  * mbedtls_platform_zeroize() using a preprocessor macro, so the function
  * declaration should be omitted.  */
 #if !defined(MBEDTLS_TEST_DEFINES_ZEROIZE) //no-check-names
-/**
+    /**
  * \brief       Securely zeroize a buffer
  *
  *              The function is meant to wipe the data contained in a buffer so
@@ -236,11 +240,11 @@ MBEDTLS_DEPRECATED typedef int mbedtls_deprecated_numeric_constant_t;
  * \param len   Length of the buffer in bytes
  *
  */
-void mbedtls_platform_zeroize(void *buf, size_t len);
+    void mbedtls_platform_zeroize(void *buf, size_t len);
 #endif
 
 #if defined(MBEDTLS_HAVE_TIME_DATE)
-/**
+    /**
  * \brief      Platform-specific implementation of gmtime_r()
  *
  *             The function is a thread-safe abstraction that behaves
@@ -266,8 +270,7 @@ void mbedtls_platform_zeroize(void *buf, size_t len);
  * \return      Pointer to an object of type struct tm on success, otherwise
  *              NULL
  */
-struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt,
-                                     struct tm *tm_buf);
+    struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf);
 #endif /* MBEDTLS_HAVE_TIME_DATE */
 
 #ifdef __cplusplus

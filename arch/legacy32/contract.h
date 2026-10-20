@@ -33,8 +33,8 @@
 #define ARCH_APP_SUFFIX ".x32"
 #define arch_kernel_switch x32_kernel_switch
 #endif
-#define ARCH_PAGE_READ (ARCH_PAGE_USER|3u)
-#define ARCH_PAGE_WRITE (ARCH_PAGE_USER|7u)
-#define ARCH_PAGE_EXEC (ARCH_PAGE_USER|11u)
-#define ARCH_PAGE_BASE (ARCH_PAGE_USER|1u)
+#define ARCH_PAGE_READ (ARCH_PAGE_USER | 3u)
+#define ARCH_PAGE_WRITE (ARCH_PAGE_USER | 7u)
+#define ARCH_PAGE_EXEC (ARCH_PAGE_USER | 11u)
+#define ARCH_PAGE_BASE (ARCH_PAGE_USER | 1u)
 #endif

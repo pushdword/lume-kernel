@@ -28,28 +28,45 @@
 #define LUME_PERF_CORES 2u
 #define LUME_PERF_PROCESSES 8u
 #define LUME_PERF_SYSCALL 33u
-enum { LUME_PERF_USER=0,LUME_PERF_KERNEL,LUME_PERF_IDLE,LUME_PERF_LOCKWAIT,LUME_PERF_MODES };
-struct lume_perf_core {
-    uint32_t counter,ticks[LUME_PERF_MODES];
-    uint32_t syscalls,interrupts,dispatches,switches;
+
+enum
+{
+    LUME_PERF_USER = 0,
+    LUME_PERF_KERNEL,
+    LUME_PERF_IDLE,
+    LUME_PERF_LOCKWAIT,
+    LUME_PERF_MODES
 };
-struct lume_perf_process {
-    uint32_t pid,parent,state,cores,user_ticks,kernel_ticks,lock_ticks;
-    uint32_t ready_ticks,max_ready_ticks,dispatches,syscalls;
+
+struct lume_perf_core
+{
+    uint32_t counter, ticks[LUME_PERF_MODES];
+    uint32_t syscalls, interrupts, dispatches, switches;
+};
+
+struct lume_perf_process
+{
+    uint32_t pid, parent, state, cores, user_ticks, kernel_ticks, lock_ticks;
+    uint32_t ready_ticks, max_ready_ticks, dispatches, syscalls;
     char name[24];
 };
-struct lume_perf_totals {
-    uint32_t spawn_calls,spawn_ticks,load_calls,load_ticks;
-    uint32_t console_calls,console_bytes,console_ticks;
-    uint32_t sd_reads,sd_writes,sd_ticks,cache_hits,cache_misses;
-    uint32_t zero_bytes,zero_ticks;
-    uint32_t read_bytes,read_ticks,copy_bytes,copy_ticks;
+
+struct lume_perf_totals
+{
+    uint32_t spawn_calls, spawn_ticks, load_calls, load_ticks;
+    uint32_t console_calls, console_bytes, console_ticks;
+    uint32_t sd_reads, sd_writes, sd_ticks, cache_hits, cache_misses;
+    uint32_t zero_bytes, zero_ticks;
+    uint32_t read_bytes, read_ticks, copy_bytes, copy_ticks;
 };
-struct lume_perf_snapshot {
-    uint32_t version,bytes,clock_hz,uptime_ms,quantum_ms,core_count,process_count;
+
+struct lume_perf_snapshot
+{
+    uint32_t version, bytes, clock_hz, uptime_ms, quantum_ms, core_count, process_count;
     struct lume_perf_core cores[LUME_PERF_CORES];
     struct lume_perf_process processes[LUME_PERF_PROCESSES];
     struct lume_perf_totals totals;
 };
-_Static_assert(sizeof(struct lume_perf_snapshot)==716,"telemetry v1 layout");
+
+_Static_assert(sizeof(struct lume_perf_snapshot) == 716, "telemetry v1 layout");
 #endif

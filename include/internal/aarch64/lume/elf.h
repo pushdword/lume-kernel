@@ -5,17 +5,31 @@
 #define LUME_ELF_LIMIT (LUME_ELF_BASE + 0x40000)
 #define LUME_ELF_PAGES 64u
 #define LUME_ELF_SEGMENTS 8u
-struct lume_elf_segment { uint64_t offset, address, file_size, memory_size; unsigned flags; };
-struct lume_elf_plan {
+
+struct lume_elf_segment
+{
+    uint64_t offset, address, file_size, memory_size;
+    unsigned flags;
+};
+
+struct lume_elf_plan
+{
     uint64_t entry;
     unsigned count, pages;
     struct lume_elf_segment segments[LUME_ELF_SEGMENTS];
 };
-struct lume_elf_image {
+
+struct lume_elf_image
+{
     uint64_t entry;
     unsigned count, task;
-    struct { uint64_t address, physical; } pages[LUME_ELF_PAGES];
+
+    struct
+    {
+        uint64_t address, physical;
+    } pages[LUME_ELF_PAGES];
 };
+
 bool lume_elf_plan(const void *, size_t, struct lume_elf_plan *);
 bool lume_elf_load(unsigned task, const void *, size_t, struct lume_elf_image *);
 void lume_elf_release(struct lume_elf_image *);
