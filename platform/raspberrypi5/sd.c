@@ -1,6 +1,6 @@
 /* BCM2712 SDHCI, polling PIO and single-sector commands. No DMA or SD Express.
- * Register/protocol references are recorded in SD.md. Writes start disabled
- * and are bounded to a separately validated Lume volume, never the MBR. */
+ * Writes start disabled and are bounded to a validated Lume volume;
+ * the MBR is excluded from the writable range. */
 #include "lume/early.h"
 #include "lume/sd.h"
 #include "lume/storage.h"

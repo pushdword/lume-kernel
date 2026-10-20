@@ -1,4 +1,4 @@
-/* Bounded wire-format helpers. Register/protocol references: WIRELESS.md. */
+/* Bounded helpers for CYW43455 wireless wire formats. */
 #include "lume/wifi.h"
 
 static uint32_t le32(const unsigned char *p)

@@ -1,4 +1,4 @@
-/* SDIO discovery and CYW43455 function-1 register access. See WIRELESS.md.
+/* SDIO discovery and CYW43455 function-1 register access.
  * Byte/block PIO transport is supplied by the platform backend. */
 #include "lume/sdio.h"
 #define R5_ERRORS 0xcf00u

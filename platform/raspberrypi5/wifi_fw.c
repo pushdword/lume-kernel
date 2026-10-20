@@ -1,5 +1,5 @@
 /* CYW43455 rev6 firmware, SDPCM/BCDC control and station Ethernet transport.
- * Linux brcmfmac register/wire-format references are recorded in WIRELESS.md. */
+ * Register access and wire formats follow the Linux brcmfmac device interface. */
 #include "lume/early.h"
 #include "lume/sdio.h"
 #include "lume/wifi.h"
