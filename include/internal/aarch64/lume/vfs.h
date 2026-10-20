@@ -1,0 +1,32 @@
+#ifndef LUME_VFS_H
+#define LUME_VFS_H
+#include <lume/abi.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "fat.h"
+#include "storage.h"
+struct lume_fd { int node; uint32_t flags; uint64_t offset; };
+struct lume_files { char cwd[LUME_PATH_MAX]; struct lume_fd fd[LUME_FD_MAX]; };
+void lume_vfs_init(const void *shell, size_t bytes);
+void lume_files_init(struct lume_files *);
+void lume_files_clone(struct lume_files *,const struct lume_files *);
+void lume_files_release(struct lume_files *);
+int64_t lume_vfs_open(struct lume_files *, const char *, uint64_t flags);
+int64_t lume_vfs_close(struct lume_files *, uint64_t fd);
+int64_t lume_vfs_read(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
+int64_t lume_vfs_write(struct lume_files *, uint64_t fd, const void *, uint64_t bytes);
+int64_t lume_vfs_seek(struct lume_files *, uint64_t fd, int64_t offset, uint64_t whence);
+int64_t lume_vfs_stat(struct lume_files *, uint64_t fd, struct lume_stat *);
+int64_t lume_vfs_getdents(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
+int64_t lume_vfs_chdir(struct lume_files *, const char *);
+bool lume_vfs_image(const char *path, const void **data, size_t *bytes);
+bool lume_vfs_mount_fat(const void *,size_t);
+bool lume_vfs_mount_storage(const struct lume_storage_ops *);
+int lume_vfs_program(struct lume_files *,const char *,const void **,size_t *);
+int64_t lume_vfs_dup2(struct lume_files *,uint64_t,uint64_t);
+int64_t lume_vfs_mkdir(struct lume_files *,const char *);
+int64_t lume_vfs_remove(struct lume_files *,const char *,bool);
+/* Console hooks; read returns -EAGAIN when no physical RX byte is available. */
+int lume_console_getc(void);
+void lume_console_putc(char);
+#endif
