@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 static unsigned checks;
+static unsigned console_calls;
+static char console_data[4096];
+static size_t console_bytes;
 #define T(x)                                                                                       \
     do                                                                                             \
     {                                                                                              \
@@ -15,9 +18,12 @@ int lume_console_getc(void)
     return -LUME_EAGAIN;
 }
 
-void lume_console_putc(char c)
+void lume_console_write(const char *data, size_t bytes)
 {
-    (void)c;
+    assert(bytes <= sizeof(console_data));
+    memcpy(console_data, data, bytes);
+    console_bytes = bytes;
+    ++console_calls;
 }
 
 int main(void)
@@ -27,6 +33,18 @@ int main(void)
     lume_vfs_init(elf, 3);
     lume_files_init(&f);
     lume_files_init(&g);
+    static const char output[] = {'a', 0, 'b', '\n', (char)0xc3, (char)0xa1};
+    T(lume_vfs_write(&f, 1, output, sizeof(output)) == sizeof(output));
+    T(console_calls == 1 && console_bytes == sizeof(output) &&
+      !memcmp(console_data, output, sizeof(output)));
+    T(lume_vfs_write(&f, 1, NULL, 0) == 0 && console_calls == 1);
+    T(lume_vfs_write(&f, 0, output, sizeof(output)) == -LUME_EBADF && console_calls == 1);
+    T(lume_vfs_write(&f, LUME_FD_MAX, output, sizeof(output)) == -LUME_EBADF && console_calls == 1);
+    char large_output[sizeof(console_data)];
+    memset(large_output, 'x', sizeof(large_output));
+    T(lume_vfs_write(&f, 2, large_output, sizeof(large_output)) == sizeof(large_output));
+    T(console_calls == 2 && console_bytes == sizeof(large_output) &&
+      !memcmp(console_data, large_output, sizeof(large_output)));
     const void *p;
     size_t bytes;
     T(lume_vfs_image("/bin/sh", &p, &bytes) && bytes == 3 && p == elf);

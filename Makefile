@@ -188,3 +188,11 @@ $(OUT)/tests/elf-load$(HOSTEXE): tests/aarch64/elf_load_test.c src/aarch64/elf.c
 $(OUT)/tests/font$(HOSTEXE): tests/aarch64/font_test.c src/common/font5x7.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -Isrc/common $^ -o "$@"
+
+ifeq ($(ARCH),aarch64)
+.PHONY: display-test-image
+display-test-image: $(OUT)/tests/display.elf
+$(OUT)/tests/display.elf: tests/aarch64/display_test.c platform/raspberrypi5/display.c src/common/terminal.c src/common/font5x7.c src/aarch64/memory.c arch/aarch64/pi5.ld src/common/terminal.h src/common/font5x7.h include/internal/aarch64/lume/display.h $(OUT)/configuration Makefile
+	mkdir -p "$(@D)"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,arch/aarch64/pi5.ld tests/aarch64/display_test.c src/common/terminal.c src/common/font5x7.c src/aarch64/memory.c -o "$@"
+endif

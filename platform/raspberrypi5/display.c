@@ -442,21 +442,34 @@ void lume_display_clear(void)
 
 void lume_display_putc(char byte)
 {
-    if (!enabled)
+    lume_display_write(&byte, 1);
+}
+
+void lume_display_write(const char *data, size_t bytes)
+{
+    if (!enabled || !bytes)
         return;
-    terminal_begin(&terminal);
-    terminal_byte(&terminal, (unsigned char)byte);
-    terminal_end(&terminal);
-    unsigned cursor = terminal.row * 65 + terminal.column;
-    for (unsigned i = 0; i < 65 * 24; ++i)
+    while (bytes)
     {
-        unsigned cell = cells[i] | (!terminal.cursor_hidden && i == cursor ? 0x10000 : 0);
-        if (cell != shown[i])
+        size_t count = bytes < LUME_DISPLAY_BATCH ? bytes : LUME_DISPLAY_BATCH;
+        lume_uart_poll_input();
+        terminal_begin(&terminal);
+        terminal_write(&terminal, (const unsigned char *)data, (unsigned)count);
+        terminal_end(&terminal);
+        unsigned cursor = terminal.row * 65 + terminal.column;
+        for (unsigned i = 0; i < 65 * 24; ++i)
         {
-            shown[i] = cell;
-            render_cell(cell, i);
-            lume_uart_poll_input();
+            unsigned cell = cells[i] | (!terminal.cursor_hidden && i == cursor ? 0x10000 : 0);
+            if (cell != shown[i])
+            {
+                shown[i] = cell;
+                render_cell(cell, i);
+                lume_uart_poll_input();
+            }
         }
+        lume_uart_poll_input();
+        data += count;
+        bytes -= count;
     }
 }
 

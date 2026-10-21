@@ -20,9 +20,10 @@ int lume_console_getc(void)
     return -LUME_EAGAIN;
 }
 
-void lume_console_putc(char c)
+void lume_console_write(const char *data, size_t bytes)
 {
-    (void)c;
+    (void)data;
+    (void)bytes;
 }
 
 int main(int argc, char **argv)

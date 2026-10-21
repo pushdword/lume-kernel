@@ -391,9 +391,8 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
     struct node *n = &nodes[d->node];
     if (n->kind == LUME_NODE_CHAR)
     {
-        const char *p = data;
-        for (uint64_t i = 0; i < bytes; ++i)
-            lume_console_putc(p[i]);
+        if (bytes)
+            lume_console_write(data, (size_t)bytes);
         return (int64_t)bytes;
     }
     if (!n->writable)

@@ -51,4 +51,5 @@ int64_t lume_vfs_remove(struct lume_files *, const char *, bool);
 /* The console read hook returns -EAGAIN when no physical RX byte is available. */
 int lume_console_getc(void);
 void lume_console_putc(char);
+void lume_console_write(const char *, size_t);
 #endif

@@ -4,6 +4,7 @@
 #include "lume/display.h"
 #include "lume/usb.h"
 #include "lume/uart_input.h"
+#include "lume/vfs.h"
 
 /* Firmware configures the RP1 BAR with enable_rp1_uart=1 and pciex4_reset=0. GPIO14 drives TX
  * on physical pin 8. GPIO15 receives RX on physical pin 10. The driver inherits firmware
@@ -96,10 +97,24 @@ void lume_uart_input_stats(void)
  * console, entered after kernel initialization, may inspect display state. */
 void lume_console_putc(char c)
 {
-    lume_uart_poll_input();
-    lume_display_putc(c);
-    lume_uart_poll_input();
-    lume_putc(c);
+    lume_console_write(&c, 1);
+}
+
+void lume_console_write(const char *data, size_t bytes)
+{
+    while (bytes)
+    {
+        size_t count = bytes < LUME_DISPLAY_BATCH ? bytes : LUME_DISPLAY_BATCH;
+        lume_uart_poll_input();
+        lume_display_write(data, count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            lume_uart_poll_input();
+            lume_putc(data[i]);
+        }
+        data += count;
+        bytes -= count;
+    }
 }
 
 void lume_putc(char c)
