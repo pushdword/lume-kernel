@@ -37,12 +37,12 @@ enum
     LUME_POLLNVAL = 32u
 };
 
-/* POLL: buffer/count name up to32 pollfd records; timeout_ms is0..60000 or
+/* POLL: buffer/count name up to32 pollfd records. timeout_ms is 0..60000 or
  * UINT32_MAX for infinite. PIPE/SOCKETPAIR return fd and other in this request.
- * DUP uses other as its minimum result; DUP2 uses other as exact destination.
- * SPAWN uses buffer for the existing20-byte lume_spawn_request; inherits all
+ * DUP uses other as its minimum result. DUP2 uses it as the exact destination.
+ * SPAWN uses buffer for the existing20-byte lume_spawn_request and inherits all
  * descriptors except CLOEXEC. Old SPAWN/SPAWN_ENV retain their legacy TTY-only
- * initialization. GET/SETFD use CLOEXEC; GET/SETFL use NONBLOCK, shared by dup.
+ * initialization. GET/SETFD use CLOEXEC. GET/SETFL use NONBLOCK, which is shared by dup.
  * flags/buffer/count/timeout fields not used by an operation must be zero. */
 struct lume_fd_request
 {

@@ -395,9 +395,9 @@ void terminal_byte(struct terminal *t, unsigned c)
     }
 }
 
-/* Plain text can move existing rows once for an entire run. Replay only
- * cells that survive that move. ANSI/UTF-8/control processing stays bytewise;
- * no screen image or MMIO string operation is introduced. */
+/* Scroll plain text once per run and replay only the cells still visible.
+ * ANSI sequences, UTF-8 and control bytes pass through the character parser.
+ * Scrolling uses existing rows without a screen buffer or MMIO string operation. */
 static unsigned plain_scroll(struct terminal *t, const unsigned char *bytes, unsigned n)
 {
     if (n <= TERM_CONTROL_BATCH || t->state || t->utf8_left)

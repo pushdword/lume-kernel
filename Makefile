@@ -60,9 +60,9 @@ PAYLOAD := $(OUT)/lume.bin
 else
 $(error Unsupported ARCH $(ARCH))
 endif
-CPPFLAGS += -Iinclude/uapi/$(ARCH) -Isrc/$(ARCH) -Isrc/$(ARCH)/freestanding -Iarch/$(ARCH) -Ivendor/$(ARCH)/fatfs -Ivendor/$(ARCH)/fat_ro -DLUME_KERNEL_PERF=1
+CPPFLAGS += -Iinclude/uapi/common -Iinclude/uapi/$(ARCH) -Isrc/common -Isrc/$(ARCH) -Isrc/$(ARCH)/freestanding -Iarch/$(ARCH) -Ivendor/$(ARCH)/fatfs -Ivendor/$(ARCH)/fat_ro -DLUME_KERNEL_PERF=1
 CFLAGS := -std=c11 -O2 $(COMMON_FLAGS)
-KERNEL_C := $(addprefix src/$(ARCH)/,kernel.c pages.c fat.c console.c terminal.c keymap_pt.c sd.c strings.c network.c uart_queue.c console_wait.c posix_fd.c random.c crypto_device.c) vendor/$(ARCH)/fat_ro/fat_ro.c vendor/$(ARCH)/fatfs/ff.c
+KERNEL_C := src/common/terminal.c $(addprefix src/$(ARCH)/,kernel.c pages.c fat.c console.c keymap_pt.c sd.c strings.c network.c uart_queue.c console_wait.c posix_fd.c random.c crypto_device.c) vendor/$(ARCH)/fat_ro/fat_ro.c vendor/$(ARCH)/fatfs/ff.c
 KERNEL_S := arch/$(ARCH)/entry.s arch/$(ARCH)/memory.s
 ifeq ($(ARCH),x32)
 KERNEL_S += src/x32/kernel_work.s
@@ -74,6 +74,9 @@ OBJECTS := $(addprefix $(OUT)/obj/,$(addsuffix .o,$(KERNEL_S) $(KERNEL_C)))
 all: $(PAYLOAD) headers
 headers:
 	mkdir -p "$(OUT)/include"
+ifneq ($(filter x32 r32,$(ARCH)),)
+	cp -Rp include/uapi/common/. "$(OUT)/include/"
+endif
 	cp -Rp include/uapi/$(ARCH)/. "$(OUT)/include/"
 $(OUT)/obj/%.c.o: %.c $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"

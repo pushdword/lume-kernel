@@ -1,5 +1,5 @@
-/* Additive crypto service40; hardware devices are discovered separately from
- * CPU instruction features. No software result is advertised as accelerated. */
+/* Crypto service 40 reports device capabilities separately from CPU features.
+ * Only hardware operations are reported as accelerated. */
 #ifndef LUME_CRYPTO_H
 #define LUME_CRYPTO_H
 #include <stdint.h>
@@ -48,7 +48,7 @@ struct lume_crypto_info
 
 /* AES-GCM: fixed96-bit nonce/full128-bit tag. A nonce must never repeat for
  * a given key. All addresses refer to the calling process. input/output may
- * coincide; output/tag may not overlap. Failed authentication emits no bytes.
+ * coincide. Output and tag must not overlap. Failed authentication emits no bytes.
  * The optional peripheral has a4KiB packet buffer and32-byte AAD limit. */
 struct lume_aead_request
 {
@@ -61,14 +61,14 @@ struct lume_crypto_limits
     uint32_t version, bytes, max_packet, max_aad, nonce_bytes, tag_bytes, key_sizes, clock_hz;
 };
 
-/* Whole hardware operations; no software fallback. All scalar/point/output
+/* Hardware operations require the corresponding engine. Scalar, point and output
  * buffers are32 bytes, encoded little-endian. X25519 clamps the scalar and
  * masks the input point's high bit. ED_BASE takes an already prepared scalar.
  * ED_VERIFY_POINT returns encode([scalar_b]B-[scalar_a]point); callers must
  * hash/reduce the challenge, enforce S<L and compare against R. Invalid or
  * noncanonical point encodings return EBADMSG and leave output unchanged.
  * cycles optionally points to a uint32_t engine-cycle result, or is zero.
- * Unused scalar_b/point addresses must be zero. Existing service/ABI intact. */
+ * Unused scalar_b/point addresses must be zero. */
 struct lume_curve_request
 {
     uint32_t version, bytes, scalar_a, scalar_b, point, output, cycles;
@@ -79,7 +79,7 @@ _Static_assert(sizeof(struct lume_curve_request) == 28, "Curve request ABI");
  * entropy source (e.g. the management PC's OS CSPRNG). No entropy is credited
  * to clocks, MAC/IP addresses, CRCs or deterministic FPGA state. State is RAM
  * only: after each boot RANDOM returns EAGAIN until explicitly seeded.
- * INFO never returns key/state. Requests are bounded; no partial RNG output.
+ * INFO never returns key/state. Requests produce all requested bytes or return an error.
  * This profile conservatively requires reseeding after1MiB of output. */
 _Static_assert(sizeof(struct lume_crypto_request) == 20, "Crypto request ABI");
 _Static_assert(sizeof(struct lume_crypto_info) == 36, "Crypto info ABI");

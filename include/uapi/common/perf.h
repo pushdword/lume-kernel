@@ -2,22 +2,22 @@
  * Counters are hardware-clock ticks modulo 2^32. Subtract unsigned values
  * between samples less than 2^32 / clock_hz apart (143.16 s at 30 MHz).
  * Per-core categories are exclusive. C trap boundaries include assembly
- * entry/restore in the surrounding user/idle interval; no cycle-accurate CPI
+ * entry/restore in the surrounding user/idle interval. No cycle-accurate CPI
  * or blocked-I/O percentage is implied. Sleeping CPUs count as idle.
- * Process CPU ticks exclude global-lock spinning; ready time is separate.
- * Lock-wait begins only after a failed CAS; uncontended acquisition is kernel.
+ * Process CPU ticks exclude global-lock spinning. Ready time has separate counters.
+ * Lock-wait begins after a failed CAS. Uncontended acquisition counts as kernel time.
  * Process kernel time is charged to the requesting process (including a
  * child's ELF load in the parent's spawn call). I/O polling remains kernel
- * time. Totals are inclusive/nested; load, SD, zero and copy must not be added.
+ * time. Load, SD, zero and copy times overlap and must not be added.
  * Snapshot syscall: (33, writable_pointer, sizeof(snapshot), version), returns
  * 0, -22 for size/version mismatch, -14 for an invalid writable range, or -5
  * when bounded rendezvous/consistent-read attempts expire. On -5 no snapshot
  * is copied to userspace. A failed initial rendezvous resets no remote record.
- * Active processes are compacted into [0, process_count); PID 0 is valid.
+ * Active processes occupy [0, process_count), including PID 0.
  * The first valid snapshot registers its calling process as an observer.
  * Accounting is normally disabled. The first observer starts a fresh shared
- * session; repeated reads and additional observers retain that session.
- * Exit/fault unregisters the process; the last observer disables accounting.
+ * observation period. Repeated reads and additional observers retain it.
+ * Exit or fault unregisters the process. The last observer disables accounting.
  * Process times/dispatches/max-ready are session counters, while cores masks
  * remain the process's lifetime history. No explicit stop syscall is needed.
  */

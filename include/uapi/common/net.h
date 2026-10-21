@@ -73,20 +73,19 @@ enum
     LUME_NET_EINPROGRESS = 115
 };
 
-/* Addresses are four wire-order octets; ports are host-order values0..65535.
+/* Addresses use four wire-order octets and ports use host-order values 0..65535.
  * buffer is a32-bit user virtual address, never a physical/MMIO pointer.
- * Call LUME_NET with (op,&request,sizeof request). version/bytes must match;
+ * Call LUME_NET with (op,&request,sizeof request). version/bytes must match the ABI.
  * flags is zero. Unused fields are ignored. All operations are nonblocking.
- * SOCKET/ACCEPT return a handle; SEND/RECV/SENDTO/RECVFROM return byte counts;
+ * SOCKET/ACCEPT return a handle. SEND/RECV/SENDTO/RECVFROM return byte counts.
  * POLL returns1 if ready,0 otherwise and replaces events with readiness flags.
- * Other operations return0 on success; errors are negative ABI errno values.
- * POLL accepts POLLIN|POLLOUT|POLLLISTEN; ERR/HUP may additionally be returned.
+ * Other operations return 0 on success or a negative ABI errno value on error.
+ * POLL accepts POLLIN|POLLOUT|POLLLISTEN and may also return ERR/HUP.
  * Optional POLLLISTEN confirms hardware listening (or an already arrived
  * connection). LISTEN itself only starts the nonblocking OPEN/LISTEN sequence.
- * Existing flag values, request layout and nonblocking operations are unchanged.
  * ACCEPT/RECVFROM replace address/port with the peer. A successful call copies
  * the request back. Receive/INFO buffers must not overlap that request.
- * EINPROGRESS leaves a CONNECT pending; use POLL afterward.
+ * Use POLL to complete a CONNECT that returned EINPROGRESS.
  */
 struct lume_net_request
 {
@@ -97,7 +96,7 @@ struct lume_net_request
     uint32_t port, buffer, length, events, flags;
 };
 
-/* CONFIG consumes exactly sizeof configuration at request.buffer;
+/* CONFIG reads exactly sizeof configuration at request.buffer.
  * INFO produces exactly sizeof info there. Both structures are versioned.
  * Interface configuration is independent of the lifetime of any one socket.
  * Reserved bytes and flags in configuration must be zero.
