@@ -173,8 +173,8 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t block, UINT n)
             lume_slow_end(token);
             io_clock_checkpoint();
             uint32_t ticks = io_perf_now() - start;
-            /* Keep snapshotv1 SDread units as requested sectors; charge the
-             * measured stream time once, not once for every sector. */
+            /* Count SDread sectors in snapshot v1. Charge elapsed stream time
+             * once for each device request. */
             if (io_perf_active())
                 for (unsigned j = 0; j < run; j++)
                     io_perf_record(PERF_SD_READ, j ? 0 : ticks, 512);
