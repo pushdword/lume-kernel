@@ -107,6 +107,13 @@ int main(void)
     T(lume_hid_getc(&h) == '@');
     press(&h, 37, 0x40);
     T(lume_hid_getc(&h) == '[');
+    const char programming[] = "{[]}";
+    for (unsigned n = 0; n < 4; ++n)
+    {
+        press(&h, 36 + n, 0x40);
+        T(lume_hid_getc(&h) == programming[n]);
+        T(lume_hid_getc(&h) == -LUME_EAGAIN);
+    }
     press(&h, 6, 1);
     T(lume_hid_getc(&h) == 3);
     press(&h, 51, 0);

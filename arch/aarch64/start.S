@@ -37,15 +37,9 @@ boot_stack:
     b 5f
 4:  msr vbar_el1, x1
 5:  isb
-    adr x0, boot_banner
-    bl lume_puts
-    mov x0, x21
-    bl lume_hex
-    mov x0, #10
-    bl lume_putc
     cmp x21, #1
     b.eq boot_el1
-    /* Permit EL1 physical counter access; establish a non-virtualized EL1. */
+    /* Enable access to the physical counter at EL1 and disable EL1 virtualization. */
     mrs x1, cnthctl_el2
     orr x1, x1, #3
     msr cnthctl_el2, x1
@@ -67,6 +61,11 @@ boot_stack:
     isb
     eret
 boot_el1:
+    mov x1, #0x300000
+    msr cpacr_el1, x1
+    isb
+    msr fpcr, xzr
+    msr fpsr, xzr
     msr spsel, #1
     ldr x1, =__stack_top
     mov sp, x1
@@ -79,7 +78,13 @@ boot_el1:
     b.hs 2f
     stp xzr, xzr, [x1], #16
     b 1b
-2:  mov x0, x20
+2:  adr x0, boot_banner
+    bl lume_puts
+    mov x0, x21
+    bl lume_hex
+    mov x0, #10
+    bl lume_putc
+    mov x0, x20
     mov x1, x21
     bl lume_main
 .global lume_stop
@@ -94,7 +99,8 @@ boot_banner:
 .global lume_psci_call
 .type lume_psci_call, %function
 lume_psci_call:
-    /* SMC32 PSCI calls may clobber x0-x17; AAPCS caller-saved agrees. */
+    /* SMC32 PSCI calls can overwrite x0 through x17. These registers are caller-saved under
+     * AAPCS. */
     stp x29, x30, [sp, #-16]!
     mov x1, #0
     mov x2, #0
@@ -107,7 +113,8 @@ lume_psci_call:
 .global lume_vectors
 lume_vectors:
 .macro VECTOR n
-    stp x0, x1, [sp, #-288]!
+    sub sp, sp, #816
+    stp x0, x1, [sp]
     mov x0, #\n
     b vector_common
     .balign 128
@@ -158,13 +165,55 @@ vector_common:
     mrs x1, tpidr_el0
     str x1, [sp, #272]
     str xzr, [sp, #280]
+    stp q0, q1, [sp, #288]
+    stp q2, q3, [sp, #320]
+    stp q4, q5, [sp, #352]
+    stp q6, q7, [sp, #384]
+    stp q8, q9, [sp, #416]
+    stp q10, q11, [sp, #448]
+    stp q12, q13, [sp, #480]
+    stp q14, q15, [sp, #512]
+    stp q16, q17, [sp, #544]
+    stp q18, q19, [sp, #576]
+    stp q20, q21, [sp, #608]
+    stp q22, q23, [sp, #640]
+    stp q24, q25, [sp, #672]
+    stp q26, q27, [sp, #704]
+    stp q28, q29, [sp, #736]
+    stp q30, q31, [sp, #768]
+    mrs x1, fpcr
+    mrs x2, fpsr
+    str x1, [sp, #800]
+    str x2, [sp, #808]
+    msr fpcr, xzr
+    msr fpsr, xzr
     mov x1, x0
     mov x0, sp
     bl lume_exception
     cbz x0, user_finished
-    add sp, sp, #288
+    add sp, sp, #816
 restore_context:
     mov x30, x0
+    ldp q0, q1, [x30, #288]
+    ldp q2, q3, [x30, #320]
+    ldp q4, q5, [x30, #352]
+    ldp q6, q7, [x30, #384]
+    ldp q8, q9, [x30, #416]
+    ldp q10, q11, [x30, #448]
+    ldp q12, q13, [x30, #480]
+    ldp q14, q15, [x30, #512]
+    ldp q16, q17, [x30, #544]
+    ldp q18, q19, [x30, #576]
+    ldp q20, q21, [x30, #608]
+    ldp q22, q23, [x30, #640]
+    ldp q24, q25, [x30, #672]
+    ldp q26, q27, [x30, #704]
+    ldp q28, q29, [x30, #736]
+    ldp q30, q31, [x30, #768]
+    ldr x1, [x30, #800]
+    ldr x2, [x30, #808]
+    msr fpcr, x1
+    msr fpsr, x2
     ldr x1, [x30, #248]
     msr sp_el0, x1
     ldp x1, x2, [x30, #256]
@@ -204,6 +253,14 @@ lume_run_user:
     stp x25, x26, [sp, #-16]!
     stp x27, x28, [sp, #-16]!
     stp x29, x30, [sp, #-16]!
+    /* AAPCS64 preserves the low 64 bits of v8-v15 across a call. */
+    stp d8, d9, [sp, #-80]!
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    mrs x1, fpcr
+    mrs x2, fpsr
+    stp x1, x2, [sp, #64]
     ldr x1, =saved_kernel_sp
     mov x2, sp
     str x2, [x1]
@@ -212,6 +269,13 @@ user_finished:
     ldr x1, =saved_kernel_sp
     ldr x1, [x1]
     mov sp, x1
+    ldp x1, x2, [sp, #64]
+    msr fpcr, x1
+    msr fpsr, x2
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    ldp d8, d9, [sp], #80
     ldp x29, x30, [sp], #16
     ldp x27, x28, [sp], #16
     ldp x25, x26, [sp], #16

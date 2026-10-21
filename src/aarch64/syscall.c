@@ -1,6 +1,8 @@
 #include "lume/early.h"
 #include "lume/vfs.h"
 #include "lume/net.h"
+#include "lume/boot_storage.h"
+#include "lume/heap.h"
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -26,6 +28,91 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return LUME_ABI_VERSION;
     case LUME_SYS_GETPID:
         return pid;
+    case LUME_SYS_PROBE:
+        return n <= 1 && lume_user_buffer(a, b, n != 0) ? 0 : -LUME_EFAULT;
+    case LUME_SYS_BRK:
+        return lume_heap_brk(pid, a);
+    case LUME_SYS_TERMINAL:
+    {
+        extern bool lume_console_ready(void);
+        if (!a)
+            return 65 | (24 << 16);
+        if (a == 1)
+            return lume_console_ready();
+        if (a == 4)
+        {
+            lume_uart_flush();
+            return 0;
+        }
+        if (a == 5 && b <= 1000)
+        {
+            uint32_t start = lume_clock_millis();
+            do
+            {
+                if (lume_console_ready())
+                    return 0;
+                lume_net_poll();
+            } while ((uint32_t)(lume_clock_millis() - start) < b);
+            return -LUME_EAGAIN;
+        }
+        return -LUME_EINVAL;
+    }
+    case LUME_SYS_MEMORY:
+        if (b != sizeof(struct lume_memory_snapshot))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        lume_heap_snapshot(pid, (void *)(uintptr_t)a);
+        return 0;
+    case LUME_SYS_PROCESS:
+        if (n != sizeof(struct lume_task_info))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        return lume_task_info((unsigned)a, (void *)(uintptr_t)b);
+    case LUME_SYS_TELEMETRY:
+        if (!a && !b && !n)
+            return lume_task_observed();
+        if (b != sizeof(struct lume_perf_snapshot) || n != LUME_PERF_VERSION)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        lume_task_telemetry(pid, (void *)(uintptr_t)a);
+        return 0;
+    case LUME_SYS_FS:
+    {
+        struct lume_stat stat;
+        if (a == LUME_FS_COMPAT_OPEN || a == LUME_FS_COMPAT_REMOVE)
+        {
+            r = string(b, p);
+            if (r)
+                return r;
+            return a == LUME_FS_COMPAT_OPEN ? lume_vfs_open_compat(files, p, n)
+                                            : lume_vfs_remove_compat(files, p, n != 0);
+        }
+        if (a == LUME_FS_SYNC)
+            return lume_vfs_stat(files, b, &stat);
+        if (a == LUME_FS_TRUNCATE)
+            return lume_vfs_truncate(files, b);
+        if (a == LUME_FS_RENAME)
+        {
+            char to[LUME_PATH_MAX];
+            r = string(b, p);
+            if (!r)
+                r = string(n, to);
+            return r ? r : lume_vfs_rename(files, p, to);
+        }
+        if (a != LUME_FS_STAT_PATH && a != LUME_FS_STAT_FD && a != LUME_FS_STAT_INODE)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(n, sizeof(stat), true))
+            return -LUME_EFAULT;
+        if (a == LUME_FS_STAT_FD)
+            return lume_vfs_stat_mode(files, b, (void *)(uintptr_t)n);
+        if (a == LUME_FS_STAT_INODE)
+            return lume_vfs_stat_inode(b, (void *)(uintptr_t)n);
+        r = string(b, p);
+        return r ? r : lume_vfs_stat_path(files, p, (void *)(uintptr_t)n);
+    }
     case LUME_SYS_CLOCK:
     {
         extern uint64_t lume_clock_monotonic(void);
@@ -39,6 +126,33 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         if (!lume_user_buffer(b, n, a == 0 || a == 2))
             return -LUME_EFAULT;
         return lume_service_call(pid, (unsigned)a, (void *)(uintptr_t)b, n);
+    }
+    case LUME_SYS_STREAM:
+    case LUME_SYS_BOOT:
+    {
+        bool stream = c->x[8] == LUME_SYS_STREAM;
+        size_t bytes =
+            stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
+        if (n != bytes || a > (stream ? LUME_STREAM_CLOSE : LUME_BOOT_ABORT))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+
+        union
+        {
+            struct lume_stream_request stream;
+            struct lume_boot_request boot;
+        } request;
+
+        unsigned char *p = (void *)&request;
+        unsigned char *user = (void *)(uintptr_t)b;
+        for (size_t i = 0; i < bytes; ++i)
+            p[i] = user[i];
+        int result = stream ? lume_stream_call(pid, (unsigned)a, &request.stream)
+                            : lume_boot_call(pid, (unsigned)a, &request.boot);
+        for (size_t i = 0; i < bytes; ++i)
+            user[i] = p[i];
+        return result;
     }
     case LUME_SYS_NETCTL:
     {
@@ -119,7 +233,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_READ:
     case LUME_SYS_WRITE:
     case LUME_SYS_GETDENTS:
-        if (n > 4096)
+        if (n > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, c->x[8] != LUME_SYS_WRITE))
             return -LUME_EFAULT;

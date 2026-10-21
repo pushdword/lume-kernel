@@ -2,8 +2,8 @@
 #define LUME_PERF_ACCOUNT_H
 #include <perf.h>
 
-/* One writer per core. Callers serialize publication with a sequence word;
- * pure arithmetic here also lets host tests exercise wrap and exclusivity. */
+/* Each core has one writer. Callers publish through a sequence word. The arithmetic helpers
+ * also support host checks of counter wrap and exclusive accounting. */
 struct perf_values
 {
     struct lume_perf_core core;

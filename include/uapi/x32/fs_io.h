@@ -2,7 +2,7 @@
 #define LUME_FS_IO_H
 #include <stdint.h>
 
-/* Additive IO38 action3; IO v1 and all existing syscall structures unchanged.
+/* IO38 action 3 extends the interface without changing IO v1 or existing syscall structures.
  * Elapsed tick counters wrap modulo 2^32, as in IO v1. */
 struct lume_fs_duration
 {

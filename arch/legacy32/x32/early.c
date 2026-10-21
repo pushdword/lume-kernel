@@ -1,5 +1,5 @@
-/* X32 instructions stay out of common kernel code. CPUINFO identity is
- * supplied by the CPU; this file never invents a CPU name/capability. */
+/* This file implements X32 instructions outside the common kernel code. CPUINFO supplies the
+ * CPU identity and capabilities. */
 #include "early.h"
 #include "x32_cpuinfo.h"
 

@@ -25,9 +25,9 @@ struct lume_fd_view
     unsigned kind, handle, access, status, references;
 };
 
-/* Scheduler lock protects every call. Backend close may release it, but its
- * last reference remains published until completion; the owning process
- * cannot execute another syscall while its private kernel stack is active. */
+/* The scheduler lock protects each call. A backend close may release the lock while keeping its
+ * last reference published until completion. The owning process cannot issue another syscall
+ * while its kernel stack is active. */
 int lume_fd_backend_close(unsigned, unsigned);
 unsigned lume_fd_tty_events(unsigned, unsigned);
 void lume_fds_start(unsigned, unsigned);

@@ -14,6 +14,8 @@ static int disk;
 static unsigned char mbr[512];
 static bool writable;
 static unsigned reads, writes, denied, checks;
+static uint64_t sectors = 121503744;
+static struct lume_volume selected;
 #define CHECK(x)                                                                                   \
     do                                                                                             \
     {                                                                                              \
@@ -48,7 +50,7 @@ void lume_console_putc(char c)
 
 uint64_t lume_sd_sectors(void)
 {
-    return 121503744;
+    return sectors;
 }
 
 bool lume_sd_read(uint64_t sector, void *out)
@@ -59,31 +61,33 @@ bool lume_sd_read(uint64_t sector, void *out)
         memcpy(out, mbr, 512);
         return true;
     }
-    return sector >= 87949312 && sector < lume_sd_sectors() &&
-           pread(disk, out, 512, (off_t)(sector - 87949312) * 512) == 512;
+    return sector >= selected.first && sector < selected.first + selected.count &&
+           pread(disk, out, 512, (off_t)(sector - selected.first) * 512) == 512;
 }
 
 bool lume_sd_write(uint64_t sector, const void *data)
 {
-    if (!writable || sector < 87949312 || sector >= 121503744)
+    if (!writable || sector < selected.first || sector >= selected.first + selected.count)
     {
         ++denied;
         return false;
     }
     ++writes;
-    return pwrite(disk, data, 512, (off_t)(sector - 87949312) * 512) == 512;
+    return pwrite(disk, data, 512, (off_t)(sector - selected.first) * 512) == 512;
 }
 
 bool lume_sd_allow_volume(uint64_t first, uint64_t count)
 {
-    CHECK(first == 87949312 && count == 33554432 && !writable);
+    CHECK(first == selected.first && count == selected.count && !writable);
     writable = true;
     return true;
 }
 
 int main(int argc, char **argv)
 {
-    CHECK(argc == 3);
+    CHECK(argc == 3 || argc == 4);
+    if (argc == 4)
+        sectors = strtoull(argv[3], NULL, 10);
     disk = open(argv[1], O_RDWR);
     CHECK(disk >= 0);
     int mbrfd = open(argv[2], O_RDONLY);
@@ -93,13 +97,15 @@ int main(int argc, char **argv)
     memcpy(before, mbr, 512);
     struct lume_volume volume;
     CHECK(lume_volume_select(before, lume_sd_sectors(), &volume));
+    selected = volume;
     for (unsigned byte = 440; byte < 512; ++byte)
     {
         unsigned char bad[512];
         memcpy(bad, before, 512);
         bad[byte] ^= 1;
-        bool required = (byte >= 440 && byte < 444) || byte == 450 || (byte >= 454 && byte < 462) ||
-                        byte == 466 || (byte >= 470 && byte < 479) || byte == 482 || byte >= 486;
+        bool required = selected.first == LUME_CARD_DATA_FIRST || (byte >= 440 && byte < 444) ||
+                        byte == 450 || (byte >= 454 && byte < 462) || byte == 466 ||
+                        (byte >= 470 && byte < 479) || byte == 482 || byte >= 486;
         if (required)
             CHECK(!lume_volume_select(bad, lume_sd_sectors(), &volume));
     }

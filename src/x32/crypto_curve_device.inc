@@ -1,5 +1,6 @@
-/* Optional complete Curve25519 engine. Private kernel buffers only; SYS-domain
- * device lease is separate from AES/RNG. Never issue user-space MMIO or SPI. */
+/* The optional Curve25519 engine performs complete operations on kernel buffers. Its SYS-domain
+ * lease is separate from the AES and RNG leases. The driver accesses the device from the kernel
+ * without user-space MMIO or SPI. */
 int lume_curve_device_discover(struct lume_crypto_device *out, uint32_t timer_hz)
 {
     *out = (struct lume_crypto_device){0};

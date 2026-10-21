@@ -5,9 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Serialized kernel API. Registration lasts until reboot; indices are stable.
- * Receive consumes one complete Ethernet frame (0=no frame, <0=error).
- * No driver callback may recursively enter the stack or this registry. */
+/* The kernel serializes access to this registry. Registrations last until reboot and keep
+ * stable indices. Receive consumes one complete Ethernet frame, returns zero when no frame is
+ * available and returns a negative value on error. Driver callbacks must not recursively enter
+ * the network stack or this registry. */
 struct lume_netif_ops
 {
     void (*poll)(void *);

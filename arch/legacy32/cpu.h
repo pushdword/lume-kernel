@@ -1,4 +1,4 @@
-/* Lume architecture selection; X32 is the default target. */
+/* X32 is the default architecture when no Lume target is selected. */
 #ifndef LUME_ARCH_CPU_H
 #define LUME_ARCH_CPU_H
 #include "contract.h"

@@ -1,5 +1,5 @@
-/* FAT/SD/cache are serialized by the filesystem gate. The scheduler lock may
- * be released during device I/O; FatFs remains deliberately non-reentrant. */
+/* The filesystem gate serializes FAT, SD and cache access. Device I/O may release the scheduler
+ * lock while the filesystem gate remains held. FatFs is non-reentrant. */
 #include "core.h"
 #include "perf_io.h"
 #include "sd.h"
@@ -12,9 +12,9 @@
 static FATFS volume;
 static struct lume_sd_card card;
 static int mounted, io_failed;
-/* Read-through cache; all access is under the filesystem gate. Writes
- * still complete the SD program/status/readback before becoming visible here.
- * Four ways avoid directory/FAT/data conflicts without a linear disk scan. */
+/* The filesystem gate protects the read-through cache. A write completes SD programming, status
+ * verification and readback before updating the cache. Four ways reduce directory, FAT and data
+ * conflicts without scanning the disk. */
 #define CACHE_SETS 256u
 #define CACHE_WAYS 4u
 
@@ -284,8 +284,8 @@ static int reader(void *ctx, uint32_t block, unsigned char *out)
 
 void filesystem_start(void)
 {
-    /* Validate FAT32 geometry and disk bounds before the upstream mount. The
-     * deployed card has mirrored FATs; active-FAT-only volumes are refused. */
+    /* Validate FAT32 geometry and disk bounds before mounting. The volume must use mirrored
+     * FATs. Volumes configured to use only an active FAT are rejected. */
     struct fat_ro geometry;
     unsigned char bpb[512];
     io_failed = 0;
@@ -490,10 +490,9 @@ void fs_process_exit(unsigned slot)
         }
 }
 
-/* Shared FD layer owns these object handles, independently of process slots.
- * The legacy per-slot functions remain for existing focused FatFs fixtures;
- * production process teardown uses fs_directory_exit and the FD reference
- * counts instead of closing a row that another process may still reference. */
+/* The shared FD layer owns object handles independently of process slots. Per-slot functions
+ * support FatFs fixtures. Process teardown uses fs_directory_exit and FD reference counts to
+ * avoid closing an object still referenced by another process. */
 int fs_object_open(const char *path, unsigned flags)
 {
     for (unsigned owner = 0; owner < MAX_PROCESSES; owner++)
@@ -1041,10 +1040,10 @@ static int load_process(unsigned slot, const char *path, uint32_t *entry)
         kputs("\n");
         return 0;
     }
-    /* FAT has no symlinks. A complete, fixed-target descriptor replaces the
-     * old launcher process without changing spawn's argv/env/CWD/status.
-     * Ordinary ELF replacements take the original path. Resolve only once;
-     * a descriptor at the BusyBox target must fail the ordinary ELF loader. */
+    /* FAT uses a fixed-target descriptor to launch BusyBox without a launcher process or
+     * symlink support. Descriptor resolution preserves spawn arguments, environment, CWD and
+     * status handling. Ordinary ELF files use the original path. Resolve a descriptor only
+     * once. A descriptor at the BusyBox target must fail ELF validation. */
     if (f_size(&f) == LUME_BUSYBOX_ALIAS_BYTES)
     {
         unsigned char descriptor[LUME_BUSYBOX_ALIAS_BYTES];

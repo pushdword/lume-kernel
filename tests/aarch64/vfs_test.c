@@ -48,6 +48,9 @@ int main(void)
     int fd = (int)lume_vfs_open(&f, "note", LUME_O_CREAT | LUME_O_RDWR);
     T(fd == 3);
     T(lume_vfs_write(&f, fd, "abc", 3) == 3);
+    T(lume_vfs_open_compat(&g, "/tmp/note", LUME_O_RDWR) == -LUME_EBUSY);
+    T(lume_vfs_remove_compat(&g, "/tmp/note", false) == -LUME_EBUSY);
+    T(lume_vfs_rename(&g, "/tmp/note", "/tmp/renamed") == -LUME_EBUSY);
     int other = (int)lume_vfs_open(&g, "/tmp/note", 0);
     T(other == 3);
     char b[4096] = {0};
@@ -76,6 +79,14 @@ int main(void)
     T(lume_vfs_read(&g, other, b, 20) == 9 && b[8] == 'a');
     T(lume_vfs_write(&g, other, "x", 1) == -LUME_EBADF);
     T(lume_vfs_close(&g, other) == 0);
+    fd = (int)lume_vfs_open_compat(&f, "/tmp/note", LUME_O_RDWR);
+    T(fd == 3 && lume_vfs_close(&f, fd) == 0);
+    T(lume_vfs_rename(&f, "/tmp/note", "/tmp/renamed") == 0);
+    T(lume_vfs_stat_path(&f, "/tmp/renamed", &st) == 0100777 && st.size == 12);
+    struct lume_stat inode_stat;
+    T(lume_vfs_stat_inode(st.inode, &inode_stat) == 0100777 && inode_stat.size == st.size);
+    T(lume_vfs_stat_inode(0, &inode_stat) == -LUME_ENOENT);
+    T(lume_vfs_remove_compat(&f, "/tmp/renamed", false) == 0);
     fd = (int)lume_vfs_open(&f, "/", 0);
     T(fd == 3);
     struct lume_dirent ent;

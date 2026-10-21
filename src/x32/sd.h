@@ -38,12 +38,14 @@ struct lume_sd_card
 int lume_sd_identify(uintptr_t base, struct lume_sd_card *card);
 int lume_sd_read(uintptr_t base, const struct lume_sd_card *card, uint32_t block,
                  unsigned char *data);
-/* All sectors validated or an error; caller must discard the output on error. */
+/* Success confirms that every sector was validated. The caller must discard the output after an
+ * error. */
 int lume_sd_read_blocks(uintptr_t, const struct lume_sd_card *, uint32_t, uint32_t,
                         unsigned char *);
 int lume_sd_decode_csd(const unsigned char *csd, struct lume_sd_card *card);
 int lume_sd_write(uintptr_t, const struct lume_sd_card *, uint32_t, const unsigned char *);
-/* CMD25 for contiguous groups; success includes status and complete readback. */
+/* CMD25 writes contiguous sector groups. Success requires status verification and complete
+ * readback. */
 int lume_sd_write_blocks(uintptr_t, const struct lume_sd_card *, uint32_t, uint32_t,
                          const unsigned char *);
 int lume_sd_sync(uintptr_t);

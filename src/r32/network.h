@@ -1,5 +1,5 @@
-/* Kernel-only W5500 backend. Calls are serialized by the network owner.
- * request/data are kernel copies; request.buffer must never be dereferenced. */
+/* The network owner serializes calls to the W5500 backend. request and data refer to kernel
+ * copies. The driver must not dereference request.buffer. */
 #ifndef LUME_NETWORK_DRIVER_H
 #define LUME_NETWORK_DRIVER_H
 #include <net.h>

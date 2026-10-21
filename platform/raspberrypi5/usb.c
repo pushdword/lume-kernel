@@ -1,9 +1,10 @@
-/* Minimal polling xHCI host, USB2 hubs and HID boot keyboards for RP1.
- * Written for Lume against Intel xHCI 1.2 and USB 2.0/HID specifications.
- * No Linux/Circle USB runtime, interrupt handlers, or synthetic input.
- * The firmware PCIe link is inherited; DMA aperture matches the MIPI driver.
- */
+/* This polling RP1 xHCI driver supports USB 2 hubs and HID boot keyboards. It implements Intel
+ * xHCI 1.2 and USB 2.0/HID protocols without an external USB runtime or interrupt handlers. It
+ * reads physical keyboard reports. The driver inherits the firmware PCIe link and uses the same
+ * DMA aperture as the MIPI driver. */
 #include "lume/early.h"
+#include "lume/mmio.h"
+#include "lume/counter.h"
 #include "lume/usb.h"
 #include "lume/xhci_ring.h"
 #include "lume/abi.h"
@@ -20,7 +21,7 @@ struct device
     unsigned char *buffer, *report;
     struct lume_xhci_ring ep0, interrupt;
     uint64_t irq_trb;
-    bool keyboard, pending, disconnected;
+    bool keyboard, hub, pending, disconnected;
     struct lume_hid hid;
 };
 
@@ -36,57 +37,43 @@ struct host
     unsigned command_code, command_slot, transfer_code;
     bool running, valid;
     unsigned errors, completions;
+    uint32_t root_ready, next_scan;
+    unsigned retired_reports, retired_characters, retired_dropped;
+    bool scanning;
 };
 static struct host hosts[2];
 static unsigned keyboard_count, hub_count;
 
-static uint32_t read32(uint64_t a)
-{
-    uint32_t v = *(volatile uint32_t *)(uintptr_t)a;
-    __asm__ volatile("dmb oshld" ::: "memory");
-    return v;
-}
-
-static void write32(uint64_t a, uint32_t v)
-{
-    *(volatile uint32_t *)(uintptr_t)a = v;
-    __asm__ volatile("dmb oshst" ::: "memory");
-}
-
 static void write64(uint64_t a, uint64_t v)
 {
-    write32(a, (uint32_t)v);
-    write32(a + 4, (uint32_t)(v >> 32));
-}
-
-static uint64_t counter(void)
-{
-    uint64_t n;
-    __asm__ volatile("isb; mrs %0,cntpct_el0" : "=r"(n));
-    return n;
+    lume_mmio_write32(a, (uint32_t)v);
+    lume_mmio_write32(a + 4, (uint32_t)(v >> 32));
 }
 
 static uint32_t milliseconds(struct host *h)
 {
-    return (uint32_t)(counter() / (h->frequency / 1000));
+    return (uint32_t)(lume_counter_read() / (h->frequency / 1000));
 }
 
 static void delay(struct host *h, unsigned us)
 {
-    uint64_t start = counter();
-    while (counter() - start < h->frequency * us / 1000000)
+    uint64_t start = lume_counter_read();
+    while (lume_counter_read() - start < h->frequency * us / 1000000)
+    {
+        lume_uart_poll_input();
         __asm__ volatile("yield");
+    }
 }
 
 static bool wait_register(struct host *h, uint64_t a, uint32_t mask, uint32_t value, unsigned ms)
 {
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     do
     {
-        if ((read32(a) & mask) == value)
+        if ((lume_mmio_read32(a) & mask) == value)
             return true;
         delay(h, 50);
-    } while (counter() - start < h->frequency * ms / 1000);
+    } while (lume_counter_read() - start < h->frequency * ms / 1000);
     return false;
 }
 
@@ -127,16 +114,36 @@ static void cache(void *p, size_t bytes, bool invalidate)
 
 static void *page(struct host *h)
 {
-    if (h->allocated == MAX_PAGES)
+    unsigned index = 0;
+    while (index < h->allocated && h->pages[index])
+        ++index;
+    if (index == MAX_PAGES)
         return 0;
     uint64_t p = lume_page_alloc(0);
     if (!p)
         return 0;
-    h->pages[h->allocated++] = p;
+    h->pages[index] = p;
+    if (index == h->allocated)
+        ++h->allocated;
     void *v = (void *)(uintptr_t)p;
     zero(v, 4096);
     cache(v, 4096, false);
     return v;
+}
+
+static void release_page(struct host *h, const void *p)
+{
+    if (!p)
+        return;
+    for (unsigned n = 0; n < h->allocated; ++n)
+        if (h->pages[n] == (uintptr_t)p)
+        {
+            if (!lume_page_free(h->pages[n]))
+                lume_fail("USB page release");
+            h->pages[n] = 0;
+            return;
+        }
+    lume_fail("USB page ownership");
 }
 
 static bool ring_init(struct host *h, struct lume_xhci_ring *r)
@@ -167,7 +174,7 @@ static void arm_keyboard(struct host *h, struct device *d)
     cache(d->report, 64, true);
     d->irq_trb = enqueue(&d->interrupt, dma(d->report), 8, (1u << 10) | 32 | 4);
     d->pending = true;
-    write32(h->doorbells + d->slot * 4, d->irq_endpoint);
+    lume_mmio_write32(h->doorbells + d->slot * 4, d->irq_endpoint);
 }
 
 static void events(struct host *h)
@@ -194,7 +201,8 @@ static void events(struct host *h)
             struct device *d = &h->devices[slot];
             if (ep == 1 && (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13)))
                 h->transfer_code = cc;
-            else if (d->keyboard && ep == d->irq_endpoint && e.parameter == d->irq_trb)
+            else if (d->keyboard && !d->disconnected && ep == d->irq_endpoint &&
+                     e.parameter == d->irq_trb)
             {
                 d->pending = false;
                 if ((cc == 1 || cc == 13) && (e.status & 0xffffff) == 0)
@@ -223,7 +231,7 @@ static void events(struct host *h)
         }
     }
     write64(h->rt + 0x38, dma(&h->events[h->event_head]) | 8);
-    write32(h->rt + 0x20, 1); /* IP W1C, IE stays clear: no RP1 interrupts. */
+    lume_mmio_write32(h->rt + 0x20, 1); /* IP W1C, IE stays clear: no RP1 interrupts. */
 }
 
 static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned control,
@@ -231,15 +239,15 @@ static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned 
 {
     h->command_code = 0;
     h->waiting_command = enqueue(&h->command, parameter, 0, (type << 10) | control);
-    write32(h->doorbells, 0);
-    uint64_t start = counter();
+    lume_mmio_write32(h->doorbells, 0);
+    uint64_t start = lume_counter_read();
     do
     {
         events(h);
         if (h->command_code)
             break;
         delay(h, 50);
-    } while (counter() - start < h->frequency);
+    } while (lume_counter_read() - start < h->frequency);
     h->waiting_command = 0;
     if (h->command_code != 1)
     {
@@ -272,15 +280,15 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
         enqueue(&d->ep0, dma(d->buffer), bytes, (3u << 10) | (input ? 1u << 16 : 0));
     h->waiting_transfer =
         enqueue(&d->ep0, 0, 0, (4u << 10) | 32 | ((!bytes || !input) ? 1u << 16 : 0));
-    write32(h->doorbells + d->slot * 4, 1);
-    uint64_t start = counter();
+    lume_mmio_write32(h->doorbells + d->slot * 4, 1);
+    uint64_t start = lume_counter_read();
     do
     {
         events(h);
         if (h->transfer_code)
             break;
         delay(h, 50);
-    } while (counter() - start < h->frequency / 2);
+    } while (lume_counter_read() - start < h->frequency / 2);
     h->waiting_transfer = 0;
     if (h->transfer_code != 1)
     {
@@ -414,8 +422,8 @@ static bool enumerate(struct host *, unsigned, unsigned, unsigned, unsigned, uns
 
 static bool hub(struct host *h, struct device *d, unsigned protocol)
 {
-    /* USB2 high-speed hubs advertising protocol 2 expose their multiple-TT
-     * function as alternate setting 1; reflect that setting in the contexts. */
+    /* USB 2 high-speed hubs with protocol 2 expose multiple-TT operation in alternate setting
+     * 1. The endpoint contexts must use that setting. */
     if (protocol == 2 && d->speed == 3 && !control(h, d, 1, 11, 1, 0, 0))
         return false;
     if (!control(h, d, 0xa0, 6, 0x2900, 0, 7))
@@ -444,6 +452,7 @@ static bool hub(struct host *h, struct device *d, unsigned protocol)
     if (!command(h, 13, dma(d->input), d->slot << 24, 0))
         return false;
     ++hub_count;
+    d->hub = true;
     lume_value("USB_HUB_SLOT", d->slot);
     lume_value("USB_HUB_PORTS", ports);
     for (unsigned port = 1; port <= ports; ++port)
@@ -539,32 +548,116 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
     return keyboard(h, d, &selected);
 }
 
+static bool remove_root(struct host *h, unsigned root)
+{
+    for (unsigned depth = 5; depth-- > 0;)
+        for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
+        {
+            struct device *d = &h->devices[slot];
+            if (!d->slot || d->root != root || d->depth != depth)
+                continue;
+            d->disconnected = true;
+            if (!command(h, 10, 0, slot << 24, 0))
+                return false;
+            h->dcbaa[slot] = 0;
+            cache(h->dcbaa, 4096, false);
+            if (d->keyboard)
+                --keyboard_count;
+            if (d->hub)
+                --hub_count;
+            h->retired_reports += d->hid.reports;
+            h->retired_characters += d->hid.characters;
+            h->retired_dropped += d->hid.dropped;
+            release_page(h, d->input);
+            release_page(h, d->output);
+            release_page(h, d->buffer);
+            release_page(h, d->report);
+            release_page(h, d->ep0.trbs);
+            release_page(h, d->interrupt.trbs);
+            *d = (struct device){0};
+        }
+    h->root_ready &= ~(1u << (root - 1));
+    return true;
+}
+
+static void scan_roots(struct host *h, bool initial)
+{
+    uint32_t now = milliseconds(h);
+    if (h->scanning || (!initial && (int32_t)(now - h->next_scan) < 0))
+        return;
+    h->scanning = true;
+    h->next_scan = now + 1000;
+    for (unsigned port = 1; port <= h->ports; ++port)
+    {
+        uint64_t reg = h->op + 0x400 + (port - 1) * 16;
+        uint32_t status = lume_mmio_read32(reg), mask = 1u << (port - 1);
+        bool connected = (status & 1) && ((status >> 10) & 15) < 4;
+        bool failed = false, allocated = false;
+        for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
+            if (h->devices[slot].slot && h->devices[slot].root == port)
+            {
+                allocated = true;
+                failed |= h->devices[slot].disconnected;
+            }
+        if (connected && (h->root_ready & mask) && !failed)
+            continue;
+        if (!connected && !allocated)
+            continue;
+        if (!remove_root(h, port) || !connected)
+            continue;
+        lume_mmio_write32(reg, (1u << 9) | 16);
+        if (!wait_register(h, reg, 18, 2, 300))
+        {
+            lume_value("USB_ROOT_RESET_FAILED", port);
+            continue;
+        }
+        delay(h, 10000);
+        status = lume_mmio_read32(reg);
+        unsigned speed = (status >> 10) & 15;
+        lume_mmio_write32(reg, (1u << 9) | 0xfe0000);
+        if (enumerate(h, port, speed, 0, 0, 0, 0, 0))
+        {
+            h->root_ready |= mask;
+            if (!initial)
+            {
+                lume_value("USB_HOTPLUG_HUBS", hub_count);
+                lume_value("USB_HOTPLUG_KEYBOARDS", keyboard_count);
+            }
+        }
+        else
+            lume_value("USB_ROOT_DEVICE_FAILED", port);
+    }
+    h->next_scan = milliseconds(h) + 1000;
+    h->scanning = false;
+}
+
 static bool host_start(struct host *h, unsigned index, uint64_t frequency)
 {
     *h = (struct host){0};
     h->index = index;
     h->frequency = frequency;
     h->base = RP1 + 0x200000 + index * 0x100000;
-    uint32_t cap = read32(h->base), hcs = read32(h->base + 4), hcc = read32(h->base + 16);
+    uint32_t cap = lume_mmio_read32(h->base), hcs = lume_mmio_read32(h->base + 4),
+             hcc = lume_mmio_read32(h->base + 16);
     lume_value(index ? "USB1_CAP" : "USB0_CAP", cap);
     if ((cap >> 16) < 0x100 || (cap >> 16) > 0x120 || (cap & 255) < 0x20 || !(hcc & 1))
         return false;
     h->op = h->base + (cap & 255);
-    h->rt = h->base + (read32(h->base + 0x18) & ~31u);
-    h->doorbells = h->base + (read32(h->base + 0x14) & ~3u);
+    h->rt = h->base + (lume_mmio_read32(h->base + 0x18) & ~31u);
+    h->doorbells = h->base + (lume_mmio_read32(h->base + 0x14) & ~3u);
     if (h->rt - h->base > 0x100000 || h->doorbells - h->base > 0x100000)
         return false;
     h->ports = hcs >> 24;
     h->context_bytes = (hcc & 4) ? 64 : 32;
     if (!h->ports || h->ports > 16 || (hcs & 255) < MAX_SLOTS)
         return false;
-    write32(h->op, 0);
+    lume_mmio_write32(h->op, 0);
     if (!wait_register(h, h->op + 4, 1, 1, 200))
         return false;
-    write32(h->op, 2);
+    lume_mmio_write32(h->op, 2);
     if (!wait_register(h, h->op, 2, 0, 1000) || !wait_register(h, h->op + 4, 0x800, 0, 1000))
         return false;
-    if (!(read32(h->op + 8) & 1))
+    if (!(lume_mmio_read32(h->op + 8) & 1))
         return false;
     h->valid = true;
     h->dcbaa = page(h);
@@ -572,7 +665,8 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     uint64_t *erst = page(h);
     if (!h->dcbaa || !h->events || !erst || !ring_init(h, &h->command))
         return false;
-    unsigned hcs2 = read32(h->base + 8), scratch = ((hcs2 >> 27) & 31) | ((hcs2 >> 16) & 0x3e0);
+    unsigned hcs2 = lume_mmio_read32(h->base + 8),
+             scratch = ((hcs2 >> 27) & 31) | ((hcs2 >> 16) & 0x3e0);
     if (scratch > 64)
         return false;
     if (scratch)
@@ -592,18 +686,18 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     }
     cache(h->dcbaa, 4096, false);
     write64(h->op + 0x30, dma(h->dcbaa));
-    write32(h->op + 0x38, MAX_SLOTS);
+    lume_mmio_write32(h->op + 0x38, MAX_SLOTS);
     write64(h->op + 0x18, h->command.dma | 1);
     erst[0] = dma(h->events);
     erst[1] = 256;
     cache(erst, 64, false);
     h->event_cycle = 1;
-    write32(h->rt + 0x28, 1);
+    lume_mmio_write32(h->rt + 0x28, 1);
     write64(h->rt + 0x30, dma(erst));
     write64(h->rt + 0x38, dma(h->events));
-    write32(h->rt + 0x24, 0);
-    write32(h->rt + 0x20, 1);
-    write32(h->op, 1);
+    lume_mmio_write32(h->rt + 0x24, 0);
+    lume_mmio_write32(h->rt + 0x20, 1);
+    lume_mmio_write32(h->op, 1);
     if (!wait_register(h, h->op + 4, 1, 0, 200))
         return false;
     h->running = true;
@@ -611,31 +705,15 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
         return false;
     lume_puts(index ? "LUME XHCI1 COMMAND RING PASS\n" : "LUME XHCI0 COMMAND RING PASS\n");
     for (unsigned port = 1; port <= h->ports; ++port)
-        write32(h->op + 0x400 + (port - 1) * 16, 1u << 9);
+        lume_mmio_write32(h->op + 0x400 + (port - 1) * 16, 1u << 9);
     delay(h, 100000);
     for (unsigned port = 1; port <= h->ports; ++port)
     {
         uint64_t reg = h->op + 0x400 + (port - 1) * 16;
-        uint32_t status = read32(reg);
+        uint32_t status = lume_mmio_read32(reg);
         lume_value(index ? "USB1_PORT_STATUS" : "USB0_PORT_STATUS", status);
-        if (!(status & 1))
-            continue;
-        unsigned speed = (status >> 10) & 15;
-        if (speed >= 4)
-            continue;
-        write32(reg, (1u << 9) | 16);
-        if (!wait_register(h, reg, 18, 2, 300))
-        {
-            lume_value("USB_ROOT_RESET_FAILED", port);
-            continue;
-        }
-        delay(h, 10000);
-        status = read32(reg);
-        speed = (status >> 10) & 15;
-        write32(reg, (1u << 9) | 0xfe0000);
-        if (!enumerate(h, port, speed, 0, 0, 0, 0, 0))
-            lume_value("USB_ROOT_DEVICE_FAILED", port);
     }
+    scan_roots(h, true);
     return true;
 }
 
@@ -643,7 +721,8 @@ bool lume_usb_start(uint64_t frequency)
 {
     keyboard_count = hub_count = 0;
     /* Same 8GiB inbound DMA aperture used by native DSI. */
-    if (read32(UINT64_C(0x1000124034)) != 18 || read32(UINT64_C(0x1000124038)) != 0x10)
+    if (lume_mmio_read32(UINT64_C(0x1000124034)) != 18 ||
+        lume_mmio_read32(UINT64_C(0x1000124038)) != 0x10)
     {
         lume_puts("USB DMA APERTURE NOT READY\n");
         return false;
@@ -664,12 +743,13 @@ void lume_usb_poll(void)
         if (!h->running)
             continue;
         events(h);
+        scan_roots(h, false);
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &h->devices[slot];
             if (!d->keyboard || d->disconnected)
                 continue;
-            if (!(read32(h->op + 0x400 + (d->root - 1) * 16) & 1))
+            if (!(lume_mmio_read32(h->op + 0x400 + (d->root - 1) * 16) & 1))
             {
                 d->disconnected = true;
                 d->hid.repeat_key = 0;
@@ -709,6 +789,9 @@ void lume_usb_stats(void)
     for (unsigned i = 0; i < 2; ++i)
     {
         errors += hosts[i].errors;
+        reports += hosts[i].retired_reports;
+        characters += hosts[i].retired_characters;
+        dropped += hosts[i].retired_dropped;
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct lume_hid *h = &hosts[i].devices[slot].hid;
@@ -731,7 +814,7 @@ bool lume_usb_stop(void)
         struct host *h = &hosts[i];
         if (!h->valid)
             continue;
-        write32(h->op, 0);
+        lume_mmio_write32(h->op, 0);
         bool stopped = wait_register(h, h->op + 4, 1, 1, 500);
         lume_value(i ? "USB1_DMA_STOPPED" : "USB0_DMA_STOPPED", stopped);
         if (!stopped)
@@ -741,7 +824,8 @@ bool lume_usb_stop(void)
         }
         h->running = false;
         for (unsigned n = 0; n < h->allocated; ++n)
-            ok = lume_page_free(h->pages[n]) && ok;
+            if (h->pages[n])
+                ok = lume_page_free(h->pages[n]) && ok;
         h->allocated = 0;
         h->valid = false;
     }

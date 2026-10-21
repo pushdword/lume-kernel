@@ -2,7 +2,8 @@
 #define LUME_WIRELESS_H
 #include "lume/netif.h"
 
-/* Common station control. Connect borrows credentials; this layer retains no keys. */
+/* Connect borrows the station credentials for the duration of the call. This layer does not
+ * retain the keys. */
 struct lume_wireless_ops
 {
     int (*scan)(void *, struct lume_wifi_bss_info *, unsigned);

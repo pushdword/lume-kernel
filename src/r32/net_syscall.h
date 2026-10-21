@@ -1,8 +1,7 @@
-/* Syscall37 marshalling. Validate/copy under queue_lock; the network owner
- * protects the driver while queue_lock is released around kernel-only copies.
- * The driver must never block for peer/timer/socket progress.
- * user_range/user_copy_* are supplied by the kernel or the focused host test.
- */
+/* Syscall 37 validates and copies requests under queue_lock. The network owner protects the
+ * driver while queue_lock is released for operations on kernel copies. Driver calls must not
+ * wait for peers, timers or socket progress. The kernel and host tests provide user_range and
+ * user_copy_*. */
 #ifndef LUME_NET_SYSCALL_H
 #define LUME_NET_SYSCALL_H
 #include <net.h>

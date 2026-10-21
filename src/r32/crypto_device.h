@@ -9,8 +9,8 @@ struct lume_crypto_device
     uint32_t base, clock_hz, available;
 };
 
-/* Private kernel pointers only. Driver overwrites data only after verifying
- * auth_ok. On encryption tag is output; on decryption it is expected input. */
+/* All pointers refer to kernel buffers. The driver verifies auth_ok before overwriting data.
+ * Encryption writes the tag. Decryption reads the expected tag. */
 struct lume_aes_packet
 {
     unsigned key_bytes, aad_bytes, bytes, decrypt;

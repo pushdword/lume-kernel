@@ -1,7 +1,7 @@
 #ifndef LUME_KERNEL_WORK_H
 #define LUME_KERNEL_WORK_H
-/* Private resumable kernel work; public176B context/368B process stay intact.
- * Suspended stacks remain bound to their original core. No C frame migrates. */
+/* Resumable kernel work keeps the public 176-byte context and 368-byte process layouts.
+ * Suspended C stacks remain on their original core. */
 #define KWORK_STACK_WORDS 4096u
 #define KWORK_CANARY 0x4b53544bu
 

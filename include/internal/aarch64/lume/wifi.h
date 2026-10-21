@@ -24,7 +24,8 @@ struct lume_wifi_frame
 
 bool lume_wifi_frame_header(const unsigned char *, size_t, struct lume_wifi_frame *);
 bool lume_wifi_tx_allowed(unsigned char, unsigned char, unsigned char, bool);
-/* 1=matching response; 0=other packet/id; -1=malformed; -2=firmware error. */
+/* The parser returns 1 for a matching response, 0 for another packet or identifier, -1 for a
+ * malformed packet and -2 for a firmware error. */
 int lume_wifi_control_reply(const unsigned char *, size_t, uint16_t, uint32_t, void *, size_t,
                             size_t *, int32_t *);
 bool lume_wifi_firmware(void);

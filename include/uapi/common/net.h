@@ -73,20 +73,22 @@ enum
     LUME_NET_EINPROGRESS = 115
 };
 
-/* Addresses use four wire-order octets and ports use host-order values 0..65535.
- * buffer is a32-bit user virtual address, never a physical/MMIO pointer.
- * Call LUME_NET with (op,&request,sizeof request). version/bytes must match the ABI.
- * flags is zero. Unused fields are ignored. All operations are nonblocking.
- * SOCKET/ACCEPT return a handle. SEND/RECV/SENDTO/RECVFROM return byte counts.
- * POLL returns1 if ready,0 otherwise and replaces events with readiness flags.
- * Other operations return 0 on success or a negative ABI errno value on error.
- * POLL accepts POLLIN|POLLOUT|POLLLISTEN and may also return ERR/HUP.
- * Optional POLLLISTEN confirms hardware listening (or an already arrived
- * connection). LISTEN itself only starts the nonblocking OPEN/LISTEN sequence.
- * ACCEPT/RECVFROM replace address/port with the peer. A successful call copies
- * the request back. Receive/INFO buffers must not overlap that request.
- * Use POLL to complete a CONNECT that returned EINPROGRESS.
- */
+/* Addresses contain four octets in wire order. Ports use host-order values from 0 through
+ * 65535. buffer is a 32-bit user virtual address. It must not contain a physical or MMIO
+ * address. LUME_NET takes the operation, request pointer and request size. version and bytes
+ * must match the request layout, and flags must be zero. Unused fields are ignored. All
+ * operations are nonblocking.
+ *
+ * SOCKET and ACCEPT return a handle. SEND, RECV, SENDTO and RECVFROM return byte counts. POLL
+ * returns 1 when ready or 0 otherwise and replaces events with readiness flags. Other
+ * operations return 0 on success. Errors are negative ABI errno values. POLL accepts POLLIN,
+ * POLLOUT and POLLLISTEN and may also return ERR or HUP. POLLLISTEN confirms that hardware is
+ * listening or that a connection has arrived. LISTEN starts the asynchronous OPEN and LISTEN
+ * sequence.
+ *
+ * ACCEPT and RECVFROM replace address and port with the peer values. Successful calls copy the
+ * request back to the caller. Receive and INFO buffers must not overlap the request. After
+ * CONNECT returns EINPROGRESS, the caller must use POLL to check its progress. */
 struct lume_net_request
 {
     uint32_t version, bytes;
@@ -96,11 +98,9 @@ struct lume_net_request
     uint32_t port, buffer, length, events, flags;
 };
 
-/* CONFIG reads exactly sizeof configuration at request.buffer.
- * INFO produces exactly sizeof info there. Both structures are versioned.
- * Interface configuration is independent of the lifetime of any one socket.
- * Reserved bytes and flags in configuration must be zero.
- */
+/* CONFIG reads exactly sizeof configuration bytes at request.buffer. INFO writes exactly sizeof
+ * info bytes there. Both structures include a version. Interface configuration persists
+ * independently of individual sockets. Configuration flags and reserved bytes must be zero. */
 struct lume_net_config
 {
     uint32_t version, bytes;

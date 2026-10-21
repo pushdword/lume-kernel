@@ -10,8 +10,8 @@ struct lume_random_state
 };
 
 void lume_secret_clear(void *, unsigned);
-/* Caller-supplied scheduling hook; compression state stays on its private
- * stack. The kernel calls it outside queue_lock with a generator lease. */
+/* The caller supplies the scheduling hook. Compression state remains on the calling stack. The
+ * kernel invokes the hook outside queue_lock while holding a generator lease. */
 void lume_random_checkpoint(void);
 void lume_sha256(const void *, unsigned, unsigned char[32]);
 void lume_hmac_sha256(const unsigned char[32], const void *, unsigned, const void *, unsigned,

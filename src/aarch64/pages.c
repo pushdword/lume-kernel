@@ -2,6 +2,7 @@
 #define MAX_PAGES (UINT64_C(0x200000000) / 4096)
 static uint64_t used[MAX_PAGES / 64], managed[MAX_PAGES / 64], free_count;
 static uint64_t cursor;
+static uint64_t total_count;
 
 static bool overlaps(uint64_t a, uint64_t size, uint64_t b, uint64_t bytes)
 {
@@ -34,6 +35,7 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
         for (uint64_t p = start; p < end; p += 4096)
         {
             bool reserve =
+                overlaps(p, 4096, LUME_USER_BASE, LUME_USER_LIMIT - LUME_USER_BASE) ||
                 overlaps(p, 4096, image_start, image_end - image_start) ||
                 overlaps(p, 4096, dtb, fdt->size) ||
                 (fdt->initrd_end > fdt->initrd_start &&
@@ -50,6 +52,35 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
             }
         }
     }
+    total_count = free_count;
+}
+
+uint64_t lume_pages_total(void)
+{
+    return total_count;
+}
+
+uint64_t lume_pages_alloc_span(unsigned count)
+{
+    if (!count || count > 32768 || free_count < count)
+        return 0;
+    unsigned run = 0;
+    for (uint64_t p = 1; p < MAX_PAGES; ++p)
+    {
+        uint64_t mask = UINT64_C(1) << (p & 63);
+        run = used[p / 64] & mask ? 0 : run + 1;
+        if (run != count)
+            continue;
+        uint64_t first = p + 1 - count;
+        for (uint64_t q = first; q <= p; ++q)
+            used[q / 64] |= UINT64_C(1) << (q & 63);
+        free_count -= count;
+        volatile uint64_t *data = (void *)(uintptr_t)(first * 4096);
+        for (size_t i = 0; i < (size_t)count * 512; ++i)
+            data[i] = 0;
+        return first * 4096;
+    }
+    return 0;
 }
 
 uint64_t lume_page_alloc(uint64_t minimum)

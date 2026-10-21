@@ -1,5 +1,7 @@
 /* BCM2712 D0 Wi-Fi SDHCI, distinct from the SD card controller. */
 #include "lume/early.h"
+#include "lume/mmio.h"
+#include "lume/counter.h"
 #include "lume/sdio.h"
 #define HOST UINT64_C(0x1001100000)
 #define PINCTRL UINT64_C(0x107d504100)
@@ -7,56 +9,36 @@
 static uint64_t frequency, commands, errors;
 static bool active;
 
-static uint32_t read32(uint64_t a)
-{
-    return *(volatile uint32_t *)(uintptr_t)a;
-}
-
-static void write32(uint64_t a, uint32_t v)
-{
-    *(volatile uint32_t *)(uintptr_t)a = v;
-    __asm__ volatile("dsb sy" ::: "memory");
-}
-
 static uint32_t rd(unsigned r)
 {
-    return read32(HOST + r);
+    return lume_mmio_read32_relaxed(HOST + r);
 }
 
 static void wr(unsigned r, uint32_t v)
 {
-    write32(HOST + r, v);
-}
-
-static uint64_t counter(void)
-{
-    uint64_t n;
-    __asm__ volatile("isb; mrs %0,cntpct_el0" : "=r"(n));
-    return n;
+    lume_mmio_write32_sync(HOST + r, v);
 }
 
 static void delay(unsigned us)
 {
-    uint64_t start = counter();
-    while (counter() - start < frequency * us / 1000000)
-        __asm__ volatile("yield");
+    lume_counter_delay_us(frequency, us);
 }
 
 static bool wait_register(unsigned r, uint32_t mask, uint32_t wanted, unsigned ms)
 {
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     do
     {
         if ((rd(r) & mask) == wanted)
             return true;
-    } while (counter() - start < frequency * ms / 1000);
+    } while (lume_counter_read() - start < frequency * ms / 1000);
     ++errors;
     return false;
 }
 
 static bool event(uint32_t mask, unsigned ms)
 {
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     uint32_t status;
     do
     {
@@ -68,7 +50,7 @@ static bool event(uint32_t mask, unsigned ms)
             wr(0x30, mask);
             return true;
         }
-    } while (counter() - start < frequency * ms / 1000);
+    } while (lume_counter_read() - start < frequency * ms / 1000);
     lume_value("WIFI_ERROR_INTERRUPT", status);
     lume_value("WIFI_ERROR_PRESENT", rd(0x24));
     ++errors;
@@ -198,18 +180,20 @@ bool lume_wifi_probe(uint64_t hz, bool d0)
         return false;
     lume_value("WIFI_BASE_HZ", (uint64_t)base_mhz * 1000000);
     /* D0 GPIO28 (WL_ON) and SD2 pins30..35. Preserve BT_ON and all other pads. */
-    uint32_t mux = read32(PINCTRL + 8);
-    write32(PINCTRL + 8, (mux & ~0xff0f0000u) | 0x11000000u); /* GPIO28 mux0, CLK/CMD mux1 */
-    mux = read32(PINCTRL + 12);
-    write32(PINCTRL + 12, (mux & ~0xffffu) | 0x1111);
+    uint32_t mux = lume_mmio_read32_relaxed(PINCTRL + 8);
+    lume_mmio_write32_sync(PINCTRL + 8,
+                           (mux & ~0xff0f0000u) | 0x11000000u); /* GPIO28 mux0, CLK/CMD mux1 */
+    mux = lume_mmio_read32_relaxed(PINCTRL + 12);
+    lume_mmio_write32_sync(PINCTRL + 12, (mux & ~0xffffu) | 0x1111);
     for (unsigned pin = 30; pin <= 35; ++pin)
     {
         unsigned offset = pin < 33 ? 20 : 24, shift = ((pin - 18) % 15) * 2;
-        uint32_t v = read32(PINCTRL + offset);
-        write32(PINCTRL + offset, (v & ~(3u << shift)) | ((pin == 30 ? 0u : 2u) << shift));
+        uint32_t v = lume_mmio_read32_relaxed(PINCTRL + offset);
+        lume_mmio_write32_sync(PINCTRL + offset,
+                               (v & ~(3u << shift)) | ((pin == 30 ? 0u : 2u) << shift));
     }
-    write32(GPIO + 4, read32(GPIO + 4) | (1u << 28));
-    write32(GPIO + 8, read32(GPIO + 8) & ~(1u << 28));
+    lume_mmio_write32_sync(GPIO + 4, lume_mmio_read32_relaxed(GPIO + 4) | (1u << 28));
+    lume_mmio_write32_sync(GPIO + 8, lume_mmio_read32_relaxed(GPIO + 8) & ~(1u << 28));
     active = true;
     delay(150000);
     wr(0x2c, 1u << 24);
@@ -249,7 +233,7 @@ void lume_wifi_stop(void)
     wr(0x38, 0);
     wr(0x34, 0);
     wr(0x2c, 0);
-    write32(GPIO + 4, read32(GPIO + 4) & ~(1u << 28));
+    lume_mmio_write32_sync(GPIO + 4, lume_mmio_read32_relaxed(GPIO + 4) & ~(1u << 28));
     active = false;
     lume_value("WIFI_TOTAL_COMMANDS", commands);
     lume_value("WIFI_TOTAL_ERRORS", errors);

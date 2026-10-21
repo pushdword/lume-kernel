@@ -1,5 +1,5 @@
-/* Private C continuation switch, using the unchanged X32 C callee-save ABI.
- * CALL supplies PC; user trap registers remain in the existing176B context. */
+/* The continuation switch preserves C callee-saved registers. The call instruction supplies the
+ * return PC. User trap registers remain in the 176-byte context. */
 .text
 .globl x32_kernel_switch
 x32_kernel_switch:

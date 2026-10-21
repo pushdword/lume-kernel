@@ -102,7 +102,7 @@
 /     0 - Include all code pages above and configured by f_setcp()
 */
 
-#define FF_USE_LFN 0
+#define FF_USE_LFN 1
 #define FF_MAX_LFN 255
 /* The FF_USE_LFN switches the support for LFN (long file name).
 /
@@ -121,7 +121,7 @@
 /  memory for the working buffer, memory management functions, ff_memalloc() and
 /  ff_memfree() exemplified in ffsystem.c, need to be added to the project. */
 
-#define FF_LFN_UNICODE 0
+#define FF_LFN_UNICODE 2
 /* This option switches the character encoding on the API when LFN is enabled.
 /
 /   0: ANSI/OEM in current CP (TCHAR = char)
@@ -161,7 +161,7 @@
 / Drive/Volume Configurations
 /---------------------------------------------------------------------------*/
 
-#define FF_VOLUMES 1
+#define FF_VOLUMES 2
 /* Number of volumes (logical drives) to be used. (1-10) */
 
 #define FF_STR_VOLUME_ID 0

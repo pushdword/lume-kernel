@@ -17,7 +17,7 @@ struct lume_xhci_ring
     unsigned head, cycle;
 };
 
-/* One outstanding TD per endpoint; no producer can lap the hardware. */
+/* Each endpoint allows one outstanding TD. The producer must not overtake hardware consumption. */
 static inline uint64_t lume_xhci_enqueue(struct lume_xhci_ring *r, uint64_t p, uint32_t s,
                                          uint32_t control)
 {

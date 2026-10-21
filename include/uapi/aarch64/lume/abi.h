@@ -1,10 +1,10 @@
 #ifndef LUME_PUBLIC_ABI_H
 #define LUME_PUBLIC_ABI_H
-/* Lume native AArch64 ABI 1.0. This header is shared with freestanding apps.
- * LP64, little endian; SVC #0x4c55; x8=number, x0..x5=arguments;
- * x0=signed result or negative LUME_E*. Other GPRs are preserved.
- * No Linux syscall or X32/R32 binary compatibility is implied.
- */
+/* Lume native AArch64 ABI 1.0 uses LP64 types and little-endian encoding. Freestanding
+ * applications share this header with the kernel. SVC #0x4c55 enters the kernel with the
+ * syscall number in x8 and arguments in x0 through x5. The kernel returns a signed result or a
+ * negative LUME_E value in x0 and preserves the other general-purpose registers. Applications
+ * must use Lume syscall numbers and AArch64 binaries. */
 #include <stdint.h>
 #define LUME_ABI_VERSION UINT64_C(0x00010000)
 #define LUME_ABI_SVC 0x4c55
@@ -33,6 +33,17 @@ enum lume_syscall
     LUME_SYS_CLOCK = 19,
     LUME_SYS_SLEEP = 20,
     LUME_SYS_SERVICE = 21,
+    LUME_SYS_STREAM = 22,
+    LUME_SYS_BOOT = 23,
+    LUME_SYS_RUN_ENV = 24,
+    LUME_SYS_FS = 25,
+    LUME_SYS_BRK = 26,
+    LUME_SYS_PROCESS = 27,
+    LUME_SYS_MEMORY = 28,
+    LUME_SYS_TELEMETRY = 29,
+    LUME_SYS_TERMINAL = 30,
+    LUME_SYS_PROBE = 31,
+    LUME_SYS_WAIT = 32,
 };
 
 enum
@@ -61,8 +72,10 @@ enum
     LUME_ENOTEMPTY = 39
 };
 
-#define LUME_ARG_MAX 16u
-#define LUME_ARG_BYTES 1024u
+#define LUME_ARG_MAX 256u
+#define LUME_ARG_BYTES 16384u
+#define LUME_ENV_MAX 64u
+#define LUME_ENV_BYTES 8192u
 
 enum
 {
@@ -71,7 +84,8 @@ enum
     LUME_O_RDWR = 2,
     LUME_O_CREAT = 0x100,
     LUME_O_TRUNC = 0x200,
-    LUME_O_APPEND = 0x400
+    LUME_O_APPEND = 0x400,
+    LUME_O_EXCL = 0x800
 };
 
 enum
@@ -91,6 +105,7 @@ enum
 #define LUME_PATH_MAX 128u
 #define LUME_NAME_MAX 47u
 #define LUME_FD_MAX 16u
+#define LUME_FILE_IO_MAX 65536u
 
 struct lume_stat
 {

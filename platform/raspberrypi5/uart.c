@@ -1,20 +1,20 @@
 #include "lume/early.h"
+#include "lume/mmio.h"
 #include "lume/abi.h"
 #include "lume/display.h"
 #include "lume/usb.h"
 #include "lume/uart_input.h"
 
-/* RP1 BAR, configured by firmware enable_rp1_uart=1 / pciex4_reset=0.
- * GPIO14 = TX, physical pin 8; GPIO15 = RX, physical pin 10.
- * Inherit the firmware's pinmux, clocks and 115200 8N1 PL011 configuration.
- * The boot firmware maps RP1 at 0x1c00000000 (observed RP1_UART boot log).
- * Linux subsequently remaps it to 0x1f00000000; that address is NOT valid here.
- * This early driver deliberately does not reset RP1 or the PCIe link.
- */
+/* Firmware configures the RP1 BAR with enable_rp1_uart=1 and pciex4_reset=0. GPIO14 drives TX
+ * on physical pin 8. GPIO15 receives RX on physical pin 10. The driver inherits firmware
+ * pinmux, clocks and the PL011 configuration at 115200 baud, 8N1. Boot firmware maps RP1 at
+ * 0x1c00000000. Linux later remaps it to 0x1f00000000, which this driver cannot use. The driver
+ * leaves RP1 and the PCIe link running. */
 #define UART_BASE UINT64_C(0x1c00030000)
-static volatile uint32_t *const uart_dr = (void *)(uintptr_t)UART_BASE;
-static volatile uint32_t *const uart_fr = (void *)(uintptr_t)(UART_BASE + 0x18);
 static struct lume_uart_input input;
+static unsigned char input_queue[4096];
+static unsigned input_head, input_tail;
+static uint64_t input_dropped;
 
 uintptr_t lume_uart_base(void)
 {
@@ -23,31 +23,65 @@ uintptr_t lume_uart_base(void)
 
 int lume_uart_getc(void)
 {
-    if (*uart_fr & (1u << 4))
+    if (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 4))
         return -LUME_EAGAIN;
-    uint32_t v = *uart_dr;
+    uint32_t v = lume_mmio_read32_relaxed(UART_BASE);
     if (v & 0xf00)
         return -LUME_EIO;
     return (int)(v & 255);
 }
 
-/* The USB keyboard remains usable without the serial adapter. A host must
- * explicitly enable UART input after each boot; pre-handshake data is ignored. */
-int lume_console_getc(void)
+/* UART input requires a host handshake after each boot. Bytes received before the handshake are
+ * ignored. The USB keyboard works independently of the serial adapter. */
+void lume_uart_poll_input(void)
 {
-    int c = lume_usb_getc();
-    if (c >= 0)
-        return c;
-    if (*uart_fr & (1u << 4))
-        return -LUME_EAGAIN;
-    uint32_t word = *uart_dr;
-    if (word & 0xf00)
-        *(volatile uint32_t *)(uintptr_t)(UART_BASE + 4) = 0;
     bool enabled = input.enabled;
-    c = lume_uart_input_feed(&input, word);
+    for (unsigned i = 0; i < 128 && !(lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 4)); ++i)
+    {
+        uint32_t word = lume_mmio_read32_relaxed(UART_BASE);
+        if (word & 0xf00)
+            lume_mmio_write32_relaxed(UART_BASE + 4, 0);
+        int c = lume_uart_input_feed(&input, word);
+        if (c < 0)
+            continue;
+        if (input_head - input_tail == sizeof(input_queue))
+            ++input_dropped;
+        else
+            input_queue[input_head++ & (sizeof(input_queue) - 1)] = (unsigned char)c;
+    }
     if (!enabled && input.enabled)
         lume_puts("LUME UART INPUT ENABLED\n");
-    return c;
+}
+
+static int console_byte(void)
+{
+    lume_uart_poll_input();
+    int c = lume_usb_getc();
+    lume_uart_poll_input();
+    if (c >= 0)
+        return c;
+    return input_head == input_tail ? -LUME_EAGAIN
+                                    : input_queue[input_tail++ & (sizeof(input_queue) - 1)];
+}
+
+static int pending_byte = -1;
+
+int lume_console_getc(void)
+{
+    if (pending_byte >= 0)
+    {
+        int c = pending_byte;
+        pending_byte = -1;
+        return c;
+    }
+    return console_byte();
+}
+
+bool lume_console_ready(void)
+{
+    if (pending_byte < 0)
+        pending_byte = console_byte();
+    return pending_byte >= 0;
 }
 
 void lume_uart_input_stats(void)
@@ -55,13 +89,16 @@ void lume_uart_input_stats(void)
     lume_value("UART_INPUT_ENABLED", input.enabled);
     lume_value("UART_INPUT_BYTES", input.bytes);
     lume_value("UART_INPUT_ERRORS", input.errors);
+    lume_value("UART_INPUT_DROPPED", input_dropped);
 }
 
 /* The boot assembly uses lume_putc before BSS initialization. Only the VFS
  * console, entered after kernel initialization, may inspect display state. */
 void lume_console_putc(char c)
 {
+    lume_uart_poll_input();
     lume_display_putc(c);
+    lume_uart_poll_input();
     lume_putc(c);
 }
 
@@ -69,10 +106,9 @@ void lume_putc(char c)
 {
     if (c == '\n')
         lume_putc('\r');
-    while (*uart_fr & (1u << 5))
+    while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
         __asm__ volatile("yield");
-    *uart_dr = (unsigned char)c;
-    __asm__ volatile("dmb oshst" ::: "memory");
+    lume_mmio_write32(UART_BASE, (unsigned char)c);
 }
 
 void lume_puts(const char *s)
@@ -99,7 +135,7 @@ void lume_value(const char *name, uint64_t value)
 
 void lume_uart_flush(void)
 {
-    while (*uart_fr & (1u << 3))
+    while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 3))
         __asm__ volatile("yield");
     __asm__ volatile("dsb sy" ::: "memory");
 }

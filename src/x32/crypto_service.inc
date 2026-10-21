@@ -1,6 +1,6 @@
-/* queue_lock protects admission/commit; a separate per-process lease protects
- * generator work outside it. SHA checkpoints may suspend the private kernel
- * stack. No global PRNG state is modified until the owner commits it. */
+/* queue_lock protects generator admission and commit. A per-process lease protects generation
+ * outside that lock. SHA checkpoints may suspend the process kernel stack. Only the lease owner
+ * commits changes to global PRNG state. */
 static struct lume_random_state kernel_random;
 static unsigned random_owner, random_wait_mask;
 static uint32_t random_wait_pid[MAX_PROCESSES];

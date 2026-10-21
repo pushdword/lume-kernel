@@ -41,7 +41,8 @@ static volatile uint32_t queue_lock;
 volatile uint32_t secondary_ready;
 uint32_t clock_hz, quantum_ms = LUME_SCHED_QUANTUM, uptime_ms, cpu_forms;
 static uint32_t last_counter, cycle_remainder, next_pid;
-static unsigned active_core_count; /* Discovery count; ABI arrays retain capacity2. */
+static unsigned
+    active_core_count; /* This count records discovered cores. The ABI arrays hold two entries. */
 static struct lume_cpu_caps cpu_caps[2];
 static struct sched_policy scheduler;
 static uint32_t scheduler_unit, scheduler_check_after;
@@ -73,8 +74,8 @@ static uint32_t perf_epoch;
 static unsigned scheduler_started, rr_deferred[2];
 static uint32_t perf_work_epoch[2];
 
-/* Busy gates retry the saved trap; active long operations retain a private
- * stack and their user-page leases until completion. Public ABI stays frozen. */
+/* A busy gate retries the saved trap. Long operations retain a kernel stack and user-page
+ * leases until they complete. The public ABI layout remains unchanged. */
 enum
 {
     FS_RETRY_SYSCALL = 1,
@@ -104,7 +105,8 @@ static unsigned slow_kind[2];
 static struct lume_io_lock io_lock[2];
 static uint32_t io_epoch, io_enabled, io_hold_started[2], io_hold_epoch[2];
 static struct io_cost_state syscall_cost;
-/* One writer per row; IRQ1/timer2/lock-wait3/checkpoint4, independent of PERF. */
+/* Each core has one writer. Path identifiers are 1 for IRQ, 2 for timer, 3 for lock wait and 4
+ * for checkpoint. These counters operate independently of PERF. */
 static volatile uint32_t uart_service_sources[2][4];
 int current[2] = {-1, -1};
 #include "kernel_work.h"
@@ -133,8 +135,8 @@ static void wake_schedulers(void)
         smp[7] = 1u << core_id();
 }
 
-/* A shared service check is cheap on byte-SPI paths; the CPU budgets and
- * service debt remain independent. Wake/selection always sample exactly. */
+/* Byte-SPI paths share the service check while CPU budgets and service debt remain independent.
+ * Wakeup and task selection always take an exact clock sample. */
 static void scheduler_account_at(uint32_t now) __attribute__((always_inline));
 
 static void scheduler_account_at(uint32_t now)
@@ -245,9 +247,9 @@ static void scheduler_balance(void)
                     scheduler_request(c);
                     break;
                 }
-    /* A bounded kernel continuation can be excluded from this choose pass.
-     * Revisit it promptly only if its actual service still outranks the task
-     * selected afterwards; an ordinary user can execute between parcels. */
+    /* A bounded kernel continuation may be skipped during this selection pass. Revisit it
+     * promptly only if its measured service still outranks the selected task. User code can run
+     * between parcels. */
     unsigned core = core_id(), work = (unsigned)console_render_pending() | kernel_work_mask;
     if (work && !scheduler.cpu[core].need)
         for (unsigned i = 0; i < MAX_PROCESSES; i++)
@@ -491,7 +493,8 @@ static int service_uart(unsigned core, unsigned reason)
         v->interrupted_owner = -1;
         perf_end(p);
     }
-    /* RX=2 and a freed request=4 can satisfy a waiter; TX bytes alone cannot. */
+    /* RX event 2 and request-release event 4 can satisfy a waiter. Transmitted bytes alone
+     * cannot satisfy it. */
     if ((changed & 6) && console_wait_mask)
         wake_schedulers();
     return changed;
@@ -502,8 +505,8 @@ static void perf_rendezvous(unsigned core)
     uint32_t request = perf_request[core];
     if (!request)
         return;
-    /* Reached only between publications. Ack is tied to this request, never
-     * inferred from a stale hint; do not serve UART until the owner releases. */
+    /* This code runs between publications. Acknowledge the current request explicitly without
+     * using a stale hint. UART service waits until the owner releases the request. */
     __asm__ volatile("" ::: "memory");
     perf_ack[core] = request;
     while (perf_request[core] == request)
@@ -582,8 +585,8 @@ static void update_uptime(void)
                      &uptime_ms);
 }
 
-/* Long I/O borrows the scheduler lock briefly for clock/wakeup work; it never
- * exposes filesystem state to another owner. Startup still has one core. */
+/* Long I/O holds the scheduler lock briefly for clock and wakeup work. Filesystem ownership
+ * remains exclusive. Startup runs on one core. */
 void lume_clock_checkpoint(void)
 {
     unsigned core = core_id(), borrowed = !kernel_held[core];
@@ -606,7 +609,7 @@ void lume_clock_checkpoint(void)
                 processes[i].state = LUME_READY;
                 lume_io_ready(i);
             }
-        /* Charge both independent budgets; live kernel stacks remain pinned. */
+        /* Charge both independent budgets while retaining the leases on live kernel stacks. */
         /* Wake callbacks can already charge a later clock sample. Reusing
          * last_counter here would turn that small backwards step into an
          * almost2^32-tick service debt and starve this continuation. */
@@ -1507,8 +1510,8 @@ static int perf_snapshot(struct lume_perf_snapshot *out)
             p->lock_ticks += v.interrupted_lock;
         }
     }
-    /* IRQ device service may have suspended an interrupted owner's pending
-     * ticks; include them without charging device work to that process. */
+    /* Include an interrupted owner's pending ticks if IRQ device service suspended them. Charge
+     * device work separately from that process. */
     out->totals = perf_totals;
     return 0;
 }
@@ -2257,8 +2260,8 @@ static int run_syscall(unsigned slot)
     uint32_t started = lume_work_counter();
     int reschedule = run_syscall_body(slot);
     uint32_t ticks = lume_work_counter() - started;
-    /* A parked gate retries this trap later; its opcode is not a byte result.
-     * Deferred FD/console waiters return0 here and finish outside this body. */
+    /* A parked gate retries this trap later. Its opcode does not represent a byte count.
+     * Deferred FD and console waiters return zero here and complete outside this function. */
     int completed = fs_pending[slot].kind != FS_RETRY_SYSCALL;
     int32_t result = (int32_t)processes[slot].context.regs[1];
     io_cost_record(&syscall_cost, epoch, operation, ticks, completed, result,
@@ -2409,7 +2412,7 @@ struct context *dispatch(struct context *incoming)
         rr_deferred[core] = 0;
         reschedule = 1;
     }
-    release_user_pins(); /* User-copy leases end; return-PC leases follow below. */
+    release_user_pins(); /* Release the user-copy leases before processing return-PC leases below. */
     struct context *next;
     if (!reschedule && slot >= 0 && console_wait_work((unsigned)slot, uptime_ms))
         reschedule = 1;
@@ -2488,7 +2491,8 @@ _Noreturn void kernel_main(void)
     kputs("\n");
     scheduler_unit = clock_hz / 1000u;
     scheduler_check_after = lume_perf_counter();
-    /* Include kernel filesystem/startup work; never reset after loading init. */
+    /* Account for filesystem and startup work in the kernel without resetting the counters
+     * after init loads. */
     last_counter = lume_perf_counter();
     filesystem_start();
     mmu_start();

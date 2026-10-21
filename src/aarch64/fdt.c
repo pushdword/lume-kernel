@@ -263,3 +263,58 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
     }
     return false;
 }
+
+bool lume_fdt_set_initrd(void *blob, size_t available, uint64_t start, uint64_t end)
+{
+    struct lume_fdt current;
+    if (!start || end <= start || end > UINT64_C(0x200000000) || end - start > 0x4000000 ||
+        !lume_fdt_read(blob, available, &current))
+        return false;
+    unsigned char *b = blob, *values[2] = {0};
+    uint32_t sizes[2] = {0}, pos = be32(b + 8), strings = be32(b + 12);
+    unsigned depth = 0;
+    bool chosen = false;
+    while (pos < be32(b + 8) + be32(b + 36))
+    {
+        uint32_t token = be32(b + pos);
+        pos += 4;
+        if (token == 1)
+        {
+            size_t n = length(b + pos, current.size - pos);
+            if (depth == 1)
+                chosen = equals(b + pos, n + 1, "chosen");
+            ++depth;
+            pos += (uint32_t)((n + 4) & ~(size_t)3);
+        }
+        else if (token == 2)
+            --depth;
+        else if (token == 3)
+        {
+            uint32_t n = be32(b + pos), name = be32(b + pos + 4);
+            pos += 8;
+            const unsigned char *key = b + strings + name;
+            size_t key_size = length(key, current.size - strings - name) + 1;
+            if (depth == 2 && chosen)
+                for (unsigned i = 0; i < 2; ++i)
+                    if (equals(key, key_size, i ? "linux,initrd-end" : "linux,initrd-start"))
+                    {
+                        if (values[i] || (n == 4 && (i ? end : start) > UINT32_MAX))
+                            return false;
+                        values[i] = b + pos;
+                        sizes[i] = n;
+                    }
+            pos += (n + 3) & ~3u;
+        }
+        else if (token == 9)
+            break;
+    }
+    if (!values[0] || !values[1])
+        return false;
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        uint64_t value = i ? end : start;
+        for (unsigned j = 0; j < sizes[i]; ++j)
+            values[i][j] = (unsigned char)(value >> (8 * (sizes[i] - j - 1)));
+    }
+    return true;
+}

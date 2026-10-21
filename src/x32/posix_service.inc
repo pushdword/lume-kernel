@@ -1,6 +1,7 @@
-/* Kernel glue: scheduler lock held, no user pointer retained as a C pointer.
- * A parked operation retries its original trap after readiness/deadline; user
- * buffers are validated again before copying results. No pins survive sleep. */
+/* The scheduler lock protects this kernel glue. It does not retain user addresses as C
+ * pointers. A parked operation retries its original trap when ready or when its deadline
+ * expires. The retry validates user buffers before copying results. Page pins are released
+ * before sleeping. */
 struct fd_waiter
 {
     uint32_t pid, operation, deadline;

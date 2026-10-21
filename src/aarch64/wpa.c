@@ -1,6 +1,6 @@
-/* WPA2 personal, CCMP, EAPOL-Key descriptor v2 only. Firmware owns 802.11
- * encryption; this bounded supplicant derives/validates the handshake keys.
- * Crypto primitives: unmodified Mbed TLS AES/SHA1 (vendor/mbedtls). */
+/* The supplicant supports WPA2 Personal with CCMP and EAPOL-Key descriptor version 2. Firmware
+ * encrypts 802.11 traffic. The supplicant derives and validates handshake keys using the
+ * unmodified Mbed TLS AES and SHA1 implementations. */
 #include "lume/wpa.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/sha1.h"

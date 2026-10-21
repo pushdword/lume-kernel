@@ -1,8 +1,9 @@
-/* Small SMP scheduling policy, independent of the public process/PERF ABI.
- * All mutations are serialized by queue_lock. Service uses hardware ticks (unit = ticks per millisecond);
- * it never depends on a PERF observer, yield count, or a global RR deadline.
- * A sleeping task retains its service debt and gets at most one short slice
- * of placement credit. No floating point, allocation, or division is used. */
+/* The SMP scheduler policy operates independently of the process and PERF ABI. queue_lock
+ * serializes mutations. Service is measured in hardware ticks, with unit equal to ticks per
+ * millisecond. Scheduling does not depend on PERF observers, yield counts or a global
+ * round-robin deadline. Sleeping tasks retain their service debt and receive at most one short
+ * slice of placement credit. The policy uses integer arithmetic without division or dynamic
+ * allocation. */
 #ifndef LUME_SCHEDULER_H
 #define LUME_SCHEDULER_H
 #include <stdint.h>
@@ -75,8 +76,8 @@ SCHED_FAST void sched_charge(struct sched_policy *s, unsigned core, uint32_t now
     t->used = UINT32_MAX - t->used < ticks ? UINT32_MAX : t->used + ticks;
 }
 
-/* Only READY/RUNNING tasks advance the placement floor. Blocked processes
- * cannot hold it back; waking after hours cannot accumulate hours of credit. */
+/* Only READY and RUNNING tasks advance the placement floor. Blocked tasks cannot delay it, and
+ * waking tasks cannot accumulate credit for their blocked time. */
 static void sched_floor(struct sched_policy *s, const unsigned *state)
 {
     uint64_t minimum = UINT64_MAX;
@@ -105,7 +106,7 @@ static void sched_wake(struct sched_policy *s, unsigned slot, uint32_t unit, uns
         t->interactive = 1;
         t->used = 0;
     }
-    /* Only real terminal input starts a burst; service debt is never erased. */
+    /* Only terminal input starts a burst. Burst handling retains the task's service debt. */
 }
 
 static int sched_pick(const struct sched_policy *s, unsigned core, const unsigned *state,
@@ -134,7 +135,7 @@ static int sched_pick(const struct sched_policy *s, unsigned core, const unsigne
                 break;
         }
     }
-    /* A small, bounded preference; affinity must never leave a CPU idle. */
+    /* Affinity provides a bounded preference and must not leave a CPU idle. */
     if (LUME_SCHED_FAIR && best >= 0 && s->task[best].last_core != core)
     {
         uint64_t ceiling = s->task[best].service + unit * 2u;

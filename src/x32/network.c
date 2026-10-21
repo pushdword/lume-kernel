@@ -1,9 +1,8 @@
-/* W5500 hardware TCP/IP over the PMOD1 SPI controller.
- * No network wait occurs here: callers retry EAGAIN/EINPROGRESS after yielding.
- * Raw FIFO access is capability/magic gated; legacy controllers keep byte I/O.
- * There are no NIC resets or RTC control-register writes.
- * Based on the WIZnet W5500 datasheet v1.1.0 and TCP application note.
- */
+/* The W5500 provides hardware TCP/IP through the PMOD1 SPI controller. Callers yield and retry
+ * EAGAIN or EINPROGRESS instead of waiting inside the driver. Raw FIFO access requires the
+ * capability bit and magic value. Legacy controllers use byte I/O. The driver leaves NIC reset
+ * and RTC control registers unchanged. Register behavior follows the WIZnet W5500 datasheet
+ * v1.1.0 and TCP application note. */
 #include "network.h"
 #include "clock_io.h"
 #include <string.h>
@@ -115,8 +114,8 @@ static int header_byte(unsigned byte)
     return byte_done();
 }
 
-/* The raw engine consumes exactly payload bytes; SD CRC framing is disabled
- * in the PMOD instance. Keep CS asserted over the W5500 header and all blocks. */
+/* The raw engine consumes exactly the payload bytes. The PMOD instance disables SD CRC framing.
+ * Keep CS asserted across the W5500 header and every payload block. */
 static int raw_payload(unsigned char *out, const unsigned char *in, unsigned n)
 {
     while (n)
@@ -341,7 +340,8 @@ static int ensure(void)
     unsigned hz = lume_net_mmio_read(BASE + 16);
     if (hz < 1000000 || hz > 100000000)
         return -LUME_NET_ENODEV;
-    unsigned div = (hz + 29999999u) / 30000000u; /* At most15MHz;30MHz source/div1. */
+    unsigned div = (hz + 29999999u) /
+                   30000000u; /* A 30 MHz source with divider 1 limits the SPI clock to 15 MHz. */
     lume_net_mmio_write(BASE, div);
     spi_hz = hz / (2u * div);
     lume_net_mmio_write(BASE + 20, 1);
@@ -422,8 +422,8 @@ static unsigned ephemeral(const struct socket_state *s)
 static int open_hardware(struct socket_state *s)
 {
     unsigned b = block(s);
-    /* Sn_MR.ND (bit5) requests immediate ACK for TCP; UDP keeps mode2.
-     * WIZnet W5500 datasheet1.0.9, socket mode register, page44. */
+    /* Sn_MR.ND bit 5 requests immediate TCP acknowledgements. UDP uses mode 2. The socket mode
+     * register is described on page 44 of the WIZnet W5500 datasheet v1.0.9. */
     return command(b, 0x10) && put(b, 0, s->protocol == LUME_NET_TCP ? 0x21 : 2) &&
            put_word(b, 4, s->port) && put(b, 2, 255) && command(b, 1);
 }

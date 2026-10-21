@@ -1,6 +1,7 @@
 /* CYW43455 rev6 firmware, SDPCM/BCDC control and station Ethernet transport.
  * Register access and wire formats follow the Linux brcmfmac device interface. */
 #include "lume/early.h"
+#include "lume/counter.h"
 #include "lume/sdio.h"
 #include "lume/wifi.h"
 #include "lume/wifi_assets.h"
@@ -999,8 +1000,7 @@ static bool start_interface(void)
         return false;
     /* This stepping and MAC were validated on the initial boot. A stopped
      * station restarts with a clean firmware/SDPCM session, not stale keys. */
-    uint64_t frequency;
-    __asm__ volatile("mrs %0,cntfrq_el0" : "=r"(frequency));
+    uint64_t frequency = lume_counter_frequency();
     return lume_wifi_probe(frequency, true) && lume_wifi_firmware() &&
            lume_wifi_prepare(station_mac);
 }
@@ -1096,7 +1096,7 @@ bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *k
     return true;
 }
 
-/* Bind this backend to the two common APIs; no lwIP types cross this boundary. */
+/* Bind the backend to both common APIs without exposing lwIP types. */
 static void cyw_poll(void *ctx)
 {
     (void)ctx;

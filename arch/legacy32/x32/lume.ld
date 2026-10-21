@@ -1,6 +1,5 @@
-/* Kernel load addresses and stack allocation.
- * The image avoids U-Boot's low SDRAM code/1MiB heap; the private stack is
- * below the finalMiB reserved for the current BIOS and boot-stage stacks. */
+/* The kernel image leaves space for U-Boot code and its 1 MiB heap in low SDRAM. The kernel
+ * stack lies below the final MiB reserved for the BIOS and boot stacks. */
 OUTPUT_FORMAT(elf32-x32)
 ENTRY(_start)
 SECTIONS {

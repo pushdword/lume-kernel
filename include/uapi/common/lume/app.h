@@ -3,7 +3,9 @@
 #define LUME_API_H
 #include <stdint.h>
 #ifndef LUME_APP_SUFFIX
-#if defined(LUME_ARCH_R32)
+#if defined(LUME_ARCH_AARCH64)
+#define LUME_APP_SUFFIX ""
+#elif defined(LUME_ARCH_R32)
 #define LUME_APP_SUFFIX ".r32"
 #else
 #define LUME_APP_SUFFIX ".x32"
@@ -64,11 +66,12 @@ enum
     LUME_PERF_STATUS
 };
 
-/* TERMINAL 4 drains UART output. TERMINAL 5 waits for input on the process TTY.
- * b is a timeout in milliseconds (0 probes, maximum 60000).
- * Return -11 when input is not ready and -110 when a drain times out.
- * Console WRITE/FDWRITE returns after queue admission, before physical TX drain.
- * Hardware without these extensions may return -95. */
+/* TERMINAL action 4 waits for the UART to drain and action 5 waits for input on the process
+ * TTY. Argument b contains a timeout in milliseconds from 0 through 60000. Zero performs a
+ * readiness probe. The operations return -11 when not ready and -110 when draining times out.
+ * Successful console WRITE and FDWRITE calls confirm that bytes were copied into the queue.
+ * Action 4 confirms physical transmission. Older hardware may return -95 when these actions are
+ * unavailable. */
 struct lume_process_info
 {
     uint32_t pid, parent, uid, state, runs, cores;
@@ -78,7 +81,11 @@ struct lume_process_info
 struct lume_directory_entry
 {
     uint32_t size, mode;
+#if defined(LUME_ARCH_AARCH64)
+    char name[48];
+#else
     char name[16];
+#endif
 };
 
 enum
@@ -92,11 +99,21 @@ enum
 };
 
 #define LUME_FILE_CHUNK 256u
+#if defined(LUME_ARCH_AARCH64)
+#define LUME_FDS 16u
+#define LUME_FILE_IO_LIMIT 65536u
+#define LUME_ARGS 256u
+#define LUME_ARG_BYTES 16384u
+#define LUME_ENVS 64u
+#define LUME_ENV_BYTES 8192u
+#else
 #define LUME_FDS 8u
+#define LUME_FILE_IO_LIMIT 4096u
 #define LUME_ARGS 8u
 #define LUME_ARG_BYTES 512u
 #define LUME_ENVS 16u
 #define LUME_ENV_BYTES 1024u
+#endif
 
 struct lume_spawn_request
 {
@@ -115,9 +132,9 @@ enum
     LUME_DEFER_SYNC = 0x1000
 };
 
-/* Writable descriptors may opt out of the default f_sync after each write.
- * Data/metadata may remain buffered until explicit FSYNC or CLOSE. Initial
- * create/truncate and TRUNCATE_HERE remain synced. Updates are not crash atomic. */
+/* Writes call f_sync by default. Writable descriptors opened with LUME_DEFER_SYNC may buffer
+ * data and metadata until FSYNC or CLOSE. Creation, initial truncation and TRUNCATE_HERE still
+ * synchronize their changes. A crash can leave partially updated data or metadata. */
 enum
 {
     LUME_SEEK_SET = 0,
@@ -128,6 +145,9 @@ enum
 struct lume_stat
 {
     uint32_t size, mode, uid, gid;
+#if defined(LUME_ARCH_AARCH64)
+    uint64_t inode;
+#endif
 };
 
 struct lume_wait_status
@@ -137,9 +157,10 @@ struct lume_wait_status
 
 #define LUME_MEMORY_VERSION 1u
 
-/* BRK 35 accepts an absolute end and returns the effective end or -errno.
- * A zero end queries the current break.
- * MEMORY 36 reads into a with b=sizeof output and c=version. Neither query grows memory. */
+/* BRK35 takes an absolute heap end address and returns the effective end or a negative errno
+ * value. A zero argument queries the current end without changing it. MEMORY36 takes the output
+ * pointer in a, the output size in b and the version in c. The snapshot query leaves the heap
+ * unchanged. */
 struct lume_memory_info
 {
     uint32_t version, bytes, page_bytes, total_pages, free_pages, process_pages, heap_base,

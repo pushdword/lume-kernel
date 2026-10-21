@@ -1,5 +1,5 @@
-/* Portuguese (Portugal), ISO USB keyboard. UTF-8 text, ANSI navigation.
- * Layout policy lives in the OS; KBD1 supplies usage+modifiers unchanged. */
+/* The Portuguese ISO keyboard layout produces UTF-8 text and ANSI navigation sequences. The OS
+ * translates the usage codes and modifiers supplied by KBD1. */
 #include "terminal.h"
 
 static unsigned utf8(unsigned c, unsigned char *out)

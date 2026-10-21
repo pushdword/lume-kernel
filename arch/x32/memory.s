@@ -1,6 +1,7 @@
-/* Freestanding C helpers. Existing ABI, caller-saved E8/EDI/ESI/ECX/EDX.
- * Natural alignment is required for dword strings; arbitrary buffers use byte.
- * Kernel C runs with DF=0. memcpy's regions must not overlap. */
+/* These freestanding C helpers use E8, EDI, ESI, ECX and EDX as caller-saved registers. Dword
+ * string operations require natural alignment. Arbitrary buffers use byte operations. The
+ * kernel clears DF before running C code. The source and destination regions passed to memcpy
+ * must not overlap. */
 .text
 .globl memcpy
 memcpy:

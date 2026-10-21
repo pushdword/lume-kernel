@@ -24,9 +24,9 @@ struct lume_io_snapshot
     uint32_t directory_opens, directory_reads, directory_replays, directory_invalidations;
 };
 
-/* IO38 action2: independent monotonic per-core service-entry counters.
- * Individual 32-bit fields are atomic. sample_begin/end bound sampling skew.
- * Counters include attempted service entries, including a failed try-lock. */
+/* IO38 action 2 reads independent monotonic service-entry counters for each core. Each 32-bit
+ * field is atomic. sample_begin and sample_end bound the sampling skew. The counters include
+ * attempted entries that fail to acquire the service lock. */
 struct lume_io_services
 {
     uint32_t version, bytes, sample_begin, sample_end;
@@ -46,26 +46,29 @@ struct lume_io_syscall_costs
     struct lume_io_syscall_cost syscall[LUME_IO_SYSCALL_COUNT];
 };
 
-/* IO38 action4: b=output,c=sizeof lume_io_syscall_costs snapshots the optional
- * syscall cost counters without joining PERF. action5: b=0 disables while
- * retaining counters (c=0). b=1 enables and resets them with c=PID filter,
- * where0 selects all processes. Control requires root. The snapshot reports
- * the current pid_filter. An exact PID filter excludes other processes before
- * reading the work counter. There is no extra user query per measured call.
- * Rows are indexed by syscall number, row0 is unused. IO38 and PERF33 are
- * excluded. calls counts run_syscall attempts, including parked gate retries.
- * errors counts immediate negative results, bytes successful immediate stream
- * results (WRITE/READFILE/READ/FDWRITE, NET send/receive, crypto RANDOM).
- * Deferred waiter completions are not counted as additional calls or bytes.
- * calls/errors/bytes saturate at UINT32_MAX. ticks_high:ticks_low is the
- * cumulative 64-bit work-counter duration. max_ticks is the largest sample.
- * Durations exclude suspended kernel continuations, but include device work,
- * polling and lock reacquisition inside run_syscall. Trap/IRET and the outer
- * dispatcher are excluded. These durations do not measure CPU residency. Each
- * attempt must take less than one32-bit counter wrap (143s at30MHz). */
-/* IO38: a=0,b=out,c=sizeof snapshot reads without joining PERF.
- * a=1,b=0/1,c=0 disables/enables+resets lock metrics (root only).
- * Wait/hold ticks measure elapsed wall cycles, including device service while
- * waiting. PERF provides a separate CPU residency estimate. Counts include
- * completed acquisitions. Hold totals include completed holds only. */
+/* IO38 action 4 copies optional syscall cost counters to b using c equal to sizeof
+ * lume_io_syscall_costs. It does not register a PERF observer. Action 5 requires root. With b
+ * equal to zero and c equal to zero, it disables collection and retains the counters. With b
+ * equal to one, it resets and enables collection using c as the PID filter. A zero filter
+ * selects all processes. The snapshot reports pid_filter. An exact PID filter excludes other
+ * processes before reading the work counter. Collection does not add a user query to each
+ * measured call.
+ *
+ * Rows are indexed by syscall number. Row zero, IO38 and PERF33 are excluded. calls counts
+ * run_syscall attempts, including parked gate retries. errors counts immediate negative
+ * results. bytes counts successful immediate WRITE, READFILE, READ and FDWRITE results, network
+ * send and receive results, and crypto RANDOM output. Deferred waiter completion does not add
+ * calls or bytes. These three counters saturate at UINT32_MAX.
+ *
+ * The ticks_high and ticks_low fields form a cumulative 64-bit work-counter duration. max_ticks
+ * holds the largest sample. Durations exclude suspended kernel continuations and include device
+ * work, polling and lock reacquisition inside run_syscall. Trap entry, IRET and the outer
+ * dispatcher are excluded. These durations therefore do not measure architectural CPU
+ * residency. Each attempt must finish within one 32-bit counter period, which is about 143
+ * seconds at 30 MHz. */
+/* IO38 action 0 copies the snapshot to b using c equal to sizeof snapshot. It does not register
+ * a PERF observer. Action 1 requires root and c equal to zero. A zero b disables lock metrics
+ * and a b equal to one resets and enables them. Wait and hold ticks measure elapsed wall
+ * cycles, including device service during the wait. PERF estimates CPU residency separately.
+ * Acquisition counts include completed acquisitions. Hold totals include completed holds. */
 #endif

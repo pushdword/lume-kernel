@@ -6,6 +6,8 @@
 #include "lume/sdio.h"
 #include "lume/wifi.h"
 #include "lume/net.h"
+#include "lume/watchdog.h"
+#include "lume/heap.h"
 
 #ifndef LUME_BUILD_ID
 #define LUME_BUILD_ID "unversioned"
@@ -18,6 +20,29 @@ extern unsigned char __image_start[], __image_end[], __stack_bottom[], __stack_t
 static volatile uint64_t bss_witness[16];
 static volatile uint64_t data_witness = UINT64_C(0x4c554d4541413634);
 static volatile unsigned expected_break, break_count;
+static uint64_t program_memory;
+static unsigned program_pages;
+
+unsigned lume_program_staging_pages(void)
+{
+    return program_pages;
+}
+
+static void *allocate_program(size_t bytes)
+{
+    if (!bytes || bytes > 128u * 1024u * 1024u)
+        return 0;
+    unsigned pages = (unsigned)((bytes + 4095) / 4096);
+    uint64_t memory = lume_pages_alloc_span(pages);
+    if (!memory)
+        return 0;
+    for (unsigned i = 0; i < program_pages; ++i)
+        if (!lume_page_free(program_memory + (uint64_t)i * 4096))
+            lume_fail("program staging release");
+    program_memory = memory;
+    program_pages = pages;
+    return (void *)(uintptr_t)memory;
+}
 
 _Noreturn void lume_fail(const char *why)
 {
@@ -34,7 +59,7 @@ _Noreturn void lume_fail(const char *why)
     lume_stop();
 }
 
-struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
+static struct lume_context *exception_dispatch(struct lume_context *frame, uint64_t vector)
 {
     uint64_t esr, elr, far;
     bool el2 = lume_current_el() == 2;
@@ -85,9 +110,23 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     lume_fail("unexpected exception");
 }
 
+struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
+{
+    bool user = (frame->spsr & 15) == 0;
+    if (user)
+        lume_task_account_enter(frame);
+    struct lume_context *result = exception_dispatch(frame, vector);
+    if (user)
+        lume_task_account_leave(result);
+    return result;
+}
+
 _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
 {
+    bool watchdog = lume_watchdog_boot();
     lume_puts("\nLUME AARCH64 BOOT BEGIN " LUME_BUILD_ID "\n");
+    if (watchdog)
+        lume_puts("LUME WATCHDOG INHERITED\n");
     lume_puts("PLATFORM=raspberrypi5 UART=RP1_GPIO14 115200_8N1\n");
     lume_value("UART_MMIO", lume_uart_base());
     lume_value("ENTRY_EL", entry_el);
@@ -155,6 +194,14 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (!lume_pages_check())
         lume_fail("physical page allocator");
     lume_puts("LUME CHECK PAGES HIGHMEM RESERVATIONS PASS\n");
+    void *initial_program = allocate_program(1024 * 1024);
+    if (!initial_program)
+        lume_fail("program image staging allocation");
+    lume_vfs_program_buffer(initial_program, 1024 * 1024);
+    lume_vfs_program_allocator(allocate_program);
+    uint64_t node_memory = lume_pages_alloc_span(512);
+    if (!node_memory || !lume_vfs_node_buffer((void *)(uintptr_t)node_memory, 2 * 1024 * 1024))
+        lume_fail("filesystem node allocation");
     if (!lume_timer_check(freq))
         lume_fail("GIC physical timer IRQ");
     lume_puts("LUME CHECK GIC TIMER IRQ PASS\n");
@@ -220,6 +267,7 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_value("PSCI_VERSION", psci_version);
     lume_display_clear();
     lume_puts("LUME INTERACTIVE CONSOLE READY\n");
+    lume_watchdog_ready();
     if (!lume_shell_start(freq, false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");

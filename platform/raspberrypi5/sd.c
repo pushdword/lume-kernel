@@ -1,54 +1,48 @@
-/* BCM2712 SDHCI, polling PIO and single-sector commands. No DMA or SD Express.
- * Writes start disabled and are bounded to a validated Lume volume;
- * the MBR is excluded from the writable range. */
+/* The BCM2712 SDHCI driver polls PIO transfers and issues single-sector commands. It does not
+ * use DMA or SD Express. Writes start disabled. After volume validation, writes are limited to
+ * that Lume volume and cannot address the MBR. */
 #include "lume/early.h"
+#include "lume/mmio.h"
+#include "lume/counter.h"
 #include "lume/sd.h"
+#include "lume/watchdog.h"
 #include "lume/storage.h"
 #define HOST UINT64_C(0x1000fff000)
 static uint64_t frequency, capacity, write_first, write_count;
+static uint64_t boot_first, boot_count;
 static uint32_t rca;
 static uint64_t reads, writes, errors, rejected;
 static bool ready;
 
 static uint32_t rd(unsigned reg)
 {
-    return *(volatile uint32_t *)(uintptr_t)(HOST + reg);
+    return lume_mmio_read32_relaxed(HOST + reg);
 }
 
 static void wr(unsigned reg, uint32_t value)
 {
-    *(volatile uint32_t *)(uintptr_t)(HOST + reg) = value;
-    __asm__ volatile("dsb sy" ::: "memory");
-}
-
-static uint64_t counter(void)
-{
-    uint64_t n;
-    __asm__ volatile("isb; mrs %0,cntpct_el0" : "=r"(n));
-    return n;
+    lume_mmio_write32_sync(HOST + reg, value);
 }
 
 static void delay(unsigned us)
 {
-    uint64_t start = counter(), ticks = frequency * us / 1000000;
-    while (counter() - start < ticks)
-        __asm__ volatile("yield");
+    lume_counter_delay_us(frequency, us);
 }
 
 static bool wait_register(unsigned reg, uint32_t mask, uint32_t wanted, unsigned ms)
 {
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     do
     {
         if ((rd(reg) & mask) == wanted)
             return true;
-    } while (counter() - start < frequency * ms / 1000);
+    } while (lume_counter_read() - start < frequency * ms / 1000);
     return false;
 }
 
 static bool event(uint32_t mask, unsigned ms)
 {
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     uint32_t status;
     do
     {
@@ -60,7 +54,7 @@ static bool event(uint32_t mask, unsigned ms)
             wr(0x30, mask);
             return true;
         }
-    } while (counter() - start < frequency * ms / 1000);
+    } while (lume_counter_read() - start < frequency * ms / 1000);
     lume_value("SD_ERROR_INTERRUPT", status);
     lume_value("SD_ERROR_PRESENT", rd(0x24));
     ++errors;
@@ -119,6 +113,7 @@ bool lume_sd_start(uint64_t hz)
 {
     ready = false;
     capacity = write_first = write_count = 0;
+    boot_first = boot_count = 0;
     rca = 0;
     reads = writes = errors = rejected = 0;
     frequency = hz;
@@ -149,7 +144,7 @@ bool lume_sd_start(uint64_t hz)
     uint32_t response;
     if (!command(8, 0x1aa, RESPONSE | CHECKS, &response) || (response & 0xfff) != 0x1aa)
         return false;
-    uint64_t start = counter();
+    uint64_t start = lume_counter_read();
     do
     {
         if (!app(41, 0x40ff8000, RESPONSE, &response))
@@ -157,7 +152,7 @@ bool lume_sd_start(uint64_t hz)
         if (response & 0x80000000u)
             break;
         delay(10000);
-    } while (counter() - start < frequency * 3);
+    } while (lume_counter_read() - start < frequency * 3);
     if ((response & 0xc0000000u) != 0xc0000000u)
         return false; /* SDHC/SDXC only */
     lume_value("SD_OCR", response);
@@ -209,11 +204,26 @@ bool lume_sd_allow_volume(uint64_t first, uint64_t count)
     return true;
 }
 
+bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count)
+{
+    unsigned char mbr[512];
+    struct lume_volume allowed;
+    if (!ready || !write_count || !lume_sd_read(0, mbr) ||
+        !lume_volume_boot_select(mbr, capacity, &allowed) || first != allowed.first ||
+        count != allowed.count)
+        return false;
+    boot_first = first;
+    boot_count = count;
+    return true;
+}
+
 static bool transfer(uint64_t sector, void *data, bool write)
 {
     if (!ready || sector >= capacity || sector > UINT32_MAX)
         return false;
-    if (write && (!write_count || sector < write_first || sector - write_first >= write_count))
+    bool data_allowed = write_count && sector >= write_first && sector - write_first < write_count;
+    bool boot_allowed = boot_count && sector >= boot_first && sector - boot_first < boot_count;
+    if (write && !data_allowed && !boot_allowed)
     {
         ++rejected;
         return false;
@@ -249,7 +259,7 @@ static bool transfer(uint64_t sector, void *data, bool write)
         return false;
     if (write)
     {
-        uint64_t start = counter();
+        uint64_t start = lume_counter_read();
         do
         {
             if (!command(13, rca, RESPONSE | CHECKS, &response))
@@ -265,7 +275,7 @@ static bool transfer(uint64_t sector, void *data, bool write)
                 ++writes;
                 return true;
             }
-        } while (counter() - start < frequency * 2);
+        } while (lume_counter_read() - start < frequency * 2);
         ++errors;
         ready = false;
         return false;
@@ -276,12 +286,24 @@ static bool transfer(uint64_t sector, void *data, bool write)
 
 bool lume_sd_read(uint64_t sector, void *data)
 {
-    return transfer(sector, data, false);
+    bool complete = transfer(sector, data, false);
+    if (complete)
+    {
+        lume_watchdog_progress();
+        lume_watchdog_poll();
+    }
+    return complete;
 }
 
 bool lume_sd_write(uint64_t sector, const void *data)
 {
-    return transfer(sector, (void *)data, true);
+    bool complete = transfer(sector, (void *)data, true);
+    if (complete)
+    {
+        lume_watchdog_progress();
+        lume_watchdog_poll();
+    }
+    return complete;
 }
 
 void lume_sd_stats(void)

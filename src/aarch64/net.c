@@ -1,5 +1,6 @@
-/* lwIP adapter for registered Ethernet interfaces. No Wi-Fi backend calls.
- * All callers execute with EL1 IRQs masked; RX is bounded and non-reentrant. */
+/* This adapter connects lwIP to registered Ethernet interfaces through the generic interface
+ * API. Callers mask EL1 IRQs. Receive processing has a fixed bound and must not reenter the
+ * adapter. */
 #include "lume/early.h"
 #include "lume/net.h"
 #include "lwip/init.h"
@@ -328,9 +329,9 @@ static bool ping(const ip_addr_t *target)
             b[i] = (unsigned char)i;
         uint16_t sum = inet_chksum(b, 24);
         memcpy(b + 2, &sum, 2);
-        /* A single lost ICMP/ARP packet must not fail a five-second probe.
-         * Reuse the identifier/sequence within this command; each new command
-         * increments it, so a late reply cannot satisfy the next probe. */
+        /* Retry lost ICMP or ARP packets within the five-second probe. Retries keep the command
+         * identifier and sequence. Each new command increments them so a late reply cannot
+         * satisfy a later probe. */
         uint32_t start = lume_clock_millis();
         while (!ping_received && (uint32_t)(lume_clock_millis() - start) < 5000)
         {

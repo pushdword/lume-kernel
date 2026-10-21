@@ -137,8 +137,8 @@ void console_wait_child_woken(unsigned slot)
     }
 }
 
-/* Sequence ordering is per pane; a logical write remains its head until all
- * parcels complete. At most16 live sequence numbers make wrap comparison safe. */
+/* Each pane maintains its own sequence order. A logical write stays at the head until all its
+ * parcels complete. At most 16 live sequence numbers keep wraparound comparisons unambiguous. */
 static unsigned head(unsigned tty, unsigned *logs)
 {
     unsigned bit = 1u << tty, slot = cached_head[tty], kind = cached_logs[tty];

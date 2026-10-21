@@ -116,10 +116,9 @@ int uart_queue_active(void)
 
 int uart_queue_start(void)
 {
-    /* CONTROL reads are defined and return zero on the legacy bus. Never
-     * write reserved bit2 until the new controller identifies itself here;
-     * the old bus rejects that write. Strict ROM POST still sees STATUS<=3
-     * until this explicit handover, and BIOS/U-Boot need no update. */
+    /* Legacy CONTROL reads return zero. Set reserved bit 2 only after identifying a controller
+     * that supports it. Older buses reject that write. STATUS stays at or below 3 for ROM POST
+     * until this handover, so BIOS and U-Boot keep their existing behavior. */
     if (uart_hal_read32(BASE + 8u) != 0x31464155u)
         return -95;
     uart_hal_write8(BASE + 8u, 4);
@@ -180,8 +179,8 @@ int uart_queue_submit(const unsigned char *data, unsigned n)
         stats.high_water = queued;
     irqs();
     release();
-    /* Slot already belongs to the kernel; consumer stops at WRITING. Copying
-     *4KiB holds neither the UART lock nor user pointers past this function. */
+    /* The kernel owns this slot and the consumer stops at WRITING. The 4 KiB copy does not hold
+     * the UART lock or retain user pointers after the function returns. */
     memcpy(r->data, data, n);
     r->size = n;
     r->position = r->cr = 0;
@@ -195,10 +194,10 @@ int uart_queue_service_ready(void)
 {
     if (!active || publish_read(&emergency) || publish_read(&uart_lock))
         return 0;
-    /* STATUS is non-destructive. No UART lock, CAS, W1C or accounting writes
-     * are needed while TX has no eligible space/data and RX/errors are quiet.
-     * queued is published atomically; producer arming and level IRQs preserve
-     * a concurrent arrival. Recheck ownership before every mutation below. */
+    /* Reading STATUS does not change device state. Quiet RX and error flags, together with
+     * unavailable TX space or data, require no UART lock, CAS, W1C or accounting writes. queued
+     * is published atomically. Producer arming and level IRQs preserve concurrent arrivals.
+     * Recheck ownership before each mutation. */
     uint32_t ready = uart_hal_read32(BASE + 4u);
     return !!((ready & 14u) || (publish_read(&queued) && (ready & 1u)));
 }
@@ -292,7 +291,7 @@ int uart_queue_read(void)
 {
     if (!active)
         return -95;
-    /* Empty RX is a read-only retry; arrival still raises the level IRQ. */
+    /* An empty RX queue requires only a read-only retry. A later arrival raises the level IRQ. */
     if (!publish_read(&rx_count))
         return -11;
     if (!acquire())
@@ -381,8 +380,8 @@ void uart_queue_emergency(const char *message)
     while (publish_read(&uart_lock) && lock_owner != mine)
         if (!--budget)
             return;
-    /* Every normal consumer checks emergency before its next byte, then
-     * releases ownership. Accepted RAM stays quarantined; no normal resume. */
+    /* Before reading another byte, each normal consumer checks emergency and releases ownership
+     * if set. Accepted RAM remains quarantined and normal processing cannot resume. */
     if (active)
     {
         budget = 1000000;

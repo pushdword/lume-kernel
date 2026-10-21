@@ -125,10 +125,10 @@ static __attribute__((noinline)) void work_preempt_ready(unsigned core, unsigned
         }
     if (!other)
     {
-        /* The ordinary choose path renews an expired slice when its owner
-         * is the only eligible runnable task. Do the same for a live stack;
-         * a sticky need bit would otherwise force full scans at every byte
-         * checkpoint for the rest of a long operation. Service debt remains. */
+        /* The normal selection path renews an expired slice when its owner is the only runnable
+         * task. Apply the same renewal to a live kernel stack. Otherwise a retained need bit
+         * forces a full scan at each byte checkpoint throughout a long operation. Renewal
+         * preserves the service debt. */
         if (scheduler.cpu[core].need)
         {
             scheduler.cpu[core].need = 0;
@@ -203,9 +203,9 @@ static __attribute__((noinline)) int invoke_slow(unsigned slot)
 {
     const uint32_t *r = processes[slot].context.regs;
     unsigned operation = r[1];
-    /* Common nonblocking calls need no private stack when their input is
-     * already resident. Keep normal validation and all errors in run_syscall;
-     * a missing read-only page still takes the resumable path before effects. */
+    /* Common nonblocking calls can run without a kernel continuation stack when their input is
+     * resident. run_syscall performs validation and reports errors. A missing read-only page
+     * enters the resumable path before the operation changes state. */
     if (operation == LUME_READ && !fd_needs_fs(slot, (int)r[4]))
         return run_syscall(slot);
     if ((operation == LUME_WRITE && !fd_needs_fs(slot, 1) && r[2] <= 4096 &&

@@ -80,7 +80,28 @@ int main(void)
             T(f.initrd_start == 0x8000000 && f.initrd_end == 0xa200000);
             for (unsigned k = 0; k < n; ++k)
                 T(!lume_fdt_read(data, k, &f));
+            T(lume_fdt_set_initrd(data, n, 0xc000000, 0xe200000));
+            T(lume_fdt_read(data, n, &f));
+            T(f.initrd_start == 0xc000000 && f.initrd_end == 0xe200000);
+            unsigned char saved[512];
+            memcpy(saved, data, sizeof(data));
+            for (unsigned k = 0; k < n; ++k)
+            {
+                T(!lume_fdt_set_initrd(data, k, 0x10000000, 0x12200000));
+                T(memcmp(data, saved, sizeof(data)) == 0);
+            }
+            T(!lume_fdt_set_initrd(data, n, 0, 0x1000));
+            T(!lume_fdt_set_initrd(data, n, 0x1000, 0x1000));
+            T(!lume_fdt_set_initrd(data, n, 0x1000, 0x5001000));
+            T(!lume_fdt_set_initrd(data, n, UINT64_MAX, 0));
+            T(memcmp(data, saved, sizeof(data)) == 0);
+            bool wide = a == 8 && b == 8;
+            T(lume_fdt_set_initrd(data, n, 0x180000000, 0x182200000) == wide);
+            if (!wide)
+                T(memcmp(data, saved, sizeof(data)) == 0);
         }
+    unsigned empty = make(data, 0, 0, 0, 0);
+    T(!lume_fdt_set_initrd(data, empty, 0xc000000, 0xe200000));
     unsigned n = make(data, 4, 0, 0x8000000, 0);
     T(!lume_fdt_read(data, n, &f));
     n = make(data, 0, 4, 0, 0xa200000);

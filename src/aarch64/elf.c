@@ -89,6 +89,9 @@ void lume_elf_release(struct lume_elf_image *image)
         if (!lume_page_free(image->pages[i].physical))
             lume_fail("ELF frame release");
     }
+    for (unsigned i = 0; i < image->metadata_pages; ++i)
+        if (!lume_page_free((uintptr_t)image->pages + (uint64_t)i * 4096))
+            lume_fail("ELF metadata release");
     *image = (struct lume_elf_image){0};
 }
 
@@ -99,6 +102,13 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
     if (!lume_elf_plan(data, size, &plan))
         return false;
     image->task = task;
+    image->metadata_pages = (unsigned)((plan.pages * sizeof(*image->pages) + 4095) / 4096);
+    image->pages = (void *)(uintptr_t)lume_pages_alloc_span(image->metadata_pages);
+    if (!image->pages)
+    {
+        *image = (struct lume_elf_image){0};
+        return false;
+    }
     for (unsigned n = 0; n < plan.count; ++n)
     {
         struct lume_elf_segment *s = &plan.segments[n];

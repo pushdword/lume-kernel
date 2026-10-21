@@ -1,17 +1,16 @@
 #include "lume/early.h"
+#include "lume/mmio.h"
 #include "lume/wpa.h"
 #define RNG UINT64_C(0x107d208000)
 
 static uint32_t rd(unsigned off)
 {
-    uint32_t v = *(volatile uint32_t *)(uintptr_t)(RNG + off);
-    __asm__ volatile("dmb oshld" ::: "memory");
-    return v;
+    return lume_mmio_read32(RNG + off);
 }
 
 static void wr(unsigned off, uint32_t v)
 {
-    *(volatile uint32_t *)(uintptr_t)(RNG + off) = v;
+    lume_mmio_write32_relaxed(RNG + off, v);
     __asm__ volatile("dsb oshst" ::: "memory");
 }
 

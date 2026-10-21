@@ -1,5 +1,6 @@
-/* Crypto service 40 reports device capabilities separately from CPU features.
- * Only hardware operations are reported as accelerated. */
+/* System call 40 exposes cryptographic operations. Device discovery reports hardware
+ * capabilities separately from CPU instruction features. Software results are not reported as
+ * hardware acceleration. */
 #ifndef LUME_CRYPTO_H
 #define LUME_CRYPTO_H
 #include <stdint.h>
@@ -46,10 +47,10 @@ struct lume_crypto_info
         reseed_count;
 };
 
-/* AES-GCM: fixed96-bit nonce/full128-bit tag. A nonce must never repeat for
- * a given key. All addresses refer to the calling process. input/output may
- * coincide. Output and tag must not overlap. Failed authentication emits no bytes.
- * The optional peripheral has a4KiB packet buffer and32-byte AAD limit. */
+/* AES-GCM uses a 96-bit nonce and a 128-bit tag. A key must never reuse a nonce. All addresses
+ * belong to the calling process. Input and output buffers may coincide, but the output and tag
+ * buffers must not overlap. Authentication failure produces no output bytes. The optional
+ * peripheral supports packets up to 4 KiB and additional authenticated data up to 32 bytes. */
 struct lume_aead_request
 {
     uint32_t version, bytes, key, key_bytes, nonce, nonce_bytes, aad, aad_bytes, input, length,
@@ -61,26 +62,25 @@ struct lume_crypto_limits
     uint32_t version, bytes, max_packet, max_aad, nonce_bytes, tag_bytes, key_sizes, clock_hz;
 };
 
-/* Hardware operations require the corresponding engine. Scalar, point and output
- * buffers are32 bytes, encoded little-endian. X25519 clamps the scalar and
- * masks the input point's high bit. ED_BASE takes an already prepared scalar.
- * ED_VERIFY_POINT returns encode([scalar_b]B-[scalar_a]point); callers must
- * hash/reduce the challenge, enforce S<L and compare against R. Invalid or
- * noncanonical point encodings return EBADMSG and leave output unchanged.
- * cycles optionally points to a uint32_t engine-cycle result, or is zero.
- * Unused scalar_b/point addresses must be zero. */
+/* The hardware performs each complete operation without a software fallback. Scalar, point and
+ * output buffers contain 32 bytes in little-endian order. X25519 clamps the scalar and masks
+ * the high bit of the input point. ED_BASE takes a prepared scalar. ED_VERIFY_POINT returns
+ * encode([scalar_b]B-[scalar_a]point). The caller must hash and reduce the challenge, enforce S
+ * < L and compare the result with R. Invalid or noncanonical point encodings return EBADMSG
+ * without changing the output. A nonzero cycles field points to a uint32_t result containing
+ * engine cycles. Unused scalar_b and point addresses must be zero. */
 struct lume_curve_request
 {
     uint32_t version, bytes, scalar_a, scalar_b, point, output, cycles;
 };
 
 _Static_assert(sizeof(struct lume_curve_request) == 28, "Curve request ABI");
-/* SEED requires root and exactly48 fresh unpredictable bytes from a trusted
- * entropy source (e.g. the management PC's OS CSPRNG). No entropy is credited
- * to clocks, MAC/IP addresses, CRCs or deterministic FPGA state. State is RAM
- * only: after each boot RANDOM returns EAGAIN until explicitly seeded.
- * INFO never returns key/state. Requests produce all requested bytes or return an error.
- * This profile conservatively requires reseeding after1MiB of output. */
+/* SEED requires root and exactly 48 fresh, unpredictable bytes from a trusted entropy source
+ * such as an operating-system CSPRNG. Clocks, MAC addresses, IP addresses, CRCs and
+ * deterministic FPGA state do not supply entropy. Generator state exists only in RAM. After
+ * boot, RANDOM returns EAGAIN until SEED initializes that state. INFO does not expose keys or
+ * generator state. Random requests have a fixed size limit and return the complete output or an
+ * error. The generator requires reseeding after 1 MiB of output. */
 _Static_assert(sizeof(struct lume_crypto_request) == 20, "Crypto request ABI");
 _Static_assert(sizeof(struct lume_crypto_info) == 36, "Crypto info ABI");
 _Static_assert(sizeof(struct lume_aead_request) == 48, "AEAD request ABI");

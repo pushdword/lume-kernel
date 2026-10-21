@@ -49,7 +49,7 @@ static unsigned video, extended, keyboard, last_present, cursor_visible, cursor_
     focus;
 static unsigned position[2], available[2];
 static struct terminal screen[2];
-/* Input remains under queue_lock; it never touches a live renderer. */
+/* queue_lock protects input processing. Input processing does not access an active renderer. */
 static unsigned render_active, input_focus, cached_geometry[2];
 static struct keymap layout[2];
 static unsigned char pending[2][16];
@@ -209,8 +209,8 @@ void console_write_tty(unsigned tty, const unsigned char *bytes, unsigned n)
         return;
     if (video)
         begin_write(tty);
-    /* Both panels consume logical runs. CR expansion belongs only to UART;
-     * publishing the visual batch now precedes its serial drain on TTY0. */
+    /* Both panels consume logical text runs. Only the UART expands carriage returns. TTY0
+     * publishes the visual batch before draining its serial output. */
     if (video)
         terminal_write(&screen[tty], bytes, n);
     if (video)
@@ -347,7 +347,9 @@ unsigned console_tty_supported(unsigned tty)
 int console_video(unsigned action, unsigned value, const unsigned char *font)
 {
     if (action == 0)
-        return extended ? 3 : video ? 1 : 0; /* Supported modes; EDID unavailable. */
+        return extended ? 3
+               : video  ? 1
+                        : 0; /* These display modes are supported without EDID discovery. */
     if (action >= 3 && action <= 5)
     {
         if (!video)

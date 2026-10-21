@@ -44,7 +44,7 @@ struct keymap
 
 /* One press event, USB boot usage + modifier byte. Returns UTF-8/ANSI bytes. */
 unsigned keymap_pt(struct keymap *, unsigned, unsigned, unsigned char[16]);
-/* TTY 0 shares its screen pane with the UART. TTY 1 has a separate pane. */
+/* The terminal provides two independent panes. TTY0 also sends output to the UART. */
 void console_render_begin(void);
 void console_render_end(void);
 void console_write_tty(unsigned, const unsigned char *, unsigned);

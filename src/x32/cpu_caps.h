@@ -9,9 +9,10 @@ struct lume_cpu_caps
     uint32_t descriptor, accelerated, implementation, icache_bytes, tlb_entries;
 };
 
-/* Inputs are CPUINFO leaves0..3 and the actual SMP/HWDT platform registers.
- * Older ISA1 cores return zero for leaves2/3: optional details remain unknown.
- * Supporting more instruction forms is compatible; form counts are not an ISA. */
+/* Inputs come from CPUINFO leaves 0 through 3 and the platform SMP and HWDT registers. Older
+ * ISA1 cores return zero for leaves 2 and 3, leaving optional details unknown. Additional
+ * instruction forms are compatible with the interface. Form counts do not identify the
+ * instruction set. */
 static inline int lume_cpu_discover(struct lume_cpu_caps *out, const uint32_t identity[4],
                                     const uint32_t isa[4], const uint32_t accel[4],
                                     const uint32_t geometry[4], uint32_t cores, uint32_t cpu_hz,

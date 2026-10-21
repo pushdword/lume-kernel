@@ -114,8 +114,8 @@ static uint16_t crc_byte(uint16_t crc, unsigned char byte)
     return (uint16_t)((crc << 8) ^ crc_table[(crc >> 8) ^ byte]);
 }
 
-/* Same RX block protocol as Genisis. STATUS is safe on legacy hardware;
- * offsets24/28 must never be touched without the capability bit and magic. */
+/* The RX block protocol matches Genisis. Legacy hardware supports STATUS reads. Offsets 24 and
+ * 28 require the capability bit and magic value before access. */
 #ifdef _MSC_VER
 typedef uint32_t sd_alias_word;
 #else
@@ -127,7 +127,7 @@ static int block_capable(uintptr_t base)
            lume_hal_read32(base + LUME_SPI_RX_BLOCK) == LUME_SPI_RX_MAGIC;
 }
 
-/* CSD TRAN_SPEED: reject reserved encodings; unit1MHz needs mantissa5.0. */
+/* Reject reserved CSD TRAN_SPEED encodings. A 1 MHz unit requires a 5.0 mantissa. */
 static int supports_spi5(const unsigned char *csd)
 {
     unsigned speed = csd[3], unit = speed & 7u, value = (speed >> 3) & 15u;
@@ -453,7 +453,7 @@ static int stop_read(uintptr_t base)
 {
     if (lume_hal_read32(base + LUME_SPI_STATUS) & LUME_SPI_BUSY)
         lume_hal_write32(base + LUME_SPI_ABORT, 1u);
-    /* A transport ABORT releases CS; select again before the STOP frame. */
+    /* Transport ABORT releases CS. Select the card again before sending the STOP frame. */
     lume_hal_write32(base + 4u, 0);
     if (transfer(base, 0x4cu) < 0)
         return LUME_SD_TRANSPORT;
@@ -663,7 +663,8 @@ int lume_sd_identify(uintptr_t base, struct lume_sd_card *card)
         goto done;
     }
     card->status = LUME_SD_READY;
-    /* Keep legacy3MHz; FIFO plus a compatible CSD permits30MHz/(2*3)=5MHz. */
+    /* Legacy transfers use 3 MHz. A FIFO controller and compatible CSD permit 5 MHz using 30
+     * MHz / (2 * 3). */
     deselect(base);
     unsigned fast = block_capable(base) && supports_spi5(csd);
     lume_hal_write32(base, fast ? 3u : 5u);

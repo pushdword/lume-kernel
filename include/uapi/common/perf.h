@@ -1,26 +1,27 @@
-/* Lume experimental OS telemetry ABI, independent of the X32 CPU ISA.
- * Counters are hardware-clock ticks modulo 2^32. Subtract unsigned values
- * between samples less than 2^32 / clock_hz apart (143.16 s at 30 MHz).
- * Per-core categories are exclusive. C trap boundaries include assembly
- * entry/restore in the surrounding user/idle interval. No cycle-accurate CPI
- * or blocked-I/O percentage is implied. Sleeping CPUs count as idle.
- * Process CPU ticks exclude global-lock spinning. Ready time has separate counters.
- * Lock-wait begins after a failed CAS. Uncontended acquisition counts as kernel time.
- * Process kernel time is charged to the requesting process (including a
- * child's ELF load in the parent's spawn call). I/O polling remains kernel
- * time. Load, SD, zero and copy times overlap and must not be added.
- * Snapshot syscall: (33, writable_pointer, sizeof(snapshot), version), returns
- * 0, -22 for size/version mismatch, -14 for an invalid writable range, or -5
- * when bounded rendezvous/consistent-read attempts expire. On -5 no snapshot
- * is copied to userspace. A failed initial rendezvous resets no remote record.
- * Active processes occupy [0, process_count), including PID 0.
- * The first valid snapshot registers its calling process as an observer.
- * Accounting is normally disabled. The first observer starts a fresh shared
- * observation period. Repeated reads and additional observers retain it.
- * Exit or fault unregisters the process. The last observer disables accounting.
- * Process times/dispatches/max-ready are session counters, while cores masks
- * remain the process's lifetime history. No explicit stop syscall is needed.
- */
+/* The Lume telemetry ABI reports OS activity independently of the X32 instruction set. Counters
+ * contain hardware-clock ticks modulo 2^32. Compute differences with unsigned subtraction and
+ * sample within 2^32 / clock_hz seconds, about 143.16 seconds at 30 MHz. Per-core categories
+ * are exclusive. Assembly trap entry and context restoration belong to the surrounding user or
+ * idle interval. These counters cannot determine cycle-accurate CPI or the percentage of time
+ * blocked on I/O. Sleeping CPUs count as idle.
+ *
+ * Process CPU ticks exclude time spinning on the global lock. Ready time is recorded
+ * separately. Lock-wait accounting starts after a failed CAS, and uncontended acquisition
+ * counts as kernel time. Kernel time is charged to the requesting process, including a child's
+ * ELF load during its parent's spawn call. I/O polling counts as kernel time. Load, SD, zero
+ * and copy totals include nested work and must not be added together.
+ *
+ * The snapshot call takes syscall number 33, a writable pointer, sizeof snapshot and a version.
+ * It returns 0 on success, -22 for a size or version mismatch, -14 for an invalid writable
+ * range and -5 when bounded rendezvous or consistent-read attempts expire. On -5, it copies no
+ * snapshot. A failed initial rendezvous does not reset remote records. Active processes occupy
+ * entries from zero up to process_count, excluding process_count itself. PID zero is valid.
+ *
+ * The first valid snapshot registers its caller as an observer and enables accounting with a
+ * fresh shared session. Further reads and observers retain that session. Exit or fault
+ * unregisters the process. The last observer disables accounting. Process times, dispatch
+ * counts and maximum ready time cover the session. Core masks retain the process lifetime
+ * history. Observer removal does not require a separate stop syscall. */
 #ifndef LUME_PERF_H
 #define LUME_PERF_H
 #include <stdint.h>

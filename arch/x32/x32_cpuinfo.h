@@ -1,6 +1,6 @@
-/* CPUINFO v1: CPU-owned hardware data, not a platform MMIO or kernel ABI.
- * EBX is callee-saved in the C ABI. Binding the output to EBX tells Clang
- * to preserve it when necessary; all four instruction outputs are explicit. */
+/* CPUINFO v1 reads hardware data owned by the CPU. It does not access platform MMIO or call the
+ * kernel. EBX is callee-saved in the C ABI. The explicit EBX output binding makes Clang
+ * preserve it when needed. All four instruction outputs are declared. */
 #ifndef X32_CPUINFO_H
 #define X32_CPUINFO_H
 #include <stdint.h>
@@ -45,10 +45,10 @@ enum x32_cpuinfo_property
     X32_CPU_ICACHE = 8u
 };
 
-/* Leaf2 EAX=1 identifies this additive descriptor. Older v1 cores return zero.
- * EBX uses enum x32_cpuinfo_feature; ECX uses the implementation flags below.
- * Leaf3 EAX=I-cache bytes, EBX=TLB entries, ECX=D-cache bytes, EDX=bus requests.
- * Physical core count and clocks belong to the platform's SMP/HWDT registers. */
+/* Leaf 2 returns EAX equal to 1 for this descriptor. Older v1 cores return zero. EBX contains
+ * x32_cpuinfo_feature values and ECX contains the implementation flags below. Leaf 3 reports
+ * I-cache bytes in EAX, TLB entries in EBX, D-cache bytes in ECX and bus requests in EDX. The
+ * platform SMP and HWDT registers report the physical core count and clocks. */
 enum x32_cpuinfo_implementation
 {
     X32_IMPL_FAST_FETCH = 1u,

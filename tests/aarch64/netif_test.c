@@ -332,7 +332,7 @@ int main(void)
     CHECK(lume_netif_register(&d) == 4);
     d = desc("eth2", LUME_IF_ETHERNET, 5, &eth2);
     CHECK(lume_netif_register(&d) == -LUME_ENOSPC && lume_netif_count() == 4);
-    /* Event cursors are per reader; reading never consumes another client's events. */
+    /* Each reader has its own event cursor. Reading leaves other readers' events available. */
     for (unsigned i = 0; i < 80; ++i)
     {
         eth.link = !eth.link;

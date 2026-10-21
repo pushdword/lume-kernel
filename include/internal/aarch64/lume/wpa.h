@@ -30,7 +30,8 @@ bool lume_wpa_unwrap(const unsigned char[16], const void *, size_t, void *, size
 bool lume_wpa_begin(struct lume_wpa *, const unsigned char[6], const void *, size_t, const void *,
                     size_t, bool (*)(void *, size_t));
 bool lume_wpa_set_rsn(struct lume_wpa *, const void *, size_t);
-/* 0=ignore; 1=response/action; -1=invalid/authentication failed. */
+/* The handler returns 0 to ignore the packet, 1 when a response or action is ready and -1 for
+ * an invalid packet or failed authentication. */
 int lume_wpa_input(struct lume_wpa *, const void *, size_t, struct lume_wpa_action *);
 bool lume_entropy(void *, size_t);
 #endif

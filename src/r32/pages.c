@@ -1,7 +1,7 @@
-/* Dynamic physical pages; metadata is serialized by the scheduler lock.
- * Reserved frames may be zeroed/filled outside it; only fully initialized
- * file pages are published. A remote RUNNING owner is never a victim.
- * A128MiB virtual window is not a reservation of128MiB physical per process. */
+/* The scheduler lock serializes physical-page metadata. Reserved frames may be zeroed or filled
+ * outside the lock. File pages are published only after initialization. A remote RUNNING
+ * process cannot be an eviction victim. Each process has a 128 MiB virtual window without
+ * reserving that amount of physical memory. */
 #include "core.h"
 #include "pager_io.h"
 #include "perf_io.h"
@@ -253,9 +253,9 @@ static uint32_t ro_frame(unsigned slot)
         pager_general_ro_pages++;
         return address;
     }
-    /* FIFO cursor avoids re-evicting the page just faulted in when one
-     * instruction needs more than one page. Never recycle a remote RUNNING
-     * owner's frame; snoop invalidation alone does not cancel in-flight reads. */
+    /* The FIFO cursor avoids immediately evicting a page faulted in by an instruction that
+     * spans multiple pages. A remote RUNNING owner's frame must not be recycled because snoop
+     * invalidation does not cancel in-flight reads. */
     unsigned core = core_id();
     unsigned cursor = next_page;
     for (unsigned n = 0; n < pool_pages; n++)
@@ -351,8 +351,8 @@ static inline __attribute__((always_inline)) int return_page_ready(unsigned slot
     (void)allow_io;
     return 1; /* Fixed4B instructions never cross a4KiB page. */
 #else
-    /* The widest instruction is12B (FARJMP: primary plus two extensions).
-     * Interior PCs cannot need a second page; retain the first-page lease. */
+    /* The widest instruction occupies 12 bytes, consisting of a FARJMP primary word and two
+     * extensions. A PC sufficiently far from the page boundary needs only the first-page lease. */
     if ((pc & 4095u) <= 4084u)
         return 1;
     /* Only valid extension-bearing encodings may need a second code page.
@@ -509,8 +509,8 @@ unsigned char *user_pointer(unsigned slot, uint32_t pointer)
     return physical(user_tables[slot][(pointer - USER_BASE) / 4096u] & ~4095u) + (pointer & 4095u);
 }
 
-/* Read-only admission hint under queue_lock. No fault, pin or copy occurs;
- * the ordinary validator still performs every check before any effect. */
+/* Read this admission hint under queue_lock. The hint does not fault, pin or copy pages. The
+ * normal validator performs all checks before the operation changes state. */
 int user_resident(unsigned slot, uint32_t pointer, unsigned bytes, unsigned write)
 {
     if (!bytes)

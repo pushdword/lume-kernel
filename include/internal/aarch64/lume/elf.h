@@ -2,8 +2,8 @@
 #define LUME_ELF_H
 #include "early.h"
 #define LUME_ELF_BASE (LUME_USER_BASE + 0x40000)
-#define LUME_ELF_LIMIT (LUME_ELF_BASE + 0x40000)
-#define LUME_ELF_PAGES 64u
+#define LUME_ELF_LIMIT LUME_HEAP_BASE
+#define LUME_ELF_PAGES ((LUME_ELF_LIMIT - LUME_ELF_BASE) / 4096u)
 #define LUME_ELF_SEGMENTS 8u
 
 struct lume_elf_segment
@@ -22,12 +22,12 @@ struct lume_elf_plan
 struct lume_elf_image
 {
     uint64_t entry;
-    unsigned count, task;
+    unsigned count, task, metadata_pages;
 
     struct
     {
         uint64_t address, physical;
-    } pages[LUME_ELF_PAGES];
+    } *pages;
 };
 
 bool lume_elf_plan(const void *, size_t, struct lume_elf_plan *);
