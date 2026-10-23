@@ -32,6 +32,7 @@ static bool public_mode, shell_script;
 static uint64_t shell_calls;
 static struct lume_elf_image images[LUME_TASK_LIMIT];
 static uint64_t wake_at[LUME_TASK_LIMIT];
+static bool pipe_wait[LUME_TASK_LIMIT];
 static bool service_loaded, service_alive, message_pending;
 static unsigned char service_status[LUME_SERVICE_BYTES];
 static struct lume_service_message service_message;
@@ -262,6 +263,7 @@ bool lume_tasks_active(void)
 
 static struct lume_context *select_task(unsigned next)
 {
+    pipe_wait[next] = false;
     current_task = next;
     states[next] = 2;
     sched_enter(&policy, 0, (int)next, now(), unit, LUME_SCHED_QUANTUM);
@@ -279,7 +281,9 @@ static void wake_tasks(void)
             bool ready = input_wait[i] && lume_console_ready();
             if (!ready && at < wake_at[i])
                 continue;
-            tasks[i].context.x[0] = input_wait[i] && !ready ? (uint64_t)-LUME_EAGAIN : 0;
+            if (!pipe_wait[i])
+                tasks[i].context.x[0] = input_wait[i] && !ready ? (uint64_t)-LUME_EAGAIN : 0;
+            pipe_wait[i] = false;
             input_wait[i] = false;
             states[i] = 1;
             sched_wake(&policy, i, unit, 0);
@@ -344,7 +348,8 @@ static int start_program(struct lume_context *frame)
         return -LUME_EAGAIN;
     struct lume_run_request request = {
         .path = frame->x[0], .argv = frame->x[1], .argc = (uint32_t)frame->x[2]};
-    bool asynchronous = frame->x[8] == LUME_SYS_RUN_ENV;
+    bool inherit = frame->x[8] == LUME_SYS_RUN_FDS;
+    bool asynchronous = frame->x[8] == LUME_SYS_RUN_ENV || inherit;
     if (asynchronous)
     {
         if (!lume_user_buffer(frame->x[0], sizeof(request), false))
@@ -432,12 +437,14 @@ static int start_program(struct lume_context *frame)
     c->elr = images[child].entry;
     c->spsr = 0x340;
     c->tpidr = child + 1;
-    if (asynchronous)
+    if (asynchronous && !inherit)
     {
         lume_files_init(&tasks[child].files);
         for (unsigned i = 0; i < sizeof(tasks[child].files.cwd); ++i)
             tasks[child].files.cwd[i] = tasks[parent].files.cwd[i];
     }
+    else if (inherit)
+        lume_files_inherit(&tasks[child].files, &tasks[parent].files);
     else
         lume_files_clone(&tasks[child].files, &tasks[parent].files);
     tasks[child].calls = tasks[child].exits = tasks[child].faults = tasks[child].preemptions = 0;
@@ -602,10 +609,11 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         int next = sched_pick(&policy, 0, states, 0, unit);
         return next >= 0 ? select_task((unsigned)next) : NULL;
     }
-    if (public_mode && (frame->x[8] == LUME_SYS_RUN || frame->x[8] == LUME_SYS_RUN_ENV))
+    if (public_mode && (frame->x[8] == LUME_SYS_RUN || frame->x[8] == LUME_SYS_RUN_ENV ||
+                        frame->x[8] == LUME_SYS_RUN_FDS))
     {
         int r = start_program(frame);
-        if (r < 0 || frame->x[8] == LUME_SYS_RUN_ENV)
+        if (r < 0 || frame->x[8] != LUME_SYS_RUN)
         {
             frame->x[0] = (uint64_t)r;
             return frame;
@@ -634,7 +642,24 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     if (public_mode && frame->x[8] != LUME_SYS_EXIT)
     {
         extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
-        frame->x[0] = (uint64_t)lume_public_call(&tasks[task].files, frame, task + 1);
+        int64_t result = lume_public_call(&tasks[task].files, frame, task + 1);
+        if (result == -LUME_EAGAIN &&
+            (frame->x[8] == LUME_SYS_READ || frame->x[8] == LUME_SYS_WRITE) &&
+            lume_vfs_pipe_wait(&tasks[task].files, frame->x[0]))
+        {
+            /* Retry the SVC with its original arguments after another task can drain or
+             * fill the channel. IRQs stay masked while the descriptor table is changed. */
+            tasks[task].context = *frame;
+            tasks[task].context.elr -= 4;
+            sched_charge(&policy, 0, now());
+            pipe_wait[task] = true;
+            input_wait[task] = false;
+            wake_at[task] = lume_clock_monotonic() + 1;
+            states[task] = 4;
+            lume_watchdog_progress();
+            return wait_ready_task();
+        }
+        frame->x[0] = (uint64_t)result;
         lume_watchdog_progress();
         return frame;
     }
@@ -875,9 +900,11 @@ bool lume_shell_start(uint64_t frequency, bool script)
     if (script)
     {
         uint64_t required = (UINT64_C(1) << LUME_SYS_READ) | (UINT64_C(1) << LUME_SYS_EXIT);
-        uint64_t launches = (UINT64_C(1) << LUME_SYS_RUN) | (UINT64_C(1) << LUME_SYS_RUN_ENV);
+        uint64_t asynchronous =
+            (UINT64_C(1) << LUME_SYS_RUN_ENV) | (UINT64_C(1) << LUME_SYS_RUN_FDS);
+        uint64_t launches = (UINT64_C(1) << LUME_SYS_RUN) | asynchronous;
         ok = ok && (shell_calls & required) == required && (shell_calls & launches);
-        if (shell_calls & (UINT64_C(1) << LUME_SYS_RUN_ENV))
+        if (shell_calls & asynchronous)
             ok = ok && (shell_calls & (UINT64_C(1) << LUME_SYS_WAIT));
         lume_value("SHELL_PUBLIC_CALL_MASK", shell_calls);
     }

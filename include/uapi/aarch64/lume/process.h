@@ -2,6 +2,8 @@
 #define LUME_PROCESS_ABI_H
 #include <stdint.h>
 
+/* RUN_ENV initializes terminal descriptors. RUN_FDS inherits open descriptors without
+ * CLOEXEC. Both calls return a child PID and WAIT reaps its exit status. */
 struct lume_run_request
 {
     uint64_t path, argv, envp;

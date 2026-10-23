@@ -44,6 +44,8 @@ enum lume_syscall
     LUME_SYS_TERMINAL = 30,
     LUME_SYS_PROBE = 31,
     LUME_SYS_WAIT = 32,
+    LUME_SYS_FD = 33,
+    LUME_SYS_RUN_FDS = 34,
 };
 
 enum
@@ -65,6 +67,7 @@ enum
     LUME_ENOSPC = 28,
     LUME_ESPIPE = 29,
     LUME_EROFS = 30,
+    LUME_EPIPE = 32,
     LUME_ENAMETOOLONG = 36,
     LUME_ENOSYS = 38,
     LUME_E2BIG = 7,
@@ -99,7 +102,8 @@ enum
 {
     LUME_NODE_FILE = 1,
     LUME_NODE_DIR = 2,
-    LUME_NODE_CHAR = 3
+    LUME_NODE_CHAR = 3,
+    LUME_NODE_PIPE = 4
 };
 
 #define LUME_PATH_MAX 128u

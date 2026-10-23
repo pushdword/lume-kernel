@@ -315,9 +315,14 @@ static bool ping(const ip_addr_t *target)
     ping_received = false;
     ++ping_sequence;
     raw_recv(pcb, ping_reply, 0);
-    struct pbuf *p = pbuf_alloc(PBUF_IP, 24, PBUF_RAM);
-    if (p)
+    /* ARP may retain a packet until address resolution completes. Each retry needs its
+     * own buffer. Keep the sequence stable within this probe to reject older replies. */
+    uint32_t start = lume_clock_millis();
+    while (!ping_received && (uint32_t)(lume_clock_millis() - start) < 5000)
     {
+        struct pbuf *p = pbuf_alloc(PBUF_IP, 24, PBUF_RAM);
+        if (!p)
+            break;
         unsigned char *b = p->payload;
         memset(b, 0, 24);
         b[0] = 8;
@@ -329,19 +334,12 @@ static bool ping(const ip_addr_t *target)
             b[i] = (unsigned char)i;
         uint16_t sum = inet_chksum(b, 24);
         memcpy(b + 2, &sum, 2);
-        /* Retry lost ICMP or ARP packets within the five-second probe. Retries keep the command
-         * identifier and sequence. Each new command increments them so a late reply cannot
-         * satisfy a later probe. */
-        uint32_t start = lume_clock_millis();
-        while (!ping_received && (uint32_t)(lume_clock_millis() - start) < 5000)
-        {
-            (void)raw_sendto(pcb, p, target);
-            uint32_t attempt = lume_clock_millis();
-            while (!ping_received && (uint32_t)(lume_clock_millis() - attempt) < 1000 &&
-                   (uint32_t)(lume_clock_millis() - start) < 5000)
-                wait_ms(1);
-        }
+        (void)raw_sendto(pcb, p, target);
         pbuf_free(p);
+        uint32_t attempt = lume_clock_millis();
+        while (!ping_received && (uint32_t)(lume_clock_millis() - attempt) < 1000 &&
+               (uint32_t)(lume_clock_millis() - start) < 5000)
+            wait_ms(1);
     }
     raw_remove(pcb);
     return ping_received;

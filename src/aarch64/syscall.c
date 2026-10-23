@@ -133,7 +133,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         bool stream = c->x[8] == LUME_SYS_STREAM;
         size_t bytes =
             stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
-        if (n != bytes || a > (stream ? LUME_STREAM_CLOSE : LUME_BOOT_ABORT))
+        if (n != bytes || a > (stream ? LUME_DATAGRAM_LISTEN : LUME_BOOT_ABORT))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -203,6 +203,26 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_close(files, a);
     case LUME_SYS_DUP2:
         return lume_vfs_dup2(files, a, b);
+    case LUME_SYS_FD:
+    {
+        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_SPAWN)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        struct lume_fd_request request = *(const struct lume_fd_request *)(uintptr_t)b;
+        if (a == LUME_FD_POLL && request.count > LUME_FD_LIMIT)
+            return -LUME_EINVAL;
+        if (a == LUME_FD_INFO &&
+            !lume_user_buffer(request.buffer, sizeof(struct lume_fd_info), true))
+            return -LUME_EFAULT;
+        if (a == LUME_FD_POLL &&
+            (!lume_user_buffer(request.buffer, request.count * sizeof(struct lume_pollfd), false) ||
+             !lume_user_buffer(request.buffer, request.count * sizeof(struct lume_pollfd), true)))
+            return -LUME_EFAULT;
+        int64_t result = lume_vfs_fd_call(files, (unsigned)a, &request);
+        *(struct lume_fd_request *)(uintptr_t)b = request;
+        return result;
+    }
     case LUME_SYS_MKDIR:
         r = string(a, p);
         return r ? r : lume_vfs_mkdir(files, p);

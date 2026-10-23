@@ -18,6 +18,11 @@ int lume_console_getc(void)
     return -LUME_EAGAIN;
 }
 
+bool lume_console_ready(void)
+{
+    return false;
+}
+
 void lume_console_write(const char *data, size_t bytes)
 {
     assert(bytes <= sizeof(console_data));
@@ -147,6 +152,68 @@ int main(void)
     T(lume_vfs_close(&f, 15) == 0 && lume_vfs_close(&f, fd) == 0);
     T(lume_vfs_remove(&f, "/tmp/a/b", true) == 0 && lume_vfs_remove(&f, "/tmp/a", true) == 0);
     T(lume_vfs_remove(&f, "/tmp", true) == -LUME_EROFS);
+    fd = (int)lume_vfs_open(&f, "/tmp/shared", LUME_O_CREAT | LUME_O_RDWR);
+    T(fd == 3 && lume_vfs_write(&f, fd, "abcdef", 6) == 6);
+    T(lume_vfs_seek(&f, fd, 0, 0) == 0 && lume_vfs_dup2(&f, fd, 10) == 10);
+    T(lume_vfs_read(&f, fd, b, 2) == 2 && !memcmp(b, "ab", 2));
+    T(lume_vfs_read(&f, 10, b, 2) == 2 && !memcmp(b, "cd", 2));
+    struct lume_files inherited;
+    lume_files_clone(&inherited, &f);
+    T(lume_vfs_read(&inherited, fd, b, 2) == 2 && !memcmp(b, "ef", 2));
+    lume_files_release(&inherited);
+    T(lume_vfs_close(&f, fd) == 0 && lume_vfs_close(&f, 10) == 0);
+    for (unsigned round = 0; round < 100; ++round)
+    {
+        struct lume_fd_request request = {.version = LUME_FD_VERSION,
+                                          .bytes = sizeof(request),
+                                          .fd = -1,
+                                          .flags = LUME_FD_CLOEXEC};
+        T(lume_vfs_fd_call(&f, LUME_FD_PIPE, &request) == 0);
+        int reading = request.fd, writing = request.other;
+        T(reading == 3 && writing == 4);
+        T(lume_vfs_stat_mode(&f, reading, &st) == 0010600 && st.kind == LUME_NODE_PIPE);
+        T(lume_vfs_read(&f, reading, b, 1) == -LUME_EAGAIN);
+        T(lume_vfs_read(&f, writing, b, 1) == -LUME_EBADF);
+        T(lume_vfs_write(&f, reading, b, 1) == -LUME_EBADF);
+        T(lume_vfs_seek(&f, reading, 0, 0) == -LUME_ESPIPE);
+        T(lume_vfs_getdents(&f, reading, b, sizeof(b)) == -LUME_ENOTDIR);
+        T(lume_vfs_pipe_wait(&f, reading));
+        lume_files_inherit(&inherited, &f);
+        T(lume_vfs_read(&inherited, reading, b, 1) == -LUME_EBADF);
+        lume_files_release(&inherited);
+        request = (struct lume_fd_request){.version = LUME_FD_VERSION,
+                                           .bytes = sizeof(request),
+                                           .fd = writing,
+                                           .flags = LUME_FD_NONBLOCK};
+        T(lume_vfs_fd_call(&f, LUME_FD_SETFL, &request) == 0);
+        T(!lume_vfs_pipe_wait(&f, writing));
+        for (unsigned i = 0; i < sizeof(b); ++i)
+            b[i] = (char)i;
+        T(lume_vfs_write(&f, writing, b, sizeof(b)) == sizeof(b));
+        T(lume_vfs_write(&f, writing, b, 1) == -LUME_EAGAIN);
+        char prefix[17];
+        T(lume_vfs_read(&f, reading, prefix, sizeof(prefix)) == sizeof(prefix));
+        T(!memcmp(prefix, b, sizeof(prefix)));
+        T(lume_vfs_write(&f, writing, b, 32) == -LUME_EAGAIN);
+        T(lume_vfs_write(&f, writing, b, 513) == 17);
+        T(lume_vfs_read(&f, reading, b, sizeof(b)) == sizeof(b));
+        for (unsigned i = 0; i < sizeof(b); ++i)
+            T((unsigned char)b[i] == (i < sizeof(b) - 17 ? (unsigned char)(i + 17)
+                                                         : (unsigned char)(i - (sizeof(b) - 17))));
+        lume_files_clone(&inherited, &f);
+        T(lume_vfs_close(&f, writing) == 0);
+        T(lume_vfs_read(&f, reading, b, 1) == -LUME_EAGAIN);
+        T(lume_vfs_close(&inherited, writing) == 0);
+        T(lume_vfs_read(&f, reading, b, 1) == 0);
+        lume_files_release(&inherited);
+        T(lume_vfs_close(&f, reading) == 0);
+        request = (struct lume_fd_request){.version = LUME_FD_VERSION, .bytes = sizeof(request)};
+        T(lume_vfs_fd_call(&f, LUME_FD_PIPE, &request) == 0);
+        T(lume_vfs_close(&f, request.fd) == 0);
+        T(lume_vfs_write(&f, request.other, b, 1) == -LUME_EPIPE);
+        T(lume_vfs_write(&f, request.other, b, 0) == 0);
+        T(lume_vfs_close(&f, request.other) == 0);
+    }
     /* Exhaust finite RAM nodes, independently of open descriptor limits. */
     int result = 0;
     for (unsigned i = 0; i < 200; ++i)

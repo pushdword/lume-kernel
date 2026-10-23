@@ -1,6 +1,7 @@
 #include "lume/abi.h"
 #include "lume/net.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +11,94 @@ static struct tcp_pcb pcb;
 static uint32_t milliseconds;
 static unsigned freed, acknowledged;
 static bool connect_ok = true;
+static tcp_accept_fn accept_callback;
+static unsigned shutdowns;
+static struct udp_pcb udp;
+static udp_recv_fn udp_callback;
+static void *udp_context;
+static struct pbuf packet;
+static unsigned char packet_data[4096];
+
+err_t tcp_bind(struct tcp_pcb *p, const ip_addr_t *address, u16_t port)
+{
+    (void)p;
+    (void)address;
+    return port == 8095 ? ERR_OK : ERR_USE;
+}
+
+struct tcp_pcb *tcp_listen_with_backlog_and_err(struct tcp_pcb *p, u8_t backlog, err_t *error)
+{
+    assert(backlog == 1);
+    *error = ERR_OK;
+    return p;
+}
+
+void tcp_accept(struct tcp_pcb *p, tcp_accept_fn callback)
+{
+    (void)p;
+    accept_callback = callback;
+}
+
+err_t tcp_shutdown(struct tcp_pcb *p, int read, int write)
+{
+    assert(p && !read && write);
+    ++shutdowns;
+    return ERR_OK;
+}
+
+struct udp_pcb *udp_new(void)
+{
+    return &udp;
+}
+
+void udp_remove(struct udp_pcb *p)
+{
+    assert(p == &udp);
+}
+
+err_t udp_bind(struct udp_pcb *p, const ip_addr_t *address, u16_t port)
+{
+    assert(p == &udp && address && port);
+    return ERR_OK;
+}
+
+err_t udp_connect(struct udp_pcb *p, const ip_addr_t *address, u16_t port)
+{
+    return udp_bind(p, address, port);
+}
+
+void udp_recv(struct udp_pcb *p, udp_recv_fn callback, void *context)
+{
+    assert(p == &udp);
+    udp_callback = callback;
+    udp_context = context;
+}
+
+err_t udp_sendto(struct udp_pcb *p, struct pbuf *buffer, const ip_addr_t *address, u16_t port)
+{
+    assert(p == &udp && buffer && address && port == 8095);
+    return ERR_OK;
+}
+
+struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t count, pbuf_type type)
+{
+    assert(layer == PBUF_TRANSPORT && type == PBUF_RAM && count <= sizeof(packet_data));
+    packet = (struct pbuf){.payload = packet_data, .len = count, .tot_len = count};
+    return &packet;
+}
+
+err_t pbuf_take(struct pbuf *p, const void *data, u16_t count)
+{
+    memcpy(p->payload, data, count);
+    return ERR_OK;
+}
+
+u16_t pbuf_copy_partial(const struct pbuf *p, void *out, u16_t count, u16_t offset)
+{
+    assert(!offset && count <= p->len);
+    memcpy(out, p->payload, count);
+    return count;
+}
 
 uint32_t lume_clock_millis(void)
 {
@@ -128,5 +217,76 @@ int main(void)
     assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == 0);
     connect_ok = false;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EIO);
-    puts("PASS TCP stream ownership, backpressure, ring wrap, EOF, reset, timeout and release");
+    r.count = 0;
+    assert(lume_stream_call(2, LUME_STREAM_CONNECT_ASYNC, &r) == 0);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == 0);
+    assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == 0);
+    connect_ok = true;
+    assert(lume_stream_call(2, LUME_STREAM_CONNECT_ASYNC, &r) == 0);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    assert(lume_stream_call(2, LUME_STREAM_SHUTDOWN_WRITE, &r) == 0 && shutdowns == 1);
+    assert(lume_stream_call(2, LUME_STREAM_SHUTDOWN_WRITE, &r) == 0 && shutdowns == 1);
+    r.count = 1;
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == -LUME_EIO);
+    pcb.errf(pcb.callback_arg, ERR_CLSD);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) ==
+           (LUME_STREAM_READABLE | LUME_STREAM_HANGUP));
+    r.count = 1;
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 0);
+    lume_stream_release(2);
+    assert(lume_stream_call(2, LUME_STREAM_LISTEN, &r) == 0);
+    unsigned listener = r.handle;
+    assert(lume_stream_call(2, LUME_STREAM_ACCEPT, &r) == -LUME_EAGAIN);
+    struct tcp_pcb incoming = {.snd_buf = 4096, .remote_port = 12345};
+    IP_ADDR4(&incoming.remote_ip, 172, 30, 1, 163);
+    assert(accept_callback(pcb.callback_arg, &incoming, ERR_OK) == ERR_OK);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_READABLE);
+    assert(lume_stream_call(2, LUME_STREAM_ACCEPT, &r) == 0 && r.handle != listener);
+    assert(r.port == 12345 && r.address[3] == 163);
+    unsigned child = r.handle;
+    r.handle = listener;
+    assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == 0);
+    r.handle = child;
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    assert(lume_stream_call(3, LUME_STREAM_CLOSE, &r) == -LUME_EBADF);
+    lume_stream_release(2);
+    r.port = 8095;
+    assert(lume_stream_call(2, LUME_DATAGRAM_CONNECT, &r) == 0);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    ip_addr_t peer;
+    IP_ADDR4(&peer, 172, 30, 1, 163);
+    for (unsigned i = 0; i < 5; ++i)
+        udp_callback(udp_context, &udp, &b, &peer, 8095);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    b.len = b.tot_len = 1200;
+    for (unsigned i = 0; i < 5; ++i)
+        udp_callback(udp_context, &udp, &b, &peer, 8095);
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        r.count = sizeof(r.data);
+        assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 1200);
+        assert(!memcmp(r.data, data, 1200));
+    }
+    r.count = sizeof(r.data);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EAGAIN);
+    r.count = 1473;
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == -LUME_EINVAL);
+    r.count = 1200;
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == 1200);
+    lume_stream_release(2);
+    assert(lume_stream_call(2, LUME_DATAGRAM_LISTEN, &r) == 0);
+    assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == 0);
+    udp_callback(udp_context, &udp, &b, &peer, 8095);
+    peer.addr ^= 0xff;
+    udp_callback(udp_context, &udp, &b, &peer, 8095);
+    r.count = sizeof(r.data);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 1200);
+    r.count = sizeof(r.data);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EAGAIN);
+    lume_stream_release(2);
+    assert(lume_stream_call(0, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
+    r.version = 0;
+    assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
+    puts(
+        "PASS TCP ownership, backpressure, EOF, reset, async connect, half-close, listener and bounded UDP queues");
 }
