@@ -42,10 +42,10 @@ void lume_mmu_switch(uint64_t base)
 bool lume_mmu_start(const struct lume_fdt *fdt)
 {
     extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[],
-        __stack_guard[];
-    struct lume_layout layout = {(uintptr_t)__image_start, (uintptr_t)__text_end,
+        __stack_guard[], __worker_guard[];
+    struct lume_layout layout = {(uintptr_t)__image_start,  (uintptr_t)__text_end,
                                  (uintptr_t)__readonly_end, (uintptr_t)__image_end,
-                                 (uintptr_t)__stack_guard};
+                                 (uintptr_t)__stack_guard,  (uintptr_t)__worker_guard};
     if (!lume_mmu_tables(fdt, &layout))
         return false;
     uint64_t mair = 0xff00;
@@ -74,7 +74,7 @@ static bool probe(uint64_t va, bool write, bool expected, uint64_t target)
 
 bool lume_mmu_check(void)
 {
-    extern unsigned char __image_start[], __stack_guard[];
+    extern unsigned char __image_start[], __stack_guard[], __worker_guard[];
     uint64_t local = UINT64_C(0x4d4d555041535321), sctlr;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
     uint64_t pa;
@@ -82,6 +82,7 @@ bool lume_mmu_check(void)
            probe((uintptr_t)__image_start, false, true, (uintptr_t)__image_start) &&
            probe((uintptr_t)__image_start, true, false, 0) && probe(0, false, false, 0) &&
            probe((uintptr_t)__stack_guard, true, false, 0) &&
+           probe((uintptr_t)__worker_guard, true, false, 0) &&
            !lume_mmu_translate(lume_mmu_root(), (uintptr_t)&local, false, false, true, &pa) &&
            !lume_mmu_translate(lume_mmu_root(), lume_uart_base(), false, false, true, &pa);
 }

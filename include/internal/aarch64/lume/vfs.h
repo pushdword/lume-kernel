@@ -49,6 +49,8 @@ int lume_vfs_program(struct lume_files *, const char *, const void **, size_t *)
 int64_t lume_vfs_dup2(struct lume_files *, uint64_t, uint64_t);
 int64_t lume_vfs_fd_call(struct lume_files *, unsigned, struct lume_fd_request *);
 bool lume_vfs_pipe_wait(struct lume_files *, uint64_t);
+struct lume_wait_queue;
+struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *, uint64_t, bool writing);
 int64_t lume_vfs_mkdir(struct lume_files *, const char *);
 int64_t lume_vfs_remove(struct lume_files *, const char *, bool);
 /* The console read hook returns -EAGAIN when no physical RX byte is available. */

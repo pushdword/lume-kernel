@@ -1,4 +1,5 @@
 #include "lume/vfs.h"
+#include "lume/wait.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -178,6 +179,9 @@ int main(void)
         T(lume_vfs_seek(&f, reading, 0, 0) == -LUME_ESPIPE);
         T(lume_vfs_getdents(&f, reading, b, sizeof(b)) == -LUME_ENOTDIR);
         T(lume_vfs_pipe_wait(&f, reading));
+        struct lume_wait_queue *read_wait = lume_vfs_pipe_queue(&f, reading, false);
+        T(lume_wait_subscribe(read_wait, 7));
+        T(!lume_wait_take(read_wait, 7));
         lume_files_inherit(&inherited, &f);
         T(lume_vfs_read(&inherited, reading, b, 1) == -LUME_EBADF);
         lume_files_release(&inherited);
@@ -190,6 +194,7 @@ int main(void)
         for (unsigned i = 0; i < sizeof(b); ++i)
             b[i] = (char)i;
         T(lume_vfs_write(&f, writing, b, sizeof(b)) == sizeof(b));
+        T(lume_wait_take(read_wait, 7));
         T(lume_vfs_write(&f, writing, b, 1) == -LUME_EAGAIN);
         char prefix[17];
         T(lume_vfs_read(&f, reading, prefix, sizeof(prefix)) == sizeof(prefix));
@@ -203,7 +208,9 @@ int main(void)
         lume_files_clone(&inherited, &f);
         T(lume_vfs_close(&f, writing) == 0);
         T(lume_vfs_read(&f, reading, b, 1) == -LUME_EAGAIN);
+        T(lume_wait_subscribe(read_wait, 7));
         T(lume_vfs_close(&inherited, writing) == 0);
+        T(lume_wait_take(read_wait, 7));
         T(lume_vfs_read(&f, reading, b, 1) == 0);
         lume_files_release(&inherited);
         T(lume_vfs_close(&f, reading) == 0);

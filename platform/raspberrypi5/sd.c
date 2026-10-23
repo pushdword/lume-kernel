@@ -1,4 +1,4 @@
-/* The BCM2712 SDHCI driver polls PIO transfers and issues single-sector commands. It does not
+/* The BCM2712 SDHCI driver uses PIO transfers and issues single-sector commands. It does not
  * use DMA or SD Express. Writes start disabled. After volume validation, writes are limited to
  * that Lume volume and cannot address the MBR. */
 #include "lume/early.h"
@@ -7,7 +7,22 @@
 #include "lume/sd.h"
 #include "lume/watchdog.h"
 #include "lume/storage.h"
-#define HOST UINT64_C(0x1000fff000)
+#include "lume/device.h"
+#include "lume/block.h"
+#include "lume/irq.h"
+#include "lume/abi.h"
+#include "lume/worker.h"
+#ifndef LUME_SD_POLL
+#define LUME_SD_POLL 0
+#endif
+static struct lume_resource resources[2] = {{UINT64_C(0x1000fff000), 0x100, LUME_RESOURCE_MMIO, 0},
+                                            {0, 1, LUME_RESOURCE_IRQ, 0}};
+static struct lume_device device;
+static struct lume_block block;
+static const struct lume_block_ops block_operations;
+static bool interrupt_mode, irq_registered;
+static volatile uint32_t pending;
+static uint64_t interrupts;
 static uint64_t frequency, capacity, write_first, write_count;
 static uint64_t boot_first, boot_count;
 static uint32_t rca;
@@ -16,17 +31,39 @@ static bool ready;
 
 static uint32_t rd(unsigned reg)
 {
-    return lume_mmio_read32_relaxed(HOST + reg);
+    return lume_mmio_read32_relaxed(resources[0].base + reg);
 }
 
 static void wr(unsigned reg, uint32_t value)
 {
-    lume_mmio_write32_sync(HOST + reg, value);
+    lume_mmio_write32_sync(resources[0].base + reg, value);
+}
+
+static void irq_handler(unsigned irq, void *context)
+{
+    (void)irq;
+    (void)context;
+    uint32_t status = rd(0x30);
+    pending |= status;
+    wr(0x30, status);
+    ++interrupts;
+}
+
+bool lume_sd_configure(uint64_t base, uint64_t size, uint32_t irq)
+{
+    if (device.state != LUME_DEVICE_OFF || base != UINT64_C(0x1000fff000) || size < 0x100 ||
+        size > 0x1000 || irq < 32 || irq >= LUME_IRQ_LIMIT)
+        return false;
+    resources[0].base = base;
+    resources[0].size = size;
+    resources[1].base = irq;
+    return true;
 }
 
 static void delay(unsigned us)
 {
-    lume_counter_delay_us(frequency, us);
+    if (!lume_worker_pause(lume_counter_read() + frequency * us / 1000000))
+        lume_counter_delay_us(frequency, us);
 }
 
 static bool wait_register(unsigned reg, uint32_t mask, uint32_t wanted, unsigned ms)
@@ -36,6 +73,7 @@ static bool wait_register(unsigned reg, uint32_t mask, uint32_t wanted, unsigned
     {
         if ((rd(reg) & mask) == wanted)
             return true;
+        (void)lume_worker_pause(lume_counter_read() + frequency / 1000);
     } while (lume_counter_read() - start < frequency * ms / 1000);
     return false;
 }
@@ -43,22 +81,43 @@ static bool wait_register(unsigned reg, uint32_t mask, uint32_t wanted, unsigned
 static bool event(uint32_t mask, unsigned ms)
 {
     uint64_t start = lume_counter_read();
-    uint32_t status;
+    uint64_t flags = lume_irq_save();
+    uint32_t status = 0;
     do
     {
-        status = rd(0x30);
+        status = interrupt_mode ? pending : rd(0x30);
         if (status & 0xffff8000u)
             break;
         if (status & mask)
         {
-            wr(0x30, mask);
+            if (interrupt_mode)
+                pending &= ~mask;
+            else
+                wr(0x30, mask);
+            lume_irq_restore(flags);
             return true;
         }
+        if (interrupt_mode)
+        {
+            /* Service an already asserted IRQ before suspending the call stack. */
+            lume_irq_restore(flags & ~UINT64_C(0x80));
+            __asm__ volatile("yield" ::: "memory");
+            (void)lume_irq_save();
+            if (!(pending & (mask | 0xffff8000u)))
+                (void)lume_worker_wait_bits(&pending, mask | 0xffff8000u,
+                                            start + frequency * ms / 1000);
+        }
     } while (lume_counter_read() - start < frequency * ms / 1000);
+    lume_irq_restore(flags);
     lume_value("SD_ERROR_INTERRUPT", status);
     lume_value("SD_ERROR_PRESENT", rd(0x24));
     ++errors;
     ready = false;
+    if (interrupt_mode)
+    {
+        wr(0x38, 0);
+        (void)lume_irq_enable((unsigned)resources[1].base, false);
+    }
     return false;
 }
 
@@ -76,6 +135,7 @@ static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t 
         return false;
     }
     wr(0x30, 0xffffffffu);
+    pending = 0;
     wr(8, argument);
     wr(12, (index << 24) | flags);
     if (!event(1, 1000))
@@ -109,7 +169,7 @@ static bool clock_rate(unsigned divider)
     return true;
 }
 
-bool lume_sd_start(uint64_t hz)
+static bool initialize(uint64_t hz)
 {
     ready = false;
     capacity = write_first = write_count = 0;
@@ -119,7 +179,7 @@ bool lume_sd_start(uint64_t hz)
     frequency = hz;
     if (!hz || hz > 1000000000)
         return false;
-    lume_value("SD_HOST", HOST);
+    lume_value("SD_HOST", resources[0].base);
     lume_value("SD_VERSION", rd(0xfc));
     uint32_t capabilities = rd(0x40);
     lume_value("SD_CAPABILITIES", capabilities);
@@ -183,6 +243,76 @@ bool lume_sd_start(uint64_t hz)
     lume_value("SD_SECTORS", capacity);
     lume_puts("LUME NATIVE SD PIO READY\n");
     return true;
+}
+
+static int probe(struct lume_device *d)
+{
+    (void)d;
+    if (!lume_irq_available())
+        return -LUME_EIO;
+    pending = 0;
+    interrupts = 0;
+    return 0;
+}
+
+static int start(struct lume_device *d)
+{
+    (void)d;
+    if (!initialize(frequency))
+        return -LUME_EIO;
+    block.sectors = capacity;
+    if (resources[1].base && !LUME_SD_POLL)
+    {
+        int result =
+            lume_irq_register((unsigned)resources[1].base, LUME_IRQ_LEVEL, irq_handler, &device);
+        if (result)
+            return result;
+        irq_registered = true;
+        if ((result = lume_irq_enable((unsigned)resources[1].base, true)) != 0)
+            return result;
+        interrupt_mode = true;
+        wr(0x38, 0xffff017f);
+    }
+    lume_value("SD_IRQ_MODE", interrupt_mode);
+    return 0;
+}
+
+static int stop(struct lume_device *d)
+{
+    (void)d;
+    wr(0x38, 0);
+    if (irq_registered)
+    {
+        int result = lume_irq_unregister((unsigned)resources[1].base, &device);
+        if (result)
+            return result;
+        irq_registered = false;
+    }
+    interrupt_mode = ready = false;
+    pending = 0;
+    return 0;
+}
+static const struct lume_driver_ops operations = {probe, start, stop, 0};
+
+bool lume_sd_start(uint64_t hz)
+{
+    if (!hz || hz > 1000000000 || device.state != LUME_DEVICE_OFF)
+        return false;
+    frequency = hz;
+    device = (struct lume_device){.version = LUME_DDK_VERSION,
+                                  .class_id = LUME_DEVICE_BLOCK,
+                                  .name = "sdhci0",
+                                  .resources = resources,
+                                  .resource_count = resources[1].base ? 2 : 1,
+                                  .ops = &operations};
+    block = (struct lume_block){
+        .device = &device, .ops = &block_operations, .sector_bytes = 512, .max_sectors = 128};
+    return lume_device_attach(&device) == 0;
+}
+
+bool lume_sd_stop(void)
+{
+    return lume_device_detach(&device) == 0;
 }
 
 uint64_t lume_sd_sectors(void)
@@ -286,7 +416,7 @@ static bool transfer(uint64_t sector, void *data, bool write)
 
 bool lume_sd_read(uint64_t sector, void *data)
 {
-    bool complete = transfer(sector, data, false);
+    bool complete = lume_block_read(&block, sector, 1, data) == 0;
     if (complete)
     {
         lume_watchdog_progress();
@@ -297,7 +427,7 @@ bool lume_sd_read(uint64_t sector, void *data)
 
 bool lume_sd_write(uint64_t sector, const void *data)
 {
-    bool complete = transfer(sector, (void *)data, true);
+    bool complete = lume_block_write(&block, sector, 1, data) == 0;
     if (complete)
     {
         lume_watchdog_progress();
@@ -312,4 +442,31 @@ void lume_sd_stats(void)
     lume_value("SD_WRITTEN_SECTORS", writes);
     lume_value("SD_ERRORS", errors);
     lume_value("SD_REJECTED_WRITES", rejected);
+    lume_value("SD_IRQ_HANDLED", interrupts);
+    lume_worker_stats();
 }
+
+static int block_read(struct lume_block *b, uint64_t sector, unsigned count, void *data)
+{
+    (void)b;
+    for (unsigned i = 0; i < count; ++i)
+        if (!transfer(sector + i, (unsigned char *)data + (size_t)i * 512, false))
+            return -LUME_EIO;
+    return 0;
+}
+
+static int block_write(struct lume_block *b, uint64_t sector, unsigned count, const void *data)
+{
+    (void)b;
+    for (unsigned i = 0; i < count; ++i)
+        if (!transfer(sector + i, (unsigned char *)data + (size_t)i * 512, true))
+            return -LUME_EIO;
+    return 0;
+}
+
+static int block_sync(struct lume_block *b)
+{
+    (void)b;
+    return ready ? 0 : -LUME_EIO;
+}
+static const struct lume_block_ops block_operations = {block_read, block_write, block_sync};

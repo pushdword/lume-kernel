@@ -46,6 +46,9 @@ enum lume_syscall
     LUME_SYS_WAIT = 32,
     LUME_SYS_FD = 33,
     LUME_SYS_RUN_FDS = 34,
+    LUME_SYS_FEATURES = 35,
+    LUME_SYS_RUN_ACTIONS = 36,
+    LUME_SYS_CAP_DROP = 37,
 };
 
 enum

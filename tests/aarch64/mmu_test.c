@@ -61,7 +61,7 @@ int main(void)
 {
     struct lume_fdt fdt = {.ram_count = 2,
                            .ram = {{0x80000, 0x3fb80000}, {0x40000000, 0x1c0000000}}};
-    struct lume_layout layout = {0x200000, 0x204000, 0x207000, 0x300000, 0x2ef000};
+    struct lume_layout layout = {0x200000, 0x204000, 0x207000, 0x300000, 0x2ef000, 0x2dd000};
     CHECK(lume_mmu_tables(&fdt, &layout));
     uint64_t pa, root = lume_mmu_root();
     CHECK(!lume_mmu_translate(root, 0, false, false, false, &pa));
@@ -74,6 +74,7 @@ int main(void)
     CHECK(lume_mmu_translate(root, 0x207123, true, false, false, &pa) && pa == 0x207123);
     CHECK(!lume_mmu_translate(root, 0x207000, false, false, true, &pa));
     CHECK(!lume_mmu_translate(root, layout.guard, true, false, false, &pa));
+    CHECK(!lume_mmu_translate(root, layout.worker_guard, true, false, false, &pa));
     CHECK(!lume_mmu_translate(root, 0x300000, false, false, false, &pa));
     CHECK(lume_mmu_translate(root, 0x100001234, true, false, false, &pa) && pa == 0x100001234);
     CHECK(lume_mmu_translate(root, 0x1fffffff8, true, false, false, &pa) && pa == 0x1fffffff8);

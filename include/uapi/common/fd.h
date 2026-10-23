@@ -19,7 +19,9 @@ enum
     LUME_FD_GETFL,
     LUME_FD_SETFL,
     LUME_FD_POLL,
-    LUME_FD_SPAWN
+    LUME_FD_SPAWN,
+    LUME_FD_GETMODE,
+    LUME_FD_SETMODE
 };
 
 enum
@@ -37,7 +39,8 @@ enum
     LUME_POLLNVAL = 32u
 };
 
-/* POLL reads up to 32 pollfd records from buffer using count as the record count. timeout_ms
+/* GETMODE returns the native access mode and append flag. SETMODE changes only append.
+ * POLL reads up to 32 pollfd records from buffer using count as the record count. timeout_ms
  * accepts 0 through 60000 or UINT32_MAX for an infinite wait. PIPE and SOCKETPAIR return
  * descriptors in fd and other. DUP uses other as the minimum result and DUP2 uses it as the
  * exact destination. SPAWN reads the 20-byte lume_spawn_request from buffer and inherits

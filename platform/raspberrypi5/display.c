@@ -12,6 +12,7 @@
 #include "lume/mmio.h"
 #include "lume/counter.h"
 #include "lume/display.h"
+#include "lume/dma.h"
 #include "terminal.h"
 #include "font5x7.h"
 #define RP1 UINT64_C(0x1c00000000)
@@ -50,12 +51,8 @@ static bool wait(uint64_t address, uint32_t mask, uint32_t value, unsigned us)
 
 static void clean(const void *p, size_t bytes)
 {
-    uint64_t ctr;
-    __asm__ volatile("mrs %0,ctr_el0" : "=r"(ctr));
-    uintptr_t line = 4u << ((ctr >> 16) & 15), end = (uintptr_t)p + bytes;
-    for (uintptr_t a = (uintptr_t)p & ~(line - 1); a < end; a += line)
-        __asm__ volatile("dc cvac,%0" ::"r"(a) : "memory");
-    __asm__ volatile("dsb oshst" ::: "memory");
+    if (!lume_dma_sync_for_device(p, bytes, LUME_DMA_TO_DEVICE))
+        lume_fail("display DMA buffer");
 }
 
 static bool i2c_begin(void)
@@ -306,15 +303,10 @@ static bool dma_start(void)
 {
     uint32_t lo = lume_mmio_read32(PCIE + 0x4034), hi = lume_mmio_read32(PCIE + 0x4038);
     lume_value("MIPI_INBOUND_BAR2_BEFORE", ((uint64_t)hi << 32) | lo);
-    /* Set an 8GiB inbound PCIe aperture at bus 0x1000000000 -> RAM 0.
-     * Outbound RP1 BAR / UART and the PCIe link are preserved. */
-    lume_mmio_write32(PCIE + 0x4034, 18);
-    lume_mmio_write32(PCIE + 0x4038, 0x10);
-    lume_mmio_write32(PCIE + 0x40b4, 1);
-    lume_mmio_write32(PCIE + 0x40b8, 0);
-    lume_mmio_write32(PCIE + 0x4008,
-                      (lume_mmio_read32(PCIE + 0x4008) & ~0xf8000000u) | (18u << 27) | 0x1000);
-    uint64_t bus = UINT64_C(0x1000000000) | (uintptr_t)fb;
+    uint64_t bus;
+    if (!lume_pi5_dma_start() ||
+        !lume_dma_map(&lume_rp1_dma_domain, (uintptr_t)fb, FRAME_BYTES, &bus))
+        return false;
     lume_mmio_write32(DSI + 0x34, 0);
     lume_mmio_write32(DMA + 4, 0);
     lume_mmio_write32(DMA + 8, 0xffffffff);

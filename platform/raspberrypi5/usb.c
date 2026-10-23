@@ -8,8 +8,8 @@
 #include "lume/usb.h"
 #include "lume/xhci_ring.h"
 #include "lume/abi.h"
+#include "lume/dma.h"
 #define RP1 UINT64_C(0x1c00000000)
-#define DMA_BASE UINT64_C(0x1000000000)
 #define MAX_SLOTS 8u
 #define MAX_PAGES 192u
 
@@ -94,22 +94,18 @@ static void copy(void *out, const void *in, size_t bytes)
 
 static uint64_t dma(const void *p)
 {
-    return DMA_BASE | (uintptr_t)p;
+    uint64_t address;
+    if (!lume_dma_map(&lume_rp1_dma_domain, (uintptr_t)p, 1, &address))
+        lume_fail("USB DMA address");
+    return address;
 }
 
 static void cache(void *p, size_t bytes, bool invalidate)
 {
-    uint64_t ctr;
-    __asm__ volatile("mrs %0,ctr_el0" : "=r"(ctr));
-    uintptr_t line = 4u << ((ctr >> 16) & 15), end = (uintptr_t)p + bytes;
-    for (uintptr_t a = (uintptr_t)p & ~(line - 1); a < end; a += line)
-    {
-        if (invalidate)
-            __asm__ volatile("dc ivac,%0" ::"r"(a) : "memory");
-        else
-            __asm__ volatile("dc cvac,%0" ::"r"(a) : "memory");
-    }
-    __asm__ volatile("dsb osh" ::: "memory");
+    bool valid = invalidate ? lume_dma_sync_for_cpu(p, bytes, LUME_DMA_FROM_DEVICE)
+                            : lume_dma_sync_for_device(p, bytes, LUME_DMA_TO_DEVICE);
+    if (!valid)
+        lume_fail("USB DMA buffer");
 }
 
 static void *page(struct host *h)
@@ -171,7 +167,8 @@ static void arm_keyboard(struct host *h, struct device *d)
 {
     if (d->pending || d->disconnected)
         return;
-    cache(d->report, 64, true);
+    if (!lume_dma_sync_for_device(d->report, 64, LUME_DMA_FROM_DEVICE))
+        lume_fail("USB keyboard DMA buffer");
     d->irq_trb = enqueue(&d->interrupt, dma(d->report), 8, (1u << 10) | 32 | 4);
     d->pending = true;
     lume_mmio_write32(h->doorbells + d->slot * 4, d->irq_endpoint);
@@ -721,8 +718,7 @@ bool lume_usb_start(uint64_t frequency)
 {
     keyboard_count = hub_count = 0;
     /* Same 8GiB inbound DMA aperture used by native DSI. */
-    if (lume_mmio_read32(UINT64_C(0x1000124034)) != 18 ||
-        lume_mmio_read32(UINT64_C(0x1000124038)) != 0x10)
+    if (!lume_pi5_dma_start())
     {
         lume_puts("USB DMA APERTURE NOT READY\n");
         return false;

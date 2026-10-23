@@ -3,6 +3,8 @@
 #include "lume/net.h"
 #include "lume/boot_storage.h"
 #include "lume/heap.h"
+#include "lume/device.h"
+#include "lume/boot.h"
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -28,6 +30,26 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return LUME_ABI_VERSION;
     case LUME_SYS_GETPID:
         return pid;
+    case LUME_SYS_CAP_DROP:
+        return b || n ? -LUME_EINVAL : lume_task_drop_capabilities(pid, a);
+    case LUME_SYS_FEATURES:
+    {
+        if (b != sizeof(struct lume_system_features) || n != LUME_FEATURE_VERSION)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        *(struct lume_system_features *)(uintptr_t)a = (struct lume_system_features){
+            .abi = LUME_ABI_VERSION,
+            .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES,
+            .pointer_bits = 64,
+            .compat_pointer_bits = 32,
+            .fd_limit = LUME_FD_MAX,
+            .task_limit = LUME_TASK_LIMIT,
+            .ddk_version = LUME_DDK_VERSION,
+            .boot_profile = LUME_BOOT_PROFILE,
+            .capabilities = lume_task_capabilities(pid)};
+        return 0;
+    }
     case LUME_SYS_PROBE:
         return n <= 1 && lume_user_buffer(a, b, n != 0) ? 0 : -LUME_EFAULT;
     case LUME_SYS_BRK:
@@ -131,6 +153,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_BOOT:
     {
         bool stream = c->x[8] == LUME_SYS_STREAM;
+        if (!stream && a != LUME_BOOT_INFO && !lume_task_capable(pid, LUME_CAP_BOOT_UPDATE))
+            return -LUME_EPERM;
         size_t bytes =
             stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
         if (n != bytes || a > (stream ? LUME_DATAGRAM_LISTEN : LUME_BOOT_ABORT))
@@ -156,6 +180,10 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_NETCTL:
     {
+        if ((a == LUME_NET_ADMIN || a == LUME_NET_WIFI_CONNECT || a == LUME_NET_WIFI_DISCONNECT ||
+             a == LUME_NET_DHCP_START || a == LUME_NET_WIFI_SCAN) &&
+            !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
+            return -LUME_EPERM;
         if (a > LUME_NET_DHCP_START || n != sizeof(struct lume_net_control))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
@@ -176,6 +204,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_NET:
     {
+        if (a >= LUME_NET_SCAN && a <= LUME_NET_DHCP && !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
+            return -LUME_EPERM;
         if (a > LUME_NET_TCP || n != sizeof(struct lume_net_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
@@ -205,7 +235,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_dup2(files, a, b);
     case LUME_SYS_FD:
     {
-        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_SPAWN)
+        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_SETMODE)
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;

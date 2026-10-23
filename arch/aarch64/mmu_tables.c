@@ -36,6 +36,9 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
         layout->text_end < layout->start || layout->readonly_end < layout->text_end ||
         layout->end < layout->readonly_end || layout->guard < layout->readonly_end ||
         layout->guard >= layout->end ||
+        (layout->worker_guard &&
+         (layout->worker_guard < layout->readonly_end || layout->worker_guard >= layout->end ||
+          (layout->worker_guard & 4095))) ||
         ((layout->start | layout->text_end | layout->readonly_end | layout->end | layout->guard) &
          4095))
         return false;
@@ -69,7 +72,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     ram_l2[0][1] = table(image_l3);
     for (uint64_t p = layout->start; p < layout->end; p += PAGE)
     {
-        if (p == layout->guard)
+        if (p == layout->guard || p == layout->worker_guard)
             continue;
         uint64_t flags = NORMAL | UXN | 3;
         if (p < layout->text_end)

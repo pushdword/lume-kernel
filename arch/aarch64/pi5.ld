@@ -12,7 +12,13 @@ SECTIONS
     .text : { KEEP(*(.text.boot)) *(.text .text.*) } :code
     . = ALIGN(4096);
     __text_end = .;
-    .rodata : { *(.rodata .rodata.*) } :code
+    .rodata : {
+        *(.rodata .rodata.*)
+        . = ALIGN(8);
+        __lume_drivers_start = .;
+        KEEP(*(.lume.drivers))
+        __lume_drivers_end = .;
+    } :code
     . = ALIGN(4096);
     .usertext : {
         __user_code_start = .;
@@ -37,6 +43,11 @@ SECTIONS
         __stack_bottom = .;
         . += 0x10000;
         __stack_top = .;
+        __worker_guard = .;
+        . += 4096;
+        __worker_stack = .;
+        . += 0x10000;
+        __worker_top = .;
     } :data
     __image_end = .;
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }

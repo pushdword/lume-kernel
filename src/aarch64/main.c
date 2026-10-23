@@ -8,6 +8,11 @@
 #include "lume/net.h"
 #include "lume/watchdog.h"
 #include "lume/heap.h"
+#include "lume/irq.h"
+#include "lume/dma.h"
+#include "lume/boot.h"
+#include "lume/device.h"
+#include "lume/worker.h"
 
 #ifndef LUME_BUILD_ID
 #define LUME_BUILD_ID "unversioned"
@@ -78,14 +83,10 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
         unsigned token = lume_irq_ack(), irq = token & 1023;
         if (irq >= 1020)
             return frame;
-        if (irq != 30)
-        {
-            lume_value("UNEXPECTED_IRQ", irq);
-            lume_fail("interrupt source");
-        }
-        lume_timer_rearm();
-        lume_irq_eoi(token);
-        return lume_tasks_irq(frame);
+        bool handled = lume_irq_dispatch(token);
+        if (!handled)
+            return frame;
+        return irq == 30 ? lume_tasks_irq(frame) : lume_tasks_device_irq(frame);
     }
     if (!el2 && vector == 4 && expected_break && (esr >> 26) == 0x3c && (esr & 0xffff) == 0x4c55)
     {
@@ -128,6 +129,7 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (watchdog)
         lume_puts("LUME WATCHDOG INHERITED\n");
     lume_puts("PLATFORM=raspberrypi5 UART=RP1_GPIO14 115200_8N1\n");
+    lume_value("BOOT_PROFILE", LUME_BOOT_PROFILE);
     lume_value("UART_MMIO", lume_uart_base());
     lume_value("ENTRY_EL", entry_el);
     lume_value("KERNEL_EL", lume_current_el());
@@ -191,9 +193,10 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_puts("LUME CHECK MMU CACHE WX GUARD PASS\n");
     lume_pages_start(&fdt, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end);
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
-    if (!lume_pages_check())
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_pages_check())
         lume_fail("physical page allocator");
-    lume_puts("LUME CHECK PAGES HIGHMEM RESERVATIONS PASS\n");
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
+        lume_puts("LUME CHECK PAGES HIGHMEM RESERVATIONS PASS\n");
     void *initial_program = allocate_program(1024 * 1024);
     if (!initial_program)
         lume_fail("program image staging allocation");
@@ -205,12 +208,22 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (!lume_timer_check(freq))
         lume_fail("GIC physical timer IRQ");
     lume_puts("LUME CHECK GIC TIMER IRQ PASS\n");
-    if (!lume_tasks_check(freq))
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
+    {
+        if (!lume_worker_check(freq))
+            lume_fail("kernel worker continuation");
+        lume_puts("LUME CHECK KERNEL WORKER PASS\n");
+    }
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_tasks_check(freq))
         lume_fail("EL0 scheduler/context/syscall checks");
-    lume_puts("LUME CHECK EL0 PREEMPT SVC ISOLATION PASS\n");
-    if (!lume_elf_tasks_check(freq))
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
+        lume_puts("LUME CHECK EL0 PREEMPT SVC ISOLATION PASS\n");
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_elf_tasks_check(freq))
         lume_fail("ELF64 process loading/execution");
-    lume_puts("LUME CHECK ELF64 LOAD BSS USER EXEC PASS\n");
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
+        lume_puts("LUME CHECK ELF64 LOAD BSS USER EXEC PASS\n");
+    if (fdt.sdhci_valid && !lume_sd_configure(fdt.sdhci_base, fdt.sdhci_size, fdt.sdhci_irq))
+        lume_fail("SDHCI resources");
     if (!lume_sd_start(freq))
         lume_fail("native SD initialization");
     unsigned char sd_sector[512];
@@ -221,8 +234,10 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_value("SD_MBR_DISK_ID", sd_disk_id);
     lume_sd_stats();
     lume_puts("LUME CHECK NATIVE SD READ ONLY PASS\n");
-    bool wireless = lume_wifi_probe(freq, fdt.bcm2712d0);
+    bool wireless = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_wifi_probe(freq, fdt.bcm2712d0);
     lume_value("WIFI_BACKPLANE_READY", wireless);
+    if (!lume_pi5_dma_start())
+        lume_fail("RP1 DMA window");
     bool display = lume_display_start(freq);
     lume_value("MIPI_NATIVE_READY", display);
     bool keyboard = lume_usb_start(freq);
@@ -256,9 +271,13 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     bool network =
         firmware && fdt.wifi_mac_valid && lume_pi5_wifi_register(fdt.wifi_mac) && lume_net_start();
     lume_value("NETWORK_READY", network);
-    if (!lume_shell_start(freq, true))
+    if (lume_drivers_start())
+        lume_fail("driver initialization");
+    lume_value("DDK_DEVICES", lume_device_count());
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_shell_start(freq, true))
         lume_fail("public ABI/VFS/shell");
-    lume_puts("LUME CHECK PUBLIC ABI VFS SHELL PASS\n");
+    if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
+        lume_puts("LUME CHECK PUBLIC ABI VFS SHELL PASS\n");
     lume_puts("LUME AARCH64 KERNEL CORE PASS " LUME_BUILD_ID "\n");
     lume_puts("LUME AARCH64 BOOT PASS " LUME_BUILD_ID "\n");
     if (!fdt.psci_smc)
@@ -276,10 +295,14 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_sd_stats();
     lume_wifi_leave(); /* Disconnect and erase supplicant session keys. */
     lume_wifi_stop();
+    if (lume_drivers_stop())
+        lume_fail("driver stop");
     if (!lume_usb_stop())
         lume_fail("USB DMA did not halt");
     if (display)
         lume_display_stop();
+    if (!lume_sd_stop())
+        lume_fail("SDHCI stop");
     lume_puts("LUME: RESTARTING SYSTEM\n");
     lume_uart_flush();
     lume_value("PSCI_RESET_RETURNED", lume_psci_call(UINT64_C(0x84000009)));

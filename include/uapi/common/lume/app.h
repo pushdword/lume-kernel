@@ -53,7 +53,8 @@ enum
     LUME_NET = 37,
     LUME_IO = 38,
     LUME_FD = 39,
-    LUME_CRYPTO = 40
+    LUME_CRYPTO = 40,
+    LUME_SPAWN_ACTIONS = 41
 };
 
 enum

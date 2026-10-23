@@ -97,6 +97,14 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
     bool root_seen = false, root_closed = false, in_psci = false;
     bool memory[32] = {0}, reserved[32] = {0}, timer[32] = {0}, chosen[32] = {0};
     bool wifi[32] = {0}, mac_seen[32] = {0};
+
+    struct
+    {
+        bool host, reg, irq;
+        uint64_t base, size;
+        uint32_t number;
+    } sdhci[32] = {{0}};
+
     unsigned char mac[32][6] = {{0}};
     unsigned address_cells = 2, size_cells = 1;
     while (span(pos, 4, end))
@@ -124,6 +132,7 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             timer[depth] = depth == 1 && equals(b + pos, n + 1, "timer");
             chosen[depth] = depth == 1 && equals(b + pos, n + 1, "chosen");
             wifi[depth] = mac_seen[depth] = false;
+            sdhci[depth].host = sdhci[depth].reg = sdhci[depth].irq = false;
             pos += (uint32_t)((n + 4) & ~(size_t)3);
             if (pos > end)
                 return false;
@@ -133,6 +142,18 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
         { /* FDT_END_NODE */
             if (!depth)
                 return false;
+            /* Root-level SDHCI resources use the root address space and the Pi5 GIC SPI
+             * binding. Nested buses remain under the platform's firmware contract. */
+            if (depth == 2 && sdhci[1].host && sdhci[1].reg &&
+                sdhci[1].base == UINT64_C(0x1000fff000))
+            {
+                if (out->sdhci_valid || sdhci[1].size < 0x100 || !sdhci[1].irq)
+                    return false;
+                out->sdhci_base = sdhci[1].base;
+                out->sdhci_size = sdhci[1].size;
+                out->sdhci_irq = sdhci[1].number;
+                out->sdhci_valid = true;
+            }
             if (wifi[depth - 1] && mac_seen[depth - 1])
             {
                 unsigned any = 0;
@@ -161,6 +182,21 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             size_t key_len = length(key, strings_size - name);
             if (key_len == strings_size - name)
                 return false;
+            if (depth == 2 && equals(key, key_len + 1, "reg") && address_cells == 2 &&
+                size_cells == 2 && n == 16)
+            {
+                sdhci[1].base = be64(b + pos);
+                sdhci[1].size = be64(b + pos + 8);
+                if (sdhci[1].base > UINT64_MAX - sdhci[1].size)
+                    return false;
+                sdhci[1].reg = true;
+            }
+            if (depth == 2 && equals(key, key_len + 1, "interrupts") && n == 12 &&
+                be32(b + pos) == 0 && be32(b + pos + 4) < 988 && be32(b + pos + 8) == 4)
+            {
+                sdhci[1].number = be32(b + pos + 4) + 32;
+                sdhci[1].irq = true;
+            }
             if (depth == 1 && equals(key, key_len + 1, "#address-cells"))
             {
                 if (n != 4)
@@ -188,6 +224,8 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             }
             if (equals(key, key_len + 1, "compatible"))
             {
+                sdhci[depth - 1].host = contains(b + pos, n, "qemu,sdhci") ||
+                                        contains(b + pos, n, "brcm,bcm2712-sdhci");
                 wifi[depth - 1] = contains(b + pos, n, "brcm,bcm4329-fmac");
                 if (contains(b + pos, n, "brcm,bcm2712d0-pinctrl"))
                     out->bcm2712d0 = true;

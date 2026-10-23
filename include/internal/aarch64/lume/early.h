@@ -21,6 +21,9 @@ struct lume_fdt
     bool wifi_mac_valid;
     unsigned char wifi_mac[6];
     uint64_t initrd_start, initrd_end;
+    uint64_t sdhci_base, sdhci_size;
+    uint32_t sdhci_irq;
+    bool sdhci_valid;
 };
 
 bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out);
@@ -77,8 +80,12 @@ bool lume_tasks_check(uint64_t frequency);
 bool lume_elf_tasks_check(uint64_t frequency);
 bool lume_shell_start(uint64_t frequency, bool script);
 struct lume_context *lume_tasks_irq(struct lume_context *);
+struct lume_context *lume_tasks_device_irq(struct lume_context *);
 struct lume_context *lume_tasks_sync(struct lume_context *, uint64_t esr, uint64_t far);
 bool lume_tasks_active(void);
+bool lume_task_capable(unsigned pid, uint64_t capabilities);
+uint64_t lume_task_capabilities(unsigned pid);
+int lume_task_drop_capabilities(unsigned pid, uint64_t);
 void lume_run_user(struct lume_context *);
 extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_USER_BASE UINT64_C(0x40000000)

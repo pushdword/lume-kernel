@@ -13,6 +13,8 @@ static const uint64_t sectors = 122167296;
 static struct lume_volume bounds[2];
 static struct lume_boot_request request;
 static unsigned deep_found;
+static bool fail_reads, fail_writes;
+static unsigned failed_reads, failed_writes;
 
 void lume_puts(const char *text)
 {
@@ -51,6 +53,14 @@ static bool transfer(uint64_t sector, void *data, bool write)
     for (unsigned i = 0; i < 2; ++i)
         if (sector >= bounds[i].first && sector - bounds[i].first < bounds[i].count)
         {
+            if (write ? fail_writes : fail_reads)
+            {
+                if (write)
+                    ++failed_writes;
+                else
+                    ++failed_reads;
+                return false;
+            }
             if (write && !allowed[i])
                 return false;
             uint64_t position = (sector - bounds[i].first) * 512;
@@ -181,6 +191,28 @@ int main(int argc, char **argv)
     configuration(false);
     assert(lume_boot_call(2, LUME_BOOT_ACTIVATE, &request) == 0 && request.active == 1);
     configuration(true);
+    unsigned char original[4096], changed[4096], recovered[4096];
+    memset(original, 0x35, sizeof(original));
+    memset(changed, 0xa7, sizeof(changed));
+    assert(data_ops->create("/data/io-fault.bin", false) == 0);
+    assert(data_ops->write("/data/io-fault.bin", 0, original, sizeof(original)) ==
+           sizeof(original));
+    fail_writes = true;
+    assert(data_ops->write("/data/io-fault.bin", 0, changed, sizeof(changed)) == -LUME_EIO);
+    fail_writes = false;
+    assert(failed_writes && failed_writes < 16 && lume_storage_start());
+    assert(data_ops->read("/data/io-fault.bin", 0, recovered, sizeof(recovered)) ==
+           sizeof(recovered));
+    assert(!memcmp(recovered, original, sizeof(original)));
+    assert(lume_storage_start());
+    fail_reads = true;
+    assert(data_ops->read("/data/io-fault.bin", 0, recovered, sizeof(recovered)) == -LUME_EIO);
+    fail_reads = false;
+    assert(failed_reads && failed_reads < 16 && lume_storage_start());
+    assert(data_ops->read("/data/io-fault.bin", 0, recovered, sizeof(recovered)) ==
+           sizeof(recovered));
+    assert(!memcmp(recovered, original, sizeof(original)));
+    assert(data_ops->remove("/data/io-fault.bin") == 0);
     assert(lume_boot_call(2, LUME_BOOT_INFO, &request) == 0 && request.active == 1);
     request.total = 1048576;
     assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == 0);
@@ -188,6 +220,7 @@ int main(int argc, char **argv)
     configuration(true);
     fclose(volumes[0]);
     fclose(volumes[1]);
-    puts("PASS native FatFs slot write, readback, activation, abort, ownership and ordering");
+    puts(
+        "PASS native FatFs slot write, readback, activation, abort, ownership, ordering and injected I/O failures");
     return 0;
 }

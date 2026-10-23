@@ -1,5 +1,6 @@
 #include "lume/vfs.h"
 #include "alias.h"
+#include "lume/wait.h"
 #define NODES 192u
 #define CAPACITY 4096u
 #define RAM_FILES 32u
@@ -22,6 +23,7 @@ static struct open_file
 static struct channel
 {
     unsigned readers, writers, head, count;
+    struct lume_wait_queue readable, writable;
     unsigned char data[LUME_PIPE_BYTES];
 } channels[PIPES];
 
@@ -372,6 +374,8 @@ int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
                 --c->writers;
             else
                 --c->readers;
+            lume_wait_wake(&c->readable);
+            lume_wait_wake(&c->writable);
             if (!c->readers && !c->writers)
                 *c = (struct channel){0};
         }
@@ -421,6 +425,7 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
             ((unsigned char *)data)[i] = c->data[(c->head + i) % LUME_PIPE_BYTES];
         c->head = (c->head + (unsigned)bytes) % LUME_PIPE_BYTES;
         c->count -= (unsigned)bytes;
+        lume_wait_wake(&c->writable);
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
@@ -477,6 +482,7 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
         for (unsigned i = 0; i < bytes; ++i)
             c->data[(c->head + c->count + i) % LUME_PIPE_BYTES] = ((const unsigned char *)data)[i];
         c->count += (unsigned)bytes;
+        lume_wait_wake(&c->readable);
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
@@ -743,6 +749,14 @@ bool lume_vfs_pipe_wait(struct lume_files *f, uint64_t fd)
     return d && d->pipe >= 0 && !(d->status & LUME_FD_NONBLOCK);
 }
 
+struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *f, uint64_t fd, bool writing)
+{
+    struct open_file *d = descriptor(f, fd);
+    if (!d || d->pipe < 0 || (d->status & LUME_FD_NONBLOCK))
+        return 0;
+    return writing ? &channels[d->pipe].writable : &channels[d->pipe].readable;
+}
+
 static unsigned events(struct lume_files *f, int fd)
 {
     if (fd < 0)
@@ -769,6 +783,18 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
     if (r->version != LUME_FD_VERSION || r->bytes != sizeof(*r))
         return -LUME_EINVAL;
     struct open_file *d = descriptor(f, (unsigned)r->fd);
+    if (op == LUME_FD_GETMODE || op == LUME_FD_SETMODE)
+    {
+        if (!d)
+            return -LUME_EBADF;
+        if (r->other || r->buffer || r->count || r->timeout_ms ||
+            (op == LUME_FD_GETMODE ? r->flags != 0 : (r->flags & ~LUME_O_APPEND) != 0))
+            return -LUME_EINVAL;
+        if (op == LUME_FD_GETMODE)
+            return d->flags & (3u | LUME_O_APPEND);
+        d->flags = (d->flags & ~LUME_O_APPEND) | r->flags;
+        return 0;
+    }
     if (op == LUME_FD_INFO)
     {
         if (r->fd || r->other || r->flags || r->count || r->timeout_ms)
