@@ -1,6 +1,7 @@
 #include "lume/vfs.h"
 #include "alias.h"
 #include "lume/wait.h"
+#include "lume/devfs.h"
 #define NODES 192u
 #define CAPACITY 4096u
 #define RAM_FILES 32u
@@ -37,11 +38,13 @@ static struct node
     const unsigned char *image;
     uint64_t bytes;
     unsigned char *data;
+    struct lume_block *block;
 } default_nodes[NODES];
 static struct node *nodes = default_nodes;
 static unsigned node_capacity = NODES;
 
 static unsigned count;
+static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
 static unsigned char default_program_buffer[262144];
@@ -216,6 +219,87 @@ static void add(const char *p, unsigned kind, const void *data, size_t bytes, bo
     n->linked = true;
 }
 
+static void block_path(const struct lume_block *b, char out[LUME_PATH_MAX])
+{
+    copy(out, "/dev/", 5);
+    copy(out + 5, b->device->name, length(b->device->name) + 1);
+}
+
+static int add_block(struct lume_block *b)
+{
+    char p[LUME_PATH_MAX];
+    block_path(b, p);
+    if (find(p) >= 0)
+        return -LUME_EEXIST;
+    unsigned slot;
+    for (slot = 8; slot < count; ++slot)
+        if (!nodes[slot].linked && !nodes[slot].references && nodes[slot].block)
+            break;
+    if (slot == count)
+    {
+        if (count == node_capacity)
+            return -LUME_ENOSPC;
+        add(p, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes), !b->read_only);
+    }
+    else
+    {
+        nodes[slot] = (struct node){.kind = LUME_NODE_BLOCK,
+                                    .writable = !b->read_only,
+                                    .linked = true,
+                                    .bytes = b->sectors * b->sector_bytes};
+        copy(nodes[slot].path, p, length(p) + 1);
+    }
+    nodes[slot].block = b;
+    return 0;
+}
+
+int lume_devfs_register_block(struct lume_block *b)
+{
+    if (!b || !b->device || !b->ops || !b->ops->read || !b->sectors || !b->max_sectors ||
+        !b->sector_bytes || b->sector_bytes > 4096 || b->sectors > INT64_MAX / b->sector_bytes ||
+        (b->device->state != LUME_DEVICE_CLAIMED && b->device->state != LUME_DEVICE_READY))
+        return -LUME_EINVAL;
+    const char *name = b->device->name;
+    if (!name || !*name || length(name) > LUME_NAME_MAX || equal(name, ".") || equal(name, "..") ||
+        equal(name, "console"))
+        return -LUME_EINVAL;
+    for (const char *p = name; *p; ++p)
+        if (*p == '/')
+            return -LUME_EINVAL;
+    unsigned slot = LUME_DEVICE_LIMIT;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        if (block_devices[i] && equal(block_devices[i]->device->name, name))
+            return -LUME_EEXIST;
+        if (!block_devices[i] && slot == LUME_DEVICE_LIMIT)
+            slot = i;
+    }
+    if (slot == LUME_DEVICE_LIMIT)
+        return -LUME_ENOSPC;
+    int error = count ? add_block(b) : 0;
+    if (error)
+        return error;
+    block_devices[slot] = b;
+    return 0;
+}
+
+int lume_devfs_unregister_block(struct lume_block *b)
+{
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (b && block_devices[i] == b)
+        {
+            for (unsigned j = 0; j < count; ++j)
+                if (nodes[j].linked && nodes[j].block == b && nodes[j].references)
+                    return -LUME_EBUSY;
+            for (unsigned j = 0; j < count; ++j)
+                if (nodes[j].linked && nodes[j].block == b)
+                    nodes[j].linked = false;
+            block_devices[i] = 0;
+            return 0;
+        }
+    return b ? 0 : -LUME_EINVAL;
+}
+
 void lume_vfs_init(const void *shell, size_t bytes)
 {
     for (unsigned i = 0; i < OPEN_FILES; ++i)
@@ -237,6 +321,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
     static const char motd[] =
         "LumeOS AArch64 / Raspberry Pi 5\nPublic ABI 1.0; RAM VFS; GPIO UART console.\n";
     add("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (block_devices[i])
+            (void)add_block(block_devices[i]);
 }
 
 static int new_object(int node, int pipe, uint32_t flags)
@@ -339,11 +426,13 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     if (index < 0)
         return index;
     struct node *n = &nodes[index];
+    if (n->block && n->block->device->state != LUME_DEVICE_READY)
+        return -LUME_EIO;
     if ((flags & 3) && n->kind == LUME_NODE_DIR)
         return -LUME_EISDIR;
     if ((flags & 3) && !n->writable)
         return -LUME_EROFS;
-    if (flags & LUME_O_TRUNC)
+    if ((flags & LUME_O_TRUNC) && n->kind == LUME_NODE_FILE)
     {
         if (n->persistent)
         {
@@ -407,6 +496,69 @@ int64_t lume_vfs_remove_compat(struct lume_files *f, const char *input, bool dir
     return lume_vfs_remove(f, input, directory);
 }
 
+/* Byte requests use whole-sector transfers. Partial writes preserve the bytes
+ * outside the requested range with a read/modify/write in serialized context. */
+static int64_t block_io(struct open_file *d, struct node *n, void *data, uint64_t bytes,
+                        bool writing)
+{
+    struct lume_block *b = n->block;
+    if (b->device->state != LUME_DEVICE_READY)
+        return -LUME_EIO;
+    if (writing && b->read_only)
+        return -LUME_EROFS;
+    if (!bytes)
+        return 0;
+    if (d->offset >= n->bytes)
+        return writing ? -LUME_ENOSPC : 0;
+    if (bytes > n->bytes - d->offset)
+        bytes = n->bytes - d->offset;
+    unsigned char sector[4096];
+    unsigned char *p = data;
+    uint64_t done = 0;
+    while (done < bytes)
+    {
+        uint64_t first = d->offset / b->sector_bytes;
+        unsigned within = (unsigned)(d->offset % b->sector_bytes);
+        uint64_t remaining = bytes - done;
+        unsigned batch = 0;
+        if (!within && remaining >= b->sector_bytes)
+        {
+            uint64_t sectors = remaining / b->sector_bytes;
+            batch = sectors > b->max_sectors ? b->max_sectors : (unsigned)sectors;
+        }
+        uint64_t amount;
+        int error;
+        if (batch)
+        {
+            amount = (uint64_t)batch * b->sector_bytes;
+            error = writing ? lume_block_write(b, first, batch, p + done)
+                            : lume_block_read(b, first, batch, p + done);
+        }
+        else
+        {
+            amount = b->sector_bytes - within;
+            if (amount > remaining)
+                amount = remaining;
+            error = lume_block_read(b, first, 1, sector);
+            if (!error)
+            {
+                if (writing)
+                {
+                    copy(sector + within, p + done, (size_t)amount);
+                    error = lume_block_write(b, first, 1, sector);
+                }
+                else
+                    copy(p + done, sector + within, (size_t)amount);
+            }
+        }
+        if (error)
+            return done ? (int64_t)done : error;
+        d->offset += amount;
+        done += amount;
+    }
+    return (int64_t)done;
+}
+
 int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t bytes)
 {
     struct open_file *d = descriptor(f, fd);
@@ -429,6 +581,8 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
+    if (n->block)
+        return block_io(d, n, data, bytes, false);
     if (n->kind == LUME_NODE_DIR)
         return -LUME_EISDIR;
     if (!bytes)
@@ -486,6 +640,8 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
+    if (n->block)
+        return block_io(d, n, (void *)data, bytes, true);
     if (n->kind == LUME_NODE_CHAR)
     {
         if (bytes)
@@ -529,6 +685,17 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
     if (d->offset > n->bytes)
         n->bytes = d->offset;
     return (int64_t)bytes;
+}
+
+int64_t lume_vfs_sync(struct lume_files *f, uint64_t fd)
+{
+    struct open_file *d = descriptor(f, fd);
+    if (!d)
+        return -LUME_EBADF;
+    if (d->pipe >= 0)
+        return -LUME_EINVAL;
+    struct node *n = &nodes[d->node];
+    return n->block ? lume_block_sync(n->block) : 0;
 }
 
 int64_t lume_vfs_seek(struct lume_files *f, uint64_t fd, int64_t offset, uint64_t whence)
@@ -612,9 +779,10 @@ static int64_t stat_node(unsigned index, struct lume_stat *out)
 {
     const struct node *n = &nodes[index];
     *out = (struct lume_stat){index + 1, n->bytes, n->kind, 0};
-    return (n->kind == LUME_NODE_DIR    ? 0040555
-            : n->kind == LUME_NODE_CHAR ? 0020444
-                                        : 0100555) |
+    return (n->kind == LUME_NODE_DIR     ? 0040555
+            : n->kind == LUME_NODE_CHAR  ? 0020444
+            : n->kind == LUME_NODE_BLOCK ? 0060444
+                                         : 0100555) |
            (n->writable ? 0222 : 0);
 }
 
@@ -765,11 +933,15 @@ static unsigned events(struct lume_files *f, int fd)
     if (!d)
         return LUME_POLLNVAL;
     if (d->pipe < 0)
+    {
+        if (nodes[d->node].block && nodes[d->node].block->device->state != LUME_DEVICE_READY)
+            return LUME_POLLERR;
         return ((d->flags & 3) != LUME_O_WRONLY &&
                         (nodes[d->node].kind != LUME_NODE_CHAR || lume_console_ready())
                     ? LUME_POLLIN
                     : 0) |
                ((d->flags & 3) ? LUME_POLLOUT : 0);
+    }
     struct channel *c = &channels[d->pipe];
     if (!(d->flags & 3))
         return (c->count || !c->writers ? LUME_POLLIN : 0) | (!c->writers ? LUME_POLLHUP : 0);
@@ -942,7 +1114,7 @@ int64_t lume_vfs_remove(struct lume_files *f, const char *input, bool directory)
     if (i < 0)
         return i;
     struct node *n = &nodes[i];
-    if (!n->writable || equal(p, "/tmp") || equal(p, "/data"))
+    if (!n->writable || n->block || equal(p, "/tmp") || equal(p, "/data"))
         return -LUME_EROFS;
     if (directory && n->kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;

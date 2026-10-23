@@ -147,5 +147,36 @@ int main(void)
         assert(!lume_elf_load(3, elf, sizeof(elf), &image));
         assert(!allocated && !mappings && !image.pages);
     }
-    puts("PASS_ELF_LOAD large image/BSS/copy/metadata/allocation rollback/mapping rollback");
+    struct lume_elf_plan plan;
+    unsigned char *tls = elf + 64 + 2 * 56;
+    put(elf + 56, 2, 3);
+    put(tls, 4, 7);
+    put(tls + 8, 8, 4096 + 32);
+    put(tls + 16, 8, LUME_ELF_BASE + 0x200000 + 32);
+    put(tls + 32, 8, 16);
+    put(tls + 40, 8, 96);
+    put(tls + 48, 8, 16);
+    assert(lume_elf_plan(elf, sizeof(elf), &plan) && plan.tls_file == 16 && plan.tls_size == 96 &&
+           plan.tls_align == 16);
+    put(tls + 48, 8, 128);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 48, 8, 3);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 48, 8, 16);
+    put(tls + 32, 8, 97);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 32, 8, 16);
+    put(tls + 40, 8, 65537);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 40, 8, 96);
+    put(tls + 8, 8, 4096 + 64);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 8, 8, 4096 + 32);
+    put(tls + 16, 8, LUME_ELF_BASE + 0x100000);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    put(tls + 16, 8, LUME_ELF_BASE + 0x200000 + 32);
+    put(elf + 56, 2, 4);
+    memcpy(tls + 56, tls, 56);
+    assert(!lume_elf_plan(elf, sizeof(elf), &plan));
+    puts("PASS_ELF_LOAD large image/BSS/copy/rollback/TLS alignment, containment and duplicates");
 }

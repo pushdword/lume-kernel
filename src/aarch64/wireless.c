@@ -7,7 +7,7 @@ struct radio
     struct lume_wifi_caps caps;
     struct lume_wireless_ops ops;
     void *context;
-    bool busy;
+    bool busy, pending;
     struct lume_wifi_state state;
 };
 static struct radio radios[LUME_NET_INTERFACES];
@@ -45,6 +45,20 @@ static void sync(struct radio *r)
     struct lume_netif *dev = lume_netif_find(r->ifindex);
     lume_netif_sync(dev);
     lume_netif_info(dev, &i);
+    if (r->pending)
+    {
+        int result = r->ops.connect_status(r->context);
+        if (result == -LUME_EAGAIN && (i.flags & LUME_IF_UP))
+            return;
+        r->pending = false;
+        if (result || !(i.flags & LUME_IF_LINK))
+        {
+            r->ops.disconnect(r->context);
+            lume_netif_sync(dev);
+            state(r, LUME_WIFI_FAILED, LUME_EIO);
+            lume_netif_info(dev, &i);
+        }
+    }
     if (!(i.flags & LUME_IF_UP))
         state(r, LUME_WIFI_DOWN, 0);
     else if (i.flags & LUME_IF_LINK)
@@ -86,7 +100,7 @@ int lume_wireless_register(uint32_t n, const struct lume_wifi_caps *caps,
         (caps->bands & ~3u) || !caps->max_scan_results ||
         caps->max_scan_results > LUME_NET_SCAN_MAX || caps->max_ssid_bytes != 32 ||
         caps->country[0] < 'A' || caps->country[0] > 'Z' || caps->country[1] < 'A' ||
-        caps->country[1] > 'Z')
+        caps->country[1] > 'Z' || (!!ops->connect_begin != !!ops->connect_status))
         return -LUME_EINVAL;
     for (unsigned i = 0; i < sizeof(caps->reserved); ++i)
         if (caps->reserved[i])
@@ -137,7 +151,7 @@ int lume_wireless_scan(uint32_t n, struct lume_wifi_bss_info *out, unsigned cap)
         return -LUME_EINVAL;
     if (!(r->caps.features & LUME_WIFI_SCAN))
         return -LUME_ENOSYS;
-    if (r->busy)
+    if (r->busy || r->pending)
         return -LUME_EBUSY;
     if (!up(r))
         return -LUME_EPERM;
@@ -182,6 +196,7 @@ int lume_wireless_disconnect(uint32_t n)
     if (r->busy)
         return -LUME_EBUSY;
     r->busy = true;
+    r->pending = false;
     r->ops.disconnect(r->context);
     r->busy = false;
     r->state.ssid_bytes = 0;
@@ -202,7 +217,7 @@ int lume_wireless_connect(uint32_t n, const struct lume_wifi_connect *request)
         return -LUME_EINVAL;
     if (!(r->caps.features & LUME_WIFI_WPA2_CCMP))
         return -LUME_ENOSYS;
-    if (r->busy)
+    if (r->busy || r->pending)
         return -LUME_EBUSY;
     if (!up(r))
         return -LUME_EPERM;
@@ -226,6 +241,40 @@ int lume_wireless_connect(uint32_t n, const struct lume_wifi_connect *request)
     {
         r->ops.disconnect(r->context);
         lume_netif_sync(lume_netif_find(n));
+        state(r, LUME_WIFI_FAILED, LUME_EIO);
+    }
+    r->busy = false;
+    return ok ? 0 : -LUME_EIO;
+}
+
+int lume_wireless_connect_begin(uint32_t n, const struct lume_wifi_connect *request)
+{
+    struct radio *r = find(n);
+    if (!r)
+        return -LUME_ENOENT;
+    if (!request || !request->ssid_bytes || request->ssid_bytes > 32 || request->key_bytes < 8 ||
+        request->key_bytes > 63)
+        return -LUME_EINVAL;
+    if (!(r->caps.features & LUME_WIFI_WPA2_CCMP) || !r->ops.connect_begin)
+        return -LUME_ENOSYS;
+    if (r->busy || r->pending)
+        return -LUME_EBUSY;
+    if (!up(r))
+        return -LUME_EPERM;
+    (void)lume_wireless_disconnect(n);
+    r->busy = true;
+    state(r, LUME_WIFI_CONNECTING, 0);
+    bool ok = r->ops.connect_begin(r->context, request->ssid, request->ssid_bytes, request->key,
+                                  request->key_bytes);
+    if (ok)
+    {
+        memcpy(r->state.ssid, request->ssid, request->ssid_bytes);
+        r->state.ssid_bytes = (uint8_t)request->ssid_bytes;
+        r->pending = true;
+    }
+    else
+    {
+        r->ops.disconnect(r->context);
         state(r, LUME_WIFI_FAILED, LUME_EIO);
     }
     r->busy = false;

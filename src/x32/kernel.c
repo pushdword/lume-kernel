@@ -1728,7 +1728,7 @@ static int syscall(unsigned slot)
         break;
     }
     case LUME_QUANTUM:
-        if (p->uid || a < 100 || a > 1000)
+        if (p->uid || a < SCHED_TICK_MS || a > 1000)
         {
             result = -22;
             break;

@@ -24,6 +24,8 @@ struct lume_fdt
     uint64_t sdhci_base, sdhci_size;
     uint32_t sdhci_irq;
     bool sdhci_valid;
+    unsigned cpu_count;
+    uint64_t cpu_affinity[4];
 };
 
 bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out);
@@ -59,6 +61,7 @@ void lume_mmu_switch(uint64_t root);
 bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack);
 void lume_mmu_release_user(unsigned task);
 uint64_t lume_mmu_task_root(unsigned task);
+void lume_mmu_share_user(unsigned, unsigned);
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write);
 void lume_pages_start(const struct lume_fdt *, uint64_t dtb, uint64_t image_start,
                       uint64_t image_end);
@@ -94,7 +97,8 @@ extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_USER_STACK UINT64_C(0x5ff00000)
 #define LUME_STACK_PAGES 256u
 #define LUME_HEAP_BASE UINT64_C(0x48000000)
-#define LUME_HEAP_LIMIT (LUME_USER_STACK - 4096)
+#define LUME_THREAD_BASE UINT64_C(0x5f000000)
+#define LUME_HEAP_LIMIT (LUME_THREAD_BASE - 4096)
 #define LUME_TASK_LIMIT 8u
 
 static inline uint64_t lume_current_el(void)

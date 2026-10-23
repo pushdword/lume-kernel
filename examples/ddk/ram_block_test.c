@@ -7,6 +7,22 @@ extern struct lume_block lume_example_ram_block;
 int lume_example_ram_block_start(void);
 int lume_example_ram_block_stop(void);
 
+int lume_console_getc(void)
+{
+    return -LUME_EAGAIN;
+}
+
+bool lume_console_ready(void)
+{
+    return false;
+}
+
+void lume_console_write(const char *data, size_t bytes)
+{
+    (void)data;
+    (void)bytes;
+}
+
 int main(void)
 {
     unsigned char input[1024], output[1024];

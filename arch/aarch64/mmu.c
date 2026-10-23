@@ -1,4 +1,5 @@
 #include "lume/mmu.h"
+#include "lume/smp.h"
 #define ADDRESS UINT64_C(0x0000fffffffff000)
 
 void lume_sync_code(uint64_t address, size_t bytes)
@@ -42,12 +43,19 @@ void lume_mmu_switch(uint64_t base)
 bool lume_mmu_start(const struct lume_fdt *fdt)
 {
     extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[],
-        __stack_guard[], __worker_guard[];
+        __stack_guard[], __worker_guard[], __secondary_stacks[];
     struct lume_layout layout = {(uintptr_t)__image_start,  (uintptr_t)__text_end,
                                  (uintptr_t)__readonly_end, (uintptr_t)__image_end,
-                                 (uintptr_t)__stack_guard,  (uintptr_t)__worker_guard};
+                                 (uintptr_t)__stack_guard,  (uintptr_t)__worker_guard,
+                                 (uintptr_t)__secondary_stacks};
     if (!lume_mmu_tables(fdt, &layout))
         return false;
+    lume_mmu_secondary();
+    return true;
+}
+
+void lume_mmu_secondary(void)
+{
     uint64_t mair = 0xff00;
     /* 39-bit VA, 4 KiB, inner shareable WB walks, TTBR1 disabled, 40-bit PA. */
     uint64_t tcr = 25 | (UINT64_C(1) << 8) | (UINT64_C(1) << 10) | (UINT64_C(3) << 12) |
@@ -59,7 +67,6 @@ bool lume_mmu_start(const struct lume_fdt *fdt)
                      : "+r"(mair), "+r"(tcr), "+r"(base), "=r"(sctlr)::"memory");
     sctlr |= 1 | 4 | (UINT64_C(1) << 12) | (UINT64_C(1) << 19);
     __asm__ volatile("msr sctlr_el1, %0; isb" ::"r"(sctlr) : "memory");
-    return true;
 }
 
 static bool probe(uint64_t va, bool write, bool expected, uint64_t target)

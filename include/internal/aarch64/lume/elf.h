@@ -15,6 +15,7 @@ struct lume_elf_segment
 struct lume_elf_plan
 {
     uint64_t entry;
+    uint64_t tls_address, tls_file, tls_size, tls_align;
     unsigned count, pages;
     struct lume_elf_segment segments[LUME_ELF_SEGMENTS];
 };
@@ -22,6 +23,7 @@ struct lume_elf_plan
 struct lume_elf_image
 {
     uint64_t entry;
+    uint64_t tls_address, tls_file, tls_size, tls_align;
     unsigned count, task, metadata_pages;
 
     struct

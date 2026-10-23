@@ -1,0 +1,28 @@
+#ifndef LUME_SMP_H
+#define LUME_SMP_H
+#include "lume/early.h"
+#define LUME_CPU_LIMIT 4u
+
+static inline unsigned lume_cpu_index(void)
+{
+    uint64_t index;
+    __asm__ volatile("mrs %0, tpidr_el1" : "=r"(index));
+    return (unsigned)index;
+}
+
+unsigned lume_cpu_count(void);
+void lume_smp_configure(const struct lume_fdt *);
+void lume_smp_start(void);
+void lume_smp_lock(void);
+void lume_smp_unlock(void);
+bool lume_smp_owned(void);
+uint64_t lume_smp_wait_ticks(void);
+uint64_t lume_smp_wait_start(unsigned);
+void lume_smp_wake(void);
+void lume_smp_quiesce(void);
+_Noreturn void lume_secondary_main(unsigned);
+void lume_tasks_secondary(void);
+void lume_mmu_secondary(void);
+void lume_pi5_irq_secondary(void);
+uint64_t lume_psci_invoke(uint64_t, uint64_t, uint64_t, uint64_t);
+#endif

@@ -34,10 +34,34 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
     if (!headers || headers > 16 || phoff < 64 || !bounded(phoff, (uint64_t)headers * 56, size))
         return false;
     bool executable_entry = false;
+    bool tls_seen = false;
+    uint64_t tls_offset = 0;
     for (unsigned n = 0; n < headers; ++n)
     {
         const unsigned char *h = b + phoff + n * 56;
         unsigned type = le32(h), flags = le32(h + 4);
+        if (type == 7)
+        {
+            if (tls_seen)
+                return false;
+            tls_seen = true;
+            uint64_t address = le64(h + 16), file = le64(h + 32), memory = le64(h + 40),
+                     align = le64(h + 48);
+            if (!memory && !file)
+                continue;
+            if (!align)
+                align = 1;
+            if (!memory || memory > 65536 || file > memory || !bounded(le64(h + 8), file, size) ||
+                address < LUME_ELF_BASE || !bounded(address, memory, LUME_ELF_LIMIT) ||
+                align > 64 || (align & (align - 1)) || ((address - le64(h + 8)) & (align - 1)))
+                return false;
+            plan->tls_address = address;
+            plan->tls_file = file;
+            plan->tls_size = memory;
+            plan->tls_align = align;
+            tls_offset = le64(h + 8);
+            continue;
+        }
         if (type == 0 || type == 4 || type == 6)
             continue;
         if (type == 0x6474e551)
@@ -77,6 +101,23 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
     }
     if (!plan->count || !executable_entry)
         return false;
+    if (plan->tls_address)
+    {
+        bool contained = false;
+        for (unsigned i = 0; i < plan->count; ++i)
+        {
+            const struct lume_elf_segment *s = &plan->segments[i];
+            uint64_t delta = plan->tls_address - s->address;
+            if (plan->tls_address >= s->address && delta <= s->memory_size &&
+                plan->tls_size <= s->memory_size - delta &&
+                (!plan->tls_file ||
+                 (delta <= s->file_size && plan->tls_file <= s->file_size - delta &&
+                  tls_offset == s->offset + delta)))
+                contained = true;
+        }
+        if (!contained)
+            return false;
+    }
     plan->entry = entry;
     return true;
 }
@@ -142,6 +183,10 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
         }
     }
     image->entry = plan.entry;
+    image->tls_address = plan.tls_address;
+    image->tls_file = plan.tls_file;
+    image->tls_size = plan.tls_size;
+    image->tls_align = plan.tls_align;
     return true;
 fail:
     lume_elf_release(image);

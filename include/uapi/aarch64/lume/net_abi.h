@@ -72,7 +72,11 @@ enum lume_net_control_op
     LUME_NET_WIFI_CONNECT = 6,
     LUME_NET_WIFI_DISCONNECT = 7,
     LUME_NET_EVENTS = 8,
-    LUME_NET_DHCP_START = 9
+    LUME_NET_DHCP_START = 9,
+    /* BEGIN accepts work without waiting for a link or lease. Query WIFI_STATE and GET
+     * for completion. Existing synchronous operations retain their contracts. */
+    LUME_NET_DHCP_BEGIN = 10,
+    LUME_NET_WIFI_CONNECT_BEGIN = 11
 };
 
 struct lume_netif_info

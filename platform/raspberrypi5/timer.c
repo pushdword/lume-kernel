@@ -3,8 +3,19 @@
 #include "lume/counter.h"
 #include "lume/watchdog.h"
 #include "lume/irq.h"
+#include "lume/smp.h"
+#include "scheduler_config.h"
 #define TIMER_IRQ 30u
-static uint64_t interval, normal_interval, next_deadline;
+
+static struct
+{
+    uint64_t interval, normal_interval, next_deadline, input_interval;
+} timers[LUME_CPU_LIMIT];
+
+#define interval timers[lume_cpu_index()].interval
+#define normal_interval timers[lume_cpu_index()].normal_interval
+#define next_deadline timers[lume_cpu_index()].next_deadline
+#define input_interval timers[lume_cpu_index()].input_interval
 static volatile uint64_t timer_ticks;
 static bool registered;
 
@@ -18,8 +29,12 @@ static void timer_irq(unsigned irq, void *context)
 void lume_timer_start(uint64_t frequency)
 {
     __asm__ volatile("msr daifset, #2" ::: "memory");
-    interval = frequency / 20; /* Lume's 50 ms accounting tick. */
+    interval =
+        (frequency / 1000) * SCHED_TICK_MS + ((frequency % 1000) * SCHED_TICK_MS + 999) / 1000;
     normal_interval = interval;
+    input_interval = frequency / 2000;
+    if (!input_interval)
+        input_interval = 1;
     if (!interval)
         lume_fail("timer interval");
     if (!lume_pi5_irq_start())
@@ -53,7 +68,7 @@ void lume_timer_rearm(void)
 void lume_timer_idle(bool idle)
 {
     /* A polled 115200-baud RX FIFO needs servicing within a millisecond. */
-    interval = idle ? normal_interval / 100 : normal_interval;
+    interval = idle && !lume_cpu_index() ? input_interval : normal_interval;
     if (!interval)
         interval = 1;
     next_deadline = lume_counter_read() + interval;

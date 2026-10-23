@@ -13,6 +13,8 @@
 #include "lume/boot.h"
 #include "lume/device.h"
 #include "lume/worker.h"
+#include "lume/smp.h"
+#include "lume/counter.h"
 
 #ifndef LUME_BUILD_ID
 #define LUME_BUILD_ID "unversioned"
@@ -83,6 +85,11 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
         unsigned token = lume_irq_ack(), irq = token & 1023;
         if (irq >= 1020)
             return frame;
+        if (!irq)
+        {
+            lume_irq_eoi(token);
+            return lume_tasks_device_irq(frame);
+        }
         bool handled = lume_irq_dispatch(token);
         if (!handled)
             return frame;
@@ -115,10 +122,19 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
 {
     bool user = (frame->spsr & 15) == 0;
     if (user)
+        lume_task_trap_enter(lume_counter_read());
+    bool acquire = !lume_smp_owned();
+    if (acquire)
+        lume_smp_lock();
+    if (user)
         lume_task_account_enter(frame);
-    struct lume_context *result = exception_dispatch(frame, vector);
+    struct lume_context *result = user && lume_cpu_index() && !lume_tasks_active()
+                                      ? NULL
+                                      : exception_dispatch(frame, vector);
     if (user)
         lume_task_account_leave(result);
+    if (acquire)
+        lume_smp_unlock();
     return result;
 }
 
@@ -191,6 +207,7 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (!lume_mmu_start(&fdt) || !lume_mmu_check())
         lume_fail("MMU/cache/W^X/guard validation");
     lume_puts("LUME CHECK MMU CACHE WX GUARD PASS\n");
+    lume_smp_configure(&fdt);
     lume_pages_start(&fdt, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end);
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_pages_check())
@@ -249,7 +266,7 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
         if (fdt.initrd_start >= fdt.ram[i].base && fdt.initrd_end > fdt.initrd_start &&
             fdt.initrd_end <= fdt.ram[i].base + fdt.ram[i].size)
             root_valid = true;
-    if (!root_valid || (fdt.initrd_start < 0x400000 && fdt.initrd_end > 0x200000) ||
+    if (!root_valid || (fdt.initrd_start < (uintptr_t)__image_end && fdt.initrd_end > 0x200000) ||
         (fdt.initrd_start < dtb + fdt.size && dtb < fdt.initrd_end) ||
         !lume_vfs_mount_fat((const void *)(uintptr_t)fdt.initrd_start,
                             (size_t)(fdt.initrd_end - fdt.initrd_start)))

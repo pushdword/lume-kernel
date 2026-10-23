@@ -10,6 +10,8 @@ struct lume_wireless_ops
     bool (*connect)(void *, const unsigned char *, size_t, const unsigned char *, size_t);
     void (*disconnect)(void *);
     void (*peer)(void *, unsigned char[6]);
+    bool (*connect_begin)(void *, const unsigned char *, size_t, const unsigned char *, size_t);
+    int (*connect_status)(void *);
 };
 
 int lume_wireless_register(uint32_t, const struct lume_wifi_caps *,
@@ -18,6 +20,7 @@ int lume_wireless_capabilities(uint32_t, struct lume_wifi_caps *);
 int lume_wireless_state(uint32_t, struct lume_wifi_state *);
 int lume_wireless_scan(uint32_t, struct lume_wifi_bss_info *, unsigned);
 int lume_wireless_connect(uint32_t, const struct lume_wifi_connect *);
+int lume_wireless_connect_begin(uint32_t, const struct lume_wifi_connect *);
 int lume_wireless_disconnect(uint32_t);
 void lume_wireless_sync(void);
 #endif

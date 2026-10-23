@@ -4,7 +4,7 @@
 
 struct lume_layout
 {
-    uint64_t start, text_end, readonly_end, end, guard, worker_guard;
+    uint64_t start, text_end, readonly_end, end, guard, worker_guard, secondary_guard;
 };
 
 bool lume_mmu_tables(const struct lume_fdt *, const struct lume_layout *);

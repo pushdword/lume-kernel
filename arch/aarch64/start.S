@@ -61,6 +61,7 @@ boot_stack:
     isb
     eret
 boot_el1:
+    msr tpidr_el1, xzr
     mov x1, #0x300000
     msr cpacr_el1, x1
     isb
@@ -108,6 +109,59 @@ lume_psci_call:
     smc #0
     ldp x29, x30, [sp], #16
     ret
+
+.global lume_psci_invoke
+lume_psci_invoke:
+    stp x29, x30, [sp, #-16]!
+    smc #0
+    ldp x29, x30, [sp], #16
+    ret
+
+.global lume_secondary_entry
+lume_secondary_entry:
+    msr daifset, #15
+    mov x20, x0
+    msr tpidr_el1, x20
+    msr spsel, #1
+    ldr x1, =__secondary_stacks
+    mov x2, #0x1000
+    movk x2, #1, lsl #16
+    madd x1, x20, x2, x1
+    mov sp, x1
+    mrs x1, CurrentEL
+    cmp x1, #8
+    b.ne secondary_el1
+    mrs x1, cnthctl_el2
+    orr x1, x1, #3
+    msr cnthctl_el2, x1
+    msr cntvoff_el2, xzr
+    mov x1, #0x80000000
+    msr hcr_el2, x1
+    mov x1, #0x33ff
+    msr cptr_el2, x1
+    msr hstr_el2, xzr
+    mov x1, #0x0800
+    movk x1, #0x30d0, lsl #16
+    msr sctlr_el1, x1
+    mov x1, sp
+    msr sp_el1, x1
+    adr x1, secondary_el1
+    msr elr_el2, x1
+    mov x1, #0x3c5
+    msr spsr_el2, x1
+    isb
+    eret
+secondary_el1:
+    mov x1, #0x300000
+    msr cpacr_el1, x1
+    ldr x1, =lume_vectors
+    msr vbar_el1, x1
+    msr fpcr, xzr
+    msr fpsr, xzr
+    isb
+    mov x0, x20
+    bl lume_secondary_main
+    b lume_stop
 
 .balign 2048
 .global lume_vectors
@@ -262,11 +316,15 @@ lume_run_user:
     mrs x2, fpsr
     stp x1, x2, [sp, #64]
     ldr x1, =saved_kernel_sp
+    mrs x3, tpidr_el1
+    add x1, x1, x3, lsl #3
     mov x2, sp
     str x2, [x1]
     b restore_context
 user_finished:
     ldr x1, =saved_kernel_sp
+    mrs x3, tpidr_el1
+    add x1, x1, x3, lsl #3
     ldr x1, [x1]
     mov sp, x1
     ldp x1, x2, [sp, #64]
@@ -286,5 +344,5 @@ user_finished:
 .bss
 .balign 8
 saved_kernel_sp:
-    .skip 8
+    .skip 32
 .section .note.GNU-stack,"",%progbits

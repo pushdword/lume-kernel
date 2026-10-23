@@ -37,6 +37,7 @@ static bool data_in_flight;
 static uint32_t data_sent_at;
 static unsigned requests, responses, events;
 static uint32_t stage, last_mailbox;
+static uint32_t join_started;
 
 static uint32_t get32(const unsigned char *p)
 {
@@ -956,6 +957,13 @@ void lume_wifi_poll(void)
     }
     if (operational)
         authenticate();
+    if (joining && lume_wifi_link())
+    {
+        joining = false;
+        lume_puts("LUME CHECK WIFI WPA2 ASSOCIATION PASS\n");
+    }
+    else if (joining && (uint32_t)(lume_clock_millis() - join_started) >= 30000)
+        lume_wifi_leave();
 }
 
 int lume_wifi_receive(void *out, size_t cap)
@@ -1061,7 +1069,7 @@ void lume_wifi_leave(void)
     lume_secret_clear(&supplicant, sizeof(supplicant));
 }
 
-bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
+static bool join_begin(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
 {
     if (!configured || !ssid || !sn || sn > 32 || !key || kn < 8 || kn > 63)
         return false;
@@ -1069,6 +1077,7 @@ bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *k
     if (!start_interface())
         return false;
     joining = true;
+    join_started = lume_clock_millis();
     unsigned char network[36] = {0};
     size_t got;
     bool ok = lume_wpa_begin(&supplicant, station_mac, ssid, sn, key, kn, lume_entropy);
@@ -1080,6 +1089,14 @@ bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *k
     for (size_t i = 0; i < sn; ++i)
         network[4 + i] = ssid[i];
     ok = ok && control(26, true, network, sizeof(network), answer, sizeof(answer), &got) == 1;
+    if (!ok)
+        lume_wifi_leave();
+    return ok;
+}
+
+bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
+{
+    bool ok = join_begin(ssid, sn, key, kn);
     uint32_t start = lume_clock_millis();
     while (ok && joining && !lume_wifi_link() && (uint32_t)(lume_clock_millis() - start) < 30000)
     {
@@ -1092,7 +1109,6 @@ bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *k
         lume_wifi_leave();
         return false;
     }
-    lume_puts("LUME CHECK WIFI WPA2 ASSOCIATION PASS\n");
     return true;
 }
 
@@ -1171,6 +1187,19 @@ static void cyw_disconnect(void *ctx)
     lume_wifi_leave();
 }
 
+static bool cyw_connect_begin(void *ctx, const unsigned char *s, size_t sn, const unsigned char *k,
+                              size_t kn)
+{
+    (void)ctx;
+    return join_begin(s, sn, k, kn);
+}
+
+static int cyw_connect_status(void *ctx)
+{
+    (void)ctx;
+    return lume_wifi_link() ? 0 : operational && joining ? -LUME_EAGAIN : -LUME_EIO;
+}
+
 static void cyw_peer(void *ctx, unsigned char out[6])
 {
     (void)ctx;
@@ -1183,7 +1212,8 @@ bool lume_pi5_wifi_register(const unsigned char mac[6])
     static const struct lume_netif_ops data = {cyw_poll, cyw_link, cyw_receive, cyw_transmit,
                                                cyw_admin};
     static const struct lume_wireless_ops control = {cyw_scan, cyw_connect, cyw_disconnect,
-                                                     cyw_peer};
+                                                     cyw_peer, cyw_connect_begin,
+                                                     cyw_connect_status};
     const struct lume_wifi_caps caps = {LUME_WIFI_STATION | LUME_WIFI_SCAN | LUME_WIFI_WPA2_CCMP,
                                         LUME_WIFI_BAND_2GHZ | LUME_WIFI_BAND_5GHZ,
                                         32,

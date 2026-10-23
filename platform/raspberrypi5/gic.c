@@ -57,6 +57,17 @@ void lume_irq_eoi(unsigned token)
 static const struct lume_irq_controller operations = {configure, enable, lume_irq_eoi,
                                                       lume_irq_save, lume_irq_restore};
 
+void lume_pi5_irq_secondary(void)
+{
+    lume_mmio_write32_sync(GICD + 0x80, UINT32_MAX);
+    lume_mmio_write32_sync(GICD + 0x400, 0x80808080);
+    lume_mmio_write32_sync(GICD + 0x41c, 0x80808080);
+    lume_mmio_write32_sync(GICD + 0x100, 1u << 30 | 1u);
+    lume_mmio_write32_sync(GICC + 4, 0xff);
+    lume_mmio_write32_sync(GICC + 8, 0);
+    lume_mmio_write32_sync(GICC, 1);
+}
+
 bool lume_pi5_irq_start(void)
 {
     if (started)
@@ -75,6 +86,8 @@ bool lume_pi5_irq_start(void)
     lume_mmio_write32_sync(GICC + 8, 0);
     lume_mmio_write32_sync(GICC, 1);
     lume_mmio_write32_sync(GICD, 1);
+    configure(0, LUME_IRQ_EDGE);
+    enable(0, true);
     started = lume_irq_controller_start(&operations, lines) == 0;
     lume_irq_restore(flags);
     return started;

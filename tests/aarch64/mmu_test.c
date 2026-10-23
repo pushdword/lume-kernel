@@ -144,6 +144,14 @@ int main(void)
     budget = 0;
     CHECK(!lume_mmu_map_user(0, LUME_HEAP_BASE + 0x400000, 0x12600000, true, false));
     budget = -1;
+    lume_mmu_share_user(3, 0);
+    CHECK(lume_mmu_task_root(3) == lume_mmu_task_root(0));
+    CHECK(lume_mmu_translate(lume_mmu_task_root(3), LUME_HEAP_BASE + 0x200011, true, true, false,
+                             &pa) &&
+          pa == 0x12400011);
+    lume_mmu_release_user(3);
+    CHECK(lume_mmu_translate(lume_mmu_task_root(0), LUME_HEAP_BASE + 0x200011, true, true, false,
+                             &pa));
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         lume_mmu_release_user(i);
     CHECK(!allocated);
@@ -152,6 +160,22 @@ int main(void)
     CHECK(!allocated);
     budget = -1;
     layout.end = 0x400001;
+    CHECK(!lume_mmu_tables(&fdt, &layout));
+    layout.end = 0x500000;
+    layout.secondary_guard = 0x480000;
+    CHECK(lume_mmu_tables(&fdt, &layout));
+    root = lume_mmu_root();
+    CHECK(lume_mmu_translate(root, 0x400000, true, false, false, &pa) && pa == 0x400000);
+    CHECK(!lume_mmu_translate(root, 0x400000, false, false, true, &pa));
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        uint64_t guard = layout.secondary_guard + (uint64_t)i * 0x11000;
+        CHECK(!lume_mmu_translate(root, guard, true, false, false, &pa));
+        CHECK(lume_mmu_translate(root, guard + 4096, true, false, false, &pa));
+    }
+    ++layout.secondary_guard;
+    CHECK(!lume_mmu_tables(&fdt, &layout));
+    layout.secondary_guard = 0x4f0000;
     CHECK(!lume_mmu_tables(&fdt, &layout));
     printf("PASS_MMU_TABLES checks=%u\n", checks);
 }

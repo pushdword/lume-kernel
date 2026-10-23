@@ -218,6 +218,18 @@ static void wait_ms(unsigned ms)
     }
 }
 
+int lume_net_dhcp_begin(uint32_t index)
+{
+    struct adapter *a = find(index);
+    if (!a)
+        return -LUME_ENOENT;
+    lume_net_poll();
+    if (!netif_is_link_up(&a->ip))
+        return -LUME_EAGAIN;
+    netif_set_default(&a->ip);
+    return dhcp_start(&a->ip) == ERR_OK ? 0 : -LUME_EIO;
+}
+
 bool lume_net_dhcp(uint32_t index)
 {
     struct adapter *a = find(index);

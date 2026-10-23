@@ -21,14 +21,27 @@
  * fresh shared session. Further reads and observers retain that session. Exit or fault
  * unregisters the process. The last observer disables accounting. Process times, dispatch
  * counts and maximum ready time cover the session. Core masks retain the process lifetime
- * history. Observer removal does not require a separate stop syscall. */
+ * history. Observer removal does not require a separate stop syscall.
+ *
+ * Native AArch64 uses syscall 29 and version 2, with room for four CPUs. Version 1
+ * is accepted only when at most two CPUs are online. Native counters cover process
+ * lifetimes and continue without observers. Ready-time and detailed I/O totals are
+ * currently zero on that port. These fields do not measure its I/O latency.
+ * LUME_PERF_THREAD in state marks a user thread. Its parent is the process ID,
+ * and pid contains the low 32 bits of its generated thread handle. */
 #ifndef LUME_PERF_H
 #define LUME_PERF_H
 #include <stdint.h>
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#define LUME_PERF_VERSION 2u
+#define LUME_PERF_CORES 4u
+#else
 #define LUME_PERF_VERSION 1u
 #define LUME_PERF_CORES 2u
+#endif
 #define LUME_PERF_PROCESSES 8u
 #define LUME_PERF_SYSCALL 33u
+#define LUME_PERF_THREAD 0x100u
 
 enum
 {
@@ -69,5 +82,15 @@ struct lume_perf_snapshot
     struct lume_perf_totals totals;
 };
 
-_Static_assert(sizeof(struct lume_perf_snapshot) == 716, "telemetry v1 layout");
+struct lume_perf_snapshot_v1
+{
+    uint32_t version, bytes, clock_hz, uptime_ms, quantum_ms, core_count, process_count;
+    struct lume_perf_core cores[2];
+    struct lume_perf_process processes[LUME_PERF_PROCESSES];
+    struct lume_perf_totals totals;
+};
+_Static_assert(sizeof(struct lume_perf_snapshot_v1) == 716, "telemetry v1 layout");
+
+_Static_assert(sizeof(struct lume_perf_snapshot) == 644 + 36 * LUME_PERF_CORES,
+               "telemetry layout");
 #endif

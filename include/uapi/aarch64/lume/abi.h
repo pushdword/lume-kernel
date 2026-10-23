@@ -49,6 +49,11 @@ enum lume_syscall
     LUME_SYS_FEATURES = 35,
     LUME_SYS_RUN_ACTIONS = 36,
     LUME_SYS_CAP_DROP = 37,
+    /* CPU takes COUNT=0, INDEX=1 or QUANTUM_MS=2 in x0, with zero x1/x2.
+     * WAIT takes a PID or zero in x0 and a blocking flag in x1. Zero preserves
+     * nonblocking behavior. Its result packs the PID above a 32-bit exit status. */
+    LUME_SYS_CPU = 38,
+    LUME_SYS_THREAD = 39,
 };
 
 enum
@@ -106,7 +111,8 @@ enum
     LUME_NODE_FILE = 1,
     LUME_NODE_DIR = 2,
     LUME_NODE_CHAR = 3,
-    LUME_NODE_PIPE = 4
+    LUME_NODE_PIPE = 4,
+    LUME_NODE_BLOCK = 5
 };
 
 #define LUME_PATH_MAX 128u

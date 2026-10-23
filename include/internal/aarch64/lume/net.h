@@ -6,6 +6,7 @@ void lume_net_poll(void);
 int lume_net_snapshot(uint32_t, struct lume_netif_info *);
 void lume_net_release(uint32_t);
 bool lume_net_dhcp(uint32_t);
+int lume_net_dhcp_begin(uint32_t);
 bool lume_net_resolve(const char *, unsigned char[4]);
 bool lume_net_ping(const char *, unsigned char[4]);
 bool lume_net_tcp(const char *);

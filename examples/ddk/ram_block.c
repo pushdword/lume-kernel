@@ -1,5 +1,6 @@
 #include <lume/block.h>
 #include <lume/abi.h>
+#include <lume/devfs.h>
 
 static unsigned char storage[8][512];
 static struct lume_device device;
@@ -38,13 +39,13 @@ static int start(struct lume_device *d)
                                                  .sectors = 8,
                                                  .sector_bytes = 512,
                                                  .max_sectors = 8};
-    return 0;
+    return lume_devfs_register_block(&lume_example_ram_block);
 }
 
 static int stop(struct lume_device *d)
 {
     (void)d;
-    return 0;
+    return lume_devfs_unregister_block(&lume_example_ram_block);
 }
 static const struct lume_driver_ops driver_ops = {.start = start, .stop = stop};
 static struct lume_device device = {.version = LUME_DDK_VERSION,

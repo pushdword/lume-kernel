@@ -17,13 +17,13 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
     uint64_t cursor = r->cursor, reserved = r->reserved;
     uint32_t count = r->count, lost = r->lost;
     struct lume_wifi_connect connect = {0};
-    if (op == LUME_NET_WIFI_CONNECT)
+    if (op == LUME_NET_WIFI_CONNECT || op == LUME_NET_WIFI_CONNECT_BEGIN)
         connect = r->data.connect;
     memset(r, 0, sizeof(*r));
     r->version = LUME_NET_CONTROL_VERSION;
     r->ifindex = index;
     int result = 0;
-    if (op > LUME_NET_DHCP_START || version != LUME_NET_CONTROL_VERSION || reserved || count ||
+    if (op > LUME_NET_WIFI_CONNECT_BEGIN || version != LUME_NET_CONTROL_VERSION || reserved || count ||
         lost || (op != LUME_NET_EVENTS && cursor) || (op == LUME_NET_ENUM && index) ||
         (op != LUME_NET_ENUM && op != LUME_NET_EVENTS && !index))
         result = -LUME_EINVAL;
@@ -78,6 +78,7 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         }
         break;
     case LUME_NET_WIFI_CONNECT:
+    case LUME_NET_WIFI_CONNECT_BEGIN:
     {
         struct lume_wifi_caps caps;
         result = lume_wireless_capabilities(index, &caps);
@@ -93,7 +94,9 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         if (!result)
         {
             lume_net_release(index);
-            result = lume_wireless_connect(index, &connect);
+            result = op == LUME_NET_WIFI_CONNECT_BEGIN
+                         ? lume_wireless_connect_begin(index, &connect)
+                         : lume_wireless_connect(index, &connect);
         }
         if (!result)
         {
@@ -129,6 +132,11 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         if (!lume_net_dhcp(index))
             result = -LUME_EAGAIN;
         else
+            result = lume_net_snapshot(index, &r->data.interfaces[0]);
+        break;
+    case LUME_NET_DHCP_BEGIN:
+        result = lume_net_dhcp_begin(index);
+        if (!result)
             result = lume_net_snapshot(index, &r->data.interfaces[0]);
         break;
     default:

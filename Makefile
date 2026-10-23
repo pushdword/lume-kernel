@@ -105,6 +105,13 @@ KERNEL_S += src/x32/kernel_work.s
 endif
 SCRIPT := arch/$(ARCH)/kernel.ld
 endif
+ifneq ($(strip $(SCHED_QUANTUM_MS)),)
+SCHED_CPPFLAGS += -DLUME_SCHED_QUANTUM=$(SCHED_QUANTUM_MS)
+endif
+ifneq ($(strip $(SCHED_INTERVAL_MS)),)
+SCHED_CPPFLAGS += -DSCHED_TICK_MS=$(SCHED_INTERVAL_MS)
+endif
+CPPFLAGS += $(SCHED_CPPFLAGS)
 OBJECTS := $(addprefix $(OUT)/obj/,$(addsuffix .o,$(KERNEL_S) $(KERNEL_C)))
 .PHONY: all headers check check-image clean
 all: $(PAYLOAD) headers
@@ -133,7 +140,7 @@ $(OUT)/image-tool$(HOSTEXE): tools/image.cpp
 $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
 TEST_CPPFLAGS := -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
-TEST_NAMES := ddk fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream vfs heap user-stack mmu elf-load font
+TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream vfs heap user-stack mmu elf-load font
 .PHONY: check-boot-storage
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/aarch64/boot_storage_test.c src/aarch64/storage.c src/aarch64/boot_storage.c src/aarch64/volume.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
@@ -142,11 +149,12 @@ check-boot-storage: $(OUT)/tests/boot-storage$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
 check-image: $(OUT)/tests/root-image$(HOSTEXE)
 	env "$(OUT)/tests/root-image$(HOSTEXE)" "$(ROOT_IMAGE)"
-$(OUT)/tests/root-image$(HOSTEXE): tests/aarch64/root_image_test.c src/aarch64/vfs.c src/aarch64/fat.c
+$(OUT)/tests/root-image$(HOSTEXE): tests/aarch64/root_image_test.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
-check: $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_NAMES)))
+check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_NAMES)))
 	env "$(OUT)/tests/ddk$(HOSTEXE)"
+	env "$(OUT)/tests/devfs$(HOSTEXE)"
 	env "$(OUT)/tests/fdt-device$(HOSTEXE)"
 	env "$(OUT)/tests/fdt-initrd$(HOSTEXE)"
 	env "$(OUT)/tests/usb$(HOSTEXE)"
@@ -164,6 +172,13 @@ check: $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_NAMES)))
 	env "$(OUT)/tests/mmu$(HOSTEXE)"
 	env "$(OUT)/tests/elf-load$(HOSTEXE)"
 	env "$(OUT)/tests/font$(HOSTEXE)"
+
+.PHONY: check-scheduler
+check-scheduler: $(foreach c,1 2 4,$(OUT)/tests/scheduler-$(c)$(HOSTEXE))
+	$(foreach c,1 2 4,env "$(OUT)/tests/scheduler-$(c)$(HOSTEXE)" &&) true
+$(OUT)/tests/scheduler-%$(HOSTEXE): tests/common/scheduler_test.c src/common/scheduler.h src/common/scheduler_config.h $(OUT)/configuration
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(SCHED_CPPFLAGS) -Isrc/common -DSCHED_CPUS=$* "$<" -o "$@"
 $(OUT)/tests/fdt-initrd$(HOSTEXE): tests/aarch64/fdt_initrd_test.c src/aarch64/fdt.c
 $(OUT)/tests/fdt-device$(HOSTEXE): tests/aarch64/fdt_device_test.c src/aarch64/fdt.c
 $(OUT)/tests/ddk$(HOSTEXE): tests/aarch64/ddk_test.c src/aarch64/device.c src/aarch64/irq.c src/aarch64/dma.c src/aarch64/block.c src/aarch64/work.c
@@ -172,7 +187,8 @@ $(OUT)/tests/uart-input$(HOSTEXE): tests/aarch64/uart_input_test.c
 $(OUT)/tests/volume$(HOSTEXE): tests/aarch64/volume_test.c src/aarch64/volume.c
 $(OUT)/tests/watchdog$(HOSTEXE): tests/aarch64/watchdog_test.c src/aarch64/watchdog.c
 $(OUT)/tests/stream$(HOSTEXE): tests/aarch64/stream_test.c src/aarch64/stream.c
-$(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/fat.c
+$(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
+$(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/aarch64/heap_test.c src/aarch64/heap.c
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/aarch64/sdio_test.c src/aarch64/sdio.c

@@ -19,7 +19,7 @@ static unsigned checks, polls, releases, dhcps;
 
 struct fake
 {
-    bool link, fail_tx, fail_admin, fail_connect;
+    bool link, fail_tx, fail_admin, fail_connect, pending;
     int receive, scan_mode;
     unsigned sent, received, scans, connects, disconnects;
     uint32_t index;
@@ -116,7 +116,23 @@ static void peer(void *ctx, unsigned char out[6])
     (void)ctx;
     memset(out, 0x42, 6);
 }
-static const struct lume_wireless_ops wifi_ops = {scan, connect, disconnect, peer};
+static bool connect_begin(void *ctx, const unsigned char *s, size_t sn, const unsigned char *k,
+                          size_t kn)
+{
+    struct fake *f = ctx;
+    bool ok = connect(ctx, s, sn, k, kn);
+    f->link = false;
+    f->pending = ok;
+    return ok;
+}
+
+static int connect_status(void *ctx)
+{
+    struct fake *f = ctx;
+    return f->link ? 0 : f->pending ? -LUME_EAGAIN : -LUME_EIO;
+}
+static const struct lume_wireless_ops wifi_ops = {scan, connect, disconnect, peer,
+                                                  connect_begin, connect_status};
 
 /* The dispatcher sees stack services only through the generic boundary. */
 void lume_net_poll(void)
@@ -145,6 +161,12 @@ bool lume_net_dhcp(uint32_t index)
     CHECK(lume_netif_find(index) != 0);
     ++dhcps;
     return true;
+}
+int lume_net_dhcp_begin(uint32_t index)
+{
+    CHECK(lume_netif_find(index) != 0);
+    ++dhcps;
+    return 0;
 }
 static struct lume_net_control request;
 
@@ -285,7 +307,7 @@ int main(void)
     request.count = 1;
     CHECK(lume_net_control(0, &request) == -LUME_EINVAL);
     init(0);
-    CHECK(lume_net_control(10, &request) == -LUME_EINVAL);
+    CHECK(lume_net_control(12, &request) == -LUME_EINVAL);
     init(99);
     CHECK(lume_net_control(LUME_NET_GET, &request) == -LUME_ENOENT);
     init(2);
@@ -306,6 +328,25 @@ int main(void)
         CHECK(((unsigned char *)&request.data)[i] == 0);
     init(2);
     CHECK(lume_net_control(LUME_NET_DHCP_START, &request) == 0 && dhcps == 1);
+    init(2);
+    request.data.connect = credentials;
+    CHECK(lume_net_control(LUME_NET_WIFI_CONNECT_BEGIN, &request) == 0 && !wifi.link);
+    CHECK(request.data.wireless.state == LUME_WIFI_CONNECTING);
+    CHECK(lume_wireless_scan(2, aps, 1) == -LUME_EBUSY);
+    CHECK(lume_wireless_connect_begin(2, &credentials) == -LUME_EBUSY);
+    CHECK(lume_wireless_state(2, &state) == 0 && state.state == LUME_WIFI_CONNECTING);
+    wifi.pending = false;
+    wifi.link = true;
+    CHECK(lume_wireless_state(2, &state) == 0 && state.state == LUME_WIFI_CONNECTED &&
+          state.ssid_bytes == 4 && !memcmp(state.ssid, "test", 4));
+    init(2);
+    CHECK(lume_net_control(LUME_NET_DHCP_BEGIN, &request) == 0 && dhcps == 2);
+    CHECK(lume_wireless_connect_begin(2, &credentials) == 0);
+    wifi.pending = false;
+    CHECK(lume_wireless_state(2, &state) == 0 && state.state == LUME_WIFI_FAILED && !wifi.link);
+    CHECK(lume_wireless_connect_begin(2, &credentials) == 0);
+    CHECK(lume_wireless_disconnect(2) == 0);
+    CHECK(lume_wireless_state(2, &state) == 0 && state.state == LUME_WIFI_DISCONNECTED);
     init(2);
     CHECK(lume_net_control(LUME_NET_WIFI_DISCONNECT, &request) == 0 && !wifi.link);
     init(2);

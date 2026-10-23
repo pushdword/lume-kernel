@@ -97,6 +97,8 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
     bool root_seen = false, root_closed = false, in_psci = false;
     bool memory[32] = {0}, reserved[32] = {0}, timer[32] = {0}, chosen[32] = {0};
     bool wifi[32] = {0}, mac_seen[32] = {0};
+    bool cpus = false, cpu = false, cpu_reg = false, cpu_enabled = true;
+    uint64_t affinity = 0;
 
     struct
     {
@@ -123,7 +125,17 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
                 root_seen = true;
             }
             if (depth == 1)
+            {
                 in_psci = equals(b + pos, n + 1, "psci");
+                cpus = equals(b + pos, n + 1, "cpus");
+            }
+            if (depth == 2 && cpus)
+            {
+                cpu = n >= 4 && b[pos] == 'c' && b[pos + 1] == 'p' && b[pos + 2] == 'u' &&
+                      b[pos + 3] == '@';
+                cpu_reg = false;
+                cpu_enabled = true;
+            }
             memory[depth] = depth == 1 && n >= 7 && b[pos] == 'm' && b[pos + 1] == 'e' &&
                             b[pos + 2] == 'm' && b[pos + 3] == 'o' && b[pos + 4] == 'r' &&
                             b[pos + 5] == 'y' && (b[pos + 6] == '@' || b[pos + 6] == 0);
@@ -142,6 +154,15 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
         { /* FDT_END_NODE */
             if (!depth)
                 return false;
+            if (depth == 3 && cpus && cpu && cpu_reg && cpu_enabled)
+            {
+                if (out->cpu_count == 4)
+                    return false;
+                for (unsigned i = 0; i < out->cpu_count; ++i)
+                    if (out->cpu_affinity[i] == affinity)
+                        return false;
+                out->cpu_affinity[out->cpu_count++] = affinity;
+            }
             /* Root-level SDHCI resources use the root address space and the Pi5 GIC SPI
              * binding. Nested buses remain under the platform's firmware contract. */
             if (depth == 2 && sdhci[1].host && sdhci[1].reg &&
@@ -182,6 +203,18 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             size_t key_len = length(key, strings_size - name);
             if (key_len == strings_size - name)
                 return false;
+            if (depth == 3 && cpus && cpu)
+            {
+                if (equals(key, key_len + 1, "reg"))
+                {
+                    if (n != 4 && n != 8)
+                        return false;
+                    affinity = n == 8 ? be64(b + pos) : be32(b + pos);
+                    cpu_reg = true;
+                }
+                if (equals(key, key_len + 1, "status"))
+                    cpu_enabled = contains(b + pos, n, "okay") || contains(b + pos, n, "ok");
+            }
             if (depth == 2 && equals(key, key_len + 1, "reg") && address_cells == 2 &&
                 size_cells == 2 && n == 16)
             {

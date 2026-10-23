@@ -5,6 +5,8 @@
 #include "lume/heap.h"
 #include "lume/device.h"
 #include "lume/boot.h"
+#include "lume/smp.h"
+#include "scheduler_config.h"
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -30,6 +32,11 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return LUME_ABI_VERSION;
     case LUME_SYS_GETPID:
         return pid;
+    case LUME_SYS_CPU:
+        return b || n || a > 2 ? -LUME_EINVAL
+               : a == 2        ? LUME_SCHED_QUANTUM
+               : a             ? lume_cpu_index()
+                               : lume_cpu_count();
     case LUME_SYS_CAP_DROP:
         return b || n ? -LUME_EINVAL : lume_task_drop_capabilities(pid, a);
     case LUME_SYS_FEATURES:
@@ -40,7 +47,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EFAULT;
         *(struct lume_system_features *)(uintptr_t)a = (struct lume_system_features){
             .abi = LUME_ABI_VERSION,
-            .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES,
+            .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES |
+                        LUME_FEATURE_THREADS | LUME_FEATURE_SMP,
             .pointer_bits = 64,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
@@ -95,6 +103,30 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_TELEMETRY:
         if (!a && !b && !n)
             return lume_task_observed();
+        if (n == 1 && b == sizeof(struct lume_perf_snapshot_v1) && lume_cpu_count() <= 2)
+        {
+            if (!lume_user_buffer(a, b, true))
+                return -LUME_EFAULT;
+            struct lume_perf_snapshot current;
+            lume_task_telemetry(pid, &current);
+            struct lume_perf_snapshot_v1 *legacy = (void *)(uintptr_t)a;
+            *legacy = (struct lume_perf_snapshot_v1){.version = 1,
+                                                     .bytes = sizeof(*legacy),
+                                                     .clock_hz = current.clock_hz,
+                                                     .uptime_ms = current.uptime_ms,
+                                                     .quantum_ms = current.quantum_ms,
+                                                     .core_count = current.core_count,
+                                                     .process_count = current.process_count};
+            for (unsigned i = 0; i < 2; ++i)
+                legacy->cores[i] = current.cores[i];
+            for (unsigned i = 0; i < LUME_PERF_PROCESSES; ++i)
+            {
+                legacy->processes[i] = current.processes[i];
+                legacy->processes[i].state &= ~LUME_PERF_THREAD;
+            }
+            legacy->totals = current.totals;
+            return 0;
+        }
         if (b != sizeof(struct lume_perf_snapshot) || n != LUME_PERF_VERSION)
             return -LUME_EINVAL;
         if (!lume_user_buffer(a, b, true))
@@ -113,7 +145,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                                             : lume_vfs_remove_compat(files, p, n != 0);
         }
         if (a == LUME_FS_SYNC)
-            return lume_vfs_stat(files, b, &stat);
+            return lume_vfs_sync(files, b);
         if (a == LUME_FS_TRUNCATE)
             return lume_vfs_truncate(files, b);
         if (a == LUME_FS_RENAME)
@@ -181,10 +213,11 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_NETCTL:
     {
         if ((a == LUME_NET_ADMIN || a == LUME_NET_WIFI_CONNECT || a == LUME_NET_WIFI_DISCONNECT ||
-             a == LUME_NET_DHCP_START || a == LUME_NET_WIFI_SCAN) &&
+             a == LUME_NET_DHCP_START || a == LUME_NET_WIFI_SCAN || a == LUME_NET_DHCP_BEGIN ||
+             a == LUME_NET_WIFI_CONNECT_BEGIN) &&
             !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
             return -LUME_EPERM;
-        if (a > LUME_NET_DHCP_START || n != sizeof(struct lume_net_control))
+        if (a > LUME_NET_WIFI_CONNECT_BEGIN || n != sizeof(struct lume_net_control))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;

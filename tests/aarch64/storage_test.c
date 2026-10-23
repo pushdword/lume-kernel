@@ -43,6 +43,11 @@ int lume_console_getc(void)
     return -LUME_EAGAIN;
 }
 
+bool lume_console_ready(void)
+{
+    return false;
+}
+
 void lume_console_write(const char *data, size_t bytes)
 {
     (void)data;

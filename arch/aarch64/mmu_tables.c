@@ -12,10 +12,11 @@
 #define PXN (UINT64_C(1) << 53)
 #define UXN (UINT64_C(1) << 54)
 #define NORMAL (AF | INNER | (UINT64_C(1) << 2))
-static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[512];
+static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[2][512];
 static _Alignas(4096) uint64_t soc_l2[512], rp1_l2[512], pcie_l2[512];
 #define USER_BLOCKS ((LUME_USER_LIMIT - LUME_USER_BASE) / BLOCK)
 static uint64_t *user_tables[LUME_TASK_LIMIT][USER_BLOCKS];
+static unsigned shared_user[LUME_TASK_LIMIT];
 static _Alignas(4096) uint64_t user_root[LUME_TASK_LIMIT][512], user_l2[LUME_TASK_LIMIT][512],
     user_l3[LUME_TASK_LIMIT][512];
 
@@ -32,19 +33,23 @@ static void zero(uint64_t *p, unsigned count)
 
 bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layout)
 {
-    if (!fdt->ram_count || layout->start != 0x200000 || layout->end > 0x400000 ||
+    if (!fdt->ram_count || layout->start != 0x200000 || layout->end > 0x600000 ||
         layout->text_end < layout->start || layout->readonly_end < layout->text_end ||
         layout->end < layout->readonly_end || layout->guard < layout->readonly_end ||
         layout->guard >= layout->end ||
         (layout->worker_guard &&
          (layout->worker_guard < layout->readonly_end || layout->worker_guard >= layout->end ||
           (layout->worker_guard & 4095))) ||
+        (layout->secondary_guard &&
+         ((layout->secondary_guard & 4095) || layout->secondary_guard < layout->readonly_end ||
+          layout->secondary_guard > layout->end ||
+          layout->end - layout->secondary_guard < 3 * 0x11000)) ||
         ((layout->start | layout->text_end | layout->readonly_end | layout->end | layout->guard) &
          4095))
         return false;
     zero(root, 512);
     zero(&ram_l2[0][0], 8 * 512);
-    zero(image_l3, 512);
+    zero(&image_l3[0][0], 1024);
     zero(soc_l2, 512);
     zero(rp1_l2, 512);
     zero(pcie_l2, 512);
@@ -69,10 +74,15 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
         }
     }
     root[0] = table(ram_l2[0]);
-    ram_l2[0][1] = table(image_l3);
+    ram_l2[0][1] = table(image_l3[0]);
+    if (layout->end > 0x400000)
+        ram_l2[0][2] = table(image_l3[1]);
     for (uint64_t p = layout->start; p < layout->end; p += PAGE)
     {
-        if (p == layout->guard || p == layout->worker_guard)
+        if (p == layout->guard || p == layout->worker_guard ||
+            (layout->secondary_guard && p >= layout->secondary_guard &&
+             p < layout->secondary_guard + 3 * 0x11000 &&
+             (p - layout->secondary_guard) % 0x11000 == 0))
             continue;
         uint64_t flags = NORMAL | UXN | 3;
         if (p < layout->text_end)
@@ -81,7 +91,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
             flags |= RO | PXN;
         else
             flags |= PXN;
-        image_l3[(p >> 12) & 511] = p | flags;
+        image_l3[(p - layout->start) / BLOCK][(p >> 12) & 511] = p | flags;
     }
     /* GIC, PCIe inbound DMA controls, and inherited RP1 MMIO. */
     root[UINT64_C(0x1000000000) >> 30] = table(pcie_l2);
@@ -105,13 +115,25 @@ uint64_t lume_mmu_root(void)
 
 uint64_t lume_mmu_task_root(unsigned task)
 {
+    if (task < LUME_TASK_LIMIT && shared_user[task])
+        task = shared_user[task] - 1;
     return task < LUME_TASK_LIMIT ? (uintptr_t)user_root[task] : 0;
+}
+
+void lume_mmu_share_user(unsigned task, unsigned owner)
+{
+    shared_user[task] = owner + 1;
 }
 
 void lume_mmu_release_user(unsigned task)
 {
     if (task >= LUME_TASK_LIMIT)
         return;
+    if (shared_user[task])
+    {
+        shared_user[task] = 0;
+        return;
+    }
     for (unsigned block = 0; block < USER_BLOCKS; ++block)
     {
         uint64_t *p = user_tables[task][block];
@@ -176,6 +198,9 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
     if (!entry || *entry)
         return false;
     *entry = pa | NORMAL | USER | PXN | 3 | (write ? 0 : RO) | (execute ? 0 : UXN);
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst" ::: "memory");
+#endif
     return true;
 }
 
@@ -185,7 +210,12 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
     {
         uint64_t *entry = user_entry(task, va, false);
         if (entry)
+        {
             *entry = 0;
+#ifdef __aarch64__
+            __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+#endif
+        }
     }
 }
 

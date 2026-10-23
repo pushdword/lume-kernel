@@ -34,6 +34,7 @@ int64_t lume_vfs_stat_inode(uint64_t, struct lume_stat *);
 int64_t lume_vfs_close(struct lume_files *, uint64_t fd);
 int64_t lume_vfs_read(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
 int64_t lume_vfs_write(struct lume_files *, uint64_t fd, const void *, uint64_t bytes);
+int64_t lume_vfs_sync(struct lume_files *, uint64_t fd);
 int64_t lume_vfs_seek(struct lume_files *, uint64_t fd, int64_t offset, uint64_t whence);
 int64_t lume_vfs_stat(struct lume_files *, uint64_t fd, struct lume_stat *);
 int64_t lume_vfs_stat_mode(struct lume_files *, uint64_t, struct lume_stat *);
