@@ -47,7 +47,8 @@ static unsigned count;
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
-static unsigned char default_program_buffer[262144];
+/* Boot installs dynamically allocated staging before loading programs. */
+static unsigned char default_program_buffer[65536];
 static void *program_buffer = default_program_buffer;
 static size_t program_capacity = sizeof(default_program_buffer);
 static void *(*program_allocate)(size_t);

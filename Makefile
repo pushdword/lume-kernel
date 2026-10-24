@@ -36,6 +36,7 @@ CFLAGS := -O2 -std=c11 -mcpu=cortex-a76 -mstrict-align -fno-pic -fno-pie $(COMMO
 CPPFLAGS := -DLUME_BOOT_PROFILE=$(PROFILE_ID) -DLUME_SD_POLL=$(SD_POLL) -Isrc/common -Iinclude/freestanding -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/fatfs -Ivendor/aarch64/lwip/src/include -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 KERNEL_C := $(wildcard src/aarch64/*.c platform/raspberrypi5/*.c vendor/aarch64/lwip/src/core/*.c vendor/aarch64/lwip/src/core/ipv4/*.c) vendor/aarch64/lwip/src/netif/ethernet.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c vendor/aarch64/mbedtls/library/aes.c vendor/aarch64/mbedtls/library/sha1.c arch/aarch64/mmu.c arch/aarch64/mmu_tables.c src/common/terminal.c src/common/font5x7.c
 KERNEL_C += arch/aarch64/dma.c
+KERNEL_C := $(filter-out %/gem.c,$(KERNEL_C))
 ifeq ($(DEBUG),1)
 CFLAGS += -g -fno-omit-frame-pointer
 endif

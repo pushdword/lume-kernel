@@ -67,6 +67,75 @@ static bool ranges(struct lume_range *out, unsigned *count, unsigned limit, cons
     return true;
 }
 
+struct fdt_device
+{
+    const unsigned char *reg, *mapping;
+    uint32_t reg_bytes, mapping_bytes, parent, phandle, interrupt_cells, irq;
+    unsigned address_cells, size_cells;
+    bool host, gic, controller, simple, enabled, irq_valid, extended, children;
+};
+
+static uint64_t cells(const unsigned char *p, unsigned count)
+{
+    return count == 2 ? be64(p) : be32(p);
+}
+
+static bool translate(const struct fdt_device *nodes, unsigned bus, uint64_t *base, uint64_t size)
+{
+    if (!size || *base > UINT64_MAX - size)
+        return false;
+    while (bus)
+    {
+        const struct fdt_device *child = &nodes[bus], *parent = &nodes[bus - 1];
+        unsigned a = child->address_cells, p = parent->address_cells, s = child->size_cells;
+        if (!child->simple || !child->mapping || a < 1 || a > 2 || p < 1 || p > 2 || s < 1 || s > 2)
+            return false;
+        uint32_t stride = 4 * (a + p + s);
+        if (child->mapping_bytes % stride)
+            return false;
+        bool found = !child->mapping_bytes;
+        uint64_t result = *base;
+        for (uint32_t i = 0; i < child->mapping_bytes; i += stride)
+        {
+            const unsigned char *entry = child->mapping + i;
+            uint64_t start = cells(entry, a), target = cells(entry + 4 * a, p);
+            uint64_t count = cells(entry + 4 * (a + p), s);
+            if (start > UINT64_MAX - count || target > UINT64_MAX - count)
+                return false;
+            if (*base >= start && size <= count && *base - start <= count - size)
+            {
+                if (found)
+                    return false;
+                result = target + (*base - start);
+                found = true;
+            }
+        }
+        if (!found || (p == 1 && (result > UINT32_MAX || size - 1 > UINT32_MAX - result)))
+            return false;
+        *base = result;
+        --bus;
+    }
+    return true;
+}
+
+static bool device_window(const struct fdt_device *nodes, unsigned index, unsigned window,
+                          uint64_t *base, uint64_t *size)
+{
+    if (!index)
+        return false;
+    const struct fdt_device *node = &nodes[index], *parent = &nodes[index - 1];
+    unsigned a = parent->address_cells, s = parent->size_cells;
+    if (!node->reg || a < 1 || a > 2 || s < 1 || s > 2)
+        return false;
+    unsigned stride = 4 * (a + s);
+    if (node->reg_bytes % stride || node->reg_bytes / stride <= window)
+        return false;
+    const unsigned char *entry = node->reg + window * stride;
+    *base = cells(entry, a);
+    *size = cells(entry + 4 * a, s);
+    return translate(nodes, index - 1, base, *size);
+}
+
 bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
 {
     const unsigned char *b = blob;
@@ -100,12 +169,8 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
     bool cpus = false, cpu = false, cpu_reg = false, cpu_enabled = true;
     uint64_t affinity = 0;
 
-    struct
-    {
-        bool host, reg, irq;
-        uint64_t base, size;
-        uint32_t number;
-    } sdhci[32] = {{0}};
+    struct fdt_device devices[32] = {{0}};
+    uint32_t sd_parent = 0, gic_phandle = 0;
 
     unsigned char mac[32][6] = {{0}};
     unsigned address_cells = 2, size_cells = 1;
@@ -144,7 +209,14 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             timer[depth] = depth == 1 && equals(b + pos, n + 1, "timer");
             chosen[depth] = depth == 1 && equals(b + pos, n + 1, "chosen");
             wifi[depth] = mac_seen[depth] = false;
-            sdhci[depth].host = sdhci[depth].reg = sdhci[depth].irq = false;
+            if (depth)
+                devices[depth - 1].children = true;
+            devices[depth] = (struct fdt_device){
+                .address_cells = 2,
+                .size_cells = 1,
+                .parent = depth ? devices[depth - 1].parent : 0,
+                .enabled = !depth || devices[depth - 1].enabled,
+            };
             pos += (uint32_t)((n + 4) & ~(size_t)3);
             if (pos > end)
                 return false;
@@ -163,17 +235,37 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
                         return false;
                 out->cpu_affinity[out->cpu_count++] = affinity;
             }
-            /* Root-level SDHCI resources use the root address space and the Pi5 GIC SPI
-             * binding. Nested buses remain under the platform's firmware contract. */
-            if (depth == 2 && sdhci[1].host && sdhci[1].reg &&
-                sdhci[1].base == UINT64_C(0x1000fff000))
+            unsigned index = depth - 1;
+            const struct fdt_device *device = &devices[index];
+            uint64_t base, size;
+            if (device->enabled && device->host && device->reg)
             {
-                if (out->sdhci_valid || sdhci[1].size < 0x100 || !sdhci[1].irq)
+                if (!device_window(devices, index, 0, &base, &size))
                     return false;
-                out->sdhci_base = sdhci[1].base;
-                out->sdhci_size = sdhci[1].size;
-                out->sdhci_irq = sdhci[1].number;
-                out->sdhci_valid = true;
+                if (base == UINT64_C(0x1000fff000))
+                {
+                    if (out->sdhci_valid || size < 0x100 || size > 0x1000 || !device->irq_valid ||
+                        !device->parent || device->extended)
+                        return false;
+                    out->sdhci_base = base;
+                    out->sdhci_size = size;
+                    out->sdhci_irq = device->irq;
+                    out->sdhci_valid = true;
+                    sd_parent = device->parent;
+                }
+            }
+            if (device->enabled && device->gic && device->controller &&
+                device->interrupt_cells == 3 && device->phandle &&
+                device_window(devices, index, 0, &base, &size) && base == UINT64_C(0x107fff9000) &&
+                size >= 0x1000)
+            {
+                if (device_window(devices, index, 1, &base, &size) &&
+                    base == UINT64_C(0x107fffa000) && size >= 0x2000)
+                {
+                    if (gic_phandle)
+                        return false;
+                    gic_phandle = device->phandle;
+                }
             }
             if (wifi[depth - 1] && mac_seen[depth - 1])
             {
@@ -215,33 +307,67 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
                 if (equals(key, key_len + 1, "status"))
                     cpu_enabled = contains(b + pos, n, "okay") || contains(b + pos, n, "ok");
             }
-            if (depth == 2 && equals(key, key_len + 1, "reg") && address_cells == 2 &&
-                size_cells == 2 && n == 16)
+            struct fdt_device *device = &devices[depth - 1];
+            if (device->children)
+                return false;
+            if (equals(key, key_len + 1, "reg") || equals(key, key_len + 1, "ranges"))
             {
-                sdhci[1].base = be64(b + pos);
-                sdhci[1].size = be64(b + pos + 8);
-                if (sdhci[1].base > UINT64_MAX - sdhci[1].size)
-                    return false;
-                sdhci[1].reg = true;
+                if (equals(key, key_len + 1, "reg"))
+                {
+                    if (device->reg)
+                        return false;
+                    device->reg = b + pos;
+                    device->reg_bytes = n;
+                }
+                else
+                {
+                    if (device->mapping)
+                        return false;
+                    device->mapping = b + pos;
+                    device->mapping_bytes = n;
+                }
             }
-            if (depth == 2 && equals(key, key_len + 1, "interrupts") && n == 12 &&
-                be32(b + pos) == 0 && be32(b + pos + 4) < 988 && be32(b + pos + 8) == 4)
+            if (equals(key, key_len + 1, "interrupts") && n == 12 && be32(b + pos) == 0 &&
+                be32(b + pos + 4) < 988 && be32(b + pos + 8) == 4)
             {
-                sdhci[1].number = be32(b + pos + 4) + 32;
-                sdhci[1].irq = true;
+                device->irq = be32(b + pos + 4) + 32;
+                device->irq_valid = true;
             }
-            if (depth == 1 && equals(key, key_len + 1, "#address-cells"))
+            if (equals(key, key_len + 1, "interrupts-extended"))
+                device->extended = true;
+            if (equals(key, key_len + 1, "status"))
+                device->enabled =
+                    device->enabled && (equals(b + pos, n, "ok") || equals(b + pos, n, "okay"));
+            if (equals(key, key_len + 1, "#address-cells"))
             {
                 if (n != 4)
                     return false;
-                address_cells = be32(b + pos);
+                device->address_cells = be32(b + pos);
+                if (depth == 1)
+                    address_cells = device->address_cells;
             }
-            if (depth == 1 && equals(key, key_len + 1, "#size-cells"))
+            if (equals(key, key_len + 1, "#size-cells"))
             {
                 if (n != 4)
                     return false;
-                size_cells = be32(b + pos);
+                device->size_cells = be32(b + pos);
+                if (depth == 1)
+                    size_cells = device->size_cells;
             }
+            if (equals(key, key_len + 1, "interrupt-parent") ||
+                equals(key, key_len + 1, "phandle") || equals(key, key_len + 1, "#interrupt-cells"))
+            {
+                if (n != 4)
+                    return false;
+                if (equals(key, key_len + 1, "interrupt-parent"))
+                    device->parent = be32(b + pos);
+                else if (equals(key, key_len + 1, "phandle"))
+                    device->phandle = be32(b + pos);
+                else
+                    device->interrupt_cells = be32(b + pos);
+            }
+            if (equals(key, key_len + 1, "interrupt-controller"))
+                device->controller = n == 0;
             if ((memory[depth - 1] || (depth == 3 && reserved[depth - 1])) &&
                 equals(key, key_len + 1, "reg"))
             {
@@ -257,8 +383,10 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             }
             if (equals(key, key_len + 1, "compatible"))
             {
-                sdhci[depth - 1].host = contains(b + pos, n, "qemu,sdhci") ||
-                                        contains(b + pos, n, "brcm,bcm2712-sdhci");
+                device->host = contains(b + pos, n, "qemu,sdhci") ||
+                               contains(b + pos, n, "brcm,bcm2712-sdhci");
+                device->simple = contains(b + pos, n, "simple-bus");
+                device->gic = contains(b + pos, n, "arm,gic-400");
                 wifi[depth - 1] = contains(b + pos, n, "brcm,bcm4329-fmac");
                 if (contains(b + pos, n, "brcm,bcm2712d0-pinctrl"))
                     out->bcm2712d0 = true;
@@ -320,6 +448,8 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             if (depth || !root_seen || !root_closed)
                 return false;
             out->size = total;
+            if (out->sdhci_valid && sd_parent != gic_phandle)
+                return false;
             if ((out->initrd_start || out->initrd_end) &&
                 (!out->initrd_start || out->initrd_start >= out->initrd_end ||
                  out->initrd_end > UINT64_C(0x200000000) ||

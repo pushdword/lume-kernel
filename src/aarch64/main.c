@@ -123,7 +123,11 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     bool user = (frame->spsr & 15) == 0;
     if (user)
         lume_task_trap_enter(lume_counter_read());
-    bool acquire = !lume_smp_owned();
+    uint64_t control;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(control));
+    /* Translation gives the kernel lock Normal memory attributes. Early
+     * exceptions must run before atomic accesses to that storage are valid. */
+    bool acquire = lume_current_el() == 1 && (control & 1) && !lume_smp_owned();
     if (acquire)
         lume_smp_lock();
     if (user)

@@ -9,7 +9,7 @@ void lume_sync_code(uint64_t address, size_t bytes)
     uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
     for (uint64_t p = address & ~(line - 1); p < address + bytes; p += line)
         __asm__ volatile("dc cvau, %0" ::"r"(p) : "memory");
-    __asm__ volatile("dsb ish; ic iallu; dsb ish; isb" ::: "memory");
+    __asm__ volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");
 }
 
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)

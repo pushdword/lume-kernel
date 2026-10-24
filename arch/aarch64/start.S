@@ -156,9 +156,9 @@ secondary_el1:
     msr cpacr_el1, x1
     ldr x1, =lume_vectors
     msr vbar_el1, x1
+    isb
     msr fpcr, xzr
     msr fpsr, xzr
-    isb
     mov x0, x20
     bl lume_secondary_main
     b lume_stop
