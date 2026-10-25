@@ -54,6 +54,8 @@ enum lume_syscall
      * nonblocking behavior. Its result packs the PID above a 32-bit exit status. */
     LUME_SYS_CPU = 38,
     LUME_SYS_THREAD = 39,
+    LUME_SYS_HARDWARE = 40,
+    LUME_SYS_MODULE = 41,
 };
 
 enum

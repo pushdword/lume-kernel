@@ -108,6 +108,9 @@ int lume_wireless_register(uint32_t n, const struct lume_wifi_caps *caps,
     for (unsigned i = 0; i < LUME_NET_INTERFACES; ++i)
         if (!radios[i].ifindex)
         {
+            int result = lume_netif_reference(lume_netif_find(n));
+            if (result)
+                return result;
             struct radio *r = &radios[i];
             r->ifindex = n;
             r->caps = *caps;
@@ -265,7 +268,7 @@ int lume_wireless_connect_begin(uint32_t n, const struct lume_wifi_connect *requ
     r->busy = true;
     state(r, LUME_WIFI_CONNECTING, 0);
     bool ok = r->ops.connect_begin(r->context, request->ssid, request->ssid_bytes, request->key,
-                                  request->key_bytes);
+                                   request->key_bytes);
     if (ok)
     {
         memcpy(r->state.ssid, request->ssid, request->ssid_bytes);

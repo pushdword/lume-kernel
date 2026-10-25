@@ -10,6 +10,7 @@ SD_POLL ?= 0
 ifeq ($(filter $(SD_POLL),0 1),)
 $(error SD_POLL must be 0 or 1)
 endif
+
 PROFILE_ID := $(if $(filter diagnostic,$(PROFILE)),0,$(if $(filter normal,$(PROFILE)),1,$(if $(filter recovery,$(PROFILE)),2,invalid)))
 ifeq ($(PROFILE_ID),invalid)
 $(error PROFILE must be diagnostic, normal or recovery)
@@ -35,7 +36,10 @@ OBJCOPY := "$(TOOLBIN)llvm-objcopy$(HOSTEXE)"
 CFLAGS := -O2 -std=c11 -mcpu=cortex-a76 -mstrict-align -fno-pic -fno-pie $(COMMON_FLAGS)
 CPPFLAGS := -DLUME_BOOT_PROFILE=$(PROFILE_ID) -DLUME_SD_POLL=$(SD_POLL) -Isrc/common -Iinclude/freestanding -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/fatfs -Ivendor/aarch64/lwip/src/include -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 KERNEL_C := $(wildcard src/aarch64/*.c platform/raspberrypi5/*.c vendor/aarch64/lwip/src/core/*.c vendor/aarch64/lwip/src/core/ipv4/*.c) vendor/aarch64/lwip/src/netif/ethernet.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c vendor/aarch64/mbedtls/library/aes.c vendor/aarch64/mbedtls/library/sha1.c arch/aarch64/mmu.c arch/aarch64/mmu_tables.c src/common/terminal.c src/common/font5x7.c
-KERNEL_C += arch/aarch64/dma.c
+KERNEL_C += arch/aarch64/dma.c src/common/resource.c src/common/hardware.c src/common/hardware_control.c src/common/string_extra.c src/common/fdt_inventory.c
+KERNEL_C += vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c
+KERNEL_C += src/common/module_elf.c src/common/modules.c
+CPPFLAGS += -Iinclude/internal/common -Ivendor/common/libfdt
 KERNEL_C := $(filter-out %/gem.c,$(KERNEL_C))
 ifeq ($(DEBUG),1)
 CFLAGS += -g -fno-omit-frame-pointer
@@ -54,7 +58,7 @@ endif
 $(OUT)/obj/arch/aarch64/elf_blob.S.o: CPPFLAGS += -DLUME_USER_ELF_FILE='"$(OUT)/diagnostic.elf"'
 $(OUT)/obj/arch/aarch64/elf_blob.S.o: $(OUT)/diagnostic.elf
 SCRIPT := arch/aarch64/pi5.ld
-LINK_FLAGS := -z max-page-size=4096
+LINK_FLAGS := -z max-page-size=4096 --build-id=sha1
 PAYLOAD := $(OUT)/lume-pi5.img
 NATIVE_CC ?= "$(TOOLBIN)clang$(HOSTEXE)"
 NATIVE_CPPFLAGS ?= -nostdinc -isystem "$(SDK)/sdk/bare"
@@ -68,7 +72,7 @@ native-responses: native-directories
 	$(foreach object,$(OBJECTS),$(file >>$(OUT)/native-jobs,$(object).rsp))
 native-build: native-responses
 	$(NATIVE_CC) --batch "$(OUT)/native-jobs"
-	$(LD) $(LINK_FLAGS) --gc-sections --build-id=none -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$(OUT)/lume.elf"
+	$(LD) $(LINK_FLAGS) --gc-sections -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$(OUT)/lume.elf"
 	$(OBJCOPY) -O binary "$(OUT)/lume.elf" "$(PAYLOAD)"
 $(OUT)/diagnostic.elf: tests/aarch64/user/start.S tests/aarch64/user/main.c tests/aarch64/user/user.ld
 	mkdir -p "$(@D)"
@@ -130,7 +134,7 @@ $(OUT)/obj/%.S.o: %.S $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -c "$<" -o "$@"
 $(OUT)/lume.elf: $(OBJECTS) $(DRIVER_OBJECTS) $(SCRIPT) Makefile $(OUT)/configuration
-	$(LD) $(LINK_FLAGS) --gc-sections --build-id=none -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$@"
+	$(LD) $(LINK_FLAGS) --gc-sections -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$@"
 $(OUT)/lume.bin: $(OUT)/lume.elf
 	$(OBJCOPY) -O binary "$<" "$@"
 $(OUT)/lume-pi5.img: $(OUT)/lume.elf
@@ -140,7 +144,7 @@ $(OUT)/image-tool$(HOSTEXE): tools/image.cpp
 	$(HOSTCXX) $(HOSTCXXFLAGS) "$<" -o "$@"
 $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
-TEST_CPPFLAGS := -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
+TEST_CPPFLAGS := -Iinclude/internal/common -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs heap user-stack mmu elf-load font
 .PHONY: check-boot-storage
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/aarch64/boot_storage_test.c src/aarch64/storage.c src/aarch64/boot_storage.c src/aarch64/volume.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c
@@ -179,9 +183,9 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 .PHONY: check-gem
 check-gem: $(OUT)/tests/gem$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/gem$(HOSTEXE): examples/ddk/gem_test.c examples/ddk/gem.c examples/ddk/gem.h examples/ddk/gem_netif.c include/ddk/lume/netif.h src/aarch64/device.c src/aarch64/netif.c
+$(OUT)/tests/gem$(HOSTEXE): examples/ddk/gem_test.c examples/ddk/gem.c examples/ddk/gem.h examples/ddk/gem_netif.c include/ddk/lume/netif.h src/common/resource.c src/aarch64/device.c src/aarch64/netif.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) examples/ddk/gem_test.c src/aarch64/device.c src/aarch64/netif.c -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) examples/ddk/gem_test.c src/common/resource.c src/aarch64/device.c src/aarch64/netif.c -o "$@"
 
 check-scheduler: $(foreach c,1 2 4,$(OUT)/tests/scheduler-$(c)$(HOSTEXE))
 	$(foreach c,1 2 4,env "$(OUT)/tests/scheduler-$(c)$(HOSTEXE)" &&) true
@@ -190,7 +194,7 @@ $(OUT)/tests/scheduler-%$(HOSTEXE): tests/common/scheduler_test.c src/common/sch
 	$(HOSTCC) $(HOSTCFLAGS) $(SCHED_CPPFLAGS) -Isrc/common -DSCHED_CPUS=$* "$<" -o "$@"
 $(OUT)/tests/fdt-initrd$(HOSTEXE): tests/aarch64/fdt_initrd_test.c src/aarch64/fdt.c
 $(OUT)/tests/fdt-device$(HOSTEXE): tests/aarch64/fdt_device_test.c src/aarch64/fdt.c
-$(OUT)/tests/ddk$(HOSTEXE): tests/aarch64/ddk_test.c src/aarch64/device.c src/aarch64/irq.c src/aarch64/dma.c src/aarch64/block.c src/aarch64/work.c
+$(OUT)/tests/ddk$(HOSTEXE): tests/aarch64/ddk_test.c src/common/resource.c src/aarch64/device.c src/aarch64/irq.c src/aarch64/dma.c src/aarch64/block.c src/aarch64/work.c
 $(OUT)/tests/usb$(HOSTEXE): tests/aarch64/usb_test.c src/aarch64/usb_descriptors.c src/aarch64/hid_keyboard.c
 $(OUT)/tests/uart-input$(HOSTEXE): tests/aarch64/uart_input_test.c
 $(OUT)/tests/volume$(HOSTEXE): tests/aarch64/volume_test.c src/aarch64/volume.c
@@ -199,7 +203,7 @@ $(OUT)/tests/icmp$(HOSTEXE): tests/aarch64/icmp_test.c src/aarch64/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/aarch64/stream_test.c src/aarch64/stream.c
 $(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
-$(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
+$(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/common/resource.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/aarch64/heap_test.c src/aarch64/heap.c
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/aarch64/sdio_test.c src/aarch64/sdio.c
@@ -242,3 +246,52 @@ $(OUT)/tests/display.elf: tests/aarch64/display_test.c platform/raspberrypi5/dis
 	mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,arch/aarch64/pi5.ld tests/aarch64/display_test.c src/common/terminal.c src/common/font5x7.c src/aarch64/memory.c src/aarch64/dma.c arch/aarch64/dma.c platform/raspberrypi5/dma.c -o "$@"
 endif
+
+.PHONY: check-hardware
+check-hardware: $(OUT)/tests/hardware$(HOSTEXE)
+	env "$(OUT)/tests/hardware$(HOSTEXE)"
+$(OUT)/tests/hardware$(HOSTEXE): tests/common/hardware_test.c src/common/hardware.c src/common/hardware_control.c src/common/resource.c src/aarch64/device.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-fdt-inventory
+check-fdt-inventory: $(OUT)/tests/fdt-inventory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/fdt-inventory$(HOSTEXE): tests/common/fdt_inventory_test.c src/common/fdt_inventory.c src/common/hardware.c src/common/resource.c vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c vendor/common/libfdt/fdt_sw.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Iinclude/internal/common -Ivendor/common/libfdt $^ -o "$@"
+
+.PHONY: check-module-elf
+check-module-elf: $(OUT)/tests/module-elf$(HOSTEXE) $(OUT)/tests/module-fixture.o
+	env "$(OUT)/tests/module-elf$(HOSTEXE)" "$(OUT)/tests/module-fixture.o"
+$(OUT)/tests/module-elf$(HOSTEXE): tests/common/module_elf_test.c src/common/module_elf.c src/aarch64/module_relocate.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+$(OUT)/tests/module-fixture.o: tests/aarch64/module_fixture.c
+	mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -c "$<" -o "$@"
+
+ifeq ($(ARCH),aarch64)
+headers: module-sdk
+.PHONY: module-sdk
+module-sdk: $(OUT)/ddk/include/lume/module_build.h
+$(OUT)/module-sdk$(HOSTEXE): tools/module_sdk.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) "$<" -o "$@"
+$(OUT)/ddk/include/lume/module_build.h: $(OUT)/lume.elf $(OUT)/module-sdk$(HOSTEXE)
+	mkdir -p "$(@D)"
+	cp -Rp include/ddk/. "$(OUT)/ddk/include/"
+	cp -Rp include/uapi/common/. "$(OUT)/ddk/include/"
+	cp -Rp include/uapi/aarch64/. "$(OUT)/ddk/include/"
+	cp -Rp include/freestanding/. "$(OUT)/ddk/include/"
+	cp include/internal/aarch64/lume/mmio.h "$(OUT)/ddk/include/lume/mmio.h"
+	cp mk/driver.mk "$(OUT)/ddk/driver.mk"
+	env "$(OUT)/module-sdk$(HOSTEXE)" "$(OUT)/lume.elf" "$@"
+endif
+
+.PHONY: check-module-services
+check-module-services: $(OUT)/tests/module-services$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/module-services$(HOSTEXE): tests/aarch64/module_services_test.c src/aarch64/module_services.c src/aarch64/device.c src/common/resource.c src/aarch64/irq.c src/aarch64/work.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"

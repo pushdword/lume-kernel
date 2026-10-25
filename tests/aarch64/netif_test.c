@@ -116,6 +116,7 @@ static void peer(void *ctx, unsigned char out[6])
     (void)ctx;
     memset(out, 0x42, 6);
 }
+
 static bool connect_begin(void *ctx, const unsigned char *s, size_t sn, const unsigned char *k,
                           size_t kn)
 {
@@ -131,8 +132,8 @@ static int connect_status(void *ctx)
     struct fake *f = ctx;
     return f->link ? 0 : f->pending ? -LUME_EAGAIN : -LUME_EIO;
 }
-static const struct lume_wireless_ops wifi_ops = {scan, connect, disconnect, peer,
-                                                  connect_begin, connect_status};
+static const struct lume_wireless_ops wifi_ops = {scan, connect,       disconnect,
+                                                  peer, connect_begin, connect_status};
 
 /* The dispatcher sees stack services only through the generic boundary. */
 void lume_net_poll(void)
@@ -162,6 +163,7 @@ bool lume_net_dhcp(uint32_t index)
     ++dhcps;
     return true;
 }
+
 int lume_net_dhcp_begin(uint32_t index)
 {
     CHECK(lume_netif_find(index) != 0);
@@ -394,6 +396,14 @@ int main(void)
         for (unsigned j = 0; j < 32; ++j)
             CHECK(two[i].reserved[j] == 0);
     CHECK(polls > 0);
+    CHECK(lume_netif_reference(a) == 0);
+    CHECK(lume_netif_unregister(1) == -LUME_EBUSY);
+    CHECK(lume_netif_admin(a, false) == 0);
+    CHECK(lume_netif_unregister(1) == -LUME_EBUSY);
+    CHECK(lume_netif_unreference(a) == 0);
+    CHECK(lume_netif_unregister(1) == 0 && !lume_netif_find(1) && lume_netif_count() == 3);
+    d = desc("eth0", LUME_IF_ETHERNET, 1, &eth);
+    CHECK(lume_netif_register(&d) == 5 && !lume_netif_find(1) && lume_netif_find(5));
     printf("PASS GENERIC NETIF WIRELESS CONTROL EVENTS %u checks\n", checks);
     return 0;
 }

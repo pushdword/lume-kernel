@@ -1,5 +1,6 @@
 #include "lume/mmu.h"
 #include "lume/elf.h"
+#include "lume/module_memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 _Alignas(4096) unsigned char __user_code_start[4096];
@@ -104,12 +105,31 @@ int main(void)
     CHECK(!lume_mmu_translate(root, 0x1c00300000, false, true, false, &pa));
     CHECK(!lume_mmu_translate(root, 0x1c00300000, false, false, true, &pa));
     CHECK(!lume_mmu_translate(root, 0x1c00400000, false, false, false, &pa));
+    CHECK(!lume_mmu_module_prepare(0x200000, 4096));
+    CHECK(lume_mmu_module_prepare(0x600000, 0x200000));
+    CHECK(!lume_mmu_module_prepare(0x800000, 0x200000));
+    CHECK(lume_mmu_module_protect(0x600000, 4096, LUME_MODULE_READ | LUME_MODULE_EXECUTE));
+    CHECK(lume_mmu_translate(root, 0x600000, false, false, true, &pa) && pa == 0x600000);
+    CHECK(!lume_mmu_translate(root, 0x600000, true, false, false, &pa));
+    CHECK(!lume_mmu_translate(root, 0x600000, false, true, true, &pa));
+    CHECK(lume_mmu_translate(root, 0x601000, true, false, false, &pa));
+    CHECK(!lume_mmu_translate(root, 0x601000, false, false, true, &pa));
+    CHECK(!lume_mmu_module_protect(0x600000, 4096,
+                                   LUME_MODULE_READ | LUME_MODULE_WRITE | LUME_MODULE_EXECUTE));
+    CHECK(!lume_mmu_module_protect(0x600001, 4096, LUME_MODULE_READ));
+    CHECK(!lume_mmu_module_protect(0x800000, 4096, LUME_MODULE_READ));
     uint64_t stacks[LUME_STACK_PAGES];
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
         stacks[i] = UINT64_C(0x100010000) + (uint64_t)i * 4096;
     CHECK(lume_mmu_user_root(0, 0x100000000, stacks));
     CHECK(lume_mmu_user_root(1, 0x100001000, stacks));
     CHECK(lume_mmu_user_root(2, 0x100002000, stacks));
+    CHECK(lume_mmu_translate(lume_mmu_task_root(1), 0x600000, false, false, true, &pa));
+    CHECK(!lume_mmu_translate(lume_mmu_task_root(1), 0x600000, true, false, false, &pa));
+    CHECK(lume_mmu_module_protect(0x600000, 4096, LUME_MODULE_READ | LUME_MODULE_WRITE));
+    CHECK(lume_mmu_translate(lume_mmu_task_root(1), 0x600000, true, false, false, &pa));
+    CHECK(!lume_mmu_translate(lume_mmu_task_root(1), 0x600000, false, false, true, &pa));
+    CHECK(lume_mmu_translate(lume_mmu_task_root(2), 0x600000, true, false, false, &pa));
     CHECK(!lume_mmu_user_root(LUME_TASK_LIMIT, 0x100000000, stacks));
     CHECK(lume_mmu_translate(lume_mmu_task_root(2), LUME_USER_DATA, true, true, false, &pa) &&
           pa == 0x100002000);
@@ -159,6 +179,11 @@ int main(void)
     CHECK(!lume_mmu_user_root(0, 0x100000000, stacks));
     CHECK(!allocated);
     budget = -1;
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x107fff9000)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x1c00100000)));
+    CHECK(!lume_mmu_device_mapping(UINT64_C(0x100000000)));
+    CHECK(!lume_mmu_device_mapping(layout.start));
+    CHECK(!lume_mmu_device_mapping(UINT64_C(1) << 39));
     layout.end = 0x400001;
     CHECK(!lume_mmu_tables(&fdt, &layout));
     layout.end = 0x500000;

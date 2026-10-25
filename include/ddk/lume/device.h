@@ -2,16 +2,10 @@
 #define LUME_DEVICE_H
 #include <stddef.h>
 #include <stdint.h>
+#include "resource.h"
 
-#define LUME_DDK_VERSION 1u
+#define LUME_DDK_VERSION 2u
 #define LUME_DEVICE_LIMIT 32u
-#define LUME_RESOURCE_LIMIT 16u
-
-enum lume_resource_kind
-{
-    LUME_RESOURCE_MMIO = 1,
-    LUME_RESOURCE_IRQ
-};
 
 enum lume_device_state
 {
@@ -31,11 +25,6 @@ enum lume_device_class
     LUME_DEVICE_BUS
 };
 
-struct lume_resource
-{
-    uint64_t base, size;
-    uint32_t kind, flags;
-};
 struct lume_device;
 
 /* Lifecycle calls run with the kernel serialized. Stop must quiesce DMA and IRQ callbacks

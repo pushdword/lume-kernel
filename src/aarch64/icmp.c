@@ -18,6 +18,14 @@ static struct echo echoes[4];
 static unsigned next_handle;
 static uint16_t next_sequence;
 
+bool lume_icmp_busy(void)
+{
+    for (unsigned i = 0; i < sizeof(echoes) / sizeof(echoes[0]); ++i)
+        if (echoes[i].owner)
+            return true;
+    return false;
+}
+
 static void close_echo(struct echo *echo)
 {
     if (echo->pcb)

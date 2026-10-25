@@ -46,6 +46,7 @@ int lume_device_detach(struct lume_device *d)
         d->state = LUME_DEVICE_FAILED;
         return d->error;
     }
+    (void)lume_resource_release(d);
     if (d->ops->release)
         d->ops->release(d);
     devices[slot] = 0;
@@ -70,6 +71,9 @@ int lume_device_attach(struct lume_device *d)
         ;
     if (slot == LUME_DEVICE_LIMIT)
         return -LUME_ENOSPC;
+    result = lume_resource_claim(d, d->resources, d->resource_count);
+    if (result)
+        return result;
     devices[slot] = d;
     d->state = LUME_DEVICE_CLAIMED;
     result = d->ops->probe ? d->ops->probe(d) : 0;

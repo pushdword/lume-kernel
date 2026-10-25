@@ -15,6 +15,8 @@
 #include "lume/worker.h"
 #include "lume/smp.h"
 #include "lume/counter.h"
+#include "lume/hardware_platform.h"
+#include "lume/modules.h"
 
 #ifndef LUME_BUILD_ID
 #define LUME_BUILD_ID "unversioned"
@@ -132,9 +134,8 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
         lume_smp_lock();
     if (user)
         lume_task_account_enter(frame);
-    struct lume_context *result = user && lume_cpu_index() && !lume_tasks_active()
-                                      ? NULL
-                                      : exception_dispatch(frame, vector);
+    struct lume_context *result =
+        user && lume_cpu_index() && !lume_tasks_active() ? NULL : exception_dispatch(frame, vector);
     if (user)
         lume_task_account_leave(result);
     if (acquire)
@@ -214,6 +215,9 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_smp_configure(&fdt);
     lume_pages_start(&fdt, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end);
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
+    int hardware_result = lume_platform_hardware_start((const void *)(uintptr_t)dtb, fdt.size);
+    if (hardware_result)
+        lume_value("HARDWARE_INVENTORY_ERROR", (uint64_t)(int64_t)hardware_result);
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_pages_check())
         lume_fail("physical page allocator");
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
@@ -295,6 +299,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (lume_drivers_start())
         lume_fail("driver initialization");
     lume_value("DDK_DEVICES", lume_device_count());
+    if (LUME_BOOT_PROFILE == LUME_BOOT_NORMAL)
+        lume_platform_modules_boot();
     bool network = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_net_start();
     lume_value("NETWORK_READY", network);
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_shell_start(freq, true))

@@ -7,9 +7,11 @@ struct lume_netif
     struct lume_netif_info info;
     struct lume_netif_ops ops;
     void *context;
+    unsigned references;
 };
 static struct lume_netif interfaces[LUME_NET_INTERFACES];
 static unsigned interface_count;
+static uint32_t next_index = 1;
 static struct lume_net_event history[HISTORY];
 static uint64_t sequence;
 
@@ -65,12 +67,18 @@ unsigned lume_netif_count(void)
 
 struct lume_netif *lume_netif_at(unsigned n)
 {
-    return n < interface_count ? &interfaces[n] : 0;
+    for (unsigned i = 0; i < LUME_NET_INTERFACES; ++i)
+        if (interfaces[i].info.ifindex && !n--)
+            return interfaces + i;
+    return NULL;
 }
 
 struct lume_netif *lume_netif_find(uint32_t n)
 {
-    return n && n <= interface_count ? &interfaces[n - 1] : 0;
+    for (unsigned i = 0; i < LUME_NET_INTERFACES; ++i)
+        if (n && interfaces[i].info.ifindex == n)
+            return interfaces + i;
+    return NULL;
 }
 
 int lume_netif_register(const struct lume_netif_descriptor *d)
@@ -92,24 +100,60 @@ int lume_netif_register(const struct lume_netif_descriptor *d)
         any |= d->mac[i];
     if (!n || n == 16 || !any || (d->mac[0] & 1))
         return -LUME_EINVAL;
-    for (unsigned i = 0; i < interface_count; ++i)
+    unsigned slot = LUME_NET_INTERFACES;
+    for (unsigned i = 0; i < LUME_NET_INTERFACES; ++i)
     {
-        if (!strcmp(interfaces[i].info.name, d->name) || !memcmp(interfaces[i].info.mac, d->mac, 6))
+        if (interfaces[i].info.ifindex && (!strcmp(interfaces[i].info.name, d->name) ||
+                                           !memcmp(interfaces[i].info.mac, d->mac, 6)))
             return -LUME_EEXIST;
+        if (!interfaces[i].info.ifindex && slot == LUME_NET_INTERFACES)
+            slot = i;
     }
-    if (interface_count == LUME_NET_INTERFACES)
+    if (slot == LUME_NET_INTERFACES || !next_index || next_index > INT32_MAX)
         return -LUME_ENOSPC;
-    struct lume_netif *p = &interfaces[interface_count];
+    struct lume_netif *p = &interfaces[slot];
     memset(p, 0, sizeof(*p));
     p->ops = *d->ops;
     p->context = d->context;
-    p->info.ifindex = ++interface_count;
+    p->info.ifindex = next_index++;
+    interface_count++;
     p->info.kind = d->kind;
     p->info.mtu = d->mtu;
     memcpy(p->info.name, d->name, n + 1);
     memcpy(p->info.mac, d->mac, 6);
     lume_net_event_emit(p->info.ifindex, LUME_EVENT_REGISTER, 0, 0, d->kind);
     return (int)p->info.ifindex;
+}
+
+int lume_netif_reference(struct lume_netif *p)
+{
+    if (!p || !p->info.ifindex)
+        return -LUME_ENOENT;
+    if (p->references == UINT32_MAX)
+        return -LUME_EBUSY;
+    p->references++;
+    return 0;
+}
+
+int lume_netif_unreference(struct lume_netif *p)
+{
+    if (!p || !p->info.ifindex || !p->references)
+        return -LUME_EINVAL;
+    p->references--;
+    return 0;
+}
+
+int lume_netif_unregister(uint32_t index)
+{
+    struct lume_netif *p = lume_netif_find(index);
+    if (!p)
+        return -LUME_ENOENT;
+    if (p->references || (p->info.flags & LUME_IF_UP))
+        return -LUME_EBUSY;
+    lume_net_event_emit(index, LUME_EVENT_UNREGISTER, 0, 0, 0);
+    memset(p, 0, sizeof(*p));
+    interface_count--;
+    return 0;
 }
 
 void lume_netif_info(const struct lume_netif *p, struct lume_netif_info *out)

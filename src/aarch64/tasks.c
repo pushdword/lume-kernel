@@ -91,7 +91,8 @@ bool lume_task_capable(unsigned pid, uint64_t required)
 int lume_task_drop_capabilities(unsigned pid, uint64_t mask)
 {
     if (!pid || pid > LUME_TASK_LIMIT ||
-        (mask & ~(uint64_t)(LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_SERVICE)))
+        (mask & ~(uint64_t)(LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_SERVICE |
+                            LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC)))
         return -LUME_EINVAL;
     capabilities[pid - 1] &= ~mask;
     return 0;
@@ -1305,7 +1306,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
         states[i] = 0;
     tasks[0].context = (struct lume_context){0};
     thread_new(thread_slots, 0, 0, false);
-    capabilities[0] = LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE;
+    capabilities[0] =
+        LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC;
     tasks[0].calls = tasks[0].exits = tasks[0].faults = tasks[0].preemptions = 0;
     tasks[0].data = lume_page_alloc(0);
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)

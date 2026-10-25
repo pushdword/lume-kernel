@@ -12,6 +12,10 @@ SECTIONS
     .text : { KEEP(*(.text.boot)) *(.text .text.*) } :code
     . = ALIGN(4096);
     __text_end = .;
+    .note.gnu.build-id : {
+        __lume_kernel_build_id = .;
+        KEEP(*(.note.gnu.build-id))
+    } :code
     .rodata : {
         *(.rodata .rodata.*)
         . = ALIGN(8);

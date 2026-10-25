@@ -45,6 +45,8 @@ static struct adapter *find(uint32_t index)
 {
     for (unsigned i = 0; i < adapter_count; ++i)
     {
+        if (!adapters[i].device)
+            continue;
         struct lume_netif_info n = {0};
         lume_netif_info(adapters[i].device, &n);
         if (n.ifindex == index)
@@ -78,6 +80,35 @@ static err_t initialize(struct netif *n)
     return ERR_OK;
 }
 
+static bool attach(struct lume_netif *device)
+{
+    struct lume_netif_info info = {0};
+    lume_netif_info(device, &info);
+    if (find(info.ifindex))
+        return true;
+    for (unsigned i = 0; i < LUME_NET_INTERFACES; ++i)
+        if (!adapters[i].device)
+        {
+            struct adapter *a = adapters + i;
+            if (lume_netif_reference(device))
+                return false;
+            a->device = device;
+            if (!netif_add(&a->ip, 0, 0, 0, device, initialize, ethernet_input))
+            {
+                a->device = NULL;
+                (void)lume_netif_unreference(device);
+                return false;
+            }
+            netif_set_up(&a->ip);
+            if (!netif_default)
+                netif_set_default(&a->ip);
+            if (adapter_count <= i)
+                adapter_count = i + 1;
+            return true;
+        }
+    return false;
+}
+
 bool lume_net_start(void)
 {
     if (started || !lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
@@ -91,14 +122,8 @@ bool lume_net_start(void)
     lwip_init();
     for (unsigned i = 0; i < lume_netif_count(); ++i)
     {
-        struct adapter *a = &adapters[adapter_count];
-        a->device = lume_netif_at(i);
-        if (!netif_add(&a->ip, 0, 0, 0, a->device, initialize, ethernet_input))
+        if (!attach(lume_netif_at(i)))
             return false;
-        netif_set_up(&a->ip);
-        if (!adapter_count)
-            netif_set_default(&a->ip);
-        ++adapter_count;
     }
     started = true;
     lume_puts("LUME NETWORK INTERFACES READY lwIP 2.2.1 IPv4\n");
@@ -135,12 +160,16 @@ void lume_net_release(uint32_t index)
 
 void lume_net_poll(void)
 {
-    if (!started || polling)
+    if ((!started && !lume_net_start()) || polling)
         return;
     polling = true;
+    for (unsigned i = 0; i < lume_netif_count(); ++i)
+        (void)attach(lume_netif_at(i));
     for (unsigned i = 0; i < adapter_count; ++i)
     {
         struct adapter *a = &adapters[i];
+        if (!a->device)
+            continue;
         struct lume_netif_info info = {0};
         lume_netif_poll(a->device);
         lume_netif_info(a->device, &info);
@@ -169,15 +198,32 @@ void lume_net_poll(void)
     }
     if (!netif_default || !netif_is_link_up(netif_default))
         for (unsigned i = 0; i < adapter_count; ++i)
-            if (netif_is_link_up(&adapters[i].ip))
+            if (adapters[i].device && netif_is_link_up(&adapters[i].ip))
             {
                 netif_set_default(&adapters[i].ip);
                 break;
             }
     sys_check_timeouts();
     for (unsigned i = 0; i < adapter_count; ++i)
-        changed(&adapters[i]);
+        if (adapters[i].device)
+            changed(&adapters[i]);
     polling = false;
+}
+
+int lume_net_detach(uint32_t index)
+{
+    if (polling || lume_stream_busy() || lume_icmp_busy())
+        return -LUME_EBUSY;
+    struct adapter *a = find(index);
+    if (!a)
+        return 0;
+    lume_net_release(index);
+    dhcp_cleanup(&a->ip);
+    netif_set_down(&a->ip);
+    netif_remove(&a->ip);
+    (void)lume_netif_unreference(a->device);
+    memset(a, 0, sizeof(*a));
+    return 0;
 }
 
 int lume_net_snapshot(uint32_t index, struct lume_netif_info *out)

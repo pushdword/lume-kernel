@@ -1,5 +1,6 @@
 #include "lume/mmu.h"
 #include "lume/elf.h"
+#include "lume/module_memory.h"
 
 #define PAGE UINT64_C(4096)
 #define BLOCK UINT64_C(0x200000)
@@ -14,6 +15,8 @@
 #define NORMAL (AF | INNER | (UINT64_C(1) << 2))
 static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[2][512];
 static _Alignas(4096) uint64_t soc_l2[512], rp1_l2[512], pcie_l2[512];
+static _Alignas(4096) uint64_t module_l3[2][512];
+static uint64_t module_first, module_base, module_end;
 #define USER_BLOCKS ((LUME_USER_LIMIT - LUME_USER_BASE) / BLOCK)
 static uint64_t *user_tables[LUME_TASK_LIMIT][USER_BLOCKS];
 static unsigned shared_user[LUME_TASK_LIMIT];
@@ -53,6 +56,8 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     zero(soc_l2, 512);
     zero(rp1_l2, 512);
     zero(pcie_l2, 512);
+    zero(&module_l3[0][0], 1024);
+    module_first = module_base = module_end = 0;
     zero(&user_root[0][0], LUME_TASK_LIMIT * 512);
     zero(&user_l2[0][0], LUME_TASK_LIMIT * 512);
     zero(&user_l3[0][0], LUME_TASK_LIMIT * 512);
@@ -245,4 +250,97 @@ bool lume_mmu_translate(uint64_t base, uint64_t va, bool write, bool user, bool 
         return true;
     }
     return false;
+}
+
+bool lume_mmu_device_mapping(uint64_t address)
+{
+    if (address >= (UINT64_C(1) << 39))
+        return false;
+    uint64_t *entries = root;
+    const unsigned shifts[] = {30, 21, 12};
+    for (unsigned level = 0; level < 3; ++level)
+    {
+        uint64_t entry = entries[(address >> shifts[level]) & 511];
+        if (!(entry & 1))
+            return false;
+        if (level != 2 && (entry & 3) == 3)
+        {
+            entries = (void *)(uintptr_t)(entry & ADDRESS);
+            continue;
+        }
+        if (level == 2 && (entry & 3) != 3)
+            return false;
+        return !(entry & ((UINT64_C(7) << 2) | USER | RO)) && (entry & PXN) && (entry & UXN);
+    }
+    return false;
+}
+
+static void module_flush(void)
+{
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+#endif
+}
+
+bool lume_mmu_module_prepare(uint64_t physical, size_t bytes)
+{
+    if (module_end || !physical || !bytes || ((physical | bytes) & (PAGE - 1)) ||
+        physical >= RAM_END || bytes > RAM_END - physical || bytes > BLOCK)
+        return false;
+    for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
+        if (user_root[task][0])
+            return false;
+    uint64_t first = physical & ~(BLOCK - 1);
+    uint64_t end = (physical + bytes + BLOCK - 1) & ~(BLOCK - 1);
+    unsigned blocks = (unsigned)((end - first) / BLOCK);
+    if (blocks > 2)
+        return false;
+    for (unsigned i = 0; i < blocks; ++i)
+    {
+        uint64_t base = first + (uint64_t)i * BLOCK;
+        uint64_t entry = ram_l2[base >> 30][(base >> 21) & 511];
+        if ((entry & 3) != 1 || (entry & ADDRESS) != base ||
+            (entry & (UINT64_C(7) << 2)) != (UINT64_C(1) << 2))
+            return false;
+        for (unsigned page = 0; page < 512; ++page)
+            module_l3[i][page] = (base + (uint64_t)page * PAGE) | NORMAL | PXN | UXN | 3;
+    }
+    for (unsigned i = 0; i < blocks; ++i)
+    {
+        uint64_t base = first + (uint64_t)i * BLOCK;
+        ram_l2[base >> 30][(base >> 21) & 511] = 0;
+    }
+    module_flush();
+    for (unsigned i = 0; i < blocks; ++i)
+    {
+        uint64_t base = first + (uint64_t)i * BLOCK;
+        ram_l2[base >> 30][(base >> 21) & 511] = table(module_l3[i]);
+    }
+    module_first = first;
+    module_base = physical;
+    module_end = physical + bytes;
+    module_flush();
+    return true;
+}
+
+bool lume_mmu_module_protect(uint64_t physical, size_t bytes, unsigned flags)
+{
+    if (!module_end || !bytes || ((physical | bytes) & (PAGE - 1)) || physical < module_base ||
+        physical >= module_end || bytes > module_end - physical || !(flags & LUME_MODULE_READ) ||
+        (flags & ~(LUME_MODULE_READ | LUME_MODULE_WRITE | LUME_MODULE_EXECUTE)) ||
+        (flags & (LUME_MODULE_WRITE | LUME_MODULE_EXECUTE)) ==
+            (LUME_MODULE_WRITE | LUME_MODULE_EXECUTE))
+        return false;
+    for (uint64_t p = physical; p < physical + bytes; p += PAGE)
+        module_l3[(p - module_first) / BLOCK][(p >> 12) & 511] = 0;
+    module_flush();
+    uint64_t attributes = NORMAL | UXN | 3;
+    if (!(flags & LUME_MODULE_WRITE))
+        attributes |= RO;
+    if (!(flags & LUME_MODULE_EXECUTE))
+        attributes |= PXN;
+    for (uint64_t p = physical; p < physical + bytes; p += PAGE)
+        module_l3[(p - module_first) / BLOCK][(p >> 12) & 511] = p | attributes;
+    module_flush();
+    return true;
 }

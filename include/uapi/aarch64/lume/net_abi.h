@@ -58,7 +58,8 @@ enum
     LUME_EVENT_LINK = 3,
     LUME_EVENT_SCAN = 4,
     LUME_EVENT_CONNECTION = 5,
-    LUME_EVENT_IPV4 = 6
+    LUME_EVENT_IPV4 = 6,
+    LUME_EVENT_UNREGISTER = 7
 };
 
 enum lume_net_control_op

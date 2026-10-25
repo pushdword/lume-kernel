@@ -5,8 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* The kernel serializes access to this registry. Registrations keep stable indices until reboot.
- * Callback code and context must remain valid for that lifetime. Receive consumes one complete
+/* The kernel serializes access to this registry. Indices are never reused during a boot.
+ * Callback code and context remain valid until unregister succeeds. Receive consumes one complete
  * Ethernet frame, returns zero when no frame is available and returns a negative value on error.
  * Transmit returns true when a frame is accepted and the caller may reuse its storage.
  * Driver callbacks must not enter the network stack or dispatch operations through this registry.
@@ -31,6 +31,9 @@ struct lume_netif_descriptor
 };
 struct lume_netif;
 int lume_netif_register(const struct lume_netif_descriptor *);
+int lume_netif_unregister(uint32_t index);
+int lume_netif_reference(struct lume_netif *);
+int lume_netif_unreference(struct lume_netif *);
 unsigned lume_netif_count(void);
 struct lume_netif *lume_netif_at(unsigned);
 struct lume_netif *lume_netif_find(uint32_t);

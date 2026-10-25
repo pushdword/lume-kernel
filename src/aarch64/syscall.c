@@ -7,6 +7,10 @@
 #include "lume/boot.h"
 #include "lume/smp.h"
 #include "scheduler_config.h"
+#include "lume/hardware.h"
+#include "lume/modules.h"
+#include "lume/kernel_memory.h"
+#include <string.h>
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -48,7 +52,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         *(struct lume_system_features *)(uintptr_t)a = (struct lume_system_features){
             .abi = LUME_ABI_VERSION,
             .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES |
-                        LUME_FEATURE_THREADS | LUME_FEATURE_SMP,
+                        LUME_FEATURE_THREADS | LUME_FEATURE_SMP | LUME_FEATURE_HARDWARE |
+                        LUME_FEATURE_MODULES,
             .pointer_bits = 64,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
@@ -60,6 +65,66 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_PROBE:
         return n <= 1 && lume_user_buffer(a, b, n != 0) ? 0 : -LUME_EFAULT;
+    case LUME_SYS_HARDWARE:
+    {
+        if (b != sizeof(struct lume_hardware_request) || n)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        struct lume_hardware_request request;
+        memcpy(&request, (const void *)(uintptr_t)a, sizeof(request));
+        int result = lume_hardware_control(&request, lume_task_capable(pid, LUME_CAP_DRIVER_ADMIN),
+                                           lume_task_capable(pid, LUME_CAP_HW_DIAGNOSTIC));
+        if (!result)
+            memcpy((void *)(uintptr_t)a, &request, sizeof(request));
+        return result;
+    }
+    case LUME_SYS_MODULE:
+    {
+        if (b != sizeof(struct lume_module_request) || n)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        struct lume_module_request request;
+        memcpy(&request, (const void *)(uintptr_t)a, sizeof(request));
+        if (request.version != LUME_MODULE_ABI_VERSION ||
+            (request.operation != LUME_MODULE_LOAD && request.operation != LUME_MODULE_INSPECT &&
+             (request.file || request.bytes)))
+            return -LUME_EINVAL;
+        int result = -LUME_EINVAL;
+        if (request.operation == LUME_MODULE_LIST && !request.id)
+            result = lume_module_info(request.index, &request.info);
+        else if (request.operation == LUME_MODULE_KERNEL && !request.id && !request.index)
+        {
+            lume_module_kernel_info(&request.info);
+            result = 0;
+        }
+        else if (request.operation == LUME_MODULE_UNLOAD && request.id && !request.index)
+            result = lume_task_capable(pid, LUME_CAP_DRIVER_ADMIN) ? lume_module_unload(request.id)
+                                                                   : -LUME_EPERM;
+        else if ((request.operation == LUME_MODULE_LOAD ||
+                  request.operation == LUME_MODULE_INSPECT) &&
+                 !request.id && !request.index)
+        {
+            if (!lume_task_capable(pid, LUME_CAP_DRIVER_ADMIN))
+                return -LUME_EPERM;
+            if (!request.bytes || request.bytes > LUME_MODULE_FILE_LIMIT)
+                return -LUME_E2BIG;
+            if (!lume_user_buffer(request.file, request.bytes, false))
+                return -LUME_EFAULT;
+            void *copy = lume_kernel_allocate((size_t)request.bytes);
+            if (!copy)
+                return -LUME_ENOMEM;
+            memcpy(copy, (const void *)(uintptr_t)request.file, (size_t)request.bytes);
+            result = request.operation == LUME_MODULE_LOAD
+                         ? lume_module_load(copy, (size_t)request.bytes, &request.info)
+                         : lume_module_inspect(copy, (size_t)request.bytes, &request.info);
+            lume_kernel_free(copy);
+        }
+        if (!result)
+            memcpy((void *)(uintptr_t)a, &request, sizeof(request));
+        return result;
+    }
     case LUME_SYS_BRK:
         return lume_heap_brk(pid, a);
     case LUME_SYS_TERMINAL:

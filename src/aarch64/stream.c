@@ -26,6 +26,14 @@ struct stream
 static struct stream streams[3];
 static unsigned sequence;
 
+bool lume_stream_busy(void)
+{
+    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i)
+        if (streams[i].owner)
+            return true;
+    return false;
+}
+
 static struct stream *allocate(unsigned owner)
 {
     for (unsigned i = 0; i < 3; ++i)
