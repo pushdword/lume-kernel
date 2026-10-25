@@ -6,6 +6,43 @@
 #define HEAP_BASE LUME_HEAP_BASE
 static uint64_t ends[LUME_TASK_LIMIT];
 
+void lume_heap_swap(unsigned a, unsigned b)
+{
+    uint64_t value = ends[a];
+    ends[a] = ends[b];
+    ends[b] = value;
+}
+
+bool lume_heap_clone(unsigned source, unsigned target)
+{
+    if (source >= LUME_TASK_LIMIT || target >= LUME_TASK_LIMIT || source == target || ends[target])
+        return false;
+    uint64_t end = ends[source] ? ends[source] : HEAP_BASE;
+    unsigned pages = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+    for (unsigned i = 0; i < pages; ++i)
+    {
+        uint64_t address = HEAP_BASE + (uint64_t)i * 4096, physical;
+        if (!lume_mmu_translate(lume_mmu_task_root(source), address, true, true, false, &physical))
+            goto fail;
+        uint64_t page = lume_page_alloc(0);
+        if (!page)
+            goto fail;
+        if (!lume_mmu_map_user(target, address, page, true, false))
+        {
+            (void)lume_page_free(page);
+            goto fail;
+        }
+        for (unsigned j = 0; j < 4096; ++j)
+            ((unsigned char *)(uintptr_t)page)[j] = ((const unsigned char *)(uintptr_t)physical)[j];
+        ends[target] = address + 4096;
+    }
+    ends[target] = end;
+    return true;
+fail:
+    lume_heap_release(target + 1);
+    return false;
+}
+
 static void release_page(unsigned task, unsigned index)
 {
     uint64_t va = HEAP_BASE + (uint64_t)index * 4096, physical;

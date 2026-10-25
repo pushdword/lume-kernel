@@ -137,7 +137,10 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     struct lume_context *result =
         user && lume_cpu_index() && !lume_tasks_active() ? NULL : exception_dispatch(frame, vector);
     if (user)
+    {
+        result = lume_tasks_deliver_signals(result);
         lume_task_account_leave(result);
+    }
     if (acquire)
         lume_smp_unlock();
     return result;

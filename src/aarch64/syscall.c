@@ -10,7 +10,11 @@
 #include "lume/hardware.h"
 #include "lume/modules.h"
 #include "lume/kernel_memory.h"
+#include "lume/socket_file.h"
+#include "lume/file_mode.h"
 #include <string.h>
+
+extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -36,6 +40,41 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return LUME_ABI_VERSION;
     case LUME_SYS_GETPID:
         return pid;
+    case LUME_SYS_CREDENTIAL:
+        return a > LUME_CREDENTIAL_UMASK ? -LUME_EINVAL
+                                         : lume_credential_call(files, pid, (unsigned)a, b, n);
+    case LUME_SYS_FILE_MODE:
+    {
+        if (a > LUME_FILE_MODE_MKDIR || n != sizeof(struct lume_file_mode_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false))
+            return -LUME_EFAULT;
+        struct lume_file_mode_request request =
+            *(const struct lume_file_mode_request *)(uintptr_t)b;
+        r = a == LUME_FILE_MODE_FD ? 0 : string(request.path, p);
+        return r ? r : lume_vfs_file_mode(files, (unsigned)a, &request, p);
+    }
+    case LUME_SYS_RANDOM:
+    {
+        if (n || b > 256)
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(a, b, true))
+            return -LUME_EFAULT;
+        unsigned char random[256];
+        for (unsigned used = 0; used < b;)
+        {
+            unsigned count = b - used > 64 ? 64 : (unsigned)b - used;
+            if (!lume_entropy(random + used, count))
+            {
+                memset(random, 0, sizeof(random));
+                return -LUME_EIO;
+            }
+            used += count;
+        }
+        memcpy((void *)(uintptr_t)a, random, b);
+        memset(random, 0, sizeof(random));
+        return (int64_t)b;
+    }
     case LUME_SYS_CPU:
         return b || n || a > 2 ? -LUME_EINVAL
                : a == 2        ? LUME_SCHED_QUANTUM
@@ -53,7 +92,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             .abi = LUME_ABI_VERSION,
             .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES |
                         LUME_FEATURE_THREADS | LUME_FEATURE_SMP | LUME_FEATURE_HARDWARE |
-                        LUME_FEATURE_MODULES,
+                        LUME_FEATURE_MODULES | LUME_FEATURE_SUPERVISION | LUME_FEATURE_FORK |
+                        LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM | LUME_FEATURE_SOCKETS |
+                        LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS | LUME_FEATURE_FILE_MODES,
             .pointer_bits = 64,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
@@ -228,7 +269,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         if (a == LUME_FS_STAT_FD)
             return lume_vfs_stat_mode(files, b, (void *)(uintptr_t)n);
         if (a == LUME_FS_STAT_INODE)
-            return lume_vfs_stat_inode(b, (void *)(uintptr_t)n);
+            return files->identity.jailed || files->identity.euid
+                       ? -LUME_EACCES
+                       : lume_vfs_stat_inode(b, (void *)(uintptr_t)n);
         r = string(b, p);
         return r ? r : lume_vfs_stat_path(files, p, (void *)(uintptr_t)n);
     }
@@ -349,6 +392,23 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EFAULT;
         int64_t result = lume_vfs_fd_call(files, (unsigned)a, &request);
         *(struct lume_fd_request *)(uintptr_t)b = request;
+        return result;
+    }
+    case LUME_SYS_SOCKET:
+    {
+        if (a > LUME_SOCKET_OPTION || n != sizeof(struct lume_socket_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        struct lume_socket_request request = *(const struct lume_socket_request *)(uintptr_t)b;
+        if (request.count > LUME_FILE_IO_MAX)
+            return -LUME_EINVAL;
+        if (a == LUME_SOCKET_SEND_FD && !lume_user_buffer(request.buffer, request.count, false))
+            return -LUME_EFAULT;
+        if (a == LUME_SOCKET_RECEIVE_FD && !lume_user_buffer(request.buffer, request.count, true))
+            return -LUME_EFAULT;
+        int64_t result = lume_socket_call(files, (unsigned)a, &request);
+        *(struct lume_socket_request *)(uintptr_t)b = request;
         return result;
     }
     case LUME_SYS_MKDIR:

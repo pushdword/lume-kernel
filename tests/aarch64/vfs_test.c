@@ -106,9 +106,9 @@ int main(void)
     fd = (int)lume_vfs_open_compat(&f, "/tmp/note", LUME_O_RDWR);
     T(fd == 3 && lume_vfs_close(&f, fd) == 0);
     T(lume_vfs_rename(&f, "/tmp/note", "/tmp/renamed") == 0);
-    T(lume_vfs_stat_path(&f, "/tmp/renamed", &st) == 0100777 && st.size == 12);
+    T(lume_vfs_stat_path(&f, "/tmp/renamed", &st) == 0100644 && st.size == 12);
     struct lume_stat inode_stat;
-    T(lume_vfs_stat_inode(st.inode, &inode_stat) == 0100777 && inode_stat.size == st.size);
+    T(lume_vfs_stat_inode(st.inode, &inode_stat) == 0100644 && inode_stat.size == st.size);
     T(lume_vfs_stat_inode(0, &inode_stat) == -LUME_ENOENT);
     T(lume_vfs_remove_compat(&f, "/tmp/renamed", false) == 0);
     fd = (int)lume_vfs_open(&f, "/", 0);

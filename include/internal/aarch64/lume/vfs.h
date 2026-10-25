@@ -6,6 +6,19 @@
 #include "fat.h"
 #include "storage.h"
 #include <fd.h>
+#include "lume/credential.h"
+
+struct lume_identity
+{
+    uint32_t uid, euid, suid, gid, egid, sgid, groups_count;
+    uint32_t groups[LUME_GROUP_MAX], umask;
+    bool jailed;
+
+    struct
+    {
+        uint64_t soft, hard;
+    } limit[LUME_LIMIT_COUNT];
+};
 
 struct lume_fd
 {
@@ -17,6 +30,7 @@ struct lume_files
 {
     char cwd[LUME_PATH_MAX];
     struct lume_fd fd[LUME_FD_MAX];
+    struct lume_identity identity;
 };
 
 void lume_vfs_init(const void *shell, size_t bytes);
@@ -43,6 +57,10 @@ int64_t lume_vfs_truncate(struct lume_files *, uint64_t);
 int64_t lume_vfs_rename(struct lume_files *, const char *, const char *);
 int64_t lume_vfs_getdents(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
 int64_t lume_vfs_chdir(struct lume_files *, const char *);
+int64_t lume_vfs_chroot(struct lume_files *, const char *);
+struct lume_file_mode_request;
+int64_t lume_vfs_file_mode(struct lume_files *, unsigned, struct lume_file_mode_request *,
+                           const char *);
 bool lume_vfs_image(const char *path, const void **data, size_t *bytes);
 bool lume_vfs_mount_fat(const void *, size_t);
 bool lume_vfs_mount_storage(const struct lume_storage_ops *);

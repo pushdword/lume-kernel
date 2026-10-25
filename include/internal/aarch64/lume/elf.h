@@ -34,6 +34,7 @@ struct lume_elf_image
 
 bool lume_elf_plan(const void *, size_t, struct lume_elf_plan *);
 bool lume_elf_load(unsigned task, const void *, size_t, struct lume_elf_image *);
+bool lume_elf_clone(unsigned task, const struct lume_elf_image *, struct lume_elf_image *);
 void lume_elf_release(struct lume_elf_image *);
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 void lume_mmu_unmap_user(unsigned task, uint64_t va);

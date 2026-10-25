@@ -97,9 +97,11 @@ extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_USER_STACK UINT64_C(0x5ff00000)
 #define LUME_STACK_PAGES 256u
 #define LUME_HEAP_BASE UINT64_C(0x48000000)
-#define LUME_THREAD_BASE UINT64_C(0x5f000000)
+#define LUME_THREAD_BASE UINT64_C(0x5e000000)
 #define LUME_HEAP_LIMIT (LUME_THREAD_BASE - 4096)
-#define LUME_TASK_LIMIT 8u
+#define LUME_TASK_LIMIT 16u
+
+struct lume_context *lume_tasks_deliver_signals(struct lume_context *);
 
 static inline uint64_t lume_current_el(void)
 {

@@ -56,6 +56,14 @@ enum lume_syscall
     LUME_SYS_THREAD = 39,
     LUME_SYS_HARDWARE = 40,
     LUME_SYS_MODULE = 41,
+    LUME_SYS_SUPERVISE = 42,
+    LUME_SYS_FORK = 43,
+    LUME_SYS_EXEC = 44,
+    LUME_SYS_RANDOM = 45,
+    LUME_SYS_SOCKET = 46,
+    LUME_SYS_CREDENTIAL = 47,
+    LUME_SYS_SIGNAL = 48,
+    LUME_SYS_FILE_MODE = 49,
 };
 
 enum
@@ -114,7 +122,8 @@ enum
     LUME_NODE_DIR = 2,
     LUME_NODE_CHAR = 3,
     LUME_NODE_PIPE = 4,
-    LUME_NODE_BLOCK = 5
+    LUME_NODE_BLOCK = 5,
+    LUME_NODE_SOCKET = 6
 };
 
 #define LUME_PATH_MAX 128u

@@ -23,7 +23,7 @@ struct stream
         unsigned char data[LUME_IO_BYTES];
     } packet[4];
 };
-static struct stream streams[3];
+static struct stream streams[16];
 static unsigned sequence;
 
 bool lume_stream_busy(void)
@@ -36,7 +36,7 @@ bool lume_stream_busy(void)
 
 static struct stream *allocate(unsigned owner)
 {
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 16; ++i)
         if (!streams[i].owner)
         {
             struct stream *s = &streams[i];
@@ -93,7 +93,7 @@ static err_t connected(void *context, struct tcp_pcb *pcb, err_t error)
 
 static void close_stream(struct stream *s)
 {
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 16; ++i)
         if (streams[i].pending == s)
             streams[i].pending = 0;
     if (s->pending)
@@ -160,12 +160,13 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
 void lume_stream_release(unsigned pid)
 {
     lume_icmp_release(pid);
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 16; ++i)
         if (streams[i].owner == pid)
             close_stream(&streams[i]);
 }
 
-int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
+static int stream_request(unsigned pid, unsigned op, struct lume_stream_request *r,
+                          bool nonblocking, unsigned options)
 {
     if (op >= LUME_ICMP_ECHO_START && op <= LUME_ICMP_ECHO_CLOSE)
         return lume_icmp_call(pid, op, r);
@@ -208,6 +209,12 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
             close_stream(s);
             return -LUME_ENOMEM;
         }
+        if (options & 1)
+            tcp_nagle_disable(s->pcb);
+        if (options & 2)
+            ip_set_option(s->pcb, SOF_KEEPALIVE);
+        if (options & 4)
+            ip_set_option(s->pcb, SOF_REUSEADDR);
         if (listening)
         {
             err_t error = tcp_bind(s->pcb, &address, (u16_t)r->port);
@@ -250,7 +257,7 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
         r->handle = s->handle;
         return 0;
     }
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 16; ++i)
         if (streams[i].owner == pid && streams[i].handle == r->handle)
             s = &streams[i];
     if (!s)
@@ -332,7 +339,8 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
     uint32_t start = lume_clock_millis();
     if (op == LUME_STREAM_RECEIVE)
     {
-        while (!s->count && !s->eof && !s->failed && (uint32_t)(lume_clock_millis() - start) < 5000)
+        while (!nonblocking && !s->count && !s->eof && !s->failed &&
+               (uint32_t)(lume_clock_millis() - start) < 5000)
             lume_net_poll();
         if (!s->count)
             return s->failed ? -LUME_EIO : s->eof ? 0 : -LUME_EAGAIN;
@@ -348,7 +356,7 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
     }
     if (s->write_closed || !s->connected)
         return -LUME_EIO;
-    while (s->pcb && !s->failed && !tcp_sndbuf(s->pcb) &&
+    while (!nonblocking && s->pcb && !s->failed && !tcp_sndbuf(s->pcb) &&
            (uint32_t)(lume_clock_millis() - start) < 5000)
         lume_net_poll();
     if (!s->pcb || s->failed)
@@ -360,4 +368,58 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
         return -LUME_EAGAIN;
     (void)tcp_output(s->pcb);
     return (int)n;
+}
+
+int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *request)
+{
+    return stream_request(pid, op, request, false, 0);
+}
+
+int lume_stream_nowait(unsigned pid, unsigned op, struct lume_stream_request *request)
+{
+    return stream_request(pid, op, request, true, 0);
+}
+
+int lume_stream_socket_create(unsigned pid, unsigned op, struct lume_stream_request *request,
+                              unsigned options)
+{
+    return stream_request(pid, op, request, true, options);
+}
+
+int lume_stream_socket_options(unsigned owner, unsigned handle, unsigned options)
+{
+    for (unsigned i = 0; i < 16; ++i)
+        if (streams[i].owner == owner && streams[i].handle == handle && streams[i].pcb)
+        {
+            struct tcp_pcb *pcb = streams[i].pcb;
+            if (streams[i].listening)
+                return -LUME_EINVAL;
+            if (options & 1)
+                tcp_nagle_disable(pcb);
+            else
+                tcp_nagle_enable(pcb);
+            if (options & 2)
+                ip_set_option(pcb, SOF_KEEPALIVE);
+            else
+                ip_reset_option(pcb, SOF_KEEPALIVE);
+            if (options & 4)
+                ip_set_option(pcb, SOF_REUSEADDR);
+            else
+                ip_reset_option(pcb, SOF_REUSEADDR);
+            return 0;
+        }
+    return -LUME_EBADF;
+}
+
+int lume_stream_socket_local(unsigned owner, unsigned handle, unsigned char address[4],
+                             unsigned *port)
+{
+    for (unsigned i = 0; i < 16; ++i)
+        if (streams[i].owner == owner && streams[i].handle == handle && streams[i].pcb)
+        {
+            memcpy(address, &ip_2_ip4(&streams[i].pcb->local_ip)->addr, 4);
+            *port = streams[i].pcb->local_port;
+            return 0;
+        }
+    return -LUME_EBADF;
 }

@@ -202,8 +202,8 @@ $(OUT)/tests/watchdog$(HOSTEXE): tests/aarch64/watchdog_test.c src/aarch64/watch
 $(OUT)/tests/icmp$(HOSTEXE): tests/aarch64/icmp_test.c src/aarch64/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/aarch64/stream_test.c src/aarch64/stream.c
-$(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
-$(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/common/resource.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
+$(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/file_modes.c src/aarch64/fat.c src/aarch64/block.c
+$(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/common/resource.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/file_modes.c src/aarch64/fat.c src/aarch64/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/aarch64/heap_test.c src/aarch64/heap.c
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/aarch64/sdio_test.c src/aarch64/sdio.c

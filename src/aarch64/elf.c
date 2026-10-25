@@ -1,4 +1,5 @@
 #include "lume/elf.h"
+#include "lume/mmu.h"
 
 static uint16_t le16(const unsigned char *p)
 {
@@ -134,6 +135,47 @@ void lume_elf_release(struct lume_elf_image *image)
         if (!lume_page_free((uintptr_t)image->pages + (uint64_t)i * 4096))
             lume_fail("ELF metadata release");
     *image = (struct lume_elf_image){0};
+}
+
+bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
+                    struct lume_elf_image *image)
+{
+    *image = *source;
+    image->task = task;
+    image->count = 0;
+    image->pages = (void *)(uintptr_t)lume_pages_alloc_span(image->metadata_pages);
+    if (!image->pages)
+    {
+        *image = (struct lume_elf_image){0};
+        return false;
+    }
+    for (unsigned i = 0; i < source->count; ++i)
+    {
+        uint64_t address = source->pages[i].address, ignored;
+        bool write = lume_mmu_translate(lume_mmu_task_root(source->task), address, true, true,
+                                        false, &ignored);
+        bool execute = lume_mmu_translate(lume_mmu_task_root(source->task), address, false, true,
+                                          true, &ignored);
+        uint64_t page = lume_page_alloc(0);
+        if (!page)
+            goto fail;
+        if (!lume_mmu_map_user(task, address, page, write, execute))
+        {
+            (void)lume_page_free(page);
+            goto fail;
+        }
+        image->pages[image->count].address = address;
+        image->pages[image->count++].physical = page;
+        for (unsigned j = 0; j < 4096; ++j)
+            ((unsigned char *)(uintptr_t)page)[j] =
+                ((const unsigned char *)(uintptr_t)source->pages[i].physical)[j];
+        if (execute)
+            lume_sync_code(page, 4096);
+    }
+    return true;
+fail:
+    lume_elf_release(image);
+    return false;
 }
 
 bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf_image *image)

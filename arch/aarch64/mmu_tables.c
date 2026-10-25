@@ -130,6 +130,42 @@ void lume_mmu_share_user(unsigned task, unsigned owner)
     shared_user[task] = owner + 1;
 }
 
+bool lume_mmu_swap_user(unsigned a, unsigned b)
+{
+    if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared_user[a] || shared_user[b])
+        return false;
+    for (unsigned i = 0; i < 512; ++i)
+    {
+        uint64_t value = user_root[a][i];
+        user_root[a][i] = user_root[b][i];
+        user_root[b][i] = value;
+        value = user_l2[a][i];
+        user_l2[a][i] = user_l2[b][i];
+        user_l2[b][i] = value;
+        value = user_l3[a][i];
+        user_l3[a][i] = user_l3[b][i];
+        user_l3[b][i] = value;
+    }
+    for (unsigned i = 0; i < USER_BLOCKS; ++i)
+    {
+        uint64_t *value = user_tables[a][i];
+        user_tables[a][i] = user_tables[b][i];
+        user_tables[b][i] = value;
+        if (user_tables[a][i] == user_l3[b])
+            user_tables[a][i] = user_l3[a];
+        if (user_tables[b][i] == user_l3[a])
+            user_tables[b][i] = user_l3[b];
+    }
+    user_root[a][LUME_USER_BASE >> 30] = table(user_l2[a]);
+    user_root[b][LUME_USER_BASE >> 30] = table(user_l2[b]);
+    user_l2[a][0] = table(user_l3[a]);
+    user_l2[b][0] = table(user_l3[b]);
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+#endif
+    return true;
+}
+
 void lume_mmu_release_user(unsigned task)
 {
     if (task >= LUME_TASK_LIMIT)

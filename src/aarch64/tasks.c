@@ -5,6 +5,7 @@
 #include "lume/smp.h"
 #include "lume/mmu.h"
 #define SCHED_CPUS LUME_CPU_LIMIT
+#define SCHED_TASKS LUME_TASK_LIMIT
 #include "scheduler_policy.h"
 #include "lume/service.h"
 #include "lume/net.h"
@@ -16,6 +17,9 @@
 #include "lume/boot.h"
 #include "lume/worker.h"
 #include "lume/thread.h"
+#include "lume/supervision.h"
+#include "lume/signal.h"
+#include <string.h>
 #include "../common/thread_state.h"
 #ifndef LUME_BOOT_TIMEOUT_SECONDS
 #define LUME_BOOT_TIMEOUT_SECONDS 0
@@ -77,6 +81,13 @@ static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static unsigned thread_pages[LUME_TASK_LIMIT];
 static bool process_exiting[LUME_TASK_LIMIT], main_thread_done[LUME_TASK_LIMIT];
 static unsigned process_status[LUME_TASK_LIMIT];
+static unsigned service_root[LUME_TASK_LIMIT];
+static bool context_replaced[LUME_TASK_LIMIT];
+static unsigned exit_signals[LUME_TASK_LIMIT];
+
+extern int64_t lume_supervision_call(unsigned, unsigned, struct lume_supervision_request *);
+extern void lume_supervision_release(unsigned);
+extern bool lume_supervision_manager(unsigned);
 
 uint64_t lume_task_capabilities(unsigned pid)
 {
@@ -92,7 +103,8 @@ int lume_task_drop_capabilities(unsigned pid, uint64_t mask)
 {
     if (!pid || pid > LUME_TASK_LIMIT ||
         (mask & ~(uint64_t)(LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_SERVICE |
-                            LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC)))
+                            LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SUPERVISOR |
+                            LUME_CAP_SERVICE_CONTROL)))
         return -LUME_EINVAL;
     capabilities[pid - 1] &= ~mask;
     return 0;
@@ -239,6 +251,7 @@ int lume_task_info(unsigned task, struct lume_task_info *out)
     unsigned state = states[task];
     *out = (struct lume_task_info){.pid = task + 1,
                                    .parent = task ? parents[task] + 1 : 0,
+                                   .uid = tasks[thread_slots[task].process].files.identity.uid,
                                    .state = state == 4   ? 5
                                             : state == 5 ? 4
                                                          : state,
@@ -333,7 +346,16 @@ static struct lume_context *select_task(unsigned);
 static struct lume_context *wait_ready_task(void);
 static struct lume_context *finish_program(unsigned);
 static int start_program(struct lume_context *);
+static int fork_program(struct lume_context *);
 static unsigned process_slot(unsigned);
+static void signal_queue(unsigned, unsigned);
+static void signal_inherit(unsigned, unsigned, bool);
+
+static uint32_t wait_status(unsigned task, bool posix)
+{
+    return posix ? (exit_signals[task] ? exit_signals[task] : (exit_codes[task] & 255) << 8)
+                 : exit_codes[task];
+}
 
 static void kernel_call(void *context)
 {
@@ -341,9 +363,10 @@ static void kernel_call(void *context)
     unsigned task = kernel_owner;
     unsigned process = process_slot(task);
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
-    kernel_result =
-        kernel_launch ? start_program(&tasks[task].context)
-                      : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
+    kernel_result = tasks[task].context.x[8] == LUME_SYS_FORK ? fork_program(&tasks[task].context)
+                    : kernel_launch ? start_program(&tasks[task].context)
+                                    : lume_public_call(&tasks[process].files, &tasks[task].context,
+                                                       process + 1);
 }
 
 static void kernel_work(void *context)
@@ -408,7 +431,8 @@ static void kernel_step(void)
         }
         else
         {
-            frame->x[0] = (uint64_t)kernel_result;
+            if (!context_replaced[task])
+                frame->x[0] = (uint64_t)kernel_result;
             states[task] = 1;
             sched_wake(&policy, task, unit, 0);
         }
@@ -425,6 +449,7 @@ static void kernel_step(void)
 
 static void release_program(unsigned task)
 {
+    lume_supervision_release(task + 1);
     lume_wait_cancel(pipe_queues[task], task);
     pipe_queues[task] = 0;
     pipe_wait[task] = false;
@@ -450,12 +475,75 @@ static void release_program(unsigned task)
 
 #include "thread_calls.h"
 
+static bool process_busy(unsigned owner)
+{
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && process_slot(i) == owner &&
+            (kernel_wait[i] || (lume_worker_busy() && kernel_owner == i)))
+            return true;
+    return false;
+}
+
+static void request_exit(unsigned owner, unsigned status)
+{
+    if (!process_exiting[owner])
+        process_status[owner] = status;
+    process_exiting[owner] = true;
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && states[i] != 5 && process_slot(i) == owner && states[i] != 2)
+        {
+            lume_wait_cancel(pipe_queues[i], i);
+            pipe_queues[i] = 0;
+            pipe_wait[i] = input_wait[i] = false;
+            thread_waiting[i] = futex_address[i] = 0;
+            wait_target[i] = 0;
+            states[i] = 1;
+            sched_wake(&policy, i, unit, 0);
+        }
+    lume_smp_wake();
+}
+
+/* The group root keeps its PID until every descendant has released its resources. */
+static bool service_drained(unsigned root)
+{
+    bool manager = lume_supervision_manager(root + 1);
+    bool pending = false;
+    for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
+        if (i != root && states[i] && !thread_slots[i].thread &&
+            ((service_root[root] == root + 1 && service_root[i] == root + 1) ||
+             (manager && service_root[i] == i + 1 && parents[i] == root)))
+        {
+            if (states[i] == 5)
+            {
+                states[i] = 0;
+                service_root[i] = 0;
+            }
+            else
+            {
+                pending = true;
+                if (!process_busy(i))
+                {
+                    parents[i] = root;
+                    request_exit(i, 143);
+                }
+            }
+        }
+    return !pending;
+}
+
 static struct lume_context *finish_program(unsigned status)
 {
     unsigned task = current_task, parent = parents[task];
     process_status[task] = status;
     bool running = false;
     process_exiting[task] = true;
+    if (!service_drained(task) || process_busy(task))
+    {
+        sched_charge(&policy, lume_cpu_index(), now());
+        states[task] = 4;
+        wake_at[task] = lume_clock_monotonic() + 1;
+        return wait_ready_task();
+    }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (thread_slots[i].thread && process_slot(i) == task && states[i])
         {
@@ -477,9 +565,16 @@ static struct lume_context *finish_program(unsigned status)
     exit_codes[task] = status;
     tasks[task].exits = 1;
     states[task] = 5;
+    signal_queue(parent, 20);
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
         if (i != 2 && parents[i] == task)
-            parents[i] = 0;
+        {
+            unsigned reaper = service_root[task] ? service_root[task] - 1 : 0;
+            parents[i] =
+                reaper != task && reaper < LUME_TASK_LIMIT && states[reaper] && states[reaper] != 5
+                    ? reaper
+                    : 0;
+        }
     unsigned waiter = LUME_TASK_LIMIT;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] == 3 && process_slot(i) == parent &&
@@ -493,9 +588,10 @@ static struct lume_context *finish_program(unsigned status)
         wait_target[waiter] = 0;
         states[task] = 0;
         states[waiter] = 1;
-        tasks[waiter].context.x[0] = tasks[waiter].context.x[8] == LUME_SYS_WAIT
-                                         ? ((uint64_t)(task + 1) << 32) | status
-                                         : status;
+        tasks[waiter].context.x[0] =
+            tasks[waiter].context.x[8] == LUME_SYS_WAIT
+                ? ((uint64_t)(task + 1) << 32) | wait_status(task, tasks[waiter].context.x[2] != 0)
+                : status;
         lume_smp_wake();
         if (!lume_cpu_index() || (waiter != 0 && waiter != 2))
             return select_task(waiter);
@@ -503,6 +599,8 @@ static struct lume_context *finish_program(unsigned status)
     int next = pick_task();
     return next >= 0 ? select_task((unsigned)next) : wait_ready_task();
 }
+
+#include "signal_calls.h"
 
 static uint32_t now(void)
 {
@@ -522,6 +620,7 @@ static struct lume_context *select_task(unsigned next)
     pipe_queues[next] = 0;
     pipe_wait[next] = false;
     current_task = next;
+    context_replaced[next] = false;
     if (!thread_slots[next].thread && (process_exiting[next] || main_thread_done[next]))
         return finish_program(process_status[next]);
     core_masks[next] |= 1u << lume_cpu_index();
@@ -535,6 +634,8 @@ static struct lume_context *select_task(unsigned next)
 
 static void wake_tasks(void)
 {
+    extern void lume_tasks_signal_timers(void);
+    lume_tasks_signal_timers();
     extern bool lume_console_ready(void);
     uint64_t at = lume_clock_monotonic();
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
@@ -612,8 +713,11 @@ static struct lume_context *kernel_begin(struct lume_context *frame, bool launch
     unsigned task = current_task;
     /* Requests consume argument registers. Preserve the complete exception frame only
      * when the call suspends or starts a synchronous child. */
-    for (unsigned i = 0; i < 9; ++i)
-        tasks[task].context.x[i] = frame->x[i];
+    if (frame->x[8] == LUME_SYS_FORK || frame->x[8] == LUME_SYS_EXEC)
+        tasks[task].context = *frame;
+    else
+        for (unsigned i = 0; i < 9; ++i)
+            tasks[task].context.x[i] = frame->x[i];
     kernel_owner = task;
     kernel_launch = launch;
     kernel_wait[task] = true;
@@ -624,6 +728,8 @@ static struct lume_context *kernel_begin(struct lume_context *frame, bool launch
     kernel_step();
     if (states[task] == 1 && !kernel_wait[task])
     {
+        if (context_replaced[task])
+            return select_task(task);
         /* A completed call keeps its running task and current timer quantum. */
         states[task] = 2;
         frame->x[0] = tasks[task].context.x[0];
@@ -653,10 +759,28 @@ static int user_string(uint64_t p, char *out, unsigned limit, unsigned *used)
     return -LUME_E2BIG;
 }
 
+static bool process_quota(unsigned owner)
+{
+    unsigned used = 0;
+    unsigned uid = tasks[owner].files.identity.uid;
+    uint64_t limit = tasks[owner].files.identity.limit[LUME_LIMIT_PROCESSES].soft;
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && !thread_slots[i].thread && tasks[i].files.identity.uid == uid)
+            ++used;
+    return used < limit;
+}
+
 static int start_program(struct lume_context *frame)
 {
     unsigned parent = current_task, child = LUME_TASK_LIMIT;
     unsigned owner = process_slot(parent);
+    bool replacing = frame->x[8] == LUME_SYS_EXEC;
+    if (replacing)
+        for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+            if (thread_slots[i].thread && states[i] && process_slot(i) == owner)
+                return -LUME_EBUSY;
+    if (!replacing && !process_quota(owner))
+        return -LUME_EAGAIN;
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
         if (i != 2 && !states[i])
         {
@@ -668,7 +792,7 @@ static int start_program(struct lume_context *frame)
     struct lume_run_request request = {
         .path = frame->x[0], .argv = frame->x[1], .argc = (uint32_t)frame->x[2]};
     bool actions_call = frame->x[8] == LUME_SYS_RUN_ACTIONS;
-    bool inherit = frame->x[8] == LUME_SYS_RUN_FDS || actions_call;
+    bool inherit = frame->x[8] == LUME_SYS_RUN_FDS || actions_call || replacing;
     bool asynchronous = frame->x[8] == LUME_SYS_RUN_ENV || inherit;
     if (asynchronous)
     {
@@ -804,6 +928,7 @@ static int start_program(struct lume_context *frame)
         lume_files_inherit(&tasks[child].files, &tasks[owner].files);
     else
         lume_files_clone(&tasks[child].files, &tasks[owner].files);
+    tasks[child].files.identity = tasks[owner].files.identity;
     files_ready = true;
     for (unsigned i = 0; i < action_count; ++i)
     {
@@ -839,12 +964,51 @@ static int start_program(struct lume_context *frame)
         for (unsigned i = 0; i < LUME_FD_MAX; ++i)
             if (tasks[child].files.fd[i].flags & LUME_FD_CLOEXEC)
                 (void)lume_vfs_close(&tasks[child].files, i);
+    if (replacing)
+    {
+        if (!lume_mmu_swap_user(owner, child))
+        {
+            load_error = -LUME_EBUSY;
+            goto fail;
+        }
+        lume_mmu_switch(lume_mmu_root());
+        lume_heap_swap(owner, child);
+        struct lume_elf_image image = images[owner];
+        images[owner] = images[child];
+        images[child] = image;
+        images[owner].task = owner;
+        images[child].task = child;
+        uint64_t page = tasks[owner].data;
+        tasks[owner].data = tasks[child].data;
+        tasks[child].data = page;
+        for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        {
+            page = tasks[owner].stack[i];
+            tasks[owner].stack[i] = tasks[child].stack[i];
+            tasks[child].stack[i] = page;
+        }
+        lume_files_release(&tasks[owner].files);
+        tasks[owner].files = tasks[child].files;
+        for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+            tasks[child].files.fd[i].object = -1;
+        tasks[owner].context = tasks[child].context;
+        tasks[owner].context.tpidr = owner + 1;
+        release_program(child);
+        thread_new(thread_slots, owner, owner, false);
+        main_thread_done[owner] = false;
+        context_replaced[owner] = true;
+        signal_inherit(owner, owner, true);
+        ++program_runs;
+        return 0;
+    }
     thread_new(thread_slots, child, child, false);
     process_exiting[child] = main_thread_done[child] = false;
     process_status[child] = 0;
-    capabilities[child] = capabilities[owner] & ~(uint64_t)LUME_CAP_SERVICE;
+    capabilities[child] = capabilities[owner] & ~(uint64_t)(LUME_CAP_SERVICE | LUME_CAP_SUPERVISOR);
+    service_root[child] = lume_supervision_manager(owner + 1) ? child + 1 : service_root[owner];
     tasks[child].calls = tasks[child].exits = tasks[child].faults = tasks[child].preemptions = 0;
     parents[child] = owner;
+    signal_inherit(child, owner, true);
     user_ticks[child] = kernel_ticks[child] = 0;
     lock_ticks[child] = 0;
     dispatches[child] = 0;
@@ -885,6 +1049,104 @@ fail:
     if (lume_pages_free() != program_before)
         lume_fail("failed program page leak");
     return load_error;
+}
+
+static int fork_program(struct lume_context *frame)
+{
+    unsigned owner = process_slot(current_task), child = LUME_TASK_LIMIT;
+    if (!process_quota(owner))
+        return -LUME_EAGAIN;
+    if (frame->x[0] || frame->x[1] || frame->x[2] || !images[owner].count)
+        return -LUME_EINVAL;
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+    {
+        if (thread_slots[i].thread && states[i] && process_slot(i) == owner)
+            return -LUME_EBUSY;
+        if (i && i != 2 && !states[i] && child == LUME_TASK_LIMIT)
+            child = i;
+    }
+    if (child == LUME_TASK_LIMIT)
+        return -LUME_EAGAIN;
+    memset(&tasks[child], 0, sizeof(tasks[child]));
+    tasks[child].data = lume_page_alloc(0);
+    for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        tasks[child].stack[i] = lume_page_alloc(0);
+    if (!tasks[child].data || !lume_mmu_user_root(child, tasks[child].data, tasks[child].stack))
+        goto fail;
+    lume_mmu_unmap_user(child, LUME_USER_BASE);
+    if (!lume_elf_clone(child, &images[owner], &images[child]) || !lume_heap_clone(owner, child))
+        goto fail;
+    memcpy((void *)(uintptr_t)tasks[child].data, (const void *)(uintptr_t)tasks[owner].data, 4096);
+    for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        memcpy((void *)(uintptr_t)tasks[child].stack[i],
+               (const void *)(uintptr_t)tasks[owner].stack[i], 4096);
+    lume_files_clone(&tasks[child].files, &tasks[owner].files);
+    tasks[child].context = *frame;
+    tasks[child].context.x[0] = 0;
+    thread_new(thread_slots, child, child, false);
+    process_exiting[child] = main_thread_done[child] = context_replaced[child] = false;
+    process_status[child] = 0;
+    capabilities[child] = capabilities[owner] & ~(uint64_t)(LUME_CAP_SERVICE | LUME_CAP_SUPERVISOR);
+    service_root[child] = service_root[owner];
+    parents[child] = owner;
+    signal_inherit(child, owner, false);
+    memcpy(task_names[child], task_names[owner], sizeof(task_names[child]));
+    user_ticks[child] = kernel_ticks[child] = lock_ticks[child] = 0;
+    dispatches[child] = core_masks[child] = 0;
+    owned[child] = true;
+    states[child] = 1;
+    ++program_runs;
+    sched_new(&policy, child, child + 1);
+    sched_wake(&policy, child, unit, 0);
+    lume_smp_wake();
+    return (int)child + 1;
+fail:
+    lume_heap_release(child + 1);
+    lume_elf_release(&images[child]);
+    if (tasks[child].data)
+        (void)lume_page_free(tasks[child].data);
+    for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        if (tasks[child].stack[i])
+            (void)lume_page_free(tasks[child].stack[i]);
+    lume_mmu_release_user(child);
+    return -LUME_ENOMEM;
+}
+
+static int supervision_stop(unsigned caller, unsigned pid)
+{
+    if (!lume_supervision_manager(caller + 1))
+        return -LUME_EPERM;
+    if (!pid || pid > LUME_TASK_LIMIT)
+        return -LUME_EINVAL;
+    unsigned target = pid - 1;
+    if (thread_slots[target].thread || !states[target] || parents[target] != caller ||
+        target == caller || service_root[target] != target + 1)
+        return -LUME_EPERM;
+    if (states[target] == 5)
+        return 0;
+    if (process_busy(target))
+        return -LUME_EBUSY;
+    request_exit(target, 143);
+    return 0;
+}
+
+static int64_t supervision_request(struct lume_context *frame, unsigned owner)
+{
+    if (frame->x[0] > LUME_SV_STOP_CHILD || frame->x[2] != sizeof(struct lume_supervision_request))
+        return -LUME_EINVAL;
+    uint64_t address = frame->x[1];
+    if (!lume_user_buffer(address, sizeof(struct lume_supervision_request), false) ||
+        !lume_user_buffer(address, sizeof(struct lume_supervision_request), true))
+        return -LUME_EFAULT;
+    struct lume_supervision_request request =
+        *(const struct lume_supervision_request *)(uintptr_t)address;
+    if (request.version != LUME_SUPERVISION_VERSION)
+        return -LUME_EINVAL;
+    int64_t result = frame->x[0] == LUME_SV_STOP_CHILD
+                         ? supervision_stop(owner, request.command)
+                         : lume_supervision_call(owner + 1, (unsigned)frame->x[0], &request);
+    *(struct lume_supervision_request *)(uintptr_t)address = request;
+    return result;
 }
 
 static struct lume_context *task_interrupt(struct lume_context *frame, bool timer)
@@ -1001,6 +1263,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         ++program_faults;
         lume_value("PROGRAM_FAULT_ESR", esr);
         lume_value("PROGRAM_FAULT_ADDRESS", far);
+        lume_value("PROGRAM_FAULT_PC", frame->elr);
+        exit_signals[task] = 11;
         return finish_program(139);
     }
     extern unsigned char lume_user_kernel_probe[], lume_user_ro_probe[];
@@ -1030,9 +1294,31 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         lume_watchdog_enter_call();
     if (public_mode && frame->x[8] == LUME_SYS_THREAD)
         return thread_call(frame);
+    if (public_mode && frame->x[8] == LUME_SYS_SUPERVISE)
+    {
+        frame->x[0] = (uint64_t)supervision_request(frame, process);
+        return frame;
+    }
+    if (public_mode && frame->x[8] == LUME_SYS_SIGNAL)
+    {
+        frame->x[0] = (uint64_t)signal_call(frame, process);
+        return frame;
+    }
     bool terminal_wait = public_mode && frame->x[8] == LUME_SYS_TERMINAL && frame->x[0] == 5;
     if (public_mode && (frame->x[8] == LUME_SYS_SLEEP || terminal_wait))
     {
+        if (!terminal_wait && frame->x[2] > 1)
+        {
+            frame->x[0] = (uint64_t)-LUME_EINVAL;
+            return frame;
+        }
+        if (!terminal_wait && frame->x[2] == 1 &&
+            (frame->x[1] != signals[process].epoch ||
+             (signals[process].pending & ~signals[process].mask)))
+        {
+            frame->x[0] = (uint64_t)-4;
+            return frame;
+        }
         uint64_t delay = terminal_wait ? frame->x[1] : frame->x[0];
         if (delay > (terminal_wait ? 1000u : 60000u))
         {
@@ -1058,7 +1344,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return next >= 0 ? select_task((unsigned)next) : NULL;
     }
     if (public_mode && (frame->x[8] == LUME_SYS_RUN || frame->x[8] == LUME_SYS_RUN_ENV ||
-                        frame->x[8] == LUME_SYS_RUN_FDS || frame->x[8] == LUME_SYS_RUN_ACTIONS))
+                        frame->x[8] == LUME_SYS_RUN_FDS || frame->x[8] == LUME_SYS_RUN_ACTIONS ||
+                        frame->x[8] == LUME_SYS_FORK || frame->x[8] == LUME_SYS_EXEC))
         return kernel_begin(frame, true);
     if (public_mode && owned[task] && frame->x[8] == LUME_SYS_EXIT)
     {
@@ -1068,7 +1355,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return process_terminate((unsigned)frame->x[0] & 255);
     if (public_mode && frame->x[8] == LUME_SYS_WAIT)
     {
-        if (frame->x[1] > 1 || frame->x[2])
+        if (frame->x[1] > 1 || frame->x[2] > 1)
         {
             frame->x[0] = (uint64_t)-LUME_EINVAL;
             return frame;
@@ -1082,7 +1369,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                 if (states[i] == 5)
                 {
                     states[i] = 0;
-                    frame->x[0] = ((uint64_t)(i + 1) << 32) | exit_codes[i];
+                    frame->x[0] = ((uint64_t)(i + 1) << 32) | wait_status(i, frame->x[2] != 0);
                     return frame;
                 }
             }
@@ -1253,6 +1540,54 @@ bool lume_elf_tasks_check(uint64_t frequency)
     return run_tasks(frequency, true);
 }
 
+static bool start_supervisor(void)
+{
+    const void *elf;
+    size_t bytes;
+    int error = lume_vfs_program(&tasks[0].files, "/data/bin/svcd", &elf, &bytes);
+    if (error == -LUME_ENOENT)
+        error = lume_vfs_program(&tasks[0].files, "/bin/svcd", &elf, &bytes);
+    if (error == -LUME_ENOENT)
+        return true;
+    if (error)
+        return false;
+    unsigned task = 1;
+    memset(&tasks[task], 0, sizeof(tasks[task]));
+    tasks[task].data = lume_page_alloc(0);
+    for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        tasks[task].stack[i] = lume_page_alloc(0);
+    owned[task] = true;
+    for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
+        if (!tasks[task].stack[i])
+            goto fail;
+    if (!tasks[task].data || !lume_mmu_user_root(task, tasks[task].data, tasks[task].stack))
+        goto fail;
+    lume_mmu_unmap_user(task, LUME_USER_BASE);
+    if (!lume_elf_load(task, elf, bytes, &images[task]))
+        goto fail;
+    lume_files_init(&tasks[task].files);
+    static const char *const arguments[] = {"/bin/svcd"};
+    static const char *const environment[] = {"PATH=/data/bin:/bin:/usr/bin", "HOME=/data/home"};
+    if (!lume_stack_build(tasks[task].stack, 1, arguments, 2, environment, images[task].entry,
+                          &tasks[task].context.sp_el0))
+        goto fail;
+    thread_new(thread_slots, task, task, false);
+    capabilities[task] = LUME_CAP_SUPERVISOR;
+    parents[task] = 0;
+    memcpy(task_names[task], "svcd", 5);
+    tasks[task].context.elr = images[task].entry;
+    tasks[task].context.spsr = 0x340;
+    tasks[task].context.tpidr = task + 1;
+    states[task] = 1;
+    sched_new(&policy, task, 1);
+    sched_wake(&policy, task, unit, 0);
+    lume_puts("LUME SERVICE SUPERVISOR EL0 PID2\n");
+    return true;
+fail:
+    release_program(task);
+    return false;
+}
+
 bool lume_shell_start(uint64_t frequency, bool script)
 {
     const void *elf;
@@ -1281,6 +1616,9 @@ bool lume_shell_start(uint64_t frequency, bool script)
         thread_pages[i] = 0;
         process_exiting[i] = main_thread_done[i] = false;
         process_status[i] = 0;
+        service_root[i] = 0;
+        context_replaced[i] = false;
+        lume_supervision_release(i + 1);
         thread_slots[i] = (struct thread_state){.process = i};
         observers[i] = false;
         input_wait[i] = false;
@@ -1306,8 +1644,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
         states[i] = 0;
     tasks[0].context = (struct lume_context){0};
     thread_new(thread_slots, 0, 0, false);
-    capabilities[0] =
-        LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC;
+    capabilities[0] = LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_DRIVER_ADMIN |
+                      LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SERVICE_CONTROL;
     tasks[0].calls = tasks[0].exits = tasks[0].faults = tasks[0].preemptions = 0;
     tasks[0].data = lume_page_alloc(0);
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
@@ -1360,6 +1698,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
         capabilities[2] = LUME_CAP_NET_ADMIN | LUME_CAP_SERVICE;
         lume_puts("LUME NET SERVICE EL0 PID3\n");
     }
+    if (!script && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && !start_supervisor())
+        lume_puts("LUME SERVICE SUPERVISOR UNAVAILABLE\n");
     active = true;
     lume_smp_lock();
     if (!script)
