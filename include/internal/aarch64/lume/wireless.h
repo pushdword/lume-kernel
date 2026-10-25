@@ -14,6 +14,7 @@ struct lume_wireless_ops
     int (*connect_status)(void *);
 };
 
+int lume_wireless_unregister(uint32_t);
 int lume_wireless_register(uint32_t, const struct lume_wifi_caps *,
                            const struct lume_wireless_ops *, void *);
 int lume_wireless_capabilities(uint32_t, struct lume_wifi_caps *);

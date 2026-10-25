@@ -283,3 +283,20 @@ int lume_wireless_connect_begin(uint32_t n, const struct lume_wifi_connect *requ
     r->busy = false;
     return ok ? 0 : -LUME_EIO;
 }
+
+int lume_wireless_unregister(uint32_t index)
+{
+    struct radio *radio = find(index);
+    if (!radio)
+        return -LUME_ENOENT;
+    if (radio->busy)
+        return -LUME_EBUSY;
+    int result = lume_wireless_disconnect(index);
+    if (result)
+        return result;
+    result = lume_netif_unreference(lume_netif_find(index));
+    if (result)
+        return result;
+    memset(radio, 0, sizeof(*radio));
+    return 0;
+}

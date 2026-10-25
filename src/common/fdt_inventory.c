@@ -34,7 +34,18 @@ static bool enabled(const void *tree, int node)
     return true;
 }
 
-static int translate(const void *tree, int bus, uint64_t *address, uint64_t size)
+static int address_value(const fdt32_t *cells, unsigned count, uint32_t *space, uint64_t *address)
+{
+    if (count < 1 || count > 3)
+        return -LUME_ENOSYS;
+    *space = count == 3 ? fdt32_to_cpu(cells[0]) & 0x03000000u : 0;
+    if (count == 3 && *space != 0x02000000u && *space != 0x03000000u)
+        return -LUME_ENOSYS;
+    *address = number(cells + (count == 3), count == 3 ? 2 : count);
+    return 0;
+}
+
+static int translate(const void *tree, int bus, uint32_t space, uint64_t *address, uint64_t size)
 {
     while (bus > 0)
     {
@@ -42,8 +53,8 @@ static int translate(const void *tree, int bus, uint64_t *address, uint64_t size
         int child_cells = cell_count(tree, bus, "#address-cells", 2);
         int parent_cells = cell_count(tree, parent, "#address-cells", 2);
         int size_cells = cell_count(tree, bus, "#size-cells", 1);
-        if (parent < 0 || child_cells < 1 || child_cells > 2 || parent_cells < 1 ||
-            parent_cells > 2 || size_cells < 1 || size_cells > 2)
+        if (parent < 0 || child_cells < 1 || child_cells > 3 || parent_cells < 1 ||
+            parent_cells > 3 || size_cells < 1 || size_cells > 2)
             return -LUME_ENOSYS;
         int bytes;
         const fdt32_t *ranges = fdt_getprop(tree, bus, "ranges", &bytes);
@@ -52,20 +63,36 @@ static int translate(const void *tree, int bus, uint64_t *address, uint64_t size
         unsigned stride = (unsigned)(child_cells + parent_cells + size_cells);
         if (bytes < 0 || (unsigned)bytes % (stride * 4))
             return -LUME_EINVAL;
+        if (!bytes && child_cells != parent_cells)
+            return -LUME_ENOSYS;
         bool matched = !bytes;
         uint64_t translated = *address;
+        uint32_t translated_space = space;
         for (unsigned i = 0; i < (unsigned)bytes / 4; i += stride)
         {
-            uint64_t base = number(ranges + i, (unsigned)child_cells);
-            uint64_t target = number(ranges + i + child_cells, (unsigned)parent_cells);
+            uint64_t base, target;
+            uint32_t source_space, target_space;
+            int result = address_value(ranges + i, (unsigned)child_cells, &source_space, &base);
+            if (result && child_cells == 3 && (fdt32_to_cpu(ranges[i]) & 0x03000000u) != space)
+                continue;
+            if (result)
+                return result;
+            if (source_space != space)
+                continue;
+            result = address_value(ranges + i + child_cells, (unsigned)parent_cells, &target_space,
+                                   &target);
+            if (result)
+                return result;
             uint64_t length = number(ranges + i + child_cells + parent_cells, (unsigned)size_cells);
             if (base > UINT64_MAX - length || target > UINT64_MAX - length)
                 return -LUME_EINVAL;
-            if (*address >= base && size <= length && *address - base <= length - size)
+            if (source_space == space && *address >= base && size <= length &&
+                *address - base <= length - size)
             {
                 if (matched)
                     return -LUME_EINVAL;
                 translated = target + (*address - base);
+                translated_space = target_space;
                 matched = true;
             }
         }
@@ -73,9 +100,10 @@ static int translate(const void *tree, int bus, uint64_t *address, uint64_t size
             (parent_cells == 1 && (translated > UINT32_MAX || size - 1 > UINT32_MAX - translated)))
             return -LUME_ENOSYS;
         *address = translated;
+        space = translated_space;
         bus = parent;
     }
-    return 0;
+    return space ? -LUME_ENOSYS : 0;
 }
 
 static int memory_resources(const void *tree, int node, struct lume_resource *resources,
@@ -88,8 +116,11 @@ static int memory_resources(const void *tree, int node, struct lume_resource *re
     int parent = fdt_parent_offset(tree, node);
     int address_cells = cell_count(tree, parent, "#address-cells", 2);
     int size_cells = cell_count(tree, parent, "#size-cells", 1);
-    if (parent < 0 || address_cells < 1 || address_cells > 2 || size_cells < 1 || size_cells > 2)
+    if (parent < 0 || address_cells < 1 || address_cells > 3 || size_cells < 0 || size_cells > 2)
         return -LUME_ENOSYS;
+    /* A zero size-cell count describes a bus-local identifier, not MMIO. */
+    if (!size_cells)
+        return bytes > 0 && !(bytes % (address_cells * 4)) ? 0 : -LUME_EINVAL;
     unsigned stride = (unsigned)(address_cells + size_cells);
     if (bytes <= 0 || (unsigned)bytes % (stride * 4))
         return -LUME_EINVAL;
@@ -97,12 +128,16 @@ static int memory_resources(const void *tree, int node, struct lume_resource *re
     {
         if (*count == LUME_HARDWARE_RESOURCES)
             return -LUME_E2BIG;
-        uint64_t address = number(reg + i, (unsigned)address_cells);
+        uint64_t address;
+        uint32_t space;
+        int result = address_value(reg + i, (unsigned)address_cells, &space, &address);
+        if (result)
+            return result;
         uint64_t size = number(reg + i + address_cells, (unsigned)size_cells);
         if (!size || address > UINT64_MAX - size ||
             (address_cells == 1 && size - 1 > UINT32_MAX - address))
             return -LUME_EINVAL;
-        int result = translate(tree, parent, &address, size);
+        result = translate(tree, parent, space, &address, size);
         if (result)
             return result;
         resources[(*count)++] =

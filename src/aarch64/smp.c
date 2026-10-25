@@ -1,3 +1,4 @@
+#include "lume/irq.h"
 #include "lume/smp.h"
 #include "lume/counter.h"
 #include "lume/mmio.h"
@@ -62,7 +63,7 @@ bool lume_smp_owned(void)
 void lume_smp_wake(void)
 {
     if (online > 1)
-        lume_mmio_write32_sync(UINT64_C(0x107fff9f00), UINT32_C(1) << 24);
+        lume_pi5_irq_notify();
 }
 
 void lume_smp_configure(const struct lume_fdt *fdt)

@@ -8,7 +8,8 @@
 static _Alignas(4096) unsigned char memory[FRAMES][4096];
 static bool used[FRAMES];
 static uint64_t virtuals[FRAMES], physicals[FRAMES];
-static unsigned allocated, mappings, syncs;
+static unsigned allocated, mappings, syncs, tasks[FRAMES];
+static bool writable[FRAMES], executable[FRAMES];
 static int allocation_budget = -1, map_budget = -1;
 
 uint64_t lume_pages_alloc_span(unsigned count)
@@ -53,31 +54,58 @@ bool lume_page_free(uint64_t page)
 
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute)
 {
-    assert(task == 3 && !(write && execute));
+    assert((task == 3 || task == 4) && !(write && execute));
     if (!map_budget)
         return false;
     if (map_budget > 0)
         --map_budget;
     for (unsigned i = 0; i < mappings; ++i)
-        assert(virtuals[i] != va);
+        assert(tasks[i] != task || virtuals[i] != va);
     assert(mappings < FRAMES);
     virtuals[mappings] = va;
+    tasks[mappings] = task;
+    writable[mappings] = write;
+    executable[mappings] = execute;
     physicals[mappings++] = pa;
     return true;
 }
 
 void lume_mmu_unmap_user(unsigned task, uint64_t va)
 {
-    assert(task == 3);
+    assert(task == 3 || task == 4);
     for (unsigned i = 0; i < mappings; ++i)
-        if (virtuals[i] == va)
+        if (tasks[i] == task && virtuals[i] == va)
         {
             --mappings;
             virtuals[i] = virtuals[mappings];
             physicals[i] = physicals[mappings];
+            tasks[i] = tasks[mappings];
+            writable[i] = writable[mappings];
+            executable[i] = executable[mappings];
             return;
         }
     abort();
+}
+
+uint64_t lume_mmu_task_root(unsigned task)
+{
+    assert(task == 3 || task == 4);
+    return task + 1;
+}
+
+bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool execute,
+                        uint64_t *physical)
+{
+    assert(user && (root == 4 || root == 5));
+    for (unsigned i = 0; i < mappings; ++i)
+        if (tasks[i] + 1 == root && virtuals[i] == va)
+        {
+            if ((write && !writable[i]) || (execute && !executable[i]))
+                return false;
+            *physical = physicals[i];
+            return true;
+        }
+    return false;
 }
 
 void lume_sync_code(uint64_t address, size_t bytes)
@@ -147,6 +175,43 @@ int main(void)
         assert(!lume_elf_load(3, elf, sizeof(elf), &image));
         assert(!allocated && !mappings && !image.pages);
     }
+    map_budget = -1;
+    put(elf + 64 + 56 + 40, 8, 4096);
+    assert(lume_elf_load(3, elf, sizeof(elf), &image));
+    assert(image.count == 2 && allocated == 3 && mappings == 2);
+    struct lume_elf_image child;
+    assert(lume_elf_clone(4, &image, &child));
+    assert(child.count == 2 && child.task == 4 && child.entry == image.entry);
+    for (unsigned i = 0; i < child.count; ++i)
+    {
+        assert(child.pages[i].physical != image.pages[i].physical);
+        assert(!memcmp((void *)(uintptr_t)child.pages[i].physical,
+                       (void *)(uintptr_t)image.pages[i].physical, 4096));
+        uint64_t physical;
+        assert(lume_mmu_translate(5, child.pages[i].address, i != 0, true, i == 0, &physical));
+        assert(!lume_mmu_translate(5, child.pages[i].address, i == 0, true, i != 0, &physical));
+    }
+    unsigned char original = *(unsigned char *)(uintptr_t)image.pages[1].physical;
+    *(unsigned char *)(uintptr_t)child.pages[1].physical ^= 255;
+    assert(*(unsigned char *)(uintptr_t)image.pages[1].physical == original);
+    lume_elf_release(&child);
+    for (int budget = 0; budget < 3; ++budget)
+    {
+        allocation_budget = budget;
+        assert(!lume_elf_clone(4, &image, &child));
+        assert(allocated == 3 && mappings == 2 && !child.pages);
+    }
+    allocation_budget = -1;
+    for (int budget = 0; budget < 2; ++budget)
+    {
+        map_budget = budget;
+        assert(!lume_elf_clone(4, &image, &child));
+        assert(allocated == 3 && mappings == 2 && !child.pages);
+    }
+    map_budget = -1;
+    lume_elf_release(&image);
+    assert(!allocated && !mappings);
+    put(elf + 64 + 56 + 40, 8, 5 * 1024 * 1024);
     struct lume_elf_plan plan;
     unsigned char *tls = elf + 64 + 2 * 56;
     put(elf + 56, 2, 3);
@@ -178,5 +243,6 @@ int main(void)
     put(elf + 56, 2, 4);
     memcpy(tls + 56, tls, 56);
     assert(!lume_elf_plan(elf, sizeof(elf), &plan));
-    puts("PASS_ELF_LOAD large image/BSS/copy/rollback/TLS alignment, containment and duplicates");
+    puts(
+        "PASS_ELF_LOAD large image/BSS/fork isolation/rollback/TLS alignment, containment and duplicates");
 }

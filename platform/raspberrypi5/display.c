@@ -508,12 +508,11 @@ bool lume_display_start(uint64_t freq)
     if (!bridge_start())
         goto fail;
     stage = "framebuffer";
+    uint64_t memory = lume_pages_alloc_span(FRAME_PAGES);
+    if (!memory)
+        goto fail;
     for (unsigned i = 0; i < FRAME_PAGES; ++i)
-    {
-        framebuffer[i] = lume_page_alloc(i ? framebuffer[0] + i * 4096 : 0);
-        if (!framebuffer[i] || (i && framebuffer[i] != framebuffer[0] + i * 4096))
-            goto fail;
-    }
+        framebuffer[i] = memory + (uint64_t)i * 4096;
     fb = (void *)(uintptr_t)framebuffer[0];
     for (unsigned i = 0; i < WIDTH * HEIGHT; ++i)
         fb[i] = 0x102030;
@@ -546,4 +545,23 @@ fail:
             }
     fb = 0;
     return false;
+}
+
+bool lume_display_release(void)
+{
+    if (!frequency)
+        return true;
+    lume_display_stop();
+    if (!dma_idle)
+        return false;
+    for (unsigned i = 0; i < FRAME_PAGES; ++i)
+        if (framebuffer[i])
+        {
+            if (!lume_page_free(framebuffer[i]))
+                return false;
+            framebuffer[i] = 0;
+        }
+    fb = NULL;
+    frequency = 0;
+    return true;
 }

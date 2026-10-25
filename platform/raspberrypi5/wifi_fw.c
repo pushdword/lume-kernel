@@ -11,6 +11,8 @@
 #include "lume/wpa.h"
 #define RAM_BASE 0x198000u
 static const struct lume_sdio_bus *bus;
+static uint32_t registered_interface;
+int lume_pi5_wifi_unregister(void);
 static struct lume_wifi_cores cores;
 static unsigned char transfer[512], verify[512], nvram[4096], raw_nvram[4096];
 static unsigned char tx[2048], rx[4096], iov[1450], answer[1024];
@@ -1211,9 +1213,8 @@ bool lume_pi5_wifi_register(const unsigned char mac[6])
 {
     static const struct lume_netif_ops data = {cyw_poll, cyw_link, cyw_receive, cyw_transmit,
                                                cyw_admin};
-    static const struct lume_wireless_ops control = {cyw_scan, cyw_connect, cyw_disconnect,
-                                                     cyw_peer, cyw_connect_begin,
-                                                     cyw_connect_status};
+    static const struct lume_wireless_ops control = {
+        cyw_scan, cyw_connect, cyw_disconnect, cyw_peer, cyw_connect_begin, cyw_connect_status};
     const struct lume_wifi_caps caps = {LUME_WIFI_STATION | LUME_WIFI_SCAN | LUME_WIFI_WPA2_CCMP,
                                         LUME_WIFI_BAND_2GHZ | LUME_WIFI_BAND_5GHZ,
                                         32,
@@ -1226,10 +1227,31 @@ bool lume_pi5_wifi_register(const unsigned char mac[6])
         .name = "wlan0", .kind = LUME_IF_WIFI, .mtu = 1500, .ops = &data};
     for (unsigned i = 0; i < 6; ++i)
         descriptor.mac[i] = mac[i];
-    int index = lume_netif_register(&descriptor);
-    if (index < 0 || lume_wireless_register((unsigned)index, &caps, &control, 0) < 0 ||
-        lume_netif_admin(lume_netif_find((unsigned)index), true) < 0)
+    if (registered_interface)
         return false;
+    int index = lume_netif_register(&descriptor);
+    if (index < 0)
+        return false;
+    registered_interface = (uint32_t)index;
+    if (lume_wireless_register((unsigned)index, &caps, &control, 0) < 0 ||
+        lume_netif_admin(lume_netif_find((unsigned)index), true) < 0)
+    {
+        (void)lume_pi5_wifi_unregister();
+        return false;
+    }
     lume_puts("LUME CHECK GENERIC NETIF WIFI API REGISTER PASS\n");
     return true;
+}
+
+int lume_pi5_wifi_unregister(void)
+{
+    if (!registered_interface)
+        return 0;
+    int result = lume_wireless_unregister(registered_interface);
+    if (result && result != -LUME_ENOENT)
+        return result;
+    result = lume_netif_unregister(registered_interface);
+    if (!result)
+        registered_interface = 0;
+    return result;
 }

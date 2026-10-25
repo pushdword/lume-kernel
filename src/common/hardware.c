@@ -6,6 +6,7 @@ struct lume_hardware
 {
     struct lume_hardware_info info;
     struct lume_resource resources[LUME_HARDWARE_RESOURCES];
+    struct lume_resource claimed[LUME_HARDWARE_RESOURCES];
     const struct lume_driver *driver;
     void *context;
     const struct lume_firmware_ops *firmware;
@@ -223,6 +224,9 @@ int lume_driver_register(const struct lume_driver *driver)
         driver->context_bytes > 65536 || (!!driver->owner_get != !!driver->owner_put) ||
         (driver->owner && !driver->owner_get))
         return -LUME_EINVAL;
+    if (driver->resource_kinds &
+        ~((1u << LUME_RESOURCE_MMIO) | (1u << LUME_RESOURCE_IRQ) | (1u << LUME_RESOURCE_IOPORT)))
+        return -LUME_EINVAL;
     for (size_t i = 0; i < driver->match_count; ++i)
         if (!driver->matches[i].kind || driver->matches[i].kind > LUME_HARDWARE_ID_BOARD ||
             driver->matches[i].reserved ||
@@ -299,8 +303,11 @@ static int detach(struct lume_hardware *h)
     int result = d->ops->stop ? d->ops->stop(h, h->context) : 0;
     if (result)
     {
-        h->info.state = LUME_HARDWARE_FAILED;
-        h->info.error = result;
+        if (result != -LUME_EBUSY)
+        {
+            h->info.state = LUME_HARDWARE_FAILED;
+            h->info.error = result;
+        }
         return result;
     }
     (void)lume_resource_release(h);
@@ -331,13 +338,18 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
         return -LUME_ENOSYS;
     if (!lume_driver_matches(driver, id))
         return -LUME_ENOENT;
+    unsigned claim_count = 0;
     for (unsigned i = 0; i < h->info.resource_count; ++i)
     {
-        int result = services->validate_resource(h->resources + i);
+        const struct lume_resource *resource = h->resources + i;
+        if (driver->resource_kinds && !(driver->resource_kinds & (1u << resource->kind)))
+            continue;
+        int result = services->validate_resource(resource);
         if (result)
             return result;
+        h->claimed[claim_count++] = *resource;
     }
-    int result = lume_resource_claim(h, h->resources, h->info.resource_count);
+    int result = lume_resource_claim(h, h->claimed, claim_count);
     if (result)
         return result;
     if (driver->owner_get && (result = driver->owner_get(driver->owner)) != 0)

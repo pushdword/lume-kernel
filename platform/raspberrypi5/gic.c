@@ -92,3 +92,8 @@ bool lume_pi5_irq_start(void)
     lume_irq_restore(flags);
     return started;
 }
+
+void lume_pi5_irq_notify(void)
+{
+    lume_mmio_write32_sync(GICD + 0xf00, UINT32_C(1) << 24);
+}

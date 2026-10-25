@@ -71,9 +71,24 @@ static int validate_resource(const struct lume_resource *resource)
 static int decode_interrupt(const void *tree, int controller, const uint32_t *cells, unsigned count,
                             struct lume_resource *resource)
 {
+    if (count == 2 && !fdt_node_check_compatible(tree, controller, "simple-bus"))
+    {
+        const char *name = fdt_get_name(tree, controller, NULL);
+        uint32_t domain = lume_hardware_firmware_id(tree, (uint64_t)controller);
+        if (!name || strcmp(name, "rp1") || !domain || cells[0] >= 64 ||
+            (cells[1] != 1 && cells[1] != 4 && cells[1] != 8))
+            return -LUME_ENOSYS;
+        *resource = (struct lume_resource){.base = cells[0],
+                                           .size = 1,
+                                           .kind = LUME_RESOURCE_IRQ,
+                                           .flags = cells[1] == 1,
+                                           .domain = domain};
+        return 0;
+    }
     if (count != 3 || fdt_node_check_compatible(tree, controller, "arm,gic-400") || cells[0] > 1 ||
         (cells[0] == 0 && cells[1] >= 988) || (cells[0] == 1 && cells[1] >= 16) ||
-        (cells[2] != 1 && cells[2] != 4))
+        (cells[2] & ~(cells[0] ? 0xff0fu : 0x0fu)) ||
+        ((cells[2] & 15) != 1 && (cells[2] & 15) != 4 && (cells[2] & 15) != 8))
         return -LUME_ENOSYS;
     struct lume_resource distributor;
     if (lume_fdt_mmio_resource(tree, controller, 0, &distributor) ||
@@ -82,7 +97,7 @@ static int decode_interrupt(const void *tree, int controller, const uint32_t *ce
     *resource = (struct lume_resource){.base = cells[1] + (cells[0] ? 16u : 32u),
                                        .size = 1,
                                        .kind = LUME_RESOURCE_IRQ,
-                                       .flags = cells[2] == 1};
+                                       .flags = (cells[2] & 15) == 1};
     return 0;
 }
 
@@ -95,7 +110,8 @@ static int dma_domain(uint32_t id, struct lume_dma_domain *domain)
     /* This platform binding uses the RP1 inbound PCIe window. */
     for (unsigned i = 0; i < info.identity_count; ++i)
         if (info.origin == LUME_HARDWARE_DT && info.identities[i].kind == LUME_HARDWARE_ID_DT &&
-            !strcmp(info.identities[i].value, "qemu,rp1-gem"))
+            (!strcmp(info.identities[i].value, "qemu,rp1-gem") ||
+             !strcmp(info.identities[i].value, "raspberrypi,rp1-gem")))
         {
             if (!lume_pi5_dma_start())
                 return -LUME_EIO;

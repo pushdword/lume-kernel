@@ -7,7 +7,7 @@
 #define LUME_HARDWARE_LIMIT 256u
 #define LUME_DRIVER_LIMIT 32u
 #define LUME_DRIVER_MATCH_LIMIT 16u
-#define LUME_DRIVER_VERSION 1u
+#define LUME_DRIVER_VERSION 2u
 
 enum lume_property_kind
 {
@@ -65,6 +65,8 @@ struct lume_driver
     const char *name;
     const struct lume_hardware_identity *matches;
     size_t match_count, context_bytes;
+    /* Zero claims every resource kind. Polling drivers can select MMIO only. */
+    uint32_t resource_kinds;
     const struct lume_hardware_ops *ops;
     void *owner;
     int (*owner_get)(void *);

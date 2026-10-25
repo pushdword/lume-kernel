@@ -43,6 +43,22 @@ struct host
 };
 static struct host hosts[2];
 static unsigned keyboard_count, hub_count;
+#ifdef LUME_PLATFORM_LKM
+static unsigned configured_hosts;
+#else
+static unsigned configured_hosts = 3;
+#endif
+
+bool lume_usb_configure_host(unsigned index, bool enabled)
+{
+    if (index >= 2 || hosts[index].valid)
+        return false;
+    if (enabled)
+        configured_hosts |= 1u << index;
+    else
+        configured_hosts &= ~(1u << index);
+    return true;
+}
 
 static void write64(uint64_t a, uint64_t v)
 {
@@ -714,17 +730,23 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     return true;
 }
 
+bool lume_usb_start_host(unsigned index, uint64_t frequency)
+{
+    if (index >= 2 || !(configured_hosts & (1u << index)) || !frequency)
+        return false;
+    if (hosts[index].valid)
+        return hosts[index].running;
+    if (!lume_pi5_dma_start())
+        return false;
+    return host_start(&hosts[index], index, frequency);
+}
+
 bool lume_usb_start(uint64_t frequency)
 {
-    keyboard_count = hub_count = 0;
-    /* Same 8GiB inbound DMA aperture used by native DSI. */
-    if (!lume_pi5_dma_start())
-    {
-        lume_puts("USB DMA APERTURE NOT READY\n");
-        return false;
-    }
+    if (!hosts[0].valid && !hosts[1].valid)
+        keyboard_count = hub_count = 0;
     for (unsigned i = 0; i < 2; ++i)
-        if (!host_start(&hosts[i], i, frequency))
+        if ((configured_hosts & (1u << i)) && !lume_usb_start_host(i, frequency))
             lume_value("USB_HOST_START_FAILED", i);
     lume_value("USB_HUB_COUNT", hub_count);
     lume_value("USB_KEYBOARD_COUNT", keyboard_count);
@@ -802,28 +824,44 @@ void lume_usb_stats(void)
     lume_value("USB_HOST_ERRORS", errors);
 }
 
+bool lume_usb_stop_host(unsigned index)
+{
+    if (index >= 2)
+        return false;
+    struct host *h = &hosts[index];
+    if (!h->valid)
+        return true;
+    lume_mmio_write32(h->op, 0);
+    bool stopped = wait_register(h, h->op + 4, 1, 1, 500);
+    lume_value(index ? "USB1_DMA_STOPPED" : "USB0_DMA_STOPPED", stopped);
+    if (!stopped)
+        return false;
+    h->running = false;
+    bool ok = true;
+    for (unsigned n = 0; n < h->allocated; ++n)
+        if (h->pages[n])
+        {
+            if (lume_page_free(h->pages[n]))
+                h->pages[n] = 0;
+            else
+                ok = false;
+        }
+    if (!ok)
+        return false;
+    for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
+    {
+        if (h->devices[slot].keyboard && keyboard_count)
+            --keyboard_count;
+        if (h->devices[slot].hub && hub_count)
+            --hub_count;
+    }
+    *h = (struct host){0};
+    return true;
+}
+
 bool lume_usb_stop(void)
 {
-    bool ok = true;
-    for (unsigned i = 0; i < 2; ++i)
-    {
-        struct host *h = &hosts[i];
-        if (!h->valid)
-            continue;
-        lume_mmio_write32(h->op, 0);
-        bool stopped = wait_register(h, h->op + 4, 1, 1, 500);
-        lume_value(i ? "USB1_DMA_STOPPED" : "USB0_DMA_STOPPED", stopped);
-        if (!stopped)
-        {
-            ok = false;
-            continue;
-        }
-        h->running = false;
-        for (unsigned n = 0; n < h->allocated; ++n)
-            if (h->pages[n])
-                ok = lume_page_free(h->pages[n]) && ok;
-        h->allocated = 0;
-        h->valid = false;
-    }
-    return ok;
+    bool first = lume_usb_stop_host(0);
+    bool second = lume_usb_stop_host(1);
+    return first && second;
 }

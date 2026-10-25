@@ -35,9 +35,9 @@ LD := "$(TOOLBIN)ld.lld$(HOSTEXE)"
 OBJCOPY := "$(TOOLBIN)llvm-objcopy$(HOSTEXE)"
 CFLAGS := -O2 -std=c11 -mcpu=cortex-a76 -mstrict-align -fno-pic -fno-pie $(COMMON_FLAGS)
 CPPFLAGS := -DLUME_BOOT_PROFILE=$(PROFILE_ID) -DLUME_SD_POLL=$(SD_POLL) -Isrc/common -Iinclude/freestanding -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/fatfs -Ivendor/aarch64/lwip/src/include -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
-KERNEL_C := $(wildcard src/aarch64/*.c platform/raspberrypi5/*.c vendor/aarch64/lwip/src/core/*.c vendor/aarch64/lwip/src/core/ipv4/*.c) vendor/aarch64/lwip/src/netif/ethernet.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c vendor/aarch64/mbedtls/library/aes.c vendor/aarch64/mbedtls/library/sha1.c arch/aarch64/mmu.c arch/aarch64/mmu_tables.c src/common/terminal.c src/common/font5x7.c
+KERNEL_C := $(wildcard src/aarch64/*.c vendor/aarch64/lwip/src/core/*.c vendor/aarch64/lwip/src/core/ipv4/*.c) vendor/aarch64/lwip/src/netif/ethernet.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c vendor/aarch64/mbedtls/library/aes.c vendor/aarch64/mbedtls/library/sha1.c arch/aarch64/mmu.c arch/aarch64/mmu_tables.c src/common/terminal.c src/common/font5x7.c
 KERNEL_C += arch/aarch64/dma.c src/common/resource.c src/common/hardware.c src/common/hardware_control.c src/common/string_extra.c src/common/fdt_inventory.c
-KERNEL_C += vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c
+KERNEL_C += vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c vendor/common/libfdt/fdt_sw.c
 KERNEL_C += src/common/module_elf.c src/common/modules.c
 CPPFLAGS += -Iinclude/internal/common -Ivendor/common/libfdt
 KERNEL_C := $(filter-out %/gem.c,$(KERNEL_C))
@@ -295,3 +295,53 @@ check-module-services: $(OUT)/tests/module-services$(HOSTEXE)
 $(OUT)/tests/module-services$(HOSTEXE): tests/aarch64/module_services_test.c src/aarch64/module_services.c src/aarch64/device.c src/common/resource.c src/aarch64/irq.c src/aarch64/work.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-fdt-pcie
+check-fdt-pcie: $(OUT)/tests/fdt-pcie$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/fdt-pcie$(HOSTEXE): tests/common/fdt_pcie_test.c src/common/fdt_inventory.c src/common/hardware.c src/common/resource.c vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c vendor/common/libfdt/fdt_sw.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/common/libfdt $^ -o "$@"
+
+ifeq ($(ARCH),aarch64)
+include mk/platform-modules.mk
+endif
+
+.PHONY: check-platform-drivers check-hardware-polling
+check-platform-drivers: $(OUT)/tests/platform-driver$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/platform-driver$(HOSTEXE): tests/aarch64/platform_driver_test.c src/aarch64/platform_driver.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+check-hardware-polling: $(OUT)/tests/hardware-polling$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/hardware-polling$(HOSTEXE): tests/common/hardware_polling_test.c src/common/hardware.c src/common/resource.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-module-boot
+check-module-boot: $(OUT)/tests/module-boot$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/module-boot$(HOSTEXE): tests/aarch64/module_boot_test.c src/aarch64/module_boot.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) "$<" -o "$@"
+
+.PHONY: check-boot-fdt
+check-boot-fdt: $(OUT)/tests/boot-fdt$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/boot-fdt$(HOSTEXE): tests/aarch64/boot_fdt_test.c src/aarch64/boot_fdt.c src/common/fdt_inventory.c src/common/hardware.c src/common/resource.c vendor/common/libfdt/fdt.c vendor/common/libfdt/fdt_ro.c vendor/common/libfdt/fdt_check.c vendor/common/libfdt/fdt_sw.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/common/libfdt $^ -o "$@"
+ifeq ($(ARCH),aarch64)
+check: check-hardware check-fdt-inventory check-module-elf check-module-services check-fdt-pcie check-platform-drivers check-hardware-polling check-module-boot check-boot-fdt
+endif
+
+.PHONY: check-boot-fdt-file
+check-boot-fdt-file: $(OUT)/tests/boot-fdt-file$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/boot-fdt-file$(HOSTEXE): tests/aarch64/boot_fdt_file_test.c src/aarch64/boot_fdt_file.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+ifeq ($(ARCH),aarch64)
+check: check-boot-fdt-file
+endif

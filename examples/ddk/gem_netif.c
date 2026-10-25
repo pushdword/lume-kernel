@@ -160,3 +160,22 @@ static struct lume_device gem_netif_device = {
 };
 
 LUME_DRIVER_ENTRY(gem_netif_driver_entry, gem_netif_device);
+
+int lume_example_gem_netif_attach(void)
+{
+    return lume_device_attach(&gem_netif_device);
+}
+
+int lume_example_gem_netif_detach(void)
+{
+    int result =
+        gem_netif_device.state == LUME_DEVICE_OFF ? 0 : lume_device_detach(&gem_netif_device);
+    if (result || !gem_network.interface)
+        return result;
+    struct lume_netif_info info = {0};
+    lume_netif_info(gem_network.interface, &info);
+    result = lume_netif_unregister(info.ifindex);
+    if (!result)
+        gem_network = (struct gem_netif_context){0};
+    return result;
+}

@@ -229,7 +229,11 @@ int lume_example_gem_configure(const unsigned char address[6], bool local_loopba
     loopback = local_loopback;
     physical_rp1 = false;
     phy_address = GEM_PHY_MDIO_ADDRESS;
+#ifdef LUME_PLATFORM_LKM
+    gem_device.resource_count = 0;
+#else
     gem_device.resource_count = sizeof(gem_resources) / sizeof(gem_resources[0]);
+#endif
     /* Return success after recording the configuration. Hardware has not been enabled here. */
     return 0;
 }
@@ -244,7 +248,11 @@ int lume_example_gem_configure_rp1(const unsigned char address[6], unsigned phy)
     physical_rp1 = true;
     phy_address = phy;
     /* Polling leaves the RP1 interrupt domain unclaimed and masked. */
+#ifdef LUME_PLATFORM_LKM
+    gem_device.resource_count = 0;
+#else
     gem_device.resource_count = 2;
+#endif
     return 0;
 }
 
@@ -256,9 +264,14 @@ static int probe(struct lume_device *d)
     /* Find the first MMIO resource. The returned pointer is const because the claimed resource
      * description must remain unchanged.
      */
+#ifdef LUME_PLATFORM_LKM
+    const struct lume_resource *mac = &gem_resources[0];
+    const struct lume_resource *cfg = &gem_resources[1];
+#else
     const struct lume_resource *mac = lume_device_resource(d, LUME_RESOURCE_MMIO, 0);
     /* Find the second MMIO resource, which describes the separate ETH_CFG bank. */
     const struct lume_resource *cfg = lume_device_resource(d, LUME_RESOURCE_MMIO, 1);
+#endif
     /* Require both banks and sufficient reserved space. The arrow operator reads a structure
      * field through a pointer.
      */
@@ -967,7 +980,7 @@ int lume_example_gem_eth_start(void)
 int lume_example_gem_eth_stop(void)
 {
     /* Ask the DDK to call stop and release its claims if stopping succeeds. */
-    return lume_device_detach(&gem_device);
+    return gem_device.state == LUME_DEVICE_OFF ? 0 : lume_device_detach(&gem_device);
 }
 
 /* Place a pointer to gem_device in the linker-retained driver table for automatic startup.

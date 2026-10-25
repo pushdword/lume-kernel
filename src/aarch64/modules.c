@@ -3,6 +3,18 @@
 #include "lume/kernel_memory.h"
 #include "lume/abi.h"
 #include "lume/module_services.h"
+#include "lume/platform_driver.h"
+#include "lume/early.h"
+#include "lume/worker.h"
+#include "lume/usb.h"
+#include "lume/display.h"
+#include "lume/watchdog.h"
+#include "lume/storage.h"
+#include "lume/vfs.h"
+#include "lume/netif.h"
+#include "lume/wireless.h"
+#include "lume/wpa.h"
+#include "lume/block.h"
 #include <string.h>
 
 extern const unsigned char __lume_kernel_build_id[];
@@ -54,6 +66,54 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_netif_admin)
     EXPORT(lume_netif_tx_error)
     EXPORT(lume_netif_rx_error)
+    EXPORT(lume_block_read)
+    EXPORT(lume_block_write)
+    EXPORT(lume_clock_millis)
+    EXPORT(lume_display_write)
+    EXPORT(lume_entropy)
+    EXPORT(lume_fail)
+    EXPORT(lume_files_init)
+    EXPORT(lume_files_release)
+    EXPORT(lume_hardware_count)
+    EXPORT(lume_hardware_info)
+    EXPORT(lume_irq_available)
+    EXPORT(lume_irq_controller_start)
+    EXPORT(lume_irq_restore)
+    EXPORT(lume_irq_save)
+    EXPORT(lume_netif_info)
+    EXPORT(lume_pages_alloc_span)
+    EXPORT(lume_page_alloc)
+    EXPORT(lume_page_free)
+    EXPORT(lume_pi5_dma_start)
+    EXPORT(lume_pi5_irq_start)
+    EXPORT(lume_platform_firmware)
+    EXPORT(lume_platform_driver_can_stop)
+    EXPORT(lume_platform_driver_register)
+    EXPORT(lume_platform_driver_unregister)
+    EXPORT(lume_putc)
+    EXPORT(lume_puts)
+    EXPORT(lume_secret_clear)
+    EXPORT(lume_uart_poll_input)
+    EXPORT(lume_usb_getc)
+    EXPORT(lume_value)
+    EXPORT(lume_vfs_open)
+    EXPORT(lume_vfs_read)
+    EXPORT(lume_vfs_seek)
+    EXPORT(lume_vfs_stat)
+    EXPORT(lume_volume_boot_select)
+    EXPORT(lume_volume_select)
+    EXPORT(lume_watchdog_poll)
+    EXPORT(lume_watchdog_progress)
+    EXPORT(lume_wireless_register)
+    EXPORT(lume_wireless_unregister)
+    EXPORT(lume_worker_pause)
+    EXPORT(lume_worker_stats)
+    EXPORT(lume_worker_wait_bits)
+    if (!strcmp(name, "lume_rp1_dma_domain"))
+    {
+        *address = (uintptr_t)&lume_rp1_dma_domain;
+        return 0;
+    }
 #undef EXPORT
     return -LUME_ENOENT;
 }

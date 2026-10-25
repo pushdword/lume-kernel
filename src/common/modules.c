@@ -114,8 +114,11 @@ static int validate(struct module *m, bool unique)
     for (size_t i = 0; i < d->driver_count; ++i)
     {
         const struct lume_driver *driver = d->drivers + i;
-        if (driver->version != LUME_DRIVER_VERSION || !text(m, driver->name, 64, true) ||
-            !driver->match_count || driver->match_count > LUME_DRIVER_MATCH_LIMIT ||
+        if (driver->version != LUME_DRIVER_VERSION ||
+            (driver->resource_kinds & ~((1u << LUME_RESOURCE_MMIO) | (1u << LUME_RESOURCE_IRQ) |
+                                        (1u << LUME_RESOURCE_IOPORT))) ||
+            !text(m, driver->name, 64, true) || !driver->match_count ||
+            driver->match_count > LUME_DRIVER_MATCH_LIMIT ||
             driver->context_bytes > 1024u * 1024u || driver->owner || driver->owner_get ||
             driver->owner_put ||
             !readable(m, driver->matches, driver->match_count * sizeof(*driver->matches),

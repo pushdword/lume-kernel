@@ -12,6 +12,7 @@ int lume_module_info(unsigned index, struct lume_module_info *);
 void lume_module_kernel_info(struct lume_module_info *);
 int lume_platform_modules_start(void);
 void lume_platform_modules_boot(void);
+int lume_platform_modules_stop(void);
 int lume_module_pin(uintptr_t callback, void **owner);
 void lume_module_unpin(void *owner);
 #endif

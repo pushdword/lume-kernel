@@ -5,6 +5,9 @@
 #include "lume/early.h"
 #include <string.h>
 
+static uint32_t retained[LUME_HARDWARE_LIMIT];
+static unsigned retained_count;
+
 static int read_file(struct lume_files *files, const char *path, size_t limit, void **data,
                      size_t *bytes)
 {
@@ -78,6 +81,32 @@ static int entry(struct lume_files *files, char *line)
         }
         return result;
     }
+    if (count >= 2 && !strcmp(tokens[0], "probe"))
+    {
+        if (count == 3 && strcmp(tokens[2], "retain"))
+            return -LUME_EINVAL;
+        const struct lume_driver *driver = lume_driver_find(tokens[1]);
+        if (!driver)
+            return -LUME_ENOENT;
+        struct lume_hardware_info info;
+        int error = 0;
+        for (unsigned i = 0; !lume_hardware_info(i, &info); ++i)
+        {
+            if (info.driver[0] || info.state == LUME_HARDWARE_DISABLED ||
+                !lume_driver_matches(driver, info.id))
+                continue;
+            int result = lume_hardware_bind(info.id, driver);
+            if (!result && count == 3)
+            {
+                if (retained_count == LUME_HARDWARE_LIMIT)
+                    return -LUME_ENOSPC;
+                retained[retained_count++] = info.id;
+            }
+            if (result && result != -LUME_ENOENT && result != -LUME_EAGAIN)
+                error = result;
+        }
+        return error;
+    }
     if (count == 3 && !strcmp(tokens[0], "bind"))
     {
         const struct lume_driver *driver = lume_driver_find(tokens[2]);
@@ -125,4 +154,25 @@ void lume_platform_modules_boot(void)
 done:
     lume_kernel_free(data);
     lume_files_release(&files);
+}
+
+int lume_platform_modules_stop(void)
+{
+    unsigned count = lume_hardware_count();
+    while (count)
+    {
+        struct lume_hardware_info info;
+        int result = lume_hardware_info(--count, &info);
+        if (result)
+            return result;
+        bool keep = false;
+        for (unsigned i = 0; i < retained_count; ++i)
+            keep = keep || retained[i] == info.id;
+        if (keep || !info.driver[0])
+            continue;
+        result = lume_hardware_unbind(info.id);
+        if (result)
+            return result;
+    }
+    return 0;
 }

@@ -89,6 +89,9 @@ static int stop(struct lume_device *device)
 }
 
 static const struct lume_resource resources[] = {
+#ifdef LUME_PLATFORM_LKM
+    {.base = GEM_CFG_BASE, .size = GEM_MMIO_BYTES, .kind = LUME_RESOURCE_MMIO},
+#endif
     {.base = PHY_CONTROL, .size = 4, .kind = LUME_RESOURCE_MMIO},
     {.base = PHY_PAD, .size = 4, .kind = LUME_RESOURCE_MMIO},
 };
@@ -100,3 +103,22 @@ static struct lume_device board = {.version = LUME_DDK_VERSION,
                                    .resource_count = sizeof(resources) / sizeof(resources[0]),
                                    .ops = &operations};
 LUME_DRIVER_ENTRY(gem_board_entry, board);
+
+int lume_example_gem_board_start(void)
+{
+#ifdef LUME_PLATFORM_LKM
+    board.resources = resources + 1;
+    board.resource_count = sizeof(resources) / sizeof(resources[0]) - 1;
+    if (lume_mmio_read32(GEM_MAC_BASE + GEM_MODULE_ID_REGISTER) == GEM_RP1_MODULE_ID)
+    {
+        board.resources = resources;
+        board.resource_count++;
+    }
+#endif
+    return lume_device_attach(&board);
+}
+
+int lume_example_gem_board_stop(void)
+{
+    return board.state == LUME_DEVICE_OFF ? 0 : lume_device_detach(&board);
+}

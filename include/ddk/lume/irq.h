@@ -40,4 +40,5 @@ bool lume_irq_available(void);
 uint64_t lume_irq_save(void);
 void lume_irq_restore(uint64_t);
 bool lume_pi5_irq_start(void);
+void lume_pi5_irq_notify(void);
 #endif

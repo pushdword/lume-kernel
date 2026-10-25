@@ -303,7 +303,11 @@ bool lume_sd_start(uint64_t hz)
                                   .class_id = LUME_DEVICE_BLOCK,
                                   .name = "sdhci0",
                                   .resources = resources,
+#ifdef LUME_PLATFORM_LKM
+                                  .resource_count = 0,
+#else
                                   .resource_count = resources[1].base ? 2 : 1,
+#endif
                                   .ops = &operations};
     block = (struct lume_block){
         .device = &device, .ops = &block_operations, .sector_bytes = 512, .max_sectors = 128};
@@ -312,7 +316,7 @@ bool lume_sd_start(uint64_t hz)
 
 bool lume_sd_stop(void)
 {
-    return lume_device_detach(&device) == 0;
+    return device.state == LUME_DEVICE_OFF || lume_device_detach(&device) == 0;
 }
 
 uint64_t lume_sd_sectors(void)

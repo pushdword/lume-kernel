@@ -17,6 +17,10 @@
 #include "lume/counter.h"
 #include "lume/hardware_platform.h"
 #include "lume/modules.h"
+#include "lume/platform_driver.h"
+#include "lume/hardware.h"
+#include "lume/kernel_memory.h"
+#include <libfdt.h>
 
 #ifndef LUME_BUILD_ID
 #define LUME_BUILD_ID "unversioned"
@@ -146,6 +150,27 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     return result;
 }
 
+static void report_platform_devices(void)
+{
+    struct lume_hardware_info info;
+    for (unsigned i = 0; !lume_hardware_info(i, &info); ++i)
+    {
+        bool matched = false;
+        for (unsigned j = 0; j < lume_driver_count(); ++j)
+            matched = matched || lume_driver_matches(lume_driver_at(j), info.id);
+        if (!matched)
+            continue;
+        lume_puts("MODULE_DEVICE ");
+        lume_puts(info.path);
+        lume_putc('\n');
+        lume_value("MODULE_DEVICE_STATE", info.state);
+        lume_value("MODULE_DEVICE_ERROR", (uint64_t)(int64_t)info.error);
+        for (unsigned j = 0; j < info.resource_count; ++j)
+            if (info.resources[j].kind == LUME_RESOURCE_MMIO)
+                lume_value("MODULE_DEVICE_MMIO", info.resources[j].base);
+    }
+}
+
 _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
 {
     bool watchdog = lume_watchdog_boot();
@@ -218,9 +243,6 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_smp_configure(&fdt);
     lume_pages_start(&fdt, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end);
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
-    int hardware_result = lume_platform_hardware_start((const void *)(uintptr_t)dtb, fdt.size);
-    if (hardware_result)
-        lume_value("HARDWARE_INVENTORY_ERROR", (uint64_t)(int64_t)hardware_result);
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_pages_check())
         lume_fail("physical page allocator");
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
@@ -233,6 +255,53 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     uint64_t node_memory = lume_pages_alloc_span(512);
     if (!node_memory || !lume_vfs_node_buffer((void *)(uintptr_t)node_memory, 2 * 1024 * 1024))
         lume_fail("filesystem node allocation");
+    extern unsigned char lume_shell_elf_begin[], lume_shell_elf_end[];
+    lume_vfs_init(lume_shell_elf_begin, (size_t)(lume_shell_elf_end - lume_shell_elf_begin));
+    bool root_valid = false;
+    for (unsigned i = 0; i < fdt.ram_count; ++i)
+        if (fdt.initrd_start >= fdt.ram[i].base && fdt.initrd_end > fdt.initrd_start &&
+            fdt.initrd_end <= fdt.ram[i].base + fdt.ram[i].size)
+            root_valid = true;
+    if (!root_valid || (fdt.initrd_start < (uintptr_t)__image_end && fdt.initrd_end > 0x200000) ||
+        (fdt.initrd_start < dtb + fdt.size && dtb < fdt.initrd_end) ||
+        !lume_vfs_mount_fat((const void *)(uintptr_t)fdt.initrd_start,
+                            (size_t)(fdt.initrd_end - fdt.initrd_start)))
+        lume_fail("FAT32 application root");
+    lume_value("FAT32_ROOT_ADDRESS", fdt.initrd_start);
+    lume_value("FAT32_ROOT_BYTES", fdt.initrd_end - fdt.initrd_start);
+    lume_puts("LUME FAT32 APPLICATION ROOT READY\n");
+    char enabled[4096];
+    size_t enabled_bytes;
+    if (lume_platform_fdt_configuration(enabled, sizeof(enabled), &enabled_bytes))
+        lume_fail("device tree configuration file");
+    lume_value("FDT_CONFIG_BYTES", enabled_bytes);
+    void *native_tree = lume_kernel_allocate(fdt.size + 4096);
+    struct lume_fdt_window window = {0};
+    (void)lume_boot_rp1_window(&window);
+    if (window.size)
+        lume_value("FDT_RP1_MMIO_BASE", window.cpu);
+    int tree_result =
+        native_tree ? lume_platform_fdt_copy((const void *)(uintptr_t)dtb, fdt.size, enabled,
+                                             enabled_bytes, &window, native_tree, fdt.size + 4096)
+                    : -LUME_ENOMEM;
+    if (tree_result)
+    {
+        lume_value("NATIVE_FDT_ERROR", (uint64_t)(int64_t)tree_result);
+        lume_fail("native device tree configuration");
+    }
+    int hardware_result = lume_platform_hardware_start(native_tree, fdt_totalsize(native_tree));
+    if (hardware_result)
+        lume_fail("hardware inventory");
+    lume_platform_firmware_configure(&fdt);
+    lume_platform_modules_boot();
+    if (!lume_platform_driver_ready(LUME_PLATFORM_IRQ) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_TIMER) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_UART) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_SD))
+    {
+        report_platform_devices();
+        lume_fail("required platform modules unavailable");
+    }
     if (!lume_timer_check(freq))
         lume_fail("GIC physical timer IRQ");
     lume_puts("LUME CHECK GIC TIMER IRQ PASS\n");
@@ -250,10 +319,6 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
         lume_fail("ELF64 process loading/execution");
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
         lume_puts("LUME CHECK ELF64 LOAD BSS USER EXEC PASS\n");
-    if (fdt.sdhci_valid && !lume_sd_configure(fdt.sdhci_base, fdt.sdhci_size, fdt.sdhci_irq))
-        lume_fail("SDHCI resources");
-    if (!lume_sd_start(freq))
-        lume_fail("native SD initialization");
     unsigned char sd_sector[512];
     if (!lume_sd_read(0, sd_sector) || sd_sector[510] != 0x55 || sd_sector[511] != 0xaa)
         lume_fail("native SD MBR read");
@@ -262,29 +327,14 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_value("SD_MBR_DISK_ID", sd_disk_id);
     lume_sd_stats();
     lume_puts("LUME CHECK NATIVE SD READ ONLY PASS\n");
-    bool wireless = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_wifi_probe(freq, fdt.bcm2712d0);
+    bool wireless = lume_platform_driver_ready(LUME_PLATFORM_WIFI);
     lume_value("WIFI_BACKPLANE_READY", wireless);
     if (!lume_pi5_dma_start())
         lume_fail("RP1 DMA window");
-    bool display = lume_display_start(freq);
+    bool display = lume_platform_driver_ready(LUME_PLATFORM_DISPLAY);
     lume_value("MIPI_NATIVE_READY", display);
-    bool keyboard = lume_usb_start(freq);
+    bool keyboard = lume_usb_keyboards() != 0;
     lume_value("USB_KEYBOARD_READY", keyboard);
-    extern unsigned char lume_shell_elf_begin[], lume_shell_elf_end[];
-    lume_vfs_init(lume_shell_elf_begin, (size_t)(lume_shell_elf_end - lume_shell_elf_begin));
-    bool root_valid = false;
-    for (unsigned i = 0; i < fdt.ram_count; ++i)
-        if (fdt.initrd_start >= fdt.ram[i].base && fdt.initrd_end > fdt.initrd_start &&
-            fdt.initrd_end <= fdt.ram[i].base + fdt.ram[i].size)
-            root_valid = true;
-    if (!root_valid || (fdt.initrd_start < (uintptr_t)__image_end && fdt.initrd_end > 0x200000) ||
-        (fdt.initrd_start < dtb + fdt.size && dtb < fdt.initrd_end) ||
-        !lume_vfs_mount_fat((const void *)(uintptr_t)fdt.initrd_start,
-                            (size_t)(fdt.initrd_end - fdt.initrd_start)))
-        lume_fail("FAT32 application root");
-    lume_value("FAT32_ROOT_ADDRESS", fdt.initrd_start);
-    lume_value("FAT32_ROOT_BYTES", fdt.initrd_end - fdt.initrd_start);
-    lume_puts("LUME FAT32 APPLICATION ROOT READY\n");
     const struct lume_storage_ops *storage = lume_storage_start();
     if (storage)
     {
@@ -294,16 +344,12 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     }
     else
         lume_puts("LUME PERSISTENT VOLUME UNAVAILABLE; WRITES DISABLED\n");
-    bool firmware = wireless && lume_wifi_firmware();
+    bool firmware = wireless;
     lume_value("WIFI_FIRMWARE_CONTROL_READY", firmware);
-    if (firmware && fdt.wifi_mac_valid)
-        (void)lume_pi5_wifi_register(fdt.wifi_mac);
     /* Attach network drivers before the IP stack enumerates registered interfaces. */
     if (lume_drivers_start())
         lume_fail("driver initialization");
     lume_value("DDK_DEVICES", lume_device_count());
-    if (LUME_BOOT_PROFILE == LUME_BOOT_NORMAL)
-        lume_platform_modules_boot();
     bool network = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_net_start();
     lume_value("NETWORK_READY", network);
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_shell_start(freq, true))
@@ -325,6 +371,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_usb_stats();
     lume_uart_input_stats();
     lume_sd_stats();
+    if (lume_platform_modules_stop())
+        lume_fail("module shutdown");
     lume_wifi_leave(); /* Disconnect and erase supplicant session keys. */
     lume_wifi_stop();
     if (lume_drivers_stop())
