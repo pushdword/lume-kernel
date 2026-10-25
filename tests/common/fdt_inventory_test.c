@@ -48,6 +48,9 @@ static void registers(const char *name, unsigned address, unsigned irq, unsigned
     fdt32_t clock[] = {cpu_to_fdt32(10), cpu_to_fdt32(3)};
     assert(!fdt_property(tree, "clocks", clock, sizeof(clock)));
     cell("configuration", 0x1234);
+    cell("phy-handle", 11);
+    static const unsigned char station[6] = {2, 0x12, 0x34, 0x56, 0x78, 0x9a};
+    assert(!fdt_property(tree, "local-mac-address", station, sizeof(station)));
     static const char labels[] = "primary\0spare";
     assert(!fdt_property(tree, "labels", labels, sizeof(labels)));
     assert(!fdt_property(tree, "read-only", NULL, 0));
@@ -96,6 +99,14 @@ static unsigned fixture(unsigned variant)
     text("compatible", "shared-dma-pool");
     end();
     end();
+    node("ethernet-phy@1");
+    cell("phandle", 11);
+    cell("reg", 1);
+    end();
+    node("pin-configuration");
+    cell("phandle", 12);
+    text("function", "gpio");
+    end();
     end();
     assert(!fdt_finish(tree));
     return fdt_totalsize(tree);
@@ -123,6 +134,22 @@ static int probe(struct lume_hardware *device, void *context)
     struct lume_property property;
     assert(!lume_hardware_property(device, "configuration", LUME_PROPERTY_U32, 0, &property));
     assert(property.kind == LUME_PROPERTY_U32 && property.values[0] == 0x1234);
+    assert(!lume_hardware_property(device, "phy-handle", LUME_PROPERTY_REFERENCE, 0, &property));
+    uint32_t phy_id = (uint32_t)property.values[0];
+    struct lume_hardware_info phy;
+    assert(!lume_hardware_get(phy_id, &phy) && !phy.identity_count);
+    assert(!lume_hardware_property_id(phy_id, "reg", LUME_PROPERTY_U32, 0, &property));
+    assert(property.values[0] == 1);
+    static const unsigned char station[6] = {2, 0x12, 0x34, 0x56, 0x78, 0x9a};
+    for (unsigned i = 0; i < sizeof(station); ++i)
+    {
+        assert(
+            !lume_hardware_property(device, "local-mac-address", LUME_PROPERTY_U8, i, &property));
+        assert(property.kind == LUME_PROPERTY_U8 && property.count == 1 &&
+               property.values[0] == station[i]);
+    }
+    assert(lume_hardware_property(device, "local-mac-address", LUME_PROPERTY_U8, 6, &property) ==
+           -LUME_EINVAL);
     assert(!lume_hardware_property(device, "labels", LUME_PROPERTY_STRING, 1, &property));
     assert(!strcmp(property.string, "spare"));
     assert(!lume_hardware_property(device, "read-only", LUME_PROPERTY_BOOLEAN, 0, &property));
@@ -171,7 +198,7 @@ int main(void)
     for (unsigned i = 0; i < bytes; ++i)
         assert(lume_hardware_import_fdt(tree, i, &ops, &added) == -LUME_EINVAL && !added);
     assert(!lume_hardware_count());
-    assert(!lume_hardware_import_fdt(tree, bytes, &ops, &added) && added == 7);
+    assert(!lume_hardware_import_fdt(tree, bytes, &ops, &added) && added == 8);
     struct lume_hardware_info info;
     assert(!lume_hardware_info(1, &info) && !strcmp(info.path, "/clock"));
     clock_id = info.id;
@@ -191,13 +218,13 @@ int main(void)
     assert(probes == 2 && lume_resource_claim_count() == 2);
     added = 123;
     assert(lume_hardware_import_fdt(tree, bytes, &ops, &added) == -LUME_EEXIST && !added);
-    assert(lume_hardware_count() == 7);
+    assert(lume_hardware_count() == 8);
     clear();
     bytes = fixture(1);
     assert(lume_hardware_import_fdt(tree, bytes, &ops, &added) == -LUME_EINVAL && !added);
     assert(!lume_hardware_count());
     bytes = fixture(2);
-    assert(!lume_hardware_import_fdt(tree, bytes, &ops, &added) && added == 7);
+    assert(!lume_hardware_import_fdt(tree, bytes, &ops, &added) && added == 8);
     assert(!lume_hardware_info(3, &info) && info.state == LUME_HARDWARE_UNSUPPORTED);
     clear();
     assert(!lume_driver_unregister(&driver) && !lume_resource_claim_count());

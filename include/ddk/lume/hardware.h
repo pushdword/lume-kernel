@@ -15,7 +15,8 @@ enum lume_property_kind
     LUME_PROPERTY_U64,
     LUME_PROPERTY_STRING,
     LUME_PROPERTY_BOOLEAN,
-    LUME_PROPERTY_REFERENCE
+    LUME_PROPERTY_REFERENCE,
+    LUME_PROPERTY_U8
 };
 
 struct lume_property

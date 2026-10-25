@@ -91,7 +91,7 @@ static struct lume_device gem_device = {
     .ops = &driver_ops,
 };
 
-/* Padding is outside the descriptor ring. Hardware wraps each one-entry ring
+/* Padding is outside the descriptor ring. Hardware wraps each ring
  * through WRAP. CPU-owned and DMA-owned objects never share a cache line. */
 /* A union overlays its members at the same starting address. The descriptor occupies the first
  * 16 bytes and the page member reserves a complete 4096-byte region.
@@ -100,6 +100,7 @@ union descriptor_page
 {
     /* Provide named access to the descriptor words at the beginning of this allocation. */
     struct gem_dma_descriptor descriptor;
+    struct gem_dma_descriptor descriptors[2];
     /* Reserve padding so this allocation cannot share a page with the next DMA object. */
     unsigned char page[GEM_DMA_PAGE_BYTES];
 };
@@ -137,6 +138,12 @@ static uint32_t control;
 static bool running, tx_pending, custom_mac, loopback;
 /* Keep a private copy of an optional station address supplied before attachment. */
 static unsigned char requested_mac[6];
+static bool physical_rp1;
+static unsigned phy_address = GEM_PHY_MDIO_ADDRESS;
+static uint32_t network_config;
+static bool phy_link_known;
+static unsigned tx_index, tx_count;
+static uint64_t tx_expected, tx_observed;
 
 /* Read one 32-bit MAC register. The caller supplies an offset in bytes rather than a full
  * address.
@@ -220,7 +227,24 @@ int lume_example_gem_configure(const unsigned char address[6], bool local_loopba
             requested_mac[i] = address[i];
     /* Remember whether the next attachment should route TX back into RX. */
     loopback = local_loopback;
+    physical_rp1 = false;
+    phy_address = GEM_PHY_MDIO_ADDRESS;
+    gem_device.resource_count = sizeof(gem_resources) / sizeof(gem_resources[0]);
     /* Return success after recording the configuration. Hardware has not been enabled here. */
+    return 0;
+}
+
+int lume_example_gem_configure_rp1(const unsigned char address[6], unsigned phy)
+{
+    if (!address || phy > 31)
+        return -LUME_EINVAL;
+    int result = lume_example_gem_configure(address, false);
+    if (result)
+        return result;
+    physical_rp1 = true;
+    phy_address = phy;
+    /* Polling leaves the RP1 interrupt domain unclaimed and masked. */
+    gem_device.resource_count = 2;
     return 0;
 }
 
@@ -248,7 +272,7 @@ static int probe(struct lume_device *d)
     /* Store the configuration-bank address separately so later offsets select the correct bank. */
     cfg_regs = (uintptr_t)cfg->base;
     /* Read base plus 0xfc and require the controller identity implemented by this binding. */
-    if (read_mac_reg(GEM_MODULE_ID_REGISTER) != GEM_MODULE_ID)
+    if (read_mac_reg(GEM_MODULE_ID_REGISTER) != (physical_rp1 ? GEM_RP1_MODULE_ID : GEM_MODULE_ID))
     {
         /* Clear both saved addresses after a failed identity/capability check. Rollback can then
          * avoid accessing an unsupported register bank.
@@ -312,7 +336,7 @@ static int phy_read(unsigned reg, uint16_t *out)
     /* Combine the Clause 22 frame format, read operation, code and MDIO addresses. */
     uint32_t command = GEM_PHY_START_OF_FRAME_CLAUSE_22 | GEM_PHY_OPERATION_READ |
                        GEM_PHY_CODE_CLAUSE_22 |
-                       ((GEM_PHY_MDIO_ADDRESS << GEM_PHY_ADDRESS_SHIFT) & GEM_PHY_ADDRESS_MASK) |
+                       ((phy_address << GEM_PHY_ADDRESS_SHIFT) & GEM_PHY_ADDRESS_MASK) |
                        (((uint32_t)reg << GEM_PHY_REGISTER_SHIFT) & GEM_PHY_REGISTER_MASK);
     write_mac_reg(GEM_PHY_MAINTENANCE, command);
     /* Wait for the command triggered by the register write to finish. */
@@ -326,6 +350,59 @@ static int phy_read(unsigned reg, uint16_t *out)
                           GEM_PHY_DATA_SHIFT);
     /* Return either the earlier wait error or the final command status to the caller. */
     return result;
+}
+
+static int phy_write(unsigned reg, uint16_t value)
+{
+    int result = mdio_idle();
+    if (result)
+        return result;
+    uint32_t command = GEM_PHY_START_OF_FRAME_CLAUSE_22 | GEM_PHY_OPERATION_WRITE |
+                       GEM_PHY_CODE_CLAUSE_22 | (phy_address << GEM_PHY_ADDRESS_SHIFT) |
+                       (reg << GEM_PHY_REGISTER_SHIFT) | value;
+    write_mac_reg(GEM_PHY_MAINTENANCE, command);
+    return mdio_idle();
+}
+
+static bool rp1_link(void)
+{
+    uint16_t status, advertise, partner, gigabit, gigabit_partner;
+    /* Read twice because the PHY latches a lost carrier until its status is read. */
+    if (phy_read(1, &status) || phy_read(1, &status) || (status & 0x24) != 0x24)
+    {
+        phy_link_known = false;
+        return false;
+    }
+    if (phy_link_known)
+        return true;
+    if (phy_read(4, &advertise) || phy_read(5, &partner) || phy_read(9, &gigabit) ||
+        phy_read(10, &gigabit_partner))
+        return false;
+    uint32_t config =
+        network_config & ~(GEM_CONFIG_SPEED_100 | GEM_CONFIG_GIGABIT | GEM_CONFIG_FULL_DUPLEX);
+    uint16_t common = advertise & partner;
+    if (((gigabit << 2) & gigabit_partner) & 0x0c00)
+    {
+        config |= GEM_CONFIG_GIGABIT;
+        if (((gigabit << 2) & gigabit_partner) & 0x0800)
+            config |= GEM_CONFIG_FULL_DUPLEX;
+    }
+    else if (common & 0x0180)
+    {
+        config |= GEM_CONFIG_SPEED_100;
+        if (common & 0x0100)
+            config |= GEM_CONFIG_FULL_DUPLEX;
+    }
+    else if (common & 0x0060)
+    {
+        if (common & 0x0040)
+            config |= GEM_CONFIG_FULL_DUPLEX;
+    }
+    else
+        return false;
+    write_mac_reg(GEM_NETWORK_CONFIG, config);
+    phy_link_known = true;
+    return true;
 }
 
 /* Expose PHY reads to other kernel code while the example is running. */
@@ -490,6 +567,21 @@ static int start(struct lume_device *d)
     /* Program the last two bytes and activate this specific-address filter in the model. */
     write_mac_reg(GEM_MAC_ADDRESS_HIGH,
                   (high << GEM_MAC_ADDRESS_HIGH_SHIFT) & GEM_MAC_ADDRESS_HIGH_MASK);
+    network_config = GEM_CONFIG_FULL_DUPLEX | GEM_CONFIG_GIGABIT | GEM_CONFIG_REMOVE_FCS;
+    if (physical_rp1)
+    {
+        unsigned width = (read_mac_reg(GEM_DESIGN_CONFIG_1) >> 25) & 7;
+        if (width != 1 && width != 2 && width != 4)
+            return -LUME_ENOSYS;
+        /* RP1 pclk is 200 MHz. Divide by 96 for Clause 22 MDIO. */
+        network_config |=
+            (5u << GEM_CONFIG_MDC_CLOCK_DIV_SHIFT) | ((width == 4   ? 2u
+                                                       : width == 2 ? 1u
+                                                                    : 0u)
+                                                      << GEM_CONFIG_DATA_BUS_WIDTH_SHIFT);
+        write_mac_reg(GEM_NETWORK_CONFIG, network_config);
+        write_mac_reg(GEM_USER_IO, 1);
+    }
     /* Enable PHY management while keeping RX and TX disabled during setup. */
     write_mac_reg(GEM_NETWORK_CONTROL, GEM_CONTROL_MDIO_ENABLE);
     /* Reserve two 16-bit values for the standard PHY identification words. */
@@ -504,19 +596,24 @@ static int start(struct lume_device *d)
         return -LUME_EIO;
     /* Combine ID1 as the high 16 bits and ID2 as the low 16 bits of one diagnostic value. */
     layout.phy_id = (uint32_t)id1 << 16 | id2;
-    /* Create the initial one-entry transmit descriptor before enabling DMA. */
-    tx.descriptor = (struct gem_dma_descriptor){
-        /* Store the low 32 bits of the private TX buffer DMA address. */
-        .address_low = (uint32_t)layout.tx_frame_dma,
-        /* Mark TX as CPU-owned and make the ring wrap after this single descriptor. No frame is
-         * submitted yet.
-         */
-        .control = GEM_TX_USED | GEM_TX_WRAP,
-        /* Store the upper 32 address bits so DMA can reach the buffer through the RP1 bus
-         * window.
-         */
-        .address_high = (uint32_t)(layout.tx_frame_dma >> 32),
-    };
+    phy_link_known = false;
+    if (physical_rp1 && (phy_write(4, 0x01e1) || phy_write(9, 0x0200) || phy_write(0, 0x1200)))
+        return -LUME_EIO;
+    /* RP1 alternates entries so the next descriptor remains CPU-owned during transmission. */
+    tx_index = 0;
+    tx_count = physical_rp1 ? 2 : 1;
+    tx_expected = tx_observed = 0;
+    if (physical_rp1)
+        (void)read_mac_reg(GEM_TX_FRAMES);
+    for (unsigned i = 0; i < tx_count; ++i)
+        tx.descriptors[i] = (struct gem_dma_descriptor){
+            /* Store the low 32 bits of the private TX buffer DMA address. */
+            .address_low = (uint32_t)layout.tx_frame_dma,
+            /* Keep every entry CPU-owned and wrap only at the end of the ring. */
+            .control = GEM_TX_USED | (i + 1 == tx_count ? GEM_TX_WRAP : 0),
+            /* Store the upper 32 address bits of the RP1 DMA address. */
+            .address_high = (uint32_t)(layout.tx_frame_dma >> 32),
+        };
     /* Publish the CPU-owned TX descriptor and initialize the RX descriptor as device-owned. Stop
      * initialization if either cache preparation fails.
      */
@@ -528,12 +625,13 @@ static int start(struct lume_device *d)
     /* Select full duplex, the modeled gigabit mode and received frames without the four-byte FCS
      * before enabling data transfer.
      */
-    write_mac_reg(GEM_NETWORK_CONFIG,
-                  GEM_CONFIG_FULL_DUPLEX | GEM_CONFIG_GIGABIT | GEM_CONFIG_REMOVE_FCS);
+    write_mac_reg(GEM_NETWORK_CONFIG, network_config);
     /* Encode the RX capacity in hardware units and select a four-beat DMA burst. */
     uint32_t rx_buffer_units = GEM_FRAME_BUFFER_BYTES / GEM_DMA_RX_BUFFER_UNIT_BYTES;
     uint32_t dma_config = GEM_DMA_ADDRESS_64 | GEM_DMA_BURST_INCR4 |
                           ((rx_buffer_units << GEM_DMA_RX_BUFFER_SHIFT) & GEM_DMA_RX_BUFFER_MASK);
+    if (physical_rp1)
+        dma_config |= GEM_DMA_TX_PACKET_BUFFER_SIZE | GEM_DMA_RX_PACKET_BUFFER_SIZE_MASK;
     write_mac_reg(GEM_DMA_CONFIG, dma_config);
     /* Program the upper TX ring address bits before writing the low queue-base word. */
     write_mac_reg(GEM_TX_QUEUE_BASE_HIGH, (uint32_t)(layout.tx_descriptor_dma >> 32));
@@ -578,12 +676,36 @@ int lume_example_gem_tx_complete(void)
     if (!running || !sync_descriptor(&tx, true))
         /* Report that the device is unavailable or its descriptor cannot be synchronized. */
         return -LUME_EIO;
+    if (physical_rp1)
+        tx_observed += read_mac_reg(GEM_TX_FRAMES);
     /* A clear USED bit means DMA still owns the descriptor. The CPU must not overwrite its frame
      * buffer yet.
      */
-    if (!(tx.descriptor.control & GEM_TX_USED))
-        /* Tell the caller to try again later without blocking the kernel. */
-        return -LUME_EAGAIN;
+    if (!(tx.descriptors[tx_index].control & GEM_TX_USED))
+    {
+        uint32_t status = physical_rp1 ? read_mac_reg(GEM_TX_STATUS) : 0;
+        if (physical_rp1 && tx_pending && (status & GEM_TX_STATUS_USED_BIT_READ) &&
+            !(status & (GEM_TX_STATUS_ACTIVE | GEM_TX_STATUS_ERRORS)))
+        {
+            /* One frame is outstanding. The counter proves egress before CPU reuse. */
+            if (tx_observed == tx_expected)
+            {
+                tx.descriptors[tx_index].control |= GEM_TX_USED;
+                if (!sync_descriptor(&tx, false))
+                    return -LUME_EIO;
+            }
+            else
+            {
+                /* Resume an idle queue that stopped at a CPU-owned entry. */
+                write_mac_reg(GEM_TX_STATUS, GEM_TX_STATUS_USED_BIT_READ);
+                write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
+                return -LUME_EAGAIN;
+            }
+        }
+        else
+            /* Tell the caller to try again later without blocking the kernel. */
+            return -LUME_EAGAIN;
+    }
     /* A CPU-owned descriptor can also be the empty descriptor prepared at startup, with no
      * result to collect.
      */
@@ -592,10 +714,13 @@ int lume_example_gem_tx_complete(void)
         return 0;
     /* Read controller completion and error flags for the submitted frame. */
     uint32_t status = read_mac_reg(GEM_TX_STATUS);
+    if (physical_rp1 && (status & GEM_TX_STATUS_ERRORS))
+        --tx_expected;
     /* Mark this completion as collected so a later poll does not report the same operation
      * again.
      */
     tx_pending = false;
+    tx_index = (tx_index + 1) % tx_count;
     /* Acknowledge the status bits that were observed. Writable flags use write-one-to-clear
      * behavior.
      */
@@ -648,13 +773,16 @@ int lume_example_gem_transmit(const void *data, size_t bytes)
     /* Describe a complete frame of the padded length and clear USED to hand this descriptor to
      * DMA. The buffer address words remain unchanged.
      */
-    tx.descriptor.control = GEM_TX_WRAP | GEM_TX_LAST | (uint32_t)padded;
+    tx.descriptors[tx_index].control =
+        GEM_TX_LAST | (uint32_t)padded | (tx_index + 1 == tx_count ? GEM_TX_WRAP : 0);
     /* Publish the descriptor only after the frame bytes have been made visible to DMA. */
     if (!sync_descriptor(&tx, false))
         /* Report unavailable hardware or failed DMA cache preparation. */
         return -LUME_EIO;
     /* Remember that a completion must be collected before the next reuse of this TX slot. */
     tx_pending = true;
+    if (physical_rp1)
+        ++tx_expected;
     /* Add the one-shot transmit-start request to the persistent enable bits and notify the
      * controller to start processing the TX queue.
      */
@@ -750,7 +878,9 @@ int lume_example_gem_receive(void *data, size_t capacity)
     /* Keep RX/TX enabled and prompt the modeled controller to reload the rearmed RX descriptor
      * and process waiting frames.
      */
-    write_mac_reg(GEM_NETWORK_CONTROL, control);
+    /* RP1 RX rearming preserves any outstanding TX_START request. */
+    if (!physical_rp1)
+        write_mac_reg(GEM_NETWORK_CONTROL, control);
     /* Return the frame length or the saved receive error after ownership has been handed back. */
     return result;
 }
@@ -776,7 +906,9 @@ bool lume_example_gem_link(void)
     /* Logical AND short-circuits when stopped. When running, read wrapper status and test only
      * its link-up bit.
      */
-    return running && (read_cfg_reg(GEM_CFG_STATUS) & GEM_CFG_STATUS_RGMII_LINK_STATUS);
+    return running &&
+           (physical_rp1 ? rp1_link()
+                         : (read_cfg_reg(GEM_CFG_STATUS) & GEM_CFG_STATUS_RGMII_LINK_STATUS));
 }
 
 /* Disable controller activity without freeing the static RAM allocations. The DDK calls this

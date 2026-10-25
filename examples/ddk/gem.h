@@ -2,8 +2,8 @@
  * hardware, while a six-byte MAC address identifies a network station. DMA means Direct Memory
  * Access: the controller reads and writes RAM without copying each byte through a CPU
  * instruction. A descriptor is a small RAM record telling DMA where a frame buffer is and who
- * may use it. TX means transmit and RX means receive. This example implements the qemu,rp1-gem
- * binding and is not a validated physical-board driver.
+ * may use it. TX means transmit and RX means receive. The default binding is qemu,rp1-gem.
+ * The RP1 board adapter supplies the firmware station address and PHY configuration.
  * C names beginning with GEM_ are constants or flags. Hexadecimal numbers start with 0x. A byte
  * contains eight bits. Expressions such as 1 << 3 move the value one three bit positions left,
  * producing a mask that selects bit 3.
@@ -40,6 +40,7 @@
  * implementation, not a network station.
  */
 #define GEM_MODULE_ID UINT32_C(0x00020118)
+#define GEM_RP1_MODULE_ID UINT32_C(0x00070109)
 /* MDIO bus address of the PHY in this device binding. */
 #define GEM_PHY_MDIO_ADDRESS 0u
 
@@ -55,6 +56,7 @@ enum gem_register
     GEM_NETWORK_CONFIG = 0x004,
     /* Read live controller status. This example checks the MDIO-idle bit here. */
     GEM_NETWORK_STATUS = 0x008,
+    GEM_USER_IO = 0x00c,
     /* Select DMA address width, RX buffer size and DMA burst configuration. */
     GEM_DMA_CONFIG = 0x010,
     /* Read TX completion/error flags. Writing a one clears the corresponding writable status
@@ -95,7 +97,10 @@ enum gem_register
     GEM_MAC_ADDRESS_HIGH = 0x08c,
     /* Read the implementation identifier. For this binding the expected value is GEM_MODULE_ID. */
     GEM_MODULE_ID_REGISTER = 0x0fc,
+    /* Successful transmitted frames. Reading clears the counter. */
+    GEM_TX_FRAMES = 0x108,
     /* Read implemented hardware capabilities. Bit 23 advertises 64-bit DMA addressing. */
+    GEM_DESIGN_CONFIG_1 = 0x280,
     GEM_DESIGN_CONFIG_6 = 0x294,
     /* Upper 32 bits of the TX descriptor ring DMA address. These bits extend TX_QUEUE_BASE. */
     GEM_TX_QUEUE_BASE_HIGH = 0x4c8,
@@ -367,10 +372,10 @@ enum gem_tx_status_fields
     GEM_TX_STATUS_FRAME_TOO_LARGE = 1u << 11,
     GEM_TX_STATUS_USED_MIDFRAME = 1u << 12,
     /* Exclude ordinary end-of-ring USED_BIT_READ from the error mask. */
-    GEM_TX_STATUS_ERRORS = GEM_TX_STATUS_RETRY_LIMIT | GEM_TX_STATUS_AMBA_ERROR |
-        GEM_TX_STATUS_UNDERRUN | GEM_TX_STATUS_LATE_COLLISION | GEM_TX_STATUS_RESPONSE_ERROR |
-        GEM_TX_STATUS_MAC_LOCKUP | GEM_TX_STATUS_DMA_LOCKUP | GEM_TX_STATUS_FRAME_TOO_LARGE |
-        GEM_TX_STATUS_USED_MIDFRAME,
+    GEM_TX_STATUS_ERRORS =
+        GEM_TX_STATUS_RETRY_LIMIT | GEM_TX_STATUS_AMBA_ERROR | GEM_TX_STATUS_UNDERRUN |
+        GEM_TX_STATUS_LATE_COLLISION | GEM_TX_STATUS_RESPONSE_ERROR | GEM_TX_STATUS_MAC_LOCKUP |
+        GEM_TX_STATUS_DMA_LOCKUP | GEM_TX_STATUS_FRAME_TOO_LARGE | GEM_TX_STATUS_USED_MIDFRAME,
 };
 
 /* RX_STATUS events are cleared by writing ones to the corresponding bits. */
@@ -626,6 +631,8 @@ struct lume_example_gem_layout
  * LUME_E value explains a rejected configuration.
  */
 int lume_example_gem_configure(const unsigned char mac[6], bool loopback);
+/* Configure the physical RP1 polling binding while detached. */
+int lume_example_gem_configure_rp1(const unsigned char mac[6], unsigned phy_address);
 /* Attach the device through the DDK. The DDK validates resources, calls probe and then calls
  * start.
  */

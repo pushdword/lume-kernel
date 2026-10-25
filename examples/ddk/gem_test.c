@@ -12,7 +12,9 @@ static void lume_mmio_write32_sync(uintptr_t, uint32_t);
 #include "gem_netif.c"
 
 static uint32_t registers[GEM_MMIO_BYTES / 4], cfg_status;
+static uint16_t phy_registers[32];
 static unsigned checks, sync_calls, fail_sync, map_calls, fail_map;
+static unsigned tx_complete_after;
 static bool dma_available = true, dma_submitted;
 const struct lume_dma_domain lume_rp1_dma_domain = {0, UINT64_C(0x1000000000),
                                                     UINT64_C(0x200000000), UINT64_MAX};
@@ -28,6 +30,12 @@ static uint32_t lume_mmio_read32(uintptr_t address)
     if (address == GEM_CFG_BASE + GEM_CFG_STATUS)
         return cfg_status;
     assert(address >= GEM_MAC_BASE && address < GEM_MAC_BASE + GEM_MMIO_BYTES);
+    if (address == GEM_MAC_BASE + GEM_TX_FRAMES)
+    {
+        uint32_t value = registers[GEM_TX_FRAMES / 4];
+        registers[GEM_TX_FRAMES / 4] = 0;
+        return value;
+    }
     return registers[(address - GEM_MAC_BASE) / 4];
 }
 
@@ -48,7 +56,10 @@ static void lume_mmio_write32_sync(uintptr_t address, uint32_t value)
     if (offset == GEM_PHY_MAINTENANCE)
     {
         unsigned reg = (value >> 18) & 31;
-        registers[offset / 4] = (value & 0xffff0000u) | (reg == 2 ? 0x141 : 0xcc2);
+        if ((value & GEM_PHY_OPERATION_MASK) == GEM_PHY_OPERATION_WRITE)
+            phy_registers[reg] = (uint16_t)value;
+        else
+            registers[offset / 4] = (value & 0xffff0000u) | phy_registers[reg];
     }
     if (offset == GEM_NETWORK_CONTROL && (value & GEM_CONTROL_TX_START))
         dma_submitted = true;
@@ -75,6 +86,11 @@ bool lume_dma_sync_for_cpu(const void *p, size_t bytes, enum lume_dma_direction 
 {
     T(p && bytes == GEM_DMA_PAGE_BYTES);
     T(direction == LUME_DMA_FROM_DEVICE || direction == LUME_DMA_BIDIRECTIONAL);
+    if (p == &tx && tx_complete_after && !--tx_complete_after)
+    {
+        tx.descriptors[tx_index].control |= GEM_TX_USED;
+        registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
+    }
     return ++sync_calls != fail_sync;
 }
 
@@ -88,6 +104,9 @@ bool lume_dma_sync_for_device(const void *p, size_t bytes, enum lume_dma_directi
 static void reset_model(void)
 {
     memset(registers, 0, sizeof(registers));
+    memset(phy_registers, 0, sizeof(phy_registers));
+    phy_registers[2] = 0x141;
+    phy_registers[3] = 0xcc2;
     registers[GEM_MODULE_ID_REGISTER / 4] = GEM_MODULE_ID;
     registers[GEM_DESIGN_CONFIG_6 / 4] = GEM_DESIGN_DMA_64;
     registers[GEM_NETWORK_STATUS / 4] = GEM_STATUS_MDIO_IDLE;
@@ -97,6 +116,7 @@ static void reset_model(void)
     sync_calls = map_calls = fail_sync = fail_map = 0;
     dma_available = true;
     dma_submitted = false;
+    tx_complete_after = 0;
 }
 
 static void receive_frame(const void *data, unsigned bytes, uint32_t flags)
@@ -136,6 +156,11 @@ static void exercise_netif(void)
     T(!lume_netif_transmit(interface, frame, 60));
     lume_netif_info(interface, &info);
     T(info.tx_packets == 1 && info.tx_errors == 1);
+    tx_complete_after = 4;
+    T(lume_netif_transmit(interface, frame, 60));
+    T(!tx_complete_after && gem_network.tx_pending);
+    lume_netif_info(interface, &info);
+    T(info.tx_packets == 2 && info.tx_errors == 1);
     tx.descriptor.control |= GEM_TX_USED;
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
     lume_netif_poll(interface);
@@ -146,7 +171,7 @@ static void exercise_netif(void)
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN;
     lume_netif_poll(interface);
     lume_netif_info(interface, &info);
-    T(info.tx_packets == 2 && info.tx_errors == 2);
+    T(info.tx_packets == 3 && info.tx_errors == 2);
     lume_netif_poll(interface);
     lume_netif_tx_error(0);
     lume_netif_info(interface, &info);
@@ -305,6 +330,66 @@ int main(void)
     T(registers[GEM_NETWORK_CONTROL / 4] & GEM_CONTROL_LOCAL_LOOPBACK);
     T(lume_example_gem_eth_stop() == 0);
     printf("GEM polling and DMA ownership: %u checks PASS\n", checks);
+    reset_model();
+    T(lume_example_gem_configure_rp1(0, 1) == -LUME_EINVAL);
+    T(lume_example_gem_configure_rp1(valid, 32) == -LUME_EINVAL);
+    T(lume_example_gem_configure_rp1(valid, 1) == 0);
+    T(lume_example_gem_eth_start() == -LUME_ENOENT);
+    registers[GEM_MODULE_ID_REGISTER / 4] = GEM_RP1_MODULE_ID;
+    registers[GEM_DESIGN_CONFIG_1 / 4] = 4u << 25;
+    phy_registers[1] = 0x24;
+    phy_registers[5] = 0x01e1;
+    phy_registers[10] = 0x0800;
+    T(lume_example_gem_eth_start() == 0);
+    T(gem_device.resource_count == 2);
+    T(tx_count == 2 && tx_index == 0);
+    T(tx.descriptors[0].control == GEM_TX_USED);
+    T(tx.descriptors[1].control == (GEM_TX_USED | GEM_TX_WRAP));
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    T(!(tx.descriptors[0].control & GEM_TX_WRAP));
+    T(tx.descriptors[1].control == (GEM_TX_USED | GEM_TX_WRAP));
+    tx.descriptors[0].control |= GEM_TX_USED;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(!lume_example_gem_tx_complete() && tx_index == 1);
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    T(tx.descriptors[1].control & GEM_TX_WRAP);
+    tx.descriptors[1].control |= GEM_TX_USED;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(!lume_example_gem_tx_complete() && tx_index == 0);
+    registers[GEM_NETWORK_CONTROL / 4] = control | GEM_CONTROL_TX_START;
+    receive_frame(frame, 60, GEM_RX_START | GEM_RX_END);
+    T(lume_example_gem_receive(out, sizeof(out)) == 60);
+    T(registers[GEM_NETWORK_CONTROL / 4] == (control | GEM_CONTROL_TX_START));
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(!(tx.descriptors[0].control & GEM_TX_USED));
+    T(registers[GEM_NETWORK_CONTROL / 4] & GEM_CONTROL_TX_START);
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ | GEM_TX_STATUS_ACTIVE;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(!(tx.descriptors[0].control & GEM_TX_USED));
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ;
+    T(lume_example_gem_tx_complete() == 0);
+    T(tx_index == 1 && (tx.descriptors[0].control & GEM_TX_USED));
+    T(tx_observed == tx_expected && tx_expected == 3);
+    T(((registers[GEM_NETWORK_CONFIG / 4] >> 18) & 7) == 5);
+    T(((registers[GEM_NETWORK_CONFIG / 4] >> 21) & 3) == 2);
+    T((registers[GEM_DMA_CONFIG / 4] & 0x700) == 0x700);
+    T(phy_registers[0] == 0x1200 && phy_registers[9] == 0x0200);
+    T(lume_example_gem_link());
+    T(registers[GEM_NETWORK_CONFIG / 4] & GEM_CONFIG_GIGABIT);
+    phy_registers[1] = 0;
+    T(!lume_example_gem_link());
+    phy_registers[1] = 0x24;
+    phy_registers[10] = 0;
+    T(lume_example_gem_link());
+    T((registers[GEM_NETWORK_CONFIG / 4] &
+       (GEM_CONFIG_GIGABIT | GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX)) ==
+      (GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX));
+    T(lume_example_gem_eth_stop() == 0);
+    T(lume_example_gem_configure(0, false) == 0 && gem_device.resource_count == 3);
+    printf("GEM RP1 identity, MDIO, DMA width and negotiated link: %u checks PASS\n", checks);
     exercise_netif();
     printf("GEM netif lifecycle and frame path: %u total checks PASS\n", checks);
     return 0;

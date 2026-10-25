@@ -45,6 +45,9 @@ static bool gem_netif_transmit(void *opaque, const void *data, size_t bytes)
 {
     struct gem_netif_context *context = opaque;
     gem_netif_poll(context);
+    /* Allow a preceding frame to finish before rejecting a serialized burst. */
+    for (unsigned i = 0; context->tx_pending && i < 10000; ++i)
+        gem_netif_poll(context);
     if (context->tx_pending || lume_example_gem_transmit(data, bytes))
         return false;
     context->tx_pending = true;

@@ -196,7 +196,7 @@ int lume_hardware_property(const struct lume_hardware *h, const char *name, unsi
                            unsigned index, struct lume_property *property)
 {
     if (!h || !property || !text_valid(name, 64) || kind < LUME_PROPERTY_U32 ||
-        kind > LUME_PROPERTY_REFERENCE)
+        kind > LUME_PROPERTY_U8)
         return -LUME_EINVAL;
     if (!h->firmware)
         return -LUME_ENOENT;

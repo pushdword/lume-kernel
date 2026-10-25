@@ -240,6 +240,14 @@ static int property(const void *tree, uint64_t token, const char *name, unsigned
     const void *data = fdt_getprop(tree, node, name, &bytes);
     if (!data)
         return bytes == -FDT_ERR_NOTFOUND ? -LUME_ENOENT : -LUME_EINVAL;
+    if (kind == LUME_PROPERTY_U8)
+    {
+        if (bytes < 0 || index >= (unsigned)bytes)
+            return -LUME_EINVAL;
+        out->values[0] = ((const unsigned char *)data)[index];
+        out->count = 1;
+        return 0;
+    }
     if (kind == LUME_PROPERTY_STRING)
     {
         if (index > INT32_MAX)
@@ -324,9 +332,16 @@ int lume_hardware_import_fdt(const void *tree, size_t bytes,
     while ((node = fdt_next_node(tree, node, &depth)) >= 0 && depth >= 0)
     {
         int strings = fdt_stringlist_count(tree, node, "compatible");
-        if (strings == -FDT_ERR_NOTFOUND || !node || excluded(tree, node))
+        if (!node || excluded(tree, node))
             continue;
-        if (strings <= 0)
+        if (strings == -FDT_ERR_NOTFOUND)
+        {
+            /* Register-addressed providers can omit a compatible identifier. */
+            if (!fdt_get_phandle(tree, node) || !fdt_getprop(tree, node, "reg", NULL))
+                continue;
+            strings = 0;
+        }
+        else if (strings <= 0)
         {
             result = -LUME_EINVAL;
             break;
