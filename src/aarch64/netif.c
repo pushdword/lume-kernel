@@ -194,6 +194,12 @@ bool lume_netif_transmit(struct lume_netif *p, const void *data, size_t n)
     return true;
 }
 
+void lume_netif_tx_error(struct lume_netif *p)
+{
+    if (p)
+        ++p->info.tx_errors;
+}
+
 void lume_netif_rx_error(struct lume_netif *p)
 {
     if (p)

@@ -16,7 +16,10 @@ enum
     LUME_STREAM_LISTEN,
     LUME_STREAM_ACCEPT,
     LUME_DATAGRAM_CONNECT,
-    LUME_DATAGRAM_LISTEN
+    LUME_DATAGRAM_LISTEN,
+    LUME_ICMP_ECHO_START,
+    LUME_ICMP_ECHO_POLL,
+    LUME_ICMP_ECHO_CLOSE
 };
 
 enum
@@ -32,6 +35,10 @@ enum
  * LISTEN/ACCEPT create separate handles. SHUTDOWN_WRITE sends FIN after queued TCP data.
  * Datagram receives consume one packet and return its source in address/port. Sends are
  * limited to 1472 bytes. A datagram listener selects its first peer until closed. */
+/* ICMP START sends one 24-byte IPv4 echo request and returns a process-owned handle.
+ * POLL returns READABLE after a matching reply, ERROR after five seconds, or zero while
+ * pending. CLOSE cancels the request and releases the handle. Process exit also releases it.
+ * These operations use address and handle. Port, count and reserved must be zero. */
 struct lume_stream_request
 {
     uint32_t version, handle, count, port;

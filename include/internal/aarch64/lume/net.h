@@ -13,6 +13,8 @@ bool lume_net_tcp(const char *);
 #include "lume/io.h"
 int lume_stream_call(unsigned, unsigned, struct lume_stream_request *);
 void lume_stream_release(unsigned);
+int lume_icmp_call(unsigned, unsigned, struct lume_stream_request *);
+void lume_icmp_release(unsigned);
 int64_t lume_net_control(unsigned, struct lume_net_control *);
 int64_t lume_net_command(unsigned, const char *, char *, size_t);
 #include "lume/net_commands.h"

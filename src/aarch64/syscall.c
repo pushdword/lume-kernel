@@ -189,7 +189,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EPERM;
         size_t bytes =
             stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
-        if (n != bytes || a > (stream ? LUME_DATAGRAM_LISTEN : LUME_BOOT_ABORT))
+        if (n != bytes || a > (stream ? LUME_ICMP_ECHO_CLOSE : LUME_BOOT_ABORT))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;

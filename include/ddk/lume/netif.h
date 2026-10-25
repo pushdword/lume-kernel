@@ -5,10 +5,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* The kernel serializes access to this registry. Registrations last until reboot and keep
- * stable indices. Receive consumes one complete Ethernet frame, returns zero when no frame is
- * available and returns a negative value on error. Driver callbacks must not recursively enter
- * the network stack or this registry. */
+/* The kernel serializes access to this registry. Registrations keep stable indices until reboot.
+ * Callback code and context must remain valid for that lifetime. Receive consumes one complete
+ * Ethernet frame, returns zero when no frame is available and returns a negative value on error.
+ * Transmit returns true when a frame is accepted and the caller may reuse its storage.
+ * Driver callbacks must not enter the network stack or dispatch operations through this registry.
+ * Poll callbacks may report asynchronous completion errors through the accounting helpers.
+ */
 struct lume_netif_ops
 {
     void (*poll)(void *);
@@ -37,6 +40,8 @@ void lume_netif_poll(struct lume_netif *);
 void lume_netif_sync(struct lume_netif *);
 int lume_netif_receive(struct lume_netif *, void *, size_t);
 bool lume_netif_transmit(struct lume_netif *, const void *, size_t);
+/* Report errors discovered outside a transmit or receive dispatch. */
+void lume_netif_tx_error(struct lume_netif *);
 void lume_netif_rx_error(struct lume_netif *);
 void lume_net_event_emit(uint32_t, uint32_t, uint32_t, uint32_t, uint64_t);
 int lume_net_events(uint32_t, uint64_t, struct lume_net_event *, unsigned, uint64_t *, uint32_t *);

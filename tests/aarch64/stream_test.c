@@ -5,6 +5,17 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *request)
+{
+    (void)owner;
+    (void)op;
+    (void)request;
+    return -LUME_EINVAL;
+}
+void lume_icmp_release(unsigned owner)
+{
+    (void)owner;
+}
 static struct netif interface;
 struct netif *netif_default = &interface;
 static struct tcp_pcb pcb;

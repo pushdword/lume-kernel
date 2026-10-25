@@ -151,6 +151,7 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
 
 void lume_stream_release(unsigned pid)
 {
+    lume_icmp_release(pid);
     for (unsigned i = 0; i < 3; ++i)
         if (streams[i].owner == pid)
             close_stream(&streams[i]);
@@ -158,6 +159,8 @@ void lume_stream_release(unsigned pid)
 
 int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *r)
 {
+    if (op >= LUME_ICMP_ECHO_START && op <= LUME_ICMP_ECHO_CLOSE)
+        return lume_icmp_call(pid, op, r);
     if (!pid || r->version != LUME_IO_VERSION || r->reserved || r->count > LUME_IO_BYTES ||
         op > LUME_DATAGRAM_LISTEN)
         return -LUME_EINVAL;

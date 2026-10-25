@@ -141,7 +141,7 @@ $(OUT)/image-tool$(HOSTEXE): tools/image.cpp
 $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
 TEST_CPPFLAGS := -Iinclude/ddk -Iinclude/internal/aarch64 -Iinclude/uapi/common -Iinclude/uapi/aarch64 -Ivendor/aarch64/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
-TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream vfs heap user-stack mmu elf-load font
+TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs heap user-stack mmu elf-load font
 .PHONY: check-boot-storage
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/aarch64/boot_storage_test.c src/aarch64/storage.c src/aarch64/boot_storage.c src/aarch64/volume.c vendor/aarch64/fatfs/ff.c vendor/aarch64/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
@@ -167,6 +167,7 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 	env "$(OUT)/tests/volume$(HOSTEXE)"
 	env "$(OUT)/tests/watchdog$(HOSTEXE)"
 	env "$(OUT)/tests/stream$(HOSTEXE)"
+	env "$(OUT)/tests/icmp$(HOSTEXE)"
 	env "$(OUT)/tests/vfs$(HOSTEXE)"
 	env "$(OUT)/tests/heap$(HOSTEXE)"
 	env "$(OUT)/tests/user-stack$(HOSTEXE)"
@@ -175,6 +176,13 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 	env "$(OUT)/tests/font$(HOSTEXE)"
 
 .PHONY: check-scheduler
+.PHONY: check-gem
+check-gem: $(OUT)/tests/gem$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/gem$(HOSTEXE): examples/ddk/gem_test.c examples/ddk/gem.c examples/ddk/gem.h examples/ddk/gem_netif.c include/ddk/lume/netif.h src/aarch64/device.c src/aarch64/netif.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) examples/ddk/gem_test.c src/aarch64/device.c src/aarch64/netif.c -o "$@"
+
 check-scheduler: $(foreach c,1 2 4,$(OUT)/tests/scheduler-$(c)$(HOSTEXE))
 	$(foreach c,1 2 4,env "$(OUT)/tests/scheduler-$(c)$(HOSTEXE)" &&) true
 $(OUT)/tests/scheduler-%$(HOSTEXE): tests/common/scheduler_test.c src/common/scheduler.h src/common/scheduler_config.h $(OUT)/configuration
@@ -187,6 +195,8 @@ $(OUT)/tests/usb$(HOSTEXE): tests/aarch64/usb_test.c src/aarch64/usb_descriptors
 $(OUT)/tests/uart-input$(HOSTEXE): tests/aarch64/uart_input_test.c
 $(OUT)/tests/volume$(HOSTEXE): tests/aarch64/volume_test.c src/aarch64/volume.c
 $(OUT)/tests/watchdog$(HOSTEXE): tests/aarch64/watchdog_test.c src/aarch64/watchdog.c
+$(OUT)/tests/icmp$(HOSTEXE): tests/aarch64/icmp_test.c src/aarch64/icmp.c
+$(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/aarch64/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/aarch64/stream_test.c src/aarch64/stream.c
 $(OUT)/tests/vfs$(HOSTEXE): tests/aarch64/vfs_test.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/aarch64/devfs_test.c examples/ddk/ram_block.c src/aarch64/device.c src/aarch64/vfs.c src/aarch64/fat.c src/aarch64/block.c

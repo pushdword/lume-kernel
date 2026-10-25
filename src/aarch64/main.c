@@ -289,12 +289,14 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
         lume_puts("LUME PERSISTENT VOLUME UNAVAILABLE; WRITES DISABLED\n");
     bool firmware = wireless && lume_wifi_firmware();
     lume_value("WIFI_FIRMWARE_CONTROL_READY", firmware);
-    bool network =
-        firmware && fdt.wifi_mac_valid && lume_pi5_wifi_register(fdt.wifi_mac) && lume_net_start();
-    lume_value("NETWORK_READY", network);
+    if (firmware && fdt.wifi_mac_valid)
+        (void)lume_pi5_wifi_register(fdt.wifi_mac);
+    /* Attach network drivers before the IP stack enumerates registered interfaces. */
     if (lume_drivers_start())
         lume_fail("driver initialization");
     lume_value("DDK_DEVICES", lume_device_count());
+    bool network = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_net_start();
+    lume_value("NETWORK_READY", network);
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_shell_start(freq, true))
         lume_fail("public ABI/VFS/shell");
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC)
