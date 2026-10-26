@@ -21,6 +21,10 @@ int lume_hardware_control(struct lume_hardware_request *request, bool administer
         return lume_hardware_bind(request->id, lume_driver_find(request->driver));
     case LUME_HARDWARE_UNBIND:
         return administer ? lume_hardware_unbind(request->id) : -LUME_EPERM;
+    case LUME_HARDWARE_RESCAN:
+        return administer ? lume_hardware_rescan() : -LUME_EPERM;
+    case LUME_HARDWARE_EJECT:
+        return administer ? lume_hardware_eject(request->id) : -LUME_EPERM;
     case LUME_HARDWARE_READ_REGISTER:
         if (!diagnose)
             return -LUME_EPERM;

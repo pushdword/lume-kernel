@@ -42,9 +42,8 @@ endif
 include platform/q35/config.mk
 include arch/amd64/config.mk
 CPPFLAGS := -DLUME_ARCH_AMD64=1 -DLUME_BOOT_PROFILE=$(PROFILE_ID) -Iarch/amd64/include/kernel -Ivendor/libfdt $(PLATFORM_CPPFLAGS) -Isrc/core -Isrc/terminal -Iinclude/freestanding -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/fatfs -Ivendor/lwip/src/include -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
-KERNEL_C := $(filter-out arch/aarch64/% platform/raspberrypi5/% src/watchdog/boot_watchdog.c src/core/worker_check.c,$(KERNEL_C_aarch64))
-KERNEL_C += arch/amd64/boot/main.c arch/amd64/context/context.c arch/amd64/mm/mmu.c arch/amd64/mm/module_memory.c arch/amd64/module_relocate.c arch/amd64/dma.c arch/amd64/smp.c platform/q35/boot.c platform/q35/console.c platform/q35/clock.c platform/q35/hardware.c platform/q35/virtio.c drivers/storage/virtio_blk/block.c drivers/net/virtio_net/net.c drivers/entropy/virtio_rng/rng.c
-KERNEL_C += drivers/display/bochs_vbe/display.c drivers/input/ps2/keyboard.c
+KERNEL_C := $(filter-out arch/aarch64/% platform/raspberrypi5/% src/watchdog/boot_watchdog.c src/core/worker_check.c drivers/input/usb_hid/hid_keyboard.c src/terminal/terminal.c src/terminal/font5x7.c,$(KERNEL_C_aarch64))
+KERNEL_C += arch/amd64/boot/main.c arch/amd64/context/context.c arch/amd64/mm/mmu.c arch/amd64/mm/module_memory.c arch/amd64/module_relocate.c arch/amd64/dma.c arch/amd64/smp.c platform/q35/boot.c platform/q35/console.c platform/q35/clock.c platform/q35/hardware.c platform/q35/pci.c platform/q35/acpi.c platform/q35/firmware.c platform/q35/pci_bus.c src/device/usb_inventory.c
 ifeq ($(DEBUG),1)
 CFLAGS += -g -fno-omit-frame-pointer
 endif
@@ -294,7 +293,7 @@ $(OUT)/tests/module-fixture.o: tests/integration/module_fixture.c
 	mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -c "$<" -o "$@"
 
-ifeq ($(ARCH),aarch64)
+ifneq ($(filter aarch64 amd64,$(ARCH)),)
 headers: module-sdk
 .PHONY: module-sdk
 module-sdk: $(OUT)/ddk/include/lume/module_build.h
@@ -307,8 +306,9 @@ $(OUT)/ddk/include/lume/module_build.h: $(OUT)/lume.elf $(OUT)/module-sdk$(HOSTE
 	cp -Rp include/uapi/. "$(OUT)/ddk/include/"
 	cp -Rp include/abi/native/. "$(OUT)/ddk/include/"
 	cp -Rp include/freestanding/. "$(OUT)/ddk/include/"
-	cp arch/aarch64/include/kernel/lume/mmio.h "$(OUT)/ddk/include/lume/mmio.h"
+	cp arch/$(ARCH)/include/kernel/lume/mmio.h "$(OUT)/ddk/include/lume/mmio.h"
 	cp mk/driver.mk "$(OUT)/ddk/driver.mk"
+	printf 'ARCH := $(ARCH)\n' > "$(OUT)/ddk/arch.mk"
 	env "$(OUT)/module-sdk$(HOSTEXE)" "$(OUT)/lume.elf" "$@"
 endif
 
@@ -328,6 +328,8 @@ $(OUT)/tests/fdt-pcie$(HOSTEXE): tests/unit/fdt_pcie_test.c src/device/fdt_inven
 
 ifeq ($(ARCH),aarch64)
 include mk/platform-modules.mk
+else ifeq ($(ARCH),amd64)
+include mk/q35-modules.mk
 endif
 
 .PHONY: check-platform-drivers check-hardware-polling
@@ -336,6 +338,27 @@ check-platform-drivers: $(OUT)/tests/platform-driver$(HOSTEXE)
 $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/device/platform_driver.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-q35
+check-q35: $(OUT)/tests/q35-pci$(HOSTEXE) $(OUT)/tests/q35-virtio$(HOSTEXE) $(OUT)/tests/q35-acpi$(HOSTEXE) $(OUT)/tests/q35-bus$(HOSTEXE) $(OUT)/tests/q35-firmware$(HOSTEXE)
+	env "$(OUT)/tests/q35-pci$(HOSTEXE)"
+	env "$(OUT)/tests/q35-virtio$(HOSTEXE)"
+	env "$(OUT)/tests/q35-acpi$(HOSTEXE)"
+	env "$(OUT)/tests/q35-bus$(HOSTEXE)"
+	env "$(OUT)/tests/q35-firmware$(HOSTEXE)"
+Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
+$(OUT)/tests/q35-pci$(HOSTEXE): tests/platform/q35/pci_test.c platform/q35/pci.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+$(OUT)/tests/q35-virtio$(HOSTEXE): tests/platform/q35/virtio_test.c platform/q35/virtio.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+$(OUT)/tests/q35-acpi$(HOSTEXE): tests/platform/q35/acpi_test.c platform/q35/acpi.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) $^ -o "$@"
+$(OUT)/tests/q35-bus$(HOSTEXE): tests/platform/q35/pci_bus_test.c platform/q35/pci_bus.c platform/q35/pci.c src/device/hardware.c src/device/resource.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) $^ -o "$@"
 check-hardware-polling: $(OUT)/tests/hardware-polling$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/hardware-polling$(HOSTEXE): tests/unit/hardware_polling_test.c src/device/hardware.c src/device/resource.c
@@ -368,3 +391,7 @@ $(OUT)/tests/boot-fdt-file$(HOSTEXE): tests/platform/raspberrypi5/boot_fdt_file_
 ifeq ($(ARCH),aarch64)
 check: check-boot-fdt-file
 endif
+
+$(OUT)/tests/q35-firmware$(HOSTEXE): tests/platform/q35/firmware_test.c platform/q35/firmware.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) $^ -o "$@"

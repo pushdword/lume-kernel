@@ -5,6 +5,7 @@
 #include "lume/platform_driver.h"
 #include "lume/abi.h"
 #include "scheduler_config.h"
+#include "lume/pci.h"
 static uint64_t frequency, epoch;
 static uint16_t masks = 0xffff;
 
@@ -45,6 +46,7 @@ static void timer_irq(unsigned irq, void *context)
     (void)irq;
     (void)context;
     lume_uart_poll_input();
+    lume_q35_hardware_tick();
 }
 
 void lume_q35_interrupt_start(void)

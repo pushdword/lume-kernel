@@ -175,6 +175,16 @@ static bool allow(uint64_t f, uint64_t n)
 
 int main(void)
 {
+    assert(lume_keyboard_getc() == -LUME_EAGAIN);
+    lume_keyboard_poll();
+    const struct lume_platform_keyboard_ops keyboard = {poll_driver, getc_driver};
+    assert(!lume_platform_driver_register(LUME_PLATFORM_KEYBOARD, &keyboard, sizeof(keyboard)));
+    assert(references == 1);
+    lume_keyboard_poll();
+    assert(lume_keyboard_getc() == 42 && received == 2);
+    assert(!lume_platform_driver_unregister(LUME_PLATFORM_KEYBOARD, &keyboard));
+    assert(!references && lume_keyboard_getc() == -LUME_EAGAIN);
+    received = 0;
     unsigned char data[4];
     assert(!lume_platform_driver_ready(LUME_PLATFORM_ENTROPY));
     assert(!lume_entropy(data, sizeof(data)));

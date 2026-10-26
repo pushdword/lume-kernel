@@ -1,4 +1,5 @@
 #include "lume/virtio.h"
+#include "lume/q35_module.h"
 #include "lume/netif.h"
 #include <string.h>
 #define RECEIVE_BUFFERS 32u
@@ -7,7 +8,9 @@ static struct lume_virtio device;
 static struct lume_virtqueue rx, tx;
 static unsigned char *receive_buffers;
 static _Alignas(16) unsigned char transmit_buffer[FRAME_BYTES];
-static bool enabled = true;
+static bool enabled;
+static int interface = -1;
+static unsigned receive_pages;
 
 static void poll(void *context)
 {
@@ -66,18 +69,24 @@ static bool transmit(void *context, const void *frame, size_t bytes)
     return lume_virtio_wait(&device, &tx, &used);
 }
 
-void lume_q35_net_start(void)
+static int module_start(struct lume_hardware *hardware, void *context)
 {
-    if (!lume_virtio_open(&device, 0x1000, 1u << 5))
-        return;
-    if (!(device.features & (1u << 5)) || !lume_virtio_queue(&device, 0, &rx) ||
-        !lume_virtio_queue(&device, 1, &tx))
-        goto fail;
+    (void)context;
+    uint32_t pci;
+    int result = q35_module_pci(hardware, 0x1af4, 0x1000, &pci);
+    if (result)
+        return result;
+    if (!lume_virtio_open(&device, pci, 0x1000, 1u << 5) || !(device.features & (1u << 5)) ||
+        !lume_virtio_queue(&device, 0, &rx) || !lume_virtio_queue(&device, 1, &tx))
+        return -LUME_EIO;
     unsigned count = rx.count < RECEIVE_BUFFERS ? rx.count : RECEIVE_BUFFERS;
-    uint64_t physical = lume_pages_alloc_span((count * FRAME_BYTES + 4095) / 4096);
+    unsigned pages = (count * FRAME_BYTES + 4095) / 4096;
+    uint64_t physical = lume_pages_alloc_span(pages);
     if (!physical)
-        goto fail;
+        return -LUME_ENOMEM;
     receive_buffers = (void *)(uintptr_t)physical;
+    receive_pages = pages;
+    enabled = true;
     lume_virtio_ready(&device);
     for (unsigned i = 0; i < count; ++i)
     {
@@ -90,9 +99,35 @@ void lume_q35_net_start(void)
         .name = "eth0", .kind = LUME_IF_ETHERNET, .mtu = 1500, .ops = &operations};
     for (unsigned i = 0; i < 6; ++i)
         descriptor.mac[i] = lume_in8(device.port + 20 + i);
-    if (lume_netif_register(&descriptor) < 0)
-        goto fail;
-    return;
-fail:
-    lume_virtio_fail(&device);
+    result = lume_netif_register(&descriptor);
+    if (result < 0)
+        return result;
+    interface = result;
+    return 0;
 }
+
+static int module_stop(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    (void)context;
+    if (interface >= 0)
+    {
+        int result = lume_netif_unregister((uint32_t)interface);
+        if (result)
+            return result;
+        interface = -1;
+    }
+    if (!lume_virtio_reset(&device))
+        return -LUME_EIO;
+    for (unsigned i = 0; i < receive_pages; ++i)
+        (void)lume_page_free((uintptr_t)receive_buffers + (uint64_t)i * 4096);
+    receive_buffers = NULL;
+    receive_pages = 0;
+    lume_virtio_queue_release(&rx);
+    lume_virtio_queue_release(&tx);
+    memset(&device, 0, sizeof(device));
+    enabled = false;
+    return 0;
+}
+
+Q35_MODULE("q35-virtio-net", LUME_HARDWARE_ID_PCI, "pci,1af4:1000", 1u << LUME_RESOURCE_IOPORT);

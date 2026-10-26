@@ -1,4 +1,6 @@
 #include "lume/q35.h"
+#include "lume/q35_module.h"
+#include "lume/platform_driver.h"
 #include "lume/counter.h"
 #include "lume/cpu.h"
 #include "lume/usb.h"
@@ -6,7 +8,7 @@
 
 static struct lume_hid keyboard;
 static unsigned char report[8];
-static bool extended;
+static bool extended, enabled;
 static unsigned pause_bytes;
 static const unsigned char usages[128] = {
     [1] = 41,  [2] = 30,  [3] = 31,  [4] = 32,  [5] = 33,  [6] = 34,  [7] = 35,  [8] = 36,
@@ -34,17 +36,19 @@ static bool controller_write(bool command, unsigned byte)
     return true;
 }
 
-void lume_q35_keyboard_start(void)
+static bool keyboard_start(void)
 {
     if (!controller_write(true, 0xad))
-        return;
+        return false;
     for (unsigned i = 0; i < 256 && (lume_in8(0x64) & 1); ++i)
         (void)lume_in8(0x60);
     /* Translation supplies set-1 scan codes. The keyboard retains its set-2 output. */
     if (!controller_write(true, 0x60) || !controller_write(false, 0x64) ||
         !controller_write(true, 0xae) || !controller_write(false, 0xf4))
-        return;
+        return false;
+    enabled = true;
     lume_puts("LUME PS2 KEYBOARD READY PT\n");
+    return true;
 }
 
 static unsigned extended_usage(unsigned scan)
@@ -80,8 +84,10 @@ static unsigned extended_usage(unsigned scan)
     }
 }
 
-void lume_q35_keyboard_poll(void)
+static void keyboard_poll(void)
 {
+    if (!enabled)
+        return;
     for (unsigned i = 0; i < 128; ++i)
     {
         unsigned status = lume_in8(0x64);
@@ -144,8 +150,47 @@ void lume_q35_keyboard_poll(void)
     lume_hid_repeat(&keyboard, lume_clock_millis());
 }
 
-int lume_q35_keyboard_getc(void)
+static int keyboard_getc(void)
 {
-    lume_q35_keyboard_poll();
+    keyboard_poll();
     return lume_hid_getc(&keyboard);
 }
+
+static const struct lume_platform_keyboard_ops operations = {keyboard_poll, keyboard_getc};
+
+static int module_start(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    struct q35_binding *binding = context;
+    memset(&keyboard, 0, sizeof(keyboard));
+    memset(report, 0, sizeof(report));
+    extended = false;
+    pause_bytes = 0;
+    if (!keyboard_start())
+        return -LUME_EIO;
+    int result =
+        lume_platform_driver_register(LUME_PLATFORM_KEYBOARD, &operations, sizeof(operations));
+    binding->registered = !result;
+    return result;
+}
+
+static int module_stop(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    struct q35_binding *binding = context;
+    if (!controller_write(true, 0xad))
+        return -LUME_EIO;
+    if (binding->registered)
+    {
+        int result = lume_platform_driver_unregister(LUME_PLATFORM_KEYBOARD, &operations);
+        if (result)
+            return result;
+        binding->registered = false;
+    }
+    enabled = false;
+    memset(&keyboard, 0, sizeof(keyboard));
+    memset(report, 0, sizeof(report));
+    return 0;
+}
+
+Q35_MODULE("q35-ps2", LUME_HARDWARE_ID_BOARD, "qemu,ps2-keyboard", 1u << LUME_RESOURCE_IOPORT);

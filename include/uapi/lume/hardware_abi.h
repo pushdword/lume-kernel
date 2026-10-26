@@ -72,7 +72,9 @@ enum lume_hardware_operation
     LUME_HARDWARE_BIND,
     LUME_HARDWARE_UNBIND,
     LUME_HARDWARE_READ_REGISTER,
-    LUME_HARDWARE_DRIVER
+    LUME_HARDWARE_DRIVER,
+    LUME_HARDWARE_RESCAN,
+    LUME_HARDWARE_EJECT
 };
 
 /* Register widths and resource extents use bytes. */

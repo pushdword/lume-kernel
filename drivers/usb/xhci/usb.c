@@ -1,9 +1,9 @@
 #include "lume/cpu.h"
+#if !defined(LUME_ARCH_AMD64)
 #include "lume/board.h"
-/* This polling RP1 xHCI driver supports USB 2 hubs and HID boot keyboards. It implements Intel
- * xHCI 1.2 and USB 2.0/HID protocols without an external USB runtime or interrupt handlers. It
- * reads physical keyboard reports. The driver inherits the firmware PCIe link and uses the same
- * DMA aperture as the MIPI driver. */
+#endif
+/* Polling xHCI transport for USB 2 hubs and HID boot keyboards. Platform bindings provide
+ * the controller address and DMA aperture. Transfer and command completion use event rings. */
 #include "lume/early.h"
 #include "lume/mmio.h"
 #include "lume/counter.h"
@@ -11,6 +11,18 @@
 #include "lume/xhci_ring.h"
 #include "lume/abi.h"
 #include "lume/dma.h"
+#if defined(LUME_ARCH_AMD64)
+#include "lume/usb_inventory.h"
+#include "lume/hardware_abi.h"
+
+static struct
+{
+    uint64_t base, size;
+    uint32_t parent;
+} pci_hosts[2];
+
+bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent);
+#endif
 #define RP1 LUME_BOARD_RP1_BASE
 #define MAX_SLOTS 8u
 #define MAX_PAGES 192u
@@ -18,6 +30,8 @@
 struct device
 {
     unsigned slot, speed, root, depth, route, tt_slot, tt_port, mtt;
+    uint32_t inventory;
+    unsigned hub_ports;
     unsigned ep0_packet, irq_endpoint, irq_packet;
     uint32_t *input, *output;
     unsigned char *buffer, *report;
@@ -61,6 +75,19 @@ bool lume_usb_configure_host(unsigned index, bool enabled)
         configured_hosts &= ~(1u << index);
     return true;
 }
+#if defined(LUME_ARCH_AMD64)
+bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent)
+{
+    if (index >= 2 || hosts[index].valid || !parent || (base & 4095) || size < 0x4000 ||
+        base < UINT64_C(0xc0000000) || base >= UINT64_C(0x100000000) ||
+        size > UINT64_C(0x100000000) - base)
+        return false;
+    pci_hosts[index].base = base;
+    pci_hosts[index].size = size;
+    pci_hosts[index].parent = parent;
+    return true;
+}
+#endif
 
 static void write64(uint64_t a, uint64_t v)
 {
@@ -113,7 +140,12 @@ static void copy(void *out, const void *in, size_t bytes)
 static uint64_t dma(const void *p)
 {
     uint64_t address;
+#if defined(LUME_ARCH_AMD64)
+    const struct lume_dma_domain identity = {0, 0, UINT64_C(0x200000000), UINT64_MAX};
+    if (!lume_dma_map(&identity, (uintptr_t)p, 1, &address))
+#else
     if (!lume_dma_map(&lume_rp1_dma_domain, (uintptr_t)p, 1, &address))
+#endif
         lume_fail("USB DMA address");
     return address;
 }
@@ -468,6 +500,7 @@ static bool hub(struct host *h, struct device *d, unsigned protocol)
         return false;
     ++hub_count;
     d->hub = true;
+    d->hub_ports = ports;
     lume_value("USB_HUB_SLOT", d->slot);
     lume_value("USB_HUB_PORTS", ports);
     for (unsigned port = 1; port <= ports; ++port)
@@ -479,6 +512,8 @@ static bool hub(struct host *h, struct device *d, unsigned protocol)
         if (!control(h, d, 0xa3, 0, 0, (uint16_t)port, 4))
             return false;
         unsigned status = d->buffer[0] | ((unsigned)d->buffer[1] << 8);
+        if (!control(h, d, 0x23, 1, 16, (uint16_t)port, 0))
+            return false;
         if (!(status & 1))
             continue;
         if (!control(h, d, 0x23, 3, 4, (uint16_t)port, 0))
@@ -538,6 +573,22 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
     if (!control(h, d, 0x80, 6, 0x100, 0, 18))
         return false;
     unsigned device_class = d->buffer[4], protocol = d->buffer[6];
+#if defined(LUME_ARCH_AMD64)
+    uint32_t parent = pci_hosts[h->index].parent;
+    if (depth)
+        for (unsigned n = 1; n <= MAX_SLOTS; ++n)
+        {
+            struct device *p = h->devices + n;
+            uint32_t mask = depth == 1 ? 0 : (1u << ((depth - 1) * 4)) - 1;
+            if (p->hub && p->root == root && p->depth + 1 == depth && p->route == (route & mask))
+                parent = p->inventory;
+        }
+    uint16_t vendor = d->buffer[8] | (uint16_t)d->buffer[9] << 8;
+    uint16_t product = d->buffer[10] | (uint16_t)d->buffer[11] << 8;
+    if (lume_usb_inventory_add(parent, root, route, slot, vendor, product, device_class,
+                               &d->inventory))
+        return false;
+#endif
     lume_value("USB_HOST", h->index);
     lume_value("USB_DEVICE_SLOT", d->slot);
     lume_value("USB_VID_PID", ((uint32_t)d->buffer[9] << 24) | ((uint32_t)d->buffer[8] << 16) |
@@ -552,15 +603,22 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
         return false;
     if (!selected.keyboard && !selected.hub && device_class != 9)
     {
+#if defined(LUME_ARCH_AMD64)
+        (void)lume_usb_inventory_state(d->inventory, LUME_HARDWARE_UNSUPPORTED, -LUME_ENOSYS);
+#endif
         lume_puts("USB DEVICE NO INPUT DRIVER\n");
         return true;
     }
     if (!control(h, d, 0, 9, selected.configuration, 0, 0))
         return false;
     delay(h, 10000);
-    if (selected.hub || device_class == 9)
-        return hub(h, d, protocol);
-    return keyboard(h, d, &selected);
+    bool ready =
+        selected.hub || device_class == 9 ? hub(h, d, protocol) : keyboard(h, d, &selected);
+#if defined(LUME_ARCH_AMD64)
+    (void)lume_usb_inventory_state(d->inventory, ready ? LUME_HARDWARE_READY : LUME_HARDWARE_FAILED,
+                                   ready ? 0 : -LUME_EIO);
+#endif
+    return ready;
 }
 
 static bool remove_root(struct host *h, unsigned root)
@@ -574,6 +632,10 @@ static bool remove_root(struct host *h, unsigned root)
             d->disconnected = true;
             if (!command(h, 10, 0, slot << 24, 0))
                 return false;
+#if defined(LUME_ARCH_AMD64)
+            if (d->inventory && lume_usb_inventory_remove(d->inventory))
+                return false;
+#endif
             h->dcbaa[slot] = 0;
             cache(h->dcbaa, 4096, false);
             if (d->keyboard)
@@ -615,7 +677,24 @@ static void scan_roots(struct host *h, bool initial)
                 failed |= h->devices[slot].disconnected;
             }
         if (connected && (h->root_ready & mask) && !failed)
-            continue;
+        {
+            /* A hub connection change rebuilds its root subtree after disabling all slots. */
+            bool changed = false;
+            for (unsigned slot = 1; slot <= MAX_SLOTS && !changed; ++slot)
+            {
+                struct device *d = h->devices + slot;
+                if (!d->hub || d->disconnected || d->root != port)
+                    continue;
+                for (unsigned p = 1; p <= d->hub_ports; ++p)
+                    if (!control(h, d, 0xa3, 0, 0, (uint16_t)p, 4) || (d->buffer[2] & 1))
+                    {
+                        changed = true;
+                        break;
+                    }
+            }
+            if (!changed)
+                continue;
+        }
         if (!connected && !allocated)
             continue;
         if (!remove_root(h, port) || !connected)
@@ -651,7 +730,13 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     *h = (struct host){0};
     h->index = index;
     h->frequency = frequency;
+#if !defined(LUME_ARCH_AMD64)
     h->base = RP1 + 0x200000 + index * 0x100000;
+#else
+    h->base = pci_hosts[index].base;
+    if (!h->base)
+        return false;
+#endif
     uint32_t cap = lume_mmio_read32(h->base), hcs = lume_mmio_read32(h->base + 4),
              hcc = lume_mmio_read32(h->base + 16);
     lume_value(index ? "USB1_CAP" : "USB0_CAP", cap);
@@ -666,6 +751,12 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     h->context_bytes = (hcc & 4) ? 64 : 32;
     if (!h->ports || h->ports > 16 || (hcs & 255) < MAX_SLOTS)
         return false;
+#if defined(LUME_ARCH_AMD64)
+    uint64_t size = pci_hosts[index].size;
+    if (h->op - h->base + 0x400 + h->ports * 16 > size || h->rt - h->base + 0x40 > size ||
+        h->doorbells - h->base + (MAX_SLOTS + 1) * 4 > size)
+        return false;
+#endif
     lume_mmio_write32(h->op, 0);
     if (!wait_register(h, h->op + 4, 1, 1, 200))
         return false;
@@ -738,8 +829,10 @@ bool lume_usb_start_host(unsigned index, uint64_t frequency)
         return false;
     if (hosts[index].valid)
         return hosts[index].running;
+#if !defined(LUME_ARCH_AMD64)
     if (!lume_pi5_dma_start())
         return false;
+#endif
     return host_start(&hosts[index], index, frequency);
 }
 
@@ -783,7 +876,9 @@ void lume_usb_poll(void)
 
 int lume_usb_getc(void)
 {
+#if !defined(LUME_ARCH_AMD64)
     lume_usb_poll();
+#endif
     for (unsigned i = 0; i < 2; ++i)
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
@@ -839,6 +934,19 @@ bool lume_usb_stop_host(unsigned index)
     if (!stopped)
         return false;
     h->running = false;
+#if defined(LUME_ARCH_AMD64)
+    for (unsigned depth = 5; depth-- > 0;)
+        for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
+        {
+            struct device *d = h->devices + slot;
+            if (d->inventory && d->depth == depth)
+            {
+                if (lume_usb_inventory_remove(d->inventory))
+                    return false;
+                d->inventory = 0;
+            }
+        }
+#endif
     bool ok = true;
     for (unsigned n = 0; n < h->allocated; ++n)
         if (h->pages[n])

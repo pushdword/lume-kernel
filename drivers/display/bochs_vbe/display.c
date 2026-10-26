@@ -1,4 +1,5 @@
 #include "lume/q35.h"
+#include "lume/q35_module.h"
 #include "lume/display.h"
 #include "lume/platform_driver.h"
 #include "terminal.h"
@@ -13,6 +14,7 @@ static volatile uint32_t *framebuffer;
 static struct terminal terminal;
 static uint32_t cells[COLUMNS * ROWS], shown[COLUMNS * ROWS];
 static bool enabled;
+static uint32_t pci;
 static const uint32_t palette[16] = {0x101820, 0xc45050, 0x70b878, 0xd4b060, 0x648ccc, 0xb078c8,
                                      0x60b8c0, 0xc4ccd4, 0x607080, 0xff8080, 0x9ce8a0, 0xffdc88,
                                      0x98bcff, 0xe0a0f0, 0x90e0e8, 0xf0f4f8};
@@ -89,12 +91,10 @@ static void putc(char character)
 
 static void stop(void)
 {
+    if (framebuffer)
+        register_write(4, 0);
     enabled = false;
-}
-
-unsigned lume_q35_console_geometry(void)
-{
-    return enabled ? COLUMNS | ROWS << 16 : 80u | 25u << 16;
+    framebuffer = NULL;
 }
 
 static bool start(uint64_t frequency)
@@ -102,9 +102,6 @@ static bool start(uint64_t frequency)
     (void)frequency;
     if (enabled)
         return true;
-    uint32_t pci;
-    if (lume_q35_pci_find(0x1234, 0x1111, &pci))
-        return false;
     uint32_t bar = lume_q35_pci_read(pci, 16);
     uint64_t address = bar & ~UINT64_C(15);
     if ((bar & 1) || address < 0xc0000000 || address > UINT64_C(0x100000000) - WIDTH * HEIGHT * 4)
@@ -136,10 +133,35 @@ static bool start(uint64_t frequency)
     return true;
 }
 
-void lume_q35_display_start(void)
+static const struct lume_platform_display_ops operations = {start, putc, write, clear, stop};
+
+static int module_start(struct lume_hardware *hardware, void *context)
 {
-    static const struct lume_platform_display_ops operations = {start, putc, write, clear, stop};
-    if (start(0) &&
-        lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations)))
-        lume_fail("VGA display registration");
+    struct q35_binding *binding = context;
+    int result = q35_module_pci(hardware, 0x1234, 0x1111, &pci);
+    if (result)
+        return result;
+    if (!start(0))
+        return -LUME_ENOENT;
+    result = lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
+    binding->registered = !result;
+    return result;
 }
+
+static int module_stop(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    struct q35_binding *binding = context;
+    if (binding->registered)
+    {
+        int result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+        if (result)
+            return result;
+        binding->registered = false;
+    }
+    stop();
+    return 0;
+}
+
+Q35_MODULE("q35-vga", LUME_HARDWARE_ID_PCI, "pci,1234:1111",
+           (1u << LUME_RESOURCE_MMIO) | (1u << LUME_RESOURCE_IOPORT));

@@ -56,16 +56,13 @@ static inline void lume_wrmsr(uint32_t index, uint64_t value)
 void lume_q35_console_start(void);
 void lume_q35_interrupt_start(void);
 void lume_q35_clock_start(void);
-void lume_q35_devices_start(void);
-void lume_q35_display_start(void);
-void lume_q35_keyboard_start(void);
-void lume_q35_keyboard_poll(void);
-int lume_q35_keyboard_getc(void);
 unsigned lume_q35_console_geometry(void);
 void lume_amd64_context_start(void);
 bool lume_q35_boot_read(uint64_t, uint64_t, struct lume_fdt *);
 uint32_t lume_q35_pci_read(uint32_t, unsigned);
 void lume_q35_pci_write(uint32_t, unsigned, uint32_t);
 int lume_q35_pci_find(uint16_t, uint16_t, uint32_t *);
+struct lume_resource;
+unsigned lume_q35_pci_resources(uint32_t, struct lume_resource *, unsigned);
 int lume_q35_hardware_start(void);
 #endif

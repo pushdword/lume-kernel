@@ -15,6 +15,9 @@ static int generate(const unsigned char *file, size_t bytes, const char *path)
 {
     if (bytes < 64 || memcmp(file, "\177ELF\2\1\1", 7))
         return 1;
+    unsigned machine = (unsigned)little(file + 18, 2);
+    if (machine != 62 && machine != 183)
+        return 1;
     uint64_t table = little(file + 40, 8), count = little(file + 60, 2);
     if (little(file + 58, 2) != 64 || !count || table > bytes || count > (bytes - table) / 64)
         return 1;
@@ -45,7 +48,7 @@ static int generate(const unsigned char *file, size_t bytes, const char *path)
                                  "#define LUME_KERNEL_BUILD_ID_BYTES {") < 0;
     for (unsigned i = 0; i < 20; ++i)
         result |= fprintf(output, "%s0x%02x", i ? ", " : "", identity[i]) < 0;
-    result |= fprintf(output, "}\n#endif\n") < 0;
+    result |= fprintf(output, "}\n#define LUME_KERNEL_ELF_MACHINE %uu\n#endif\n", machine) < 0;
     result |= fclose(output) != 0;
     return result;
 }

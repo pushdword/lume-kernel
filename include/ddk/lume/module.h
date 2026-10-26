@@ -32,6 +32,7 @@ struct lume_module_descriptor
 
 #define LUME_MODULE_HEADER(module_name)                                                            \
     .magic = LUME_MODULE_MAGIC, .size = sizeof(struct lume_module_descriptor),                     \
-    .version = LUME_MODULE_VERSION, .ddk_version = LUME_DDK_VERSION, .machine = 183,               \
-    .kernel_build = LUME_KERNEL_BUILD_ID_BYTES, .name = module_name
+    .version = LUME_MODULE_VERSION, .ddk_version = LUME_DDK_VERSION,                               \
+    .machine = LUME_KERNEL_ELF_MACHINE, .kernel_build = LUME_KERNEL_BUILD_ID_BYTES,                \
+    .name = module_name
 #endif

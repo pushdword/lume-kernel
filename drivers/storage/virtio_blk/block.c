@@ -1,4 +1,5 @@
 #include "lume/virtio.h"
+#include "lume/q35_module.h"
 #include "lume/platform_driver.h"
 #include <string.h>
 static struct lume_virtio device;
@@ -87,10 +88,7 @@ static bool configure(uint64_t base, uint64_t size, uint32_t irq)
 
 static bool stop(void)
 {
-    if (!device.port)
-        return true;
-    lume_out8(device.port + 18, 0);
-    return !lume_in8(device.port + 18);
+    return lume_virtio_reset(&device);
 }
 
 static void stats(void)
@@ -98,22 +96,51 @@ static void stats(void)
     lume_value("VIRTIO_BLOCK_SECTORS", capacity);
 }
 
-void lume_q35_block_start(void)
+static const struct lume_platform_sd_ops operations = {
+    start, configure, stop, read_sector, write_sector, sectors, allow, allow_boot, stats};
+
+static int module_start(struct lume_hardware *hardware, void *context)
 {
-    if (!lume_virtio_open(&device, 0x1001, (1u << 5) | (1u << 9)))
-        return;
-    if (!lume_virtio_queue(&device, 0, &queue) || queue.count < 3)
-        goto fail;
+    struct q35_binding *binding = context;
+    uint32_t pci;
+    int result = q35_module_pci(hardware, 0x1af4, 0x1001, &pci);
+    if (result)
+        return result;
+    if (!lume_virtio_open(&device, pci, 0x1001, (1u << 5) | (1u << 9)) ||
+        !lume_virtio_queue(&device, 0, &queue) || queue.count < 3)
+        return -LUME_EIO;
     capacity = (uint64_t)lume_in32(device.port + 20) | (uint64_t)lume_in32(device.port + 24) << 32;
     if (!capacity)
-        goto fail;
+        return -LUME_EIO;
     lume_virtio_ready(&device);
-    static const struct lume_platform_sd_ops operations = {
-        start, configure, stop, read_sector, write_sector, sectors, allow, allow_boot, stats};
-    if (lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations)))
-        goto fail;
-    return;
-fail:
-    lume_virtio_fail(&device);
-    capacity = 0;
+    result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
+    binding->registered = !result;
+    return result;
 }
+
+static int module_stop(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    struct q35_binding *binding = context;
+    if (binding->registered)
+    {
+        int result = lume_platform_driver_can_stop(LUME_PLATFORM_SD, &operations);
+        if (result)
+            return result;
+    }
+    if (!lume_virtio_reset(&device))
+        return -LUME_EIO;
+    if (binding->registered)
+    {
+        int result = lume_platform_driver_unregister(LUME_PLATFORM_SD, &operations);
+        if (result)
+            return result;
+        binding->registered = false;
+    }
+    lume_virtio_queue_release(&queue);
+    memset(&device, 0, sizeof(device));
+    capacity = allowed_first = allowed_count = 0;
+    return 0;
+}
+
+Q35_MODULE("q35-virtio-blk", LUME_HARDWARE_ID_PCI, "pci,1af4:1001", 1u << LUME_RESOURCE_IOPORT);

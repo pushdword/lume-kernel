@@ -1,6 +1,19 @@
 #include "lume/q35.h"
+#include "lume/acpi.h"
+#include "lume/firmware.h"
 #include <string.h>
 #define EARLY_LIMIT UINT64_C(0x40000000)
+static struct lume_acpi acpi;
+
+struct firmware_memory
+{
+    uint64_t map, bytes;
+};
+
+const struct lume_acpi *lume_q35_acpi(void)
+{
+    return acpi.rsdp ? &acpi : NULL;
+}
 
 static uint32_t word(uint64_t address)
 {
@@ -16,6 +29,16 @@ static uint64_t wide(uint64_t address)
 static bool early(uint64_t address, uint64_t bytes)
 {
     return address && address < EARLY_LIMIT && bytes <= EARLY_LIMIT - address;
+}
+
+static bool firmware_read(void *context, uint64_t address, void *out, size_t bytes)
+{
+    const struct firmware_memory *memory = context;
+    bool permitted = lume_q35_firmware_range((const void *)(uintptr_t)memory->map,
+                                             (size_t)memory->bytes, address, bytes);
+    if (permitted)
+        memcpy(out, (const void *)(uintptr_t)address, bytes);
+    return permitted;
 }
 
 static bool contains_ram(const struct lume_fdt *memory, uint64_t address, uint64_t bytes)
@@ -67,6 +90,9 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
         }
         offset += size;
     }
+    struct firmware_memory firmware = {map, bytes};
+    uint64_t ebda = *(const volatile uint16_t *)(uintptr_t)0x40e;
+    (void)lume_acpi_find(&acpi, firmware_read, &firmware, ebda << 4);
     extern unsigned char __image_start[], __image_end[];
     for (unsigned i = 0; i < count; ++i)
     {

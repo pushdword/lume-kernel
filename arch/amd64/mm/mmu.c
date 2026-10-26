@@ -1,6 +1,7 @@
 #include "lume/mmu.h"
 #include "lume/elf.h"
 #include "lume/module_memory.h"
+#include "lume/acpi.h"
 #include <string.h>
 #define PRESENT UINT64_C(1)
 #define WRITE UINT64_C(2)
@@ -80,6 +81,27 @@ bool lume_mmu_start(const struct lume_fdt *description)
                 directories[g][b] = base | PRESENT | WRITE | HUGE | NX | 0x18;
         }
     }
+    /* ECAM is described by MCFG and may sit below the fixed PCI MMIO aperture. */
+    const struct lume_acpi *acpi = lume_q35_acpi();
+    if (acpi)
+        for (unsigned i = 0; i < acpi->segment_count; ++i)
+        {
+            const struct lume_acpi_segment *s = acpi->segments + i;
+            uint64_t start = s->base + ((uint64_t)s->first << 20);
+            uint64_t end = s->base + (((uint64_t)s->last + 1) << 20);
+            if (start < UINT64_C(0x80000000) || end > UINT64_C(0x100000000))
+                continue;
+            uint64_t first = start & ~(BLOCK - 1), limit = (end + BLOCK - 1) & ~(BLOCK - 1);
+            for (uint64_t base = first; base < limit; base += BLOCK)
+            {
+                for (unsigned n = 0; n < description->ram_count; ++n)
+                    if (base < description->ram[n].base + description->ram[n].size &&
+                        description->ram[n].base < base + BLOCK)
+                        return false;
+                directories[base >> 30][(base >> 21) & 511] =
+                    base | PRESENT | WRITE | HUGE | NX | 0x18;
+            }
+        }
     uint64_t first = (uintptr_t)__image_start / BLOCK;
     uint64_t end = ((uintptr_t)__image_end + BLOCK - 1) / BLOCK;
     if (end - first > 16 || end > 512)

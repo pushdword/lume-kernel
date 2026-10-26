@@ -8,6 +8,7 @@
 #include "lume/boot.h"
 #include "lume/modules.h"
 #include "lume/display.h"
+#include "lume/pci.h"
 static uint64_t program_memory;
 static unsigned program_pages;
 
@@ -46,8 +47,6 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     lume_pages_start(&memory, 0, (uintptr_t)__image_start, (uintptr_t)__image_end);
     lume_q35_interrupt_start();
     lume_q35_clock_start();
-    lume_q35_display_start();
-    lume_q35_keyboard_start();
     lume_value("TSC_HZ", lume_q35_tsc_frequency());
     lume_value("COUNTER_HZ", lume_counter_frequency());
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
@@ -67,7 +66,13 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     lume_platform_firmware_configure(&memory);
     if (lume_q35_hardware_start())
         lume_fail("kernel module and hardware services");
-    lume_q35_devices_start();
+    lume_platform_modules_boot();
+    if (!lume_platform_driver_ready(LUME_PLATFORM_SD) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_DISPLAY) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_KEYBOARD) ||
+        !lume_platform_driver_ready(LUME_PLATFORM_ENTROPY))
+        lume_fail("required q35 modules unavailable");
+    lume_puts("LUME Q35 MODULES READY\n");
     const struct lume_storage_ops *storage = lume_storage_start();
     if (storage && !lume_vfs_mount_storage(storage))
         lume_fail("persistent FAT32 volume");
@@ -80,5 +85,8 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_shell_start(lume_counter_frequency(), false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");
+    lume_q35_hardware_stop();
+    if (lume_platform_modules_stop())
+        lume_fail("module shutdown");
     lume_stop();
 }

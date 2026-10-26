@@ -17,6 +17,8 @@ struct lume_virtio_used
 
 struct lume_virtqueue
 {
+    uint64_t allocation;
+    unsigned pages;
     uint16_t port, number, count, consumed;
     struct lume_virtio_desc *descriptors;
     volatile uint16_t *available, *used;
@@ -30,14 +32,14 @@ struct lume_virtio
     bool failed;
 };
 
-bool lume_virtio_open(struct lume_virtio *, uint16_t, uint32_t);
+bool lume_virtio_open(struct lume_virtio *, uint32_t, uint16_t, uint32_t);
 bool lume_virtio_queue(struct lume_virtio *, unsigned, struct lume_virtqueue *);
 void lume_virtio_ready(struct lume_virtio *);
 void lume_virtio_fail(struct lume_virtio *);
 void lume_virtio_submit(struct lume_virtqueue *, unsigned);
 bool lume_virtio_take(struct lume_virtqueue *, unsigned *, unsigned *);
 bool lume_virtio_wait(struct lume_virtio *, struct lume_virtqueue *, unsigned *);
-void lume_q35_block_start(void);
-void lume_q35_net_start(void);
-void lume_q35_entropy_start(void);
+bool lume_virtio_reset(struct lume_virtio *);
+/* Release queues only after the device acknowledges reset. */
+void lume_virtio_queue_release(struct lume_virtqueue *);
 #endif

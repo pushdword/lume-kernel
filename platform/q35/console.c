@@ -2,6 +2,7 @@
 #include "lume/platform_driver.h"
 #include "lume/cpu.h"
 #include "lume/display.h"
+#include "lume/usb.h"
 #define COM1 0x3f8
 static int pending = -1;
 
@@ -13,7 +14,15 @@ static int input(void)
         pending = -1;
         return value;
     }
-    return lume_in8(COM1 + 5) & 1 ? lume_in8(COM1) : lume_q35_keyboard_getc();
+    if (lume_in8(COM1 + 5) & 1)
+        return lume_in8(COM1);
+    int value = lume_keyboard_getc();
+    return value >= 0 ? value : lume_usb_getc();
+}
+
+unsigned lume_q35_console_geometry(void)
+{
+    return lume_platform_driver_ready(LUME_PLATFORM_DISPLAY) ? 84u | 36u << 16 : 80u | 25u << 16;
 }
 
 static bool ready(void)

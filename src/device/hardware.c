@@ -12,13 +12,32 @@ struct lume_hardware
     const struct lume_firmware_ops *firmware;
     const void *firmware_context;
     uint64_t firmware_node;
-    bool busy;
+    bool busy, absent;
 };
 
 static struct lume_hardware hardware[LUME_HARDWARE_LIMIT];
 static const struct lume_driver *drivers[LUME_DRIVER_LIMIT];
 static const struct lume_hardware_services *services;
 static uint32_t next_id = 1;
+static const struct lume_hardware_bus_ops *bus_ops;
+
+int lume_hardware_bus_services(const struct lume_hardware_bus_ops *ops)
+{
+    if (!ops || !ops->rescan || !ops->eject || bus_ops)
+        return -LUME_EINVAL;
+    bus_ops = ops;
+    return 0;
+}
+
+int lume_hardware_rescan(void)
+{
+    return bus_ops ? bus_ops->rescan() : -LUME_ENOSYS;
+}
+
+int lume_hardware_eject(uint32_t id)
+{
+    return bus_ops ? bus_ops->eject(id) : -LUME_ENOSYS;
+}
 
 static bool text_valid(const char *text, size_t capacity)
 {
@@ -69,7 +88,7 @@ int lume_hardware_add(const struct lume_hardware_description *d, uint32_t *id)
 {
     if (!d || !id || !text_valid(d->name, LUME_HARDWARE_NAME) ||
         !text_valid(d->path, LUME_HARDWARE_PATH) || !d->origin ||
-        d->origin > LUME_HARDWARE_VIRTUAL || d->state > LUME_HARDWARE_UNSUPPORTED ||
+        d->origin > LUME_HARDWARE_VIRTUAL || d->state > LUME_HARDWARE_FAILED ||
         d->identity_count > LUME_HARDWARE_IDS || (d->identity_count && !d->identities) ||
         d->resource_count > LUME_HARDWARE_RESOURCES || (d->resource_count && !d->resources) ||
         (d->parent && !find(d->parent)) || (d->firmware && !d->firmware->property))
@@ -139,6 +158,38 @@ int lume_hardware_remove(uint32_t id)
         if (hardware[i].info.id && hardware[i].info.parent == id)
             return -LUME_EBUSY;
     memset(h, 0, sizeof(*h));
+    return 0;
+}
+
+int lume_hardware_state(uint32_t id, unsigned state, int error)
+{
+    struct lume_hardware *h = find(id);
+    if (!h)
+        return -LUME_ENOENT;
+    if (state > LUME_HARDWARE_FAILED || h->busy)
+        return -LUME_EINVAL;
+    h->info.state = state;
+    h->info.error = error;
+    h->absent = state == LUME_HARDWARE_ABSENT;
+    if (h->absent)
+        for (unsigned pass = 0; pass < LUME_HARDWARE_LIMIT; ++pass)
+        {
+            bool changed = false;
+            for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            {
+                struct lume_hardware *child = hardware + i;
+                struct lume_hardware *parent = find(child->info.parent);
+                if (child->info.id && !child->absent && parent && parent->absent)
+                {
+                    child->absent = true;
+                    child->info.state = LUME_HARDWARE_ABSENT;
+                    child->info.error = error;
+                    changed = true;
+                }
+            }
+            if (!changed)
+                break;
+        }
     return 0;
 }
 
@@ -334,6 +385,8 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
         return -LUME_EBUSY;
     if (h->info.state == LUME_HARDWARE_DISABLED)
         return -LUME_EACCES;
+    if (h->absent)
+        return -LUME_ENOENT;
     if (h->info.state == LUME_HARDWARE_UNSUPPORTED)
         return -LUME_ENOSYS;
     if (!lume_driver_matches(driver, id))
@@ -401,6 +454,8 @@ int lume_hardware_unbind(uint32_t id)
         return -LUME_ENOENT;
     if (h->busy || h->info.references)
         return -LUME_EBUSY;
+    if (h->absent && h->driver)
+        return -LUME_EIO;
     if (!h->driver)
         return 0;
     h->busy = true;

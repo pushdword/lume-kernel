@@ -3,6 +3,8 @@ ifeq ($(origin CC),default)
 CC := clang
 endif
 DDK ?= /data/sdk/ddk
+-include $(DDK)/arch.mk
+ARCH ?= aarch64
 DRIVER ?= ram_block
 SOURCES ?= $(DRIVER).c
 ifeq ($(origin LD),default)
@@ -11,7 +13,14 @@ endif
 LD ?= ld.lld
 MODULE ?= 0
 OBJECTS := $(SOURCES:.c=.o)
-DDK_FLAGS := --target=aarch64-unknown-none-elf -mcpu=cortex-a76 -mstrict-align -std=c11 -O2 -g -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -nostdinc -isystem "$(DDK)/bare" -I"$(DDK)/include"
+ifeq ($(ARCH),amd64)
+DDK_TARGET := --target=x86_64-unknown-none-elf -march=x86-64 -mno-red-zone -mgeneral-regs-only
+else ifeq ($(ARCH),aarch64)
+DDK_TARGET := --target=aarch64-unknown-none-elf -mcpu=cortex-a76 -mstrict-align
+else
+$(error Unsupported driver architecture $(ARCH))
+endif
+DDK_FLAGS := $(DDK_TARGET) -std=c11 -O2 -g -fno-omit-frame-pointer -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -nostdinc -isystem "$(DDK)/bare" -I"$(DDK)/include"
 .PHONY: all module
 module: $(DRIVER).lkm
 ifeq ($(MODULE),1)

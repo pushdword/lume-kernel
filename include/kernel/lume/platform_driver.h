@@ -16,6 +16,7 @@ enum lume_platform_driver_kind
     LUME_PLATFORM_DISPLAY = 7,
     LUME_PLATFORM_ENTROPY = 8,
     LUME_PLATFORM_WIFI = 9,
+    LUME_PLATFORM_KEYBOARD = 10,
     LUME_PLATFORM_DRIVER_COUNT
 };
 
@@ -107,6 +108,15 @@ struct lume_platform_wifi_ops
     bool (*lume_pi5_wifi_register)(const unsigned char *mac);
     void (*lume_wifi_leave)(void);
 };
+
+struct lume_platform_keyboard_ops
+{
+    void (*poll)(void);
+    int (*getc)(void);
+};
+
+void lume_keyboard_poll(void);
+int lume_keyboard_getc(void);
 
 /* Registered callbacks belong to one loaded module or the platform kernel text.
  * Registration pins module callbacks. Callers serialize lifecycle changes with the kernel

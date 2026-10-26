@@ -9,6 +9,20 @@
 static unsigned allocations, owner_references, starts, stops;
 static int probe_error, start_error, stop_error;
 static bool fail_allocate;
+static unsigned rescans, ejections;
+
+static int rescan_bus(void)
+{
+    ++rescans;
+    return 0;
+}
+
+static int eject_bus(uint32_t id)
+{
+    assert(id == 42);
+    ++ejections;
+    return -LUME_ENOENT;
+}
 
 struct instance
 {
@@ -107,6 +121,19 @@ static const struct lume_driver driver = {
 
 int main(void)
 {
+    assert(lume_hardware_rescan() == -LUME_ENOSYS);
+    assert(lume_hardware_eject(42) == -LUME_ENOSYS);
+    assert(lume_hardware_bus_services(NULL) == -LUME_EINVAL);
+    const struct lume_hardware_bus_ops bus = {rescan_bus, eject_bus};
+    assert(!lume_hardware_bus_services(&bus));
+    assert(lume_hardware_bus_services(&bus) == -LUME_EINVAL);
+    struct lume_hardware_request bus_request = {
+        .version = LUME_HARDWARE_VERSION, .operation = LUME_HARDWARE_RESCAN, .id = 42};
+    assert(lume_hardware_control(&bus_request, false, true) == -LUME_EPERM && !rescans);
+    assert(!lume_hardware_control(&bus_request, true, false) && rescans == 1);
+    bus_request.operation = LUME_HARDWARE_EJECT;
+    assert(lume_hardware_control(&bus_request, false, true) == -LUME_EPERM && !ejections);
+    assert(lume_hardware_control(&bus_request, true, false) == -LUME_ENOENT && ejections == 1);
     struct lume_resource resources[] = {
         {.base = UINT64_C(0x100001000), .size = 256, .kind = LUME_RESOURCE_MMIO},
         {.base = 2048, .size = 1, .kind = LUME_RESOURCE_IRQ, .domain = 7}};

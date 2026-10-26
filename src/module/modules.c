@@ -5,6 +5,9 @@
 #include "lume/abi.h"
 #include "lume/module_services.h"
 #include "lume/platform_driver.h"
+#if defined(LUME_ARCH_AMD64)
+#include "lume/usb_inventory.h"
+#endif
 #include "lume/early.h"
 #include "lume/worker.h"
 #include "lume/usb.h"
@@ -17,6 +20,10 @@
 #include "lume/wpa.h"
 #include "lume/block.h"
 #include <string.h>
+#if defined(LUME_ARCH_AMD64)
+#include "lume/q35.h"
+#include "lume/counter.h"
+#endif
 
 extern const unsigned char __lume_kernel_build_id[];
 
@@ -37,6 +44,7 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_kernel_allocate)
     EXPORT(lume_kernel_free)
     EXPORT(lume_hardware_id)
+    EXPORT(lume_hardware_get)
     EXPORT(lume_hardware_resource)
     EXPORT(lume_hardware_property)
     EXPORT(lume_hardware_property_id)
@@ -91,6 +99,15 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_platform_driver_can_stop)
     EXPORT(lume_platform_driver_register)
     EXPORT(lume_platform_driver_unregister)
+#if defined(LUME_ARCH_AMD64)
+    EXPORT(lume_q35_pci_read)
+    EXPORT(lume_q35_pci_write)
+    EXPORT(lume_q35_counter_frequency)
+    EXPORT(lume_q35_counter_value)
+    EXPORT(lume_usb_inventory_add)
+    EXPORT(lume_usb_inventory_state)
+    EXPORT(lume_usb_inventory_remove)
+#endif
     EXPORT(lume_putc)
     EXPORT(lume_puts)
     EXPORT(lume_secret_clear)

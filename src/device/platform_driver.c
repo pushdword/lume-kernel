@@ -33,6 +33,7 @@ union operations
     struct lume_platform_display_ops display;
     struct lume_platform_entropy_ops entropy;
     struct lume_platform_wifi_ops wifi;
+    struct lume_platform_keyboard_ops keyboard;
 };
 
 static struct provider
@@ -68,6 +69,8 @@ static size_t operation_bytes(unsigned kind)
         return sizeof(struct lume_platform_entropy_ops);
     case LUME_PLATFORM_WIFI:
         return sizeof(struct lume_platform_wifi_ops);
+    case LUME_PLATFORM_KEYBOARD:
+        return sizeof(struct lume_platform_keyboard_ops);
     default:
         return 0;
     }
@@ -117,6 +120,19 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
 bool lume_platform_driver_ready(unsigned kind)
 {
     return kind < LUME_PLATFORM_DRIVER_COUNT && providers[kind].source;
+}
+
+void lume_keyboard_poll(void)
+{
+    if (providers[LUME_PLATFORM_KEYBOARD].source)
+        providers[LUME_PLATFORM_KEYBOARD].operations.keyboard.poll();
+}
+
+int lume_keyboard_getc(void)
+{
+    return providers[LUME_PLATFORM_KEYBOARD].source
+               ? providers[LUME_PLATFORM_KEYBOARD].operations.keyboard.getc()
+               : -LUME_EAGAIN;
 }
 
 int lume_platform_driver_can_stop(unsigned kind, const void *operations)

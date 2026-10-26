@@ -1,4 +1,9 @@
 #include "lume/q35.h"
+#include "lume/pci.h"
+#include "lume/acpi.h"
+#include "lume/work.h"
+#include "lume/usb.h"
+#include "lume/counter.h"
 #include "lume/abi.h"
 #include "lume/hardware.h"
 #include "lume/kernel_memory.h"
@@ -65,6 +70,80 @@ static int dma_domain(uint32_t id, struct lume_dma_domain *domain)
     return 0;
 }
 
+static bool active;
+static uint64_t next_scan;
+
+static void poll_hardware(void *context)
+{
+    (void)context;
+    if (!active)
+        return;
+    lume_usb_poll();
+    uint64_t now = lume_clock_millis();
+    if (now >= next_scan)
+    {
+        next_scan = now + 1000;
+        (void)lume_q35_pci_rescan();
+    }
+}
+static struct lume_work hardware_work = {.run = poll_hardware};
+
+void lume_q35_hardware_tick(void)
+{
+    if (active)
+        (void)lume_work_submit(&hardware_work);
+}
+
+void lume_q35_hardware_stop(void)
+{
+    active = false;
+    (void)lume_work_cancel(&hardware_work);
+}
+
+static int rescan(void)
+{
+    int result = lume_q35_pci_rescan();
+    if (!result)
+        lume_usb_poll();
+    return result;
+}
+
+static int acpi_inventory(uint32_t parent)
+{
+    const struct lume_acpi *acpi = lume_q35_acpi();
+    if (!acpi)
+    {
+        lume_puts("ACPI unavailable, PCI legacy configuration active\n");
+        return 0;
+    }
+    lume_value("ACPI_RSDP", acpi->rsdp);
+    lume_value("ACPI_TABLES", acpi->table_count);
+    lume_value("ACPI_CPUS", acpi->cpus);
+    lume_value("ACPI_IOAPICS", acpi->ioapics);
+    lume_value("ACPI_MCFG_SEGMENTS", acpi->segment_count);
+    for (unsigned i = 0; i < acpi->table_count; ++i)
+    {
+        struct lume_hardware_identity identity = {.kind = LUME_HARDWARE_ID_ACPI};
+        memcpy(identity.value, acpi->tables[i].signature, 5);
+        char path[] = "/q35/acpi/00-XXXX";
+        path[10] = "0123456789abcdef"[i >> 4];
+        path[11] = "0123456789abcdef"[i & 15];
+        memcpy(path + 13, identity.value, 4);
+        struct lume_hardware_description d = {.parent = parent,
+                                              .origin = LUME_HARDWARE_ACPI,
+                                              .state = LUME_HARDWARE_DISCOVERED,
+                                              .name = identity.value,
+                                              .path = path,
+                                              .identities = &identity,
+                                              .identity_count = 1};
+        uint32_t id;
+        int result = lume_hardware_add(&d, &id);
+        if (result)
+            return result;
+    }
+    return 0;
+}
+
 int lume_q35_hardware_start(void)
 {
     static const struct lume_hardware_services services = {lume_kernel_allocate, lume_kernel_free,
@@ -90,44 +169,29 @@ int lume_q35_hardware_start(void)
     if (result)
         return result;
     uint32_t parent = id;
-    const char digits[] = "0123456789abcdef";
-    for (unsigned bus = 0; bus < 256; ++bus)
-        for (unsigned slot = 0; slot < 32; ++slot)
-            for (unsigned function = 0; function < 8; ++function)
-            {
-                uint32_t address = bus << 16 | slot << 11 | function << 8;
-                uint32_t value = lume_q35_pci_read(address, 0);
-                if ((value & 0xffff) == 0xffff)
-                {
-                    if (!function)
-                        break;
-                    continue;
-                }
-                struct lume_hardware_identity pci = {.kind = LUME_HARDWARE_ID_PCI};
-                memcpy(pci.value, "pci,0000:0000", 14);
-                for (unsigned n = 0; n < 4; ++n)
-                {
-                    pci.value[4 + n] = digits[value >> (12 - n * 4) & 15];
-                    pci.value[9 + n] = digits[value >> (28 - n * 4) & 15];
-                }
-                char path[] = "/q35/pci/00:00.0";
-                path[9] = digits[bus >> 4];
-                path[10] = digits[bus & 15];
-                path[12] = digits[slot >> 4];
-                path[13] = digits[slot & 15];
-                path[15] = digits[function];
-                struct lume_hardware_description device = {.parent = parent,
-                                                           .origin = LUME_HARDWARE_PCI,
-                                                           .state = LUME_HARDWARE_DISCOVERED,
-                                                           .name = pci.value,
-                                                           .path = path,
-                                                           .identities = &pci,
-                                                           .identity_count = 1};
-                result = lume_hardware_add(&device, &id);
-                if (result)
-                    return result;
-                if (!function && !(lume_q35_pci_read(address, 12) & 0x00800000))
-                    break;
-            }
-    return 0;
+    const struct lume_hardware_identity keyboard_id = {LUME_HARDWARE_ID_BOARD, 0,
+                                                       "qemu,ps2-keyboard"};
+    const struct lume_resource keyboard_ports[] = {
+        {.base = 0x60, .size = 1, .kind = LUME_RESOURCE_IOPORT},
+        {.base = 0x64, .size = 1, .kind = LUME_RESOURCE_IOPORT}};
+    const struct lume_hardware_description keyboard = {.parent = parent,
+                                                       .origin = LUME_HARDWARE_BOARD,
+                                                       .state = LUME_HARDWARE_DISCOVERED,
+                                                       .name = "ps2-keyboard",
+                                                       .path = "/q35/ps2",
+                                                       .identities = &keyboard_id,
+                                                       .identity_count = 1,
+                                                       .resources = keyboard_ports,
+                                                       .resource_count = 2};
+    result = lume_hardware_add(&keyboard, &id);
+    if (result)
+        return result;
+    result = acpi_inventory(parent);
+    if (!result)
+        result = lume_q35_pci_start(parent);
+    static const struct lume_hardware_bus_ops bus = {rescan, lume_q35_pci_eject};
+    if (!result)
+        result = lume_hardware_bus_services(&bus);
+    active = !result;
+    return result;
 }

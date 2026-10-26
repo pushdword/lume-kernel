@@ -1,4 +1,5 @@
 #include "lume/virtio.h"
+#include "lume/q35_module.h"
 #include "lume/platform_driver.h"
 #include <string.h>
 static struct lume_virtio device;
@@ -28,17 +29,40 @@ static bool entropy(void *out, size_t bytes)
     return true;
 }
 
-void lume_q35_entropy_start(void)
+static const struct lume_platform_entropy_ops operations = {entropy};
+
+static int module_start(struct lume_hardware *hardware, void *context)
 {
-    if (!lume_virtio_open(&device, 0x1005, 0))
-        return;
-    if (!lume_virtio_queue(&device, 0, &queue))
-        goto fail;
+    struct q35_binding *binding = context;
+    uint32_t pci;
+    int result = q35_module_pci(hardware, 0x1af4, 0x1005, &pci);
+    if (result)
+        return result;
+    if (!lume_virtio_open(&device, pci, 0x1005, 0) || !lume_virtio_queue(&device, 0, &queue))
+        return -LUME_EIO;
     lume_virtio_ready(&device);
-    static const struct lume_platform_entropy_ops operations = {entropy};
-    if (lume_platform_driver_register(LUME_PLATFORM_ENTROPY, &operations, sizeof(operations)))
-        goto fail;
-    return;
-fail:
-    lume_virtio_fail(&device);
+    result = lume_platform_driver_register(LUME_PLATFORM_ENTROPY, &operations, sizeof(operations));
+    binding->registered = !result;
+    return result;
 }
+
+static int module_stop(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    struct q35_binding *binding = context;
+    if (!lume_virtio_reset(&device))
+        return -LUME_EIO;
+    if (binding->registered)
+    {
+        int result = lume_platform_driver_unregister(LUME_PLATFORM_ENTROPY, &operations);
+        if (result)
+            return result;
+        binding->registered = false;
+    }
+    lume_virtio_queue_release(&queue);
+    memset(&device, 0, sizeof(device));
+    memset(buffer, 0, sizeof(buffer));
+    return 0;
+}
+
+Q35_MODULE("q35-virtio-rng", LUME_HARDWARE_ID_PCI, "pci,1af4:1005", 1u << LUME_RESOURCE_IOPORT);

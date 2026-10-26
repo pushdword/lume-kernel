@@ -81,6 +81,17 @@ struct lume_hardware_services
     int (*dma_domain)(uint32_t id, struct lume_dma_domain *);
 };
 
+struct lume_hardware_bus_ops
+{
+    int (*rescan)(void);
+    int (*eject)(uint32_t id);
+};
+
+int lume_hardware_bus_services(const struct lume_hardware_bus_ops *);
+int lume_hardware_rescan(void);
+int lume_hardware_eject(uint32_t id);
+int lume_hardware_state(uint32_t id, unsigned state, int error);
+
 /* Descriptions are copied. Registered drivers and services outlive every association.
  * Lifecycle calls run with the kernel serialized. Stop handles partial initialization. */
 int lume_hardware_services(const struct lume_hardware_services *);
