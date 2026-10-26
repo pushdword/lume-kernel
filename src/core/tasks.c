@@ -299,7 +299,7 @@ void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
         out->cores[c].syscalls = cpus[c].calls;
         out->cores[c].dispatches = cpus[c].dispatches;
     }
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+    for (unsigned i = 0; i < LUME_TASK_LIMIT && out->process_count < LUME_PERF_PROCESSES; ++i)
     {
         struct lume_task_info info;
         if (!lume_task_info(i, &info))
