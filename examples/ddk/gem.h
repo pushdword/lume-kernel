@@ -372,10 +372,10 @@ enum gem_tx_status_fields
     GEM_TX_STATUS_FRAME_TOO_LARGE = 1u << 11,
     GEM_TX_STATUS_USED_MIDFRAME = 1u << 12,
     /* Exclude ordinary end-of-ring USED_BIT_READ from the error mask. */
-    GEM_TX_STATUS_ERRORS =
-        GEM_TX_STATUS_RETRY_LIMIT | GEM_TX_STATUS_AMBA_ERROR | GEM_TX_STATUS_UNDERRUN |
-        GEM_TX_STATUS_LATE_COLLISION | GEM_TX_STATUS_RESPONSE_ERROR | GEM_TX_STATUS_MAC_LOCKUP |
-        GEM_TX_STATUS_DMA_LOCKUP | GEM_TX_STATUS_FRAME_TOO_LARGE | GEM_TX_STATUS_USED_MIDFRAME,
+    GEM_TX_STATUS_ERRORS = GEM_TX_STATUS_RETRY_LIMIT | GEM_TX_STATUS_AMBA_ERROR |
+        GEM_TX_STATUS_UNDERRUN | GEM_TX_STATUS_LATE_COLLISION | GEM_TX_STATUS_RESPONSE_ERROR |
+        GEM_TX_STATUS_MAC_LOCKUP | GEM_TX_STATUS_DMA_LOCKUP | GEM_TX_STATUS_FRAME_TOO_LARGE |
+        GEM_TX_STATUS_USED_MIDFRAME,
 };
 
 /* RX_STATUS events are cleared by writing ones to the corresponding bits. */
@@ -632,7 +632,8 @@ struct lume_example_gem_layout
  */
 int lume_example_gem_configure(const unsigned char mac[6], bool loopback);
 /* Configure the physical RP1 polling binding while detached. */
-int lume_example_gem_configure_rp1(const unsigned char mac[6], unsigned phy_address);
+int lume_example_gem_configure_rp1(const unsigned char mac[6], unsigned phy_address,
+                                   const unsigned led_modes[2]);
 /* Attach the device through the DDK. The DDK validates resources, calls probe and then calls
  * start.
  */

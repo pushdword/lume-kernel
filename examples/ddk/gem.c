@@ -32,7 +32,17 @@
  * milliseconds.
  */
 #define GEM_POLL_LIMIT 10000u
-
+#define BCM54213PE_PHY_ID UINT32_C(0x600d84a2)
+#define BCM_PHY_SHADOW 0x1cu
+#define BCM_PHY_SHADOW_WRITE 0x8000u
+#define BCM_PHY_SHADOW_DATA_MASK 0x03ffu
+#define BCM_PHY_LED_SHADOW (0x0du << 10)
+#define BCM_PHY_LED_FIELDS_MASK 0x00ffu
+#define BCM_PHY_LED_MULTICOLOR_SOURCE 0x0au
+#define BCM_PHY_EXP_SELECT 0x17u
+#define BCM_PHY_EXP_DATA 0x15u
+#define BCM_PHY_MULTICOLOR_REG 0x0f04u
+#define BCM_PHY_LED_IN_PHASE 0x0100u
 /* Declare the probe callback before its address is used in driver_ops. static makes the function
  * name private to this C file.
  */
@@ -140,6 +150,7 @@ static bool running, tx_pending, custom_mac, loopback;
 static unsigned char requested_mac[6];
 static bool physical_rp1;
 static unsigned phy_address = GEM_PHY_MDIO_ADDRESS;
+static unsigned phy_led_modes[2];
 static uint32_t network_config;
 static bool phy_link_known;
 static unsigned tx_index, tx_count;
@@ -238,15 +249,21 @@ int lume_example_gem_configure(const unsigned char address[6], bool local_loopba
     return 0;
 }
 
-int lume_example_gem_configure_rp1(const unsigned char address[6], unsigned phy)
+int lume_example_gem_configure_rp1(const unsigned char address[6], unsigned phy,
+                                   const unsigned led_modes[2])
 {
-    if (!address || phy > 31)
+    if (!address || phy > 31u || !led_modes || led_modes[0] > 9u || led_modes[1] > 9u)
         return -LUME_EINVAL;
+
     int result = lume_example_gem_configure(address, false);
     if (result)
         return result;
+
     physical_rp1 = true;
     phy_address = phy;
+    phy_led_modes[0] = led_modes[0];
+    phy_led_modes[1] = led_modes[1];
+
     /* Polling leaves the RP1 interrupt domain unclaimed and masked. */
 #ifdef LUME_PLATFORM_LKM
     gem_device.resource_count = 0;
@@ -375,6 +392,39 @@ static int phy_write(unsigned reg, uint16_t value)
                        (reg << GEM_PHY_REGISTER_SHIFT) | value;
     write_mac_reg(GEM_PHY_MAINTENANCE, command);
     return mdio_idle();
+}
+
+static int bcm54213_configure_leds(void)
+{
+    uint16_t value;
+    int result = phy_write(BCM_PHY_SHADOW, BCM_PHY_LED_SHADOW);
+    if (result)
+        return result;
+
+    result = phy_read(BCM_PHY_SHADOW, &value);
+    if (result)
+        return result;
+
+    value = (uint16_t)((value & BCM_PHY_SHADOW_DATA_MASK & ~BCM_PHY_LED_FIELDS_MASK) |
+                       BCM_PHY_LED_MULTICOLOR_SOURCE | (BCM_PHY_LED_MULTICOLOR_SOURCE << 4));
+
+    result =
+        phy_write(BCM_PHY_SHADOW, (uint16_t)(BCM_PHY_SHADOW_WRITE | BCM_PHY_LED_SHADOW | value));
+    if (result)
+        return result;
+
+    result = phy_write(BCM_PHY_EXP_SELECT, BCM_PHY_MULTICOLOR_REG);
+    if (result)
+        return result;
+
+    result = phy_read(BCM_PHY_EXP_DATA, &value);
+    if (result)
+        return result;
+
+    value = (uint16_t)((value & ~BCM_PHY_LED_FIELDS_MASK) | BCM_PHY_LED_IN_PHASE |
+                       phy_led_modes[0] | (phy_led_modes[1] << 4));
+
+    return phy_write(BCM_PHY_EXP_DATA, value);
 }
 
 static bool rp1_link(void)
@@ -610,6 +660,12 @@ static int start(struct lume_device *d)
     /* Combine ID1 as the high 16 bits and ID2 as the low 16 bits of one diagnostic value. */
     layout.phy_id = (uint32_t)id1 << 16 | id2;
     phy_link_known = false;
+    if (physical_rp1 && layout.phy_id == BCM54213PE_PHY_ID)
+    {
+        int result = bcm54213_configure_leds();
+        if (result)
+            return result;
+    }
     if (physical_rp1 && (phy_write(4, 0x01e1) || phy_write(9, 0x0200) || phy_write(0, 0x1200)))
         return -LUME_EIO;
     /* RP1 alternates entries so the next descriptor remains CPU-owned during transmission. */

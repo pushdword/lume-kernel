@@ -13,8 +13,12 @@ static void lume_mmio_write32_sync(uintptr_t, uint32_t);
 
 static uint32_t registers[GEM_MMIO_BYTES / 4], cfg_status;
 static uint16_t phy_registers[32];
+static uint16_t phy_shadows[32], phy_expansion[65536];
+static unsigned phy_shadow_select;
 static unsigned checks, sync_calls, fail_sync, map_calls, fail_map;
 static unsigned tx_complete_after;
+static unsigned mdio_commands, fail_mdio_at, phy_vendor_accesses;
+const unsigned led_modes[2] = {0u, 8u};
 static bool dma_available = true, dma_submitted;
 const struct lume_dma_domain lume_rp1_dma_domain = {0, UINT64_C(0x1000000000),
                                                     UINT64_C(0x200000000), UINT64_MAX};
@@ -24,6 +28,34 @@ const struct lume_dma_domain lume_rp1_dma_domain = {0, UINT64_C(0x1000000000),
         assert(condition);                                                                         \
         ++checks;                                                                                  \
     } while (0)
+
+static uint16_t model_phy_read(unsigned reg)
+{
+    if (reg == 0x1cu)
+        return (uint16_t)((phy_shadow_select << 10) | phy_shadows[phy_shadow_select]);
+    if (reg == 0x15u)
+        return phy_expansion[phy_registers[0x17u]];
+
+    return phy_registers[reg];
+}
+
+static void model_phy_write(unsigned reg, uint16_t value)
+{
+    if (reg == 0x1cu)
+    {
+        phy_shadow_select = (value >> 10) & 31u;
+        if (value & 0x8000u)
+            phy_shadows[phy_shadow_select] = value & 0x03ffu;
+    }
+    else if (reg == 0x15u)
+    {
+        phy_expansion[phy_registers[0x17u]] = value;
+    }
+    else
+    {
+        phy_registers[reg] = value;
+    }
+}
 
 static uint32_t lume_mmio_read32(uintptr_t address)
 {
@@ -55,11 +87,22 @@ static void lume_mmio_write32_sync(uintptr_t address, uint32_t value)
         registers[offset / 4] = value;
     if (offset == GEM_PHY_MAINTENANCE)
     {
-        unsigned reg = (value >> 18) & 31;
+        unsigned reg = (value >> 18) & 31u;
+        ++mdio_commands;
+
+        if (reg == 0x1cu || reg == 0x17u || reg == 0x15u)
+            ++phy_vendor_accesses;
+
+        if (fail_mdio_at && mdio_commands == fail_mdio_at)
+        {
+            registers[GEM_NETWORK_STATUS / 4] &= ~GEM_STATUS_MDIO_IDLE;
+            return;
+        }
+
         if ((value & GEM_PHY_OPERATION_MASK) == GEM_PHY_OPERATION_WRITE)
-            phy_registers[reg] = (uint16_t)value;
+            model_phy_write(reg, (uint16_t)value);
         else
-            registers[offset / 4] = (value & 0xffff0000u) | phy_registers[reg];
+            registers[offset / 4] = (value & 0xffff0000u) | model_phy_read(reg);
     }
     if (offset == GEM_NETWORK_CONTROL && (value & GEM_CONTROL_TX_START))
         dma_submitted = true;
@@ -105,6 +148,10 @@ static void reset_model(void)
 {
     memset(registers, 0, sizeof(registers));
     memset(phy_registers, 0, sizeof(phy_registers));
+    memset(phy_shadows, 0, sizeof(phy_shadows));
+    memset(phy_expansion, 0, sizeof(phy_expansion));
+    mdio_commands = fail_mdio_at = phy_vendor_accesses = 0;
+    phy_shadow_select = 0;
     phy_registers[2] = 0x141;
     phy_registers[3] = 0xcc2;
     registers[GEM_MODULE_ID_REGISTER / 4] = GEM_MODULE_ID;
@@ -331,16 +378,28 @@ int main(void)
     T(lume_example_gem_eth_stop() == 0);
     printf("GEM polling and DMA ownership: %u checks PASS\n", checks);
     reset_model();
-    T(lume_example_gem_configure_rp1(0, 1) == -LUME_EINVAL);
-    T(lume_example_gem_configure_rp1(valid, 32) == -LUME_EINVAL);
-    T(lume_example_gem_configure_rp1(valid, 1) == 0);
+    T(lume_example_gem_configure_rp1(0, 1, led_modes) == -LUME_EINVAL);
+    T(lume_example_gem_configure_rp1(valid, 32, led_modes) == -LUME_EINVAL);
+    T(lume_example_gem_configure_rp1(valid, 1, led_modes) == 0);
     T(lume_example_gem_eth_start() == -LUME_ENOENT);
     registers[GEM_MODULE_ID_REGISTER / 4] = GEM_RP1_MODULE_ID;
     registers[GEM_DESIGN_CONFIG_1 / 4] = 4u << 25;
     phy_registers[1] = 0x24;
     phy_registers[5] = 0x01e1;
     phy_registers[10] = 0x0800;
+    phy_registers[2] = 0x600d;
+    phy_registers[3] = 0x84a2;
+
+    phy_shadows[0x0d] = 0x02c3;
+    phy_shadows[0x0c] = 0x0155;
+    phy_expansion[0x0f04] = 0xa45a;
+    phy_expansion[0x0f05] = 0x5aa5;
+
     T(lume_example_gem_eth_start() == 0);
+    T(phy_shadows[0x0d] == 0x02aa);
+    T(phy_shadows[0x0c] == 0x0155);
+    T(phy_expansion[0x0f04] == 0xa580);
+    T(phy_expansion[0x0f05] == 0x5aa5);
     T(gem_device.resource_count == 2);
     T(tx_count == 2 && tx_index == 0);
     T(tx.descriptors[0].control == GEM_TX_USED);
@@ -387,6 +446,70 @@ int main(void)
     T((registers[GEM_NETWORK_CONFIG / 4] &
        (GEM_CONFIG_GIGABIT | GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX)) ==
       (GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX));
+    T(lume_example_gem_eth_stop() == 0);
+    /* Reapply LED modes after the PHY register contents change. */
+    phy_shadows[0x0d] = 0x02c3;
+    phy_expansion[0x0f04] = 0xa45a;
+
+    T(lume_example_gem_eth_start() == 0);
+    T(phy_shadows[0x0d] == 0x02aa);
+    T(phy_expansion[0x0f04] == 0xa580);
+    T(lume_example_gem_eth_stop() == 0);
+
+    /* Leave vendor registers untouched on other PHY models. */
+    const uint32_t other_phys[2] = {0x01410cc2u, 0x600d84a0u};
+    for (unsigned i = 0; i < 2u; ++i)
+    {
+        phy_registers[2] = (uint16_t)(other_phys[i] >> 16);
+        phy_registers[3] = (uint16_t)other_phys[i];
+        phy_shadows[0x0d] = 0x02c3;
+        phy_expansion[0x0f04] = 0xa45a;
+        phy_vendor_accesses = 0;
+
+        T(lume_example_gem_eth_start() == 0);
+        T(phy_vendor_accesses == 0);
+        T(phy_shadows[0x0d] == 0x02c3);
+        T(phy_expansion[0x0f04] == 0xa45a);
+        T(lume_example_gem_eth_stop() == 0);
+    }
+
+    /* Two PHY identification reads precede the six LED transactions. */
+    for (unsigned failure = 3u; failure <= 8u; ++failure)
+    {
+        reset_model();
+        registers[GEM_MODULE_ID_REGISTER / 4] = GEM_RP1_MODULE_ID;
+        registers[GEM_DESIGN_CONFIG_1 / 4] = 4u << 25;
+        phy_registers[2] = 0x600d;
+        phy_registers[3] = 0x84a2;
+        phy_shadows[0x0d] = 0x02c3;
+        phy_expansion[0x0f04] = 0xa45a;
+
+        T(lume_example_gem_configure_rp1(valid, 1, led_modes) == 0);
+        fail_mdio_at = failure;
+
+        T(lume_example_gem_eth_start() == -LUME_EIO);
+        T(mdio_commands == failure);
+        T(gem_device.state == LUME_DEVICE_OFF);
+        T(lume_device_count() == 0);
+        T(registers[GEM_NETWORK_CONTROL / 4] == 0);
+
+        fail_mdio_at = 0;
+        registers[GEM_NETWORK_STATUS / 4] |= GEM_STATUS_MDIO_IDLE;
+
+        T(lume_example_gem_eth_start() == 0);
+        T(phy_shadows[0x0d] == 0x02aa);
+        T(phy_expansion[0x0f04] == 0xa580);
+        T(lume_example_gem_eth_stop() == 0);
+    }
+
+    /* The simulated binding must not use Broadcom vendor registers. */
+    reset_model();
+    phy_registers[2] = 0x600d;
+    phy_registers[3] = 0x84a2;
+
+    T(lume_example_gem_configure(valid, false) == 0);
+    T(lume_example_gem_eth_start() == 0);
+    T(phy_vendor_accesses == 0);
     T(lume_example_gem_eth_stop() == 0);
     T(lume_example_gem_configure(0, false) == 0 && gem_device.resource_count == 3);
     printf("GEM RP1 identity, MDIO, DMA width and negotiated link: %u checks PASS\n", checks);

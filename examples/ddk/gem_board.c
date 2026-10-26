@@ -49,16 +49,38 @@ static int start(struct lume_device *device)
     int result = lume_hardware_property_id(id, "phy-handle", LUME_PROPERTY_REFERENCE, 0, &property);
     if (result)
         return result;
-    result = lume_hardware_property_id((uint32_t)property.values[0], "reg", LUME_PROPERTY_U32, 0,
-                                       &property);
+
+    const uint32_t phy_node = (uint32_t)property.values[0];
+
+    result = lume_hardware_property_id(phy_node, "reg", LUME_PROPERTY_U32, 0, &property);
     if (result)
         return result;
-    if (property.values[0] > 31)
+    if (property.values[0] > 31u)
         return -LUME_EINVAL;
-    result = lume_example_gem_configure_rp1(mac, (unsigned)property.values[0]);
+
+    const unsigned phy_address = (unsigned)property.values[0];
+    unsigned led_modes[2] = {0u, 8u};
+
+    for (unsigned i = 0; i < 2u; ++i)
+    {
+        result = lume_hardware_property_id(phy_node, "led-modes", LUME_PROPERTY_U32, i, &property);
+        if (result == -LUME_ENOENT && i == 0u)
+            break;
+        if (result)
+            return result;
+        if (property.values[0] > 9u)
+            return -LUME_EINVAL;
+
+        led_modes[i] = (unsigned)property.values[0];
+    }
+
+    result = lume_example_gem_configure_rp1(mac, phy_address, led_modes);
     if (result)
         return result;
-    lume_value("GEM_PHY_ADDRESS", property.values[0]);
+
+    lume_value("GEM_PHY_ADDRESS", phy_address);
+    lume_value("GEM_PHY_LED0_MODE", led_modes[0]);
+    lume_value("GEM_PHY_LED1_MODE", led_modes[1]);
     saved_control = lume_mmio_read32(PHY_CONTROL);
     saved_pad = lume_mmio_read32(PHY_PAD);
     saved_output = lume_mmio_read32(PHY_RIO) & PHY_BIT;
