@@ -2,9 +2,9 @@ SHELL := sh
 .DEFAULT_GOAL := all
 ARCH ?= x32
 CPU ?= $(if $(filter aarch64,$(ARCH)),cortex-a76,)
-BOARD ?= $(if $(filter aarch64,$(ARCH)),raspberrypi5,tang25k)
+BOARD ?= $(if $(filter amd64,$(ARCH)),q35,$(if $(filter aarch64,$(ARCH)),raspberrypi5,tang25k))
 SDK ?=
-PROFILE ?= diagnostic
+PROFILE ?= $(if $(filter amd64,$(ARCH)),normal,diagnostic)
 DEBUG ?= 0
 DRIVER_OBJECTS ?=
 SD_POLL ?= 0
@@ -32,7 +32,33 @@ HOSTEXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 TOOLBIN = $(if $(strip $(SDK)),$(SDK)/bin/,)
 include mk/kernel.mk
 COMMON_FLAGS := -ffreestanding -fno-builtin -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections
-ifeq ($(ARCH),aarch64)
+ifeq ($(ARCH),amd64)
+ifneq ($(BOARD),q35)
+$(error AMD64 requires BOARD=q35)
+endif
+ifeq ($(PROFILE),diagnostic)
+$(error AMD64 supports normal and recovery boot profiles)
+endif
+include platform/q35/config.mk
+include arch/amd64/config.mk
+CPPFLAGS := -DLUME_ARCH_AMD64=1 -DLUME_BOOT_PROFILE=$(PROFILE_ID) -Iarch/amd64/include/kernel -Ivendor/libfdt $(PLATFORM_CPPFLAGS) -Isrc/core -Isrc/terminal -Iinclude/freestanding -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/fatfs -Ivendor/lwip/src/include -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
+KERNEL_C := $(filter-out arch/aarch64/% platform/raspberrypi5/% src/watchdog/boot_watchdog.c src/core/worker_check.c,$(KERNEL_C_aarch64))
+KERNEL_C += arch/amd64/boot/main.c arch/amd64/context/context.c arch/amd64/mm/mmu.c arch/amd64/mm/module_memory.c arch/amd64/module_relocate.c arch/amd64/dma.c arch/amd64/smp.c platform/q35/boot.c platform/q35/console.c platform/q35/clock.c platform/q35/hardware.c platform/q35/virtio.c drivers/storage/virtio_blk/block.c drivers/net/virtio_net/net.c drivers/entropy/virtio_rng/rng.c
+KERNEL_C += drivers/display/bochs_vbe/display.c drivers/input/ps2/keyboard.c
+ifeq ($(DEBUG),1)
+CFLAGS += -g -fno-omit-frame-pointer
+endif
+KERNEL_S := arch/amd64/boot/start.S arch/amd64/boot/payload.S arch/amd64/context/interrupt.S arch/amd64/context/worker.S
+ifneq ($(strip $(SHELL_ELF)),)
+$(OUT)/obj/arch/amd64/boot/payload.S.o: CPPFLAGS += -DLUME_SHELL_ELF_FILE='"$(SHELL_ELF)"'
+empty :=
+space := $(empty) $(empty)
+$(OUT)/obj/arch/amd64/boot/payload.S.o: $(subst $(space),\$(space),$(SHELL_ELF))
+endif
+SCRIPT := $(PLATFORM_LINKER)
+LINK_FLAGS := -m elf_x86_64 -z max-page-size=4096 --build-id=sha1
+PAYLOAD := $(OUT)/lume-amd64.bin
+else ifeq ($(ARCH),aarch64)
 include platform/$(BOARD)/config.mk
 include arch/aarch64/config.mk
 CPPFLAGS := -DLUME_BOOT_PROFILE=$(PROFILE_ID) -DLUME_SD_POLL=$(SD_POLL) -Isrc/core -Isrc/terminal -Iinclude/freestanding -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/fatfs -Ivendor/lwip/src/include -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
@@ -129,6 +155,8 @@ $(OUT)/obj/%.S.o: %.S $(OUT)/configuration Makefile
 	$(CC) $(CPPFLAGS) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -c "$<" -o "$@"
 $(OUT)/lume.elf: $(PROFILE_FILE) arch/$(ARCH)/config.mk mk/kernel.mk $(OBJECTS) $(DRIVER_OBJECTS) $(SCRIPT) Makefile $(OUT)/configuration
 	$(LD) $(LINK_FLAGS) --gc-sections -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$@"
+$(OUT)/lume-amd64.bin: $(OUT)/lume.elf
+	$(OBJCOPY) -O binary "$<" "$@"
 $(OUT)/lume.bin: $(OUT)/lume.elf
 	$(OBJCOPY) -O binary "$<" "$@"
 $(OUT)/lume-pi5.img: $(OUT)/lume.elf
@@ -138,7 +166,7 @@ $(OUT)/image-tool$(HOSTEXE): tools/image.cpp
 	$(HOSTCXX) $(HOSTCXXFLAGS) "$<" -o "$@"
 $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
-UAPI_ABI := $(if $(filter aarch64,$(ARCH)),include/abi/native,include/abi/$(ARCH))
+UAPI_ABI := $(if $(filter aarch64 amd64,$(ARCH)),include/abi/native,include/abi/$(ARCH))
 TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Iinclude/kernel -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs heap user-stack mmu elf-load font
 .PHONY: check-boot-storage

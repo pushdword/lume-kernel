@@ -70,7 +70,11 @@ static err_t initialize(struct netif *n)
     lume_netif_info(n->state, &i);
     n->name[0] = i.kind == LUME_IF_WIFI ? 'w' : 'e';
     n->name[1] = i.kind == LUME_IF_WIFI ? 'l' : 'n';
+#if defined(LUME_ARCH_AMD64)
+    n->hostname = "lume-q35";
+#else
     n->hostname = "lume-pi5";
+#endif
     n->mtu = (u16_t)i.mtu;
     n->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
     n->hwaddr_len = 6;

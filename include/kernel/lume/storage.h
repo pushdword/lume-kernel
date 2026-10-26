@@ -22,6 +22,7 @@ struct lume_volume
     uint64_t first, count;
 };
 
+#define LUME_Q35_DISK_ID UINT32_C(0x354d554c)
 #define LUME_CARD_DISK_ID UINT32_C(0x324d554c)
 #define LUME_CARD_BOOT_FIRST UINT64_C(2048)
 #define LUME_CARD_BOOT_SECTORS UINT64_C(1048576)

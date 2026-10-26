@@ -36,6 +36,22 @@ bool lume_volume_select(const unsigned char p[512], uint64_t sectors, struct lum
     *out = (struct lume_volume){0};
     if (p[510] != 0x55 || p[511] != 0xaa)
         return false;
+#if defined(LUME_ARCH_AMD64)
+    if (u32(p + 440) == LUME_Q35_DISK_ID)
+    {
+        if (sectors > UINT32_MAX || sectors <= 2048 + 65536 || p[444] || p[445] ||
+            !partition(p + 446, false, 2048, (uint32_t)(sectors - 2048)))
+            return false;
+        for (unsigned i = 0; i < 440; ++i)
+            if (p[i])
+                return false;
+        for (unsigned i = 462; i < 510; ++i)
+            if (p[i])
+                return false;
+        *out = (struct lume_volume){2048, sectors - 2048};
+        return true;
+    }
+#endif
     if (u32(p + 440) == LUME_CARD_DISK_ID)
         return dedicated(p, sectors, out);
     if (u32(p + 440) != 0xb8d65c68 || sectors != 121503744)

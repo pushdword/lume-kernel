@@ -1,10 +1,10 @@
 #ifndef LUME_PUBLIC_ABI_H
 #define LUME_PUBLIC_ABI_H
-/* Lume native AArch64 ABI 1.0 uses LP64 types and little-endian encoding. Freestanding
- * applications share this header with the kernel. SVC #0x4c55 enters the kernel with the
- * syscall number in x8 and arguments in x0 through x5. The kernel returns a signed result or a
- * negative LUME_E value in x0 and preserves the other general-purpose registers. Applications
- * must use Lume syscall numbers and AArch64 binaries. */
+/* Lume native ABI 1.0 uses LP64 types and little-endian encoding. Applications use
+ * Lume syscall numbers and ELF files for their target architecture. AArch64 enters with
+ * SVC #0x4c55, the number in x8 and arguments in x0 through x2. AMD64 enters with INT 0x80,
+ * the number in R8 and arguments in RDI, RSI and RDX. The result replaces the first argument.
+ * Other general-purpose registers are preserved. Negative results encode LUME_E values. */
 #include <stdint.h>
 #define LUME_ABI_VERSION UINT64_C(0x00010000)
 #define LUME_ABI_SVC 0x4c55
@@ -64,6 +64,8 @@ enum lume_syscall
     LUME_SYS_CREDENTIAL = 47,
     LUME_SYS_SIGNAL = 48,
     LUME_SYS_FILE_MODE = 49,
+    /* AMD64 sets the FS base to a writable, self-referencing thread control block. */
+    LUME_SYS_TLS = 50,
 };
 
 enum

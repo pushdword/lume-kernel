@@ -40,6 +40,16 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return LUME_ABI_VERSION;
     case LUME_SYS_GETPID:
         return pid;
+    case LUME_SYS_TLS:
+#if defined(LUME_ARCH_AMD64)
+        if (b || n || (a & 7) || !lume_user_buffer(a, 16, true) ||
+            *(const uint64_t *)(uintptr_t)a != a)
+            return -LUME_EINVAL;
+        LUME_CONTEXT_TLS(c) = a;
+        return 0;
+#else
+        return -LUME_ENOSYS;
+#endif
     case LUME_SYS_CREDENTIAL:
         return a > LUME_CREDENTIAL_UMASK ? -LUME_EINVAL
                                          : lume_credential_call(files, pid, (unsigned)a, b, n);
@@ -91,10 +101,11 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         *(struct lume_system_features *)(uintptr_t)a = (struct lume_system_features){
             .abi = LUME_ABI_VERSION,
             .features = LUME_FEATURE_FDS | LUME_FEATURE_SPAWN_ACTIONS | LUME_FEATURE_CAPABILITIES |
-                        LUME_FEATURE_THREADS | LUME_FEATURE_SMP | LUME_FEATURE_HARDWARE |
-                        LUME_FEATURE_MODULES | LUME_FEATURE_SUPERVISION | LUME_FEATURE_FORK |
-                        LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM | LUME_FEATURE_SOCKETS |
-                        LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS | LUME_FEATURE_FILE_MODES,
+                        LUME_FEATURE_THREADS | (lume_cpu_count() > 1 ? LUME_FEATURE_SMP : 0) |
+                        LUME_FEATURE_HARDWARE | LUME_FEATURE_MODULES | LUME_FEATURE_SUPERVISION |
+                        LUME_FEATURE_FORK | LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM |
+                        LUME_FEATURE_SOCKETS | LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS |
+                        LUME_FEATURE_FILE_MODES,
             .pointer_bits = 64,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
@@ -172,7 +183,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         extern bool lume_console_ready(void);
         if (!a)
+#if defined(LUME_ARCH_AMD64)
+        {
+            extern unsigned lume_q35_console_geometry(void);
+            return lume_q35_console_geometry();
+        }
+#else
             return 65 | (24 << 16);
+#endif
         if (a == 1)
             return lume_console_ready();
         if (a == 4)

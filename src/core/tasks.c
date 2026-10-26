@@ -1237,10 +1237,11 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return NULL;
     unsigned task = current_task;
     unsigned process = process_slot(task);
-    bool svc = (esr >> 26) == 0x15 && (esr & 0xffff) == LUME_ABI_SVC;
+    bool svc = lume_arch_is_syscall(esr, true);
     bool independent =
         svc && (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_ABI ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_GETPID ||
+                LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_TLS ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_CLOCK ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FEATURES ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_PROBE ||
@@ -1254,7 +1255,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         if (lume_worker_busy() && !independent)
         {
             tasks[task].context = *frame;
-            if ((esr >> 26) == 0x15 && (esr & 0xffff) == LUME_ABI_SVC)
+            if (lume_arch_is_syscall(esr, true))
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
             kernel_wait[task] = true;
             states[task] = 4;
@@ -1266,7 +1267,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return thread_slots[task].thread ? thread_finish(0) : finish_program(process_status[task]);
     if (public_mode && thread_slots[task].thread && !svc)
         return process_terminate(139);
-    if (public_mode && task == 2 && ((esr >> 26) != 0x15 || (esr & 0xffff) != LUME_ABI_SVC))
+    if (public_mode && task == 2 && !lume_arch_is_syscall(esr, true))
     {
         service_alive = false;
         states[2] = 0;
@@ -1275,7 +1276,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         int next = pick_task();
         return next >= 0 ? select_task((unsigned)next) : NULL;
     }
-    if (public_mode && owned[task] && ((esr >> 26) != 0x15 || (esr & 0xffff) != LUME_ABI_SVC))
+    if (public_mode && owned[task] && !lume_arch_is_syscall(esr, true))
     {
         ++program_faults;
         lume_value("PROGRAM_FAULT_ESR", esr);
@@ -1285,7 +1286,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return finish_program(139);
     }
     extern unsigned char lume_user_kernel_probe[], lume_user_ro_probe[];
-    if (!public_mode && (esr >> 26) == 0x24 && (esr & 63) == 15)
+    if (!public_mode && lume_arch_permission_fault(esr))
     {
         uint64_t kernel_probe =
             LUME_USER_BASE + (uintptr_t)lume_user_kernel_probe - (uintptr_t)__user_code_start;
@@ -1301,7 +1302,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         LUME_CONTEXT_PC(frame) += LUME_SYSCALL_INSTRUCTION_BYTES;
         return frame;
     }
-    if ((esr >> 26) != 0x15 || (esr & 0xffff) != (public_mode ? LUME_ABI_SVC : 0u))
+    if (!lume_arch_is_syscall(esr, public_mode))
         return NULL;
     ++tasks[task].calls;
     ++local.calls;

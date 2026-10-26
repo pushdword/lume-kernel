@@ -108,8 +108,9 @@ struct lume_platform_wifi_ops
     void (*lume_wifi_leave)(void);
 };
 
-/* Registered callbacks belong to one loaded module. Registration pins that module.
- * Callers serialize lifecycle changes with the kernel and quiesce hardware before removal. */
+/* Registered callbacks belong to one loaded module or the platform kernel text.
+ * Registration pins module callbacks. Callers serialize lifecycle changes with the kernel
+ * and quiesce hardware before removal. */
 struct lume_fdt;
 void lume_platform_firmware_configure(const struct lume_fdt *);
 const struct lume_fdt *lume_platform_firmware(void);

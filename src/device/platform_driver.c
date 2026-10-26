@@ -92,6 +92,12 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
         void *current = NULL;
         memcpy(&callback, (const unsigned char *)operations + offset, sizeof(callback));
         int result = callback ? lume_module_pin(callback, &current) : -LUME_EINVAL;
+#if defined(LUME_ARCH_AMD64)
+        extern unsigned char __image_start[], __text_end[];
+        if (result == -LUME_ENOENT && callback >= (uintptr_t)__image_start &&
+            callback < (uintptr_t)__text_end)
+            result = 0;
+#endif
         if (result || (owner && current != owner))
         {
             lume_module_unpin(current);

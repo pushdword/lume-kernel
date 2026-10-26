@@ -1,6 +1,7 @@
 #ifndef LUME_ARCH_CONTEXT_H
 #define LUME_ARCH_CONTEXT_H
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 struct lume_context
@@ -23,6 +24,42 @@ _Static_assert(offsetof(struct lume_context, fpsr) == 808, "AArch64 FPSR offset"
 #define LUME_CONTEXT_SYSCALL_REGISTER 8u
 #define LUME_CONTEXT_LINK_REGISTER 30u
 #define LUME_SYSCALL_INSTRUCTION_BYTES 4u
+#define LUME_CODE_ALIGNMENT 4u
+
+static inline bool lume_arch_is_syscall(uint64_t cause, bool public_abi)
+{
+    return (cause >> 26) == 0x15 && (cause & 0xffff) == (public_abi ? 0x4c55u : 0u);
+}
+
+static inline bool lume_arch_permission_fault(uint64_t cause)
+{
+    return (cause >> 26) == 0x24 && (cause & 63) == 15;
+}
+
+static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer)
+{
+    LUME_CONTEXT_REG(c, LUME_CONTEXT_LINK_REGISTER) = restorer;
+    LUME_CONTEXT_PC(c) = handler;
+    return true;
+}
+
+static inline uint64_t lume_arch_tls_size(uint64_t size, uint64_t align)
+{
+    return ((16 + align - 1) & ~(align - 1)) + size;
+}
+
+static inline uint64_t lume_arch_tls_pointer(uint64_t base, uint64_t size, uint64_t align)
+{
+    (void)size;
+    (void)align;
+    return base;
+}
+
+static inline uint64_t lume_arch_tls_data(uint64_t base, uint64_t size, uint64_t align)
+{
+    (void)size;
+    return base + ((16 + align - 1) & ~(align - 1));
+}
 
 static inline void lume_arch_idle_irq(void)
 {

@@ -104,8 +104,11 @@ static int64_t thread_create(const struct lume_thread_request *r)
         tasks[task].stack[i] = 0;
     uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
     uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
-    uint64_t bias = (16 + align - 1) & ~(align - 1);
-    unsigned tls_pages = (unsigned)((bias + images[owner].tls_size + 4095) / 4096);
+    uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
+#if defined(LUME_ARCH_AMD64)
+    tls_size += 16;
+#endif
+    unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
     unsigned stack_pages = (unsigned)((r->stack_bytes + 4095) / 4096);
     thread_pages[task] = tls_pages + 1 + stack_pages;
     lume_mmu_share_user(task, owner);
@@ -125,16 +128,25 @@ static int64_t thread_create(const struct lume_thread_request *r)
     }
     lume_arch_flush_user_tlb();
     uint64_t tid = thread_id(thread_slots, task);
-    uint64_t *tcb = (void *)(uintptr_t)base;
+    uint64_t tp = lume_arch_tls_pointer(base, images[owner].tls_size, align);
+    uint64_t *tcb = (void *)(uintptr_t)tp;
+#if defined(LUME_ARCH_AMD64)
+    tcb[0] = tp;
+#else
     tcb[0] = tid;
+#endif
     tcb[1] = owner + 1;
+    uint64_t tls_data = lume_arch_tls_data(base, images[owner].tls_size, align);
     for (uint64_t i = 0; i < images[owner].tls_file; ++i)
-        *(unsigned char *)(uintptr_t)(base + bias + i) =
+        *(unsigned char *)(uintptr_t)(tls_data + i) =
             *(const unsigned char *)(uintptr_t)(images[owner].tls_address + i);
     struct lume_context *c = &tasks[task].context;
     LUME_CONTEXT_PC(c) = r->entry;
     LUME_CONTEXT_SP(c) = base + (uint64_t)thread_pages[task] * 4096;
-    LUME_CONTEXT_TLS(c) = base;
+#if defined(LUME_ARCH_AMD64)
+    LUME_CONTEXT_SP(c) -= 8;
+#endif
+    LUME_CONTEXT_TLS(c) = tp;
     LUME_CONTEXT_STATUS(c) = LUME_CONTEXT_USER_STATUS;
     LUME_CONTEXT_REG(c, 0) = r->argument;
     parents[task] = owner;

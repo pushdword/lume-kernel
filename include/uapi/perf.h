@@ -23,16 +23,16 @@
  * counts and maximum ready time cover the session. Core masks retain the process lifetime
  * history. Observer removal does not require a separate stop syscall.
  *
- * Native AArch64 uses syscall 29 and version 2, with room for four CPUs. Version 1
+ * Native AArch64 and AMD64 use syscall 29 and version 2, with room for four CPUs. Version 1
  * is accepted only when at most two CPUs are online. Native counters cover process
  * lifetimes and continue without observers. Ready-time and detailed I/O totals are
- * currently zero on that port. These fields do not measure its I/O latency.
+ * currently zero on those ports. These fields do not measure their I/O latency.
  * LUME_PERF_THREAD in state marks a user thread. Its parent is the process ID,
  * and pid contains the low 32 bits of its generated thread handle. */
 #ifndef LUME_PERF_H
 #define LUME_PERF_H
 #include <stdint.h>
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 #define LUME_PERF_VERSION 2u
 #define LUME_PERF_CORES 4u
 #else
@@ -89,8 +89,8 @@ struct lume_perf_snapshot_v1
     struct lume_perf_process processes[LUME_PERF_PROCESSES];
     struct lume_perf_totals totals;
 };
+
 _Static_assert(sizeof(struct lume_perf_snapshot_v1) == 716, "telemetry v1 layout");
 
-_Static_assert(sizeof(struct lume_perf_snapshot) == 644 + 36 * LUME_PERF_CORES,
-               "telemetry layout");
+_Static_assert(sizeof(struct lume_perf_snapshot) == 644 + 36 * LUME_PERF_CORES, "telemetry layout");
 #endif

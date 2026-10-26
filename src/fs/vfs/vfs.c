@@ -357,7 +357,11 @@ void lume_vfs_init(const void *shell, size_t bytes)
     nodes[count - 1].device = 2;
     add("/bin/sh", LUME_NODE_FILE, shell, bytes, false);
     static const char motd[] =
-        "LumeOS AArch64 / Raspberry Pi 5\nPublic ABI 1.0; RAM VFS; GPIO UART console.\n";
+#if defined(LUME_ARCH_AMD64)
+        "LumeOS AMD64 / QEMU q35\nNative ABI 1.0. COM1 serial console.\n";
+#else
+        "LumeOS AArch64 / Raspberry Pi 5\nNative ABI 1.0. GPIO UART console.\n";
+#endif
     add("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (block_devices[i])

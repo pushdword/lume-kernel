@@ -128,7 +128,8 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
         {
             uint64_t physical;
             uint64_t root = lume_mmu_task_root(owner);
-            if ((r.handler & 3) || (r.restorer & 3) ||
+            if ((r.handler & (LUME_CODE_ALIGNMENT - 1)) ||
+                (r.restorer & (LUME_CODE_ALIGNMENT - 1)) ||
                 !lume_mmu_translate(root, r.handler, false, true, true, &physical) ||
                 !lume_mmu_translate(root, r.restorer, false, true, true, &physical))
                 return -LUME_EFAULT;
@@ -261,8 +262,11 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
             if (action.flags & (1u << 2))
                 s->action[number] = (struct signal_action){0};
             LUME_CONTEXT_REG(frame, 0) = number;
-            LUME_CONTEXT_REG(frame, LUME_CONTEXT_LINK_REGISTER) = action.restorer;
-            LUME_CONTEXT_PC(frame) = action.handler;
+            if (!lume_context_signal(frame, action.handler, action.restorer))
+            {
+                exit_signals[owner] = 11;
+                return lume_tasks_deliver_signals(finish_program(139));
+            }
             return frame;
         }
     return frame;

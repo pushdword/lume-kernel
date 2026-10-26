@@ -97,9 +97,13 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *);
 
 static inline uint64_t lume_current_el(void)
 {
+#if defined(LUME_ARCH_AMD64)
+    return 1;
+#else
     uint64_t value;
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(value));
     return value >> 2;
+#endif
 }
 
 /* Monotonic platform clock shared by protocols and drivers. */
