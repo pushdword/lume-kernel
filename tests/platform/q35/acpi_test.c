@@ -65,6 +65,62 @@ static void fixture(bool extended)
     sum(0xe0100, 36, 32);
 }
 
+static void cpu_fixture(unsigned count)
+{
+    fixture(true);
+    unsigned char ioapic[12];
+    memcpy(ioapic, memory + 0x11034, sizeof(ioapic));
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned address = 0x1102c + i * 8;
+        memory[address] = 0;
+        memory[address + 1] = 8;
+        memory[address + 2] = (unsigned char)i;
+        memory[address + 3] = (unsigned char)i;
+        put32(address + 4, 1);
+    }
+    memcpy(memory + 0x1102c + count * 8, ioapic, sizeof(ioapic));
+    table(0x11000, "APIC", 44 + count * 8 + sizeof(ioapic));
+}
+
+static void cpu_topology(void)
+{
+    struct lume_acpi acpi, saved;
+    cpu_fixture(4);
+    const unsigned char ids[] = {2, 0, 6, 9};
+    for (unsigned i = 0; i < 4; ++i)
+        memory[0x1102f + i * 8] = ids[i];
+    sum(0x11000, 88, 9);
+    assert(lume_acpi_read(&acpi, read_memory, NULL, 0xe0100) && acpi.cpus == 4);
+    for (unsigned i = 0; i < 4; ++i)
+        assert(acpi.apic_ids[i] == ids[i]);
+    put32(0x11030 + 2 * 8, 2);
+    sum(0x11000, 88, 9);
+    assert(lume_acpi_read(&acpi, read_memory, NULL, 0xe0100) && acpi.cpus == 3);
+    assert(acpi.apic_ids[2] == 9);
+    saved = acpi;
+    memory[0x1102f + 3 * 8] = 2;
+    sum(0x11000, 88, 9);
+    assert(!lume_acpi_read(&acpi, read_memory, NULL, 0xe0100));
+    assert(!memcmp(&acpi, &saved, sizeof(acpi)));
+    cpu_fixture(256);
+    assert(lume_acpi_read(&acpi, read_memory, NULL, 0xe0100) && acpi.cpus == 256);
+    assert(acpi.apic_ids[255] == 255);
+    cpu_fixture(257);
+    assert(!lume_acpi_read(&acpi, read_memory, NULL, 0xe0100));
+    fixture(true);
+    memset(memory + 0x1102c, 0, 16);
+    memory[0x1102c] = 9;
+    memory[0x1102d] = 16;
+    put32(0x11030, 300);
+    put32(0x11034, 1);
+    table(0x11000, "APIC", 60);
+    assert(lume_acpi_read(&acpi, read_memory, NULL, 0xe0100) && acpi.cpus == 1);
+    assert(acpi.apic_ids[0] == 300);
+    puts(
+        "ACPI_CPU_PASS sparse IDs, enabled CPUs, duplicate rejection, capacity and x2APIC records");
+}
+
 int main(void)
 {
     struct lume_acpi acpi;
@@ -104,6 +160,7 @@ int main(void)
     memcpy(memory + 0x90000, memory + 0xe0100, 36);
     memset(memory + 0xe0100, 0, 36);
     assert(lume_acpi_find(&acpi, read_memory, NULL, 0x90000) && acpi.rsdp == 0x90000);
+    cpu_topology();
     puts("ACPI_PASS RSDT/XSDT, EBDA/BIOS search, checksums, bounds, MADT, FADT and MCFG conflicts");
     return 0;
 }

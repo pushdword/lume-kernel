@@ -1,12 +1,9 @@
 #ifndef LUME_SMP_H
 #define LUME_SMP_H
 #include "lume/early.h"
-#define LUME_CPU_LIMIT 1u
+#define LUME_CPU_LIMIT 4u
 
-static inline unsigned lume_cpu_index(void)
-{
-    return 0;
-}
+unsigned lume_cpu_index(void);
 
 unsigned lume_cpu_count(void);
 void lume_smp_configure(const struct lume_fdt *);
@@ -22,4 +19,7 @@ uint64_t lume_smp_wait_start(unsigned);
 void lume_smp_wake(void);
 void lume_smp_quiesce(void);
 void lume_tasks_secondary(void);
+void lume_smp_tlb_service(void);
+void lume_smp_tlb_flush(void);
+_Noreturn void lume_amd64_secondary_main(unsigned);
 #endif

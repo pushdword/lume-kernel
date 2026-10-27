@@ -9,6 +9,7 @@
 #include "lume/modules.h"
 #include "lume/display.h"
 #include "lume/pci.h"
+#include "lume/smp.h"
 static uint64_t program_memory;
 static unsigned program_pages;
 
@@ -41,6 +42,7 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     struct lume_fdt memory;
     if (!lume_q35_boot_read(info, magic, &memory))
         lume_fail("invalid Multiboot memory map or application root");
+    lume_smp_configure(&memory);
     if (!lume_mmu_start(&memory))
         lume_fail("AMD64 memory mappings");
     extern unsigned char __image_start[], __image_end[];

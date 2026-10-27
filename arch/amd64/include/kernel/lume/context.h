@@ -52,11 +52,8 @@ static inline void lume_arch_idle_irq(void)
     __asm__ volatile("sti\nhlt\ncli" : : : "memory");
 }
 
-static inline void lume_arch_flush_user_tlb(void)
-{
-    uint64_t root;
-    __asm__ volatile("movq %%cr3, %0\nmovq %0, %%cr3" : "=r"(root) : : "memory");
-}
+void lume_smp_tlb_flush(void);
+#define lume_arch_flush_user_tlb lume_smp_tlb_flush
 
 static inline uint64_t lume_arch_tls_size(uint64_t size, uint64_t align)
 {

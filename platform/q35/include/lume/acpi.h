@@ -6,6 +6,7 @@
 
 #define LUME_ACPI_TABLES 64u
 #define LUME_ACPI_SEGMENTS 8u
+#define LUME_ACPI_CPUS 256u
 
 struct lume_acpi_table
 {
@@ -28,6 +29,7 @@ struct lume_acpi
     bool legacy_keyboard;
     struct lume_acpi_table tables[LUME_ACPI_TABLES];
     struct lume_acpi_segment segments[LUME_ACPI_SEGMENTS];
+    uint32_t apic_ids[LUME_ACPI_CPUS];
 };
 
 typedef bool (*lume_acpi_reader)(void *, uint64_t, void *, size_t);

@@ -29,6 +29,7 @@ SECTIONS
         __trap_stack = .; . += 0x20000; __trap_top = .;
         __fault_guard = .; . += 4096;
         __fault_stack = .; . += 0x8000; __fault_top = .;
+        __secondary_stacks = .; . += 3 * 0x50000;
     }
     . = ALIGN(4096);
     __image_end = .;

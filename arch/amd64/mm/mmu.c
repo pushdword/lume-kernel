@@ -2,6 +2,7 @@
 #include "lume/elf.h"
 #include "lume/module_memory.h"
 #include "lume/acpi.h"
+#include "lume/apic.h"
 #include <string.h>
 #define PRESENT UINT64_C(1)
 #define WRITE UINT64_C(2)
@@ -19,13 +20,23 @@ static _Alignas(4096) uint64_t task_pdpt[LUME_TASK_LIMIT][512];
 static _Alignas(4096) uint64_t task_pd[LUME_TASK_LIMIT][512];
 static uint64_t *task_pt[LUME_TASK_LIMIT][USER_BLOCKS];
 static unsigned shared[LUME_TASK_LIMIT];
+static _Alignas(4096) uint64_t trampoline_pages[512];
 static uint64_t module_base, module_end, module_first;
 extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[];
 extern unsigned char __stack_guard[], __worker_guard[], __trap_guard[], __fault_guard[];
+extern unsigned char __secondary_stacks[];
 
 static uint64_t table(const uint64_t *p, bool user)
 {
     return (uintptr_t)p | PRESENT | WRITE | (user ? USER : 0);
+}
+
+void lume_mmu_ap_trampoline(bool enable)
+{
+    /* The startup page is writable only until every AP enters the kernel mappings. */
+    trampoline_pages[LUME_AP_TRAMPOLINE / 4096] = LUME_AP_TRAMPOLINE | PRESENT | WRITE | NX;
+    directories[0][0] = enable ? table(trampoline_pages, false) : 0;
+    lume_arch_flush_user_tlb();
 }
 
 uint64_t lume_mmu_root(void)
@@ -121,6 +132,12 @@ bool lume_mmu_start(const struct lume_fdt *description)
                 address == (uintptr_t)__worker_guard || address == (uintptr_t)__trap_guard ||
                 address == (uintptr_t)__fault_guard)
                 flags = 0;
+            if (address >= (uintptr_t)__secondary_stacks)
+            {
+                uint64_t offset = (address - (uintptr_t)__secondary_stacks) % LUME_AP_STACK_BYTES;
+                if (!offset || offset == 0x21000 || offset == 0x42000)
+                    flags = 0;
+            }
             /* Multiboot may place its first module inside the final image window. */
             if (address >= (uintptr_t)__image_end && address >= initrd_first_page &&
                 address < initrd_end)
@@ -238,7 +255,7 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
     if (p)
     {
         *p = 0;
-        __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+        lume_arch_flush_user_tlb();
     }
 }
 

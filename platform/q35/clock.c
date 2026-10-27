@@ -6,6 +6,8 @@
 #include "lume/abi.h"
 #include "scheduler_config.h"
 #include "lume/pci.h"
+#include "lume/smp.h"
+#include "lume/apic.h"
 static uint64_t frequency, epoch;
 static uint16_t masks = 0xffff;
 
@@ -99,6 +101,11 @@ uint64_t lume_q35_counter_value(uint64_t raw)
 static void timer_start(uint64_t hz)
 {
     (void)hz;
+    if (lume_cpu_index())
+    {
+        lume_apic_timer_start();
+        return;
+    }
     uint32_t divisor = 1193182u * SCHED_TICK_MS / 1000;
     if (!divisor || divisor > 65535)
         lume_fail("PIT scheduler interval");
@@ -110,6 +117,11 @@ static void timer_start(uint64_t hz)
 
 static void timer_stop(void)
 {
+    if (lume_cpu_index())
+    {
+        lume_apic_timer_stop();
+        return;
+    }
     (void)lume_irq_enable(32, false);
 }
 

@@ -48,7 +48,8 @@ KERNEL_C += arch/amd64/boot/main.c arch/amd64/context/context.c arch/amd64/mm/mm
 ifeq ($(DEBUG),1)
 CFLAGS += -g -fno-omit-frame-pointer
 endif
-KERNEL_S := arch/amd64/boot/start.S arch/amd64/boot/payload.S arch/amd64/context/interrupt.S arch/amd64/context/worker.S
+KERNEL_C += arch/amd64/apic.c
+KERNEL_S := arch/amd64/boot/start.S arch/amd64/boot/secondary.S arch/amd64/boot/payload.S arch/amd64/context/interrupt.S arch/amd64/context/worker.S
 ifneq ($(strip $(SHELL_ELF)),)
 $(OUT)/obj/arch/amd64/boot/payload.S.o: CPPFLAGS += -DLUME_SHELL_ELF_FILE='"$(SHELL_ELF)"'
 empty :=
@@ -391,6 +392,13 @@ check-q35: $(OUT)/tests/q35-pci$(HOSTEXE) $(OUT)/tests/q35-virtio$(HOSTEXE) $(OU
 	env "$(OUT)/tests/q35-acpi$(HOSTEXE)"
 	env "$(OUT)/tests/q35-bus$(HOSTEXE)"
 	env "$(OUT)/tests/q35-firmware$(HOSTEXE)"
+.PHONY: check-amd64-context
+check-q35: check-amd64-context
+check-amd64-context: $(OUT)/tests/amd64-context$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_ARCH_AMD64=1 $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -o "$@"
 Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
 $(OUT)/tests/q35-pci$(HOSTEXE): tests/platform/q35/pci_test.c platform/q35/pci.c
 	mkdir -p "$(@D)"

@@ -93,10 +93,16 @@ static bool parse(struct lume_acpi *out, lume_acpi_reader read, void *context,
                 unsigned minimum = kind == 0 ? 8 : kind == 9 ? 16 : 12;
                 if (bytes < minimum || !read(context, address + offset, data, minimum))
                     return false;
-                if (kind == 0 && (u32(data + 4) & 3))
-                    ++out->cpus;
-                if (kind == 9 && (u32(data + 8) & 3))
-                    ++out->cpus;
+                if ((kind == 0 && (u32(data + 4) & 1)) || (kind == 9 && (u32(data + 8) & 1)))
+                {
+                    uint32_t id = kind == 0 ? data[3] : u32(data + 4);
+                    if (out->cpus == LUME_ACPI_CPUS)
+                        return false;
+                    for (unsigned i = 0; i < out->cpus; ++i)
+                        if (out->apic_ids[i] == id)
+                            return false;
+                    out->apic_ids[out->cpus++] = id;
+                }
                 if (kind == 1)
                     ++out->ioapics;
                 if (kind == 5)

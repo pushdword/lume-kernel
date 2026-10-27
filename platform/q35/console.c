@@ -5,6 +5,7 @@
 #include "lume/usb.h"
 #include "lume/worker.h"
 #include "lume/console_output.h"
+#include "lume/smp.h"
 #define COM1 0x3f8
 static int pending = -1;
 
@@ -43,10 +44,20 @@ static void transmit(const char *data, size_t bytes)
 {
     for (size_t i = 0; i < bytes; ++i)
     {
+        if (!(i & 63))
+            lume_smp_tlb_service();
         while (!(lume_in8(COM1 + 5) & 0x20))
+        {
+            lume_smp_tlb_service();
             lume_cpu_relax();
+        }
         lume_out8(COM1, (unsigned char)data[i]);
     }
+}
+
+void lume_console_receive_checkpoint(void)
+{
+    lume_smp_tlb_service();
 }
 
 void lume_putc(char c)

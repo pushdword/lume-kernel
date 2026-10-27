@@ -14,7 +14,7 @@ TRAP \n
 .irp n,8,10,11,12,13,14,17,21,29,30
 TRAP \n,1
 .endr
-.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,255
+.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,128,255
 TRAP \n
 .endr
 lume_trap_common:
@@ -58,7 +58,11 @@ lume_run_user:
     pushq %r14
     pushq %r15
     subq $8, %rsp
-    movq %rsp, lume_kernel_return_sp(%rip)
+    movq %rdi, %r12
+    call lume_cpu_index
+    leaq lume_kernel_return_sp(%rip), %rcx
+    movq %rsp, (%rcx,%rax,8)
+    movq %r12, %rdi
 lume_context_restore:
     call lume_amd64_context_prepare
     movq %rax, %rdi
@@ -92,7 +96,9 @@ lume_context_restore:
     movq 0(%rdi), %rdi
     iretq
 lume_user_finished:
-    movq lume_kernel_return_sp(%rip), %rsp
+    call lume_cpu_index
+    leaq lume_kernel_return_sp(%rip), %rcx
+    movq (%rcx,%rax,8), %rsp
     addq $8, %rsp
     popq %r15
     popq %r14
@@ -103,11 +109,11 @@ lume_user_finished:
     ret
 .bss
 .balign 8
-lume_kernel_return_sp: .skip 8
+lume_kernel_return_sp: .skip 32
 .section .rodata
 .global lume_isr_table
 lume_isr_table:
-.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,255
+.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,128,255
     .quad lume_isr_\n
 .endr
 .section .note.GNU-stack,"",@progbits

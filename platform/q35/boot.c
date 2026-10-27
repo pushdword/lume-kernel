@@ -1,6 +1,7 @@
 #include "lume/q35.h"
 #include "lume/acpi.h"
 #include "lume/firmware.h"
+#include "lume/apic.h"
 #include <string.h>
 #define EARLY_LIMIT UINT64_C(0x40000000)
 static struct lume_acpi acpi;
@@ -106,6 +107,16 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
             memory->initrd_start = start;
             memory->initrd_end = end;
         }
+    }
+    if (acpi.cpus > 1)
+    {
+        if (!contains_ram(memory, LUME_AP_TRAMPOLINE, 4096))
+            return false;
+        for (unsigned i = 0; i < memory->reserved_count; ++i)
+            if (LUME_AP_TRAMPOLINE < memory->reserved[i].base + memory->reserved[i].size &&
+                memory->reserved[i].base < LUME_AP_TRAMPOLINE + 4096)
+                return false;
+        memory->reserved[memory->reserved_count++] = (struct lume_range){LUME_AP_TRAMPOLINE, 4096};
     }
     return memory->ram_count &&
            contains_ram(memory, (uintptr_t)__image_start, __image_end - __image_start);

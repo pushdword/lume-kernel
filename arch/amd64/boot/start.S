@@ -93,6 +93,7 @@ lume_boot_gdtr:
     .long lume_boot_gdt
 .section .bss
 .balign 4096
+.global lume_boot_pml4
 lume_boot_pml4: .skip 4096
 lume_boot_pdpt: .skip 4096
 lume_boot_pd: .skip 4096
