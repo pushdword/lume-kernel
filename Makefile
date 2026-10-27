@@ -1,5 +1,6 @@
 SHELL := sh
 .DEFAULT_GOAL := all
+
 ARCH ?= x32
 CPU ?= $(if $(filter aarch64,$(ARCH)),cortex-a76,)
 BOARD ?= $(if $(filter amd64,$(ARCH)),q35,$(if $(filter aarch64,$(ARCH)),raspberrypi5,tang25k))
@@ -451,7 +452,7 @@ check: check-work-queue
 .PHONY: check-worker-slices
 check-worker-slices: $(OUT)/tests/worker-slices$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/worker.c src/core/worker_check.c src/core/work.c include/kernel/lume/worker.h
+$(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/worker.c src/core/worker_check.c src/core/work.c src/core/activity.c include/kernel/lume/worker.h include/kernel/lume/activity.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/core/work.c -o "$@"
 check: check-worker-slices
@@ -487,3 +488,27 @@ $(OUT)/tests/console-output$(HOSTEXE): tests/unit/console_output_test.c src/core
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
 check: check-console-output
+
+.PHONY: check-activity
+check-activity: $(OUT)/tests/activity$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/activity$(HOSTEXE): tests/unit/activity_test.c src/core/activity.c include/uapi/lume/activity.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Iarch/$(ARCH)/include/kernel "$<" -o "$@"
+check: check-activity
+
+.PHONY: check-uart-irq
+check-uart-irq: $(OUT)/tests/uart-irq$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/uart-irq$(HOSTEXE): tests/unit/uart_irq_test.c drivers/serial/pl011/rp1_irq.c drivers/serial/pl011/uart_irq.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check: check-uart-irq
+
+.PHONY: check-uart-rx
+check-uart-rx: $(OUT)/tests/uart-rx$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/uart-rx$(HOSTEXE): tests/unit/uart_rx_test.c platform/raspberrypi5/uart_rx.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check: check-uart-rx

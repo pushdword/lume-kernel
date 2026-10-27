@@ -3,6 +3,7 @@
 #include "lume/counter.h"
 #include "lume/mmio.h"
 #include "lume/ticket_lock.h"
+#include "lume/uart_rx.h"
 
 static uint64_t affinities[LUME_CPU_LIMIT];
 static unsigned configured = 1, online = 1;
@@ -46,6 +47,7 @@ void lume_smp_lock(void)
             waiting = true;
         }
         __asm__ volatile("yield" ::: "memory");
+        lume_pi5_uart_rx_checkpoint();
     }
     uint64_t waited = waiting ? lume_counter_read() - began : 0;
     lock_cpus[cpu].waited = waited;

@@ -5,6 +5,9 @@
 #include "lume/abi.h"
 #include "lume/module_services.h"
 #include "lume/platform_driver.h"
+#if defined(__aarch64__)
+#include "lume/uart_rx.h"
+#endif
 #if defined(LUME_ARCH_AMD64)
 #include "lume/usb_inventory.h"
 #endif
@@ -87,6 +90,13 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_hardware_count)
     EXPORT(lume_hardware_info)
     EXPORT(lume_irq_available)
+#if defined(__aarch64__)
+    EXPORT(lume_pi5_uart_rx_enable)
+    EXPORT(lume_pi5_uart_rx_collect)
+    EXPORT(lume_pi5_uart_rx_checkpoint)
+    EXPORT(lume_pi5_uart_rx_read)
+    EXPORT(lume_pi5_uart_rx_dropped)
+#endif
     EXPORT(lume_irq_controller_start)
     EXPORT(lume_irq_restore)
     EXPORT(lume_irq_save)

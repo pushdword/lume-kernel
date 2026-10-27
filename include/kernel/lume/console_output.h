@@ -14,14 +14,16 @@ struct lume_console_output
     uint64_t ticket;
 };
 
-/* Capture, render and completion require the kernel lock. Transmission uses only
- * the copied payload and a pinned provider, with IRQs masked and the kernel lock released. */
+/* Capture, render and completion require the kernel lock. Transmission requires a
+ * copied payload and a pinned provider, with IRQs masked and the kernel lock released. */
 void lume_console_output_begin(struct lume_console_output *);
 void lume_console_output_end(struct lume_console_output *);
 void lume_console_output_send(const struct lume_console_output *);
 void lume_console_output_finish(struct lume_console_output *);
 
 void lume_console_output_start(void);
+/* Raw receive progress is bounded and cannot enter subsystem callbacks. */
+void lume_console_receive_checkpoint(void);
 uint64_t lume_console_serial_reserve(void);
 void lume_console_serial_wait(uint64_t);
 uint64_t lume_console_serial_lock(void);

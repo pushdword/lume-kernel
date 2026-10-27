@@ -1,4 +1,5 @@
 #include "lume/netif.h"
+#include "lume/activity.h"
 #include <string.h>
 #define HISTORY 32u
 
@@ -198,9 +199,12 @@ void lume_netif_poll(struct lume_netif *p)
 {
     if (p)
     {
+        unsigned activity = lume_activity_enter(
+            p->info.kind == LUME_IF_WIFI ? LUME_ACTIVITY_WIFI : LUME_ACTIVITY_ETHERNET);
         if (p->info.flags & LUME_IF_UP)
             p->ops.poll(p->context);
         lume_netif_sync(p);
+        lume_activity_leave(activity);
     }
 }
 
@@ -210,7 +214,10 @@ int lume_netif_receive(struct lume_netif *p, void *out, size_t cap)
         return -LUME_EINVAL;
     if (!(p->info.flags & LUME_IF_UP))
         return 0;
+    unsigned activity = lume_activity_enter(p->info.kind == LUME_IF_WIFI ? LUME_ACTIVITY_WIFI
+                                                                         : LUME_ACTIVITY_ETHERNET);
     int n = p->ops.receive(p->context, out, cap);
+    lume_activity_leave(activity);
     if (n < 0 || (n && (n < 14 || (size_t)n > cap || (unsigned)n > p->info.mtu + 14)))
     {
         ++p->info.rx_errors;

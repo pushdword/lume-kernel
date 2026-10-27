@@ -5,6 +5,7 @@
 #include "lume/dma.h"
 #include "lume/usb.h"
 #include "lume/console_output.h"
+#include "lume/activity.h"
 #include <string.h>
 
 static struct lume_fdt firmware;
@@ -335,7 +336,10 @@ int lume_console_getc(void)
     struct provider *provider = providers + LUME_PLATFORM_UART;
     if (!provider->source)
         return lume_usb_getc();
-    return provider->operations.uart.lume_console_getc();
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_INPUT);
+    int result = provider->operations.uart.lume_console_getc();
+    lume_activity_leave(activity);
+    return result;
 }
 
 bool lume_console_ready(void)
@@ -348,7 +352,10 @@ bool lume_console_ready(void)
         pending_keyboard = lume_usb_getc();
         return pending_keyboard >= 0;
     }
-    return provider->operations.uart.lume_console_ready();
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_INPUT);
+    bool result = provider->operations.uart.lume_console_ready();
+    lume_activity_leave(activity);
+    return result;
 }
 
 void lume_console_putc(char c)
@@ -436,7 +443,9 @@ void lume_uart_poll_input(void)
     {
         return;
     }
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_INPUT);
     provider->operations.uart.lume_uart_poll_input();
+    lume_activity_leave(activity);
 }
 
 void lume_uart_input_stats(void)
@@ -478,7 +487,10 @@ bool lume_sd_read(uint64_t sector, void *data)
     struct provider *provider = providers + LUME_PLATFORM_SD;
     if (!provider->source)
         return false;
-    return provider->operations.sd.lume_sd_read(sector, data);
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_read(sector, data);
+    lume_activity_leave(activity);
+    return result;
 }
 
 bool lume_sd_write(uint64_t sector, const void *data)
@@ -486,7 +498,10 @@ bool lume_sd_write(uint64_t sector, const void *data)
     struct provider *provider = providers + LUME_PLATFORM_SD;
     if (!provider->source)
         return false;
-    return provider->operations.sd.lume_sd_write(sector, data);
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_write(sector, data);
+    lume_activity_leave(activity);
+    return result;
 }
 
 uint64_t lume_sd_sectors(void)
@@ -541,7 +556,9 @@ void lume_usb_poll(void)
     {
         return;
     }
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_USB);
     provider->operations.usb.lume_usb_poll();
+    lume_activity_leave(activity);
 }
 
 int lume_usb_getc(void)
@@ -549,7 +566,10 @@ int lume_usb_getc(void)
     struct provider *provider = providers + LUME_PLATFORM_USB;
     if (!provider->source)
         return -LUME_EAGAIN;
-    return provider->operations.usb.lume_usb_getc();
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_USB);
+    int result = provider->operations.usb.lume_usb_getc();
+    lume_activity_leave(activity);
+    return result;
 }
 
 bool lume_usb_stop(void)

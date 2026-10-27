@@ -20,6 +20,7 @@
 #include "lume/platform_driver.h"
 #include "lume/hardware.h"
 #include "lume/kernel_memory.h"
+#include "lume/activity.h"
 #include <libfdt.h>
 
 #ifndef LUME_BUILD_ID
@@ -96,7 +97,9 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
             lume_irq_eoi(token);
             return lume_tasks_device_irq(frame);
         }
+        unsigned activity = lume_activity_enter(LUME_ACTIVITY_IRQ);
         bool handled = lume_irq_dispatch(token);
+        lume_activity_leave(activity);
         if (!handled)
             return frame;
         return irq == 30 ? lume_tasks_irq(frame) : lume_tasks_device_irq(frame);

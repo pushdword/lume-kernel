@@ -8,6 +8,7 @@
 #include "lume/smp.h"
 #include "scheduler_config.h"
 #include "lume/hardware.h"
+#include "lume/activity.h"
 #include "lume/modules.h"
 #include "lume/kernel_memory.h"
 #include "lume/socket_file.h"
@@ -225,6 +226,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EFAULT;
         return lume_task_info((unsigned)a, (void *)(uintptr_t)b);
     case LUME_SYS_TELEMETRY:
+        if (n >= LUME_ACTIVITY_READ && n <= LUME_ACTIVITY_STOP)
+        {
+            if (b != sizeof(struct lume_activity_snapshot))
+                return -LUME_EINVAL;
+            if (!lume_user_buffer(a, b, true))
+                return -LUME_EFAULT;
+            return lume_activity_snapshot((unsigned)n, (void *)(uintptr_t)a);
+        }
         if (!a && !b && !n)
             return lume_task_observed();
         if (n == 1 && b == sizeof(struct lume_perf_snapshot_v1) && lume_cpu_count() <= 2)

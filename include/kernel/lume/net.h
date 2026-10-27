@@ -5,6 +5,7 @@ bool lume_net_start(void);
 int lume_net_detach(uint32_t);
 bool lume_stream_busy(void);
 void lume_net_poll(void);
+void lume_net_poll_background(void);
 int lume_net_snapshot(uint32_t, struct lume_netif_info *);
 void lume_net_release(uint32_t);
 bool lume_net_dhcp(uint32_t);

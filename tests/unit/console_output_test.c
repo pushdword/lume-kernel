@@ -103,6 +103,24 @@ static void stress(uint32_t seed)
 #define LUME_BOARD_H
 #define LUME_BOARD_RP1_UART_BASE UINT64_C(0x1c00030000)
 static unsigned full_polls, register_reads, display_calls, usb_calls, checkpoints;
+static unsigned raw_checkpoints, raw_reads;
+
+void lume_pi5_uart_rx_checkpoint(void)
+{
+    ++raw_checkpoints;
+}
+
+int lume_pi5_uart_rx_read(void)
+{
+    ++raw_reads;
+    return -11;
+}
+
+uint64_t lume_pi5_uart_rx_dropped(void)
+{
+    return 0;
+}
+
 static unsigned char wire[256], rendered[128];
 static size_t wire_bytes, rendered_bytes;
 
@@ -122,13 +140,6 @@ static void lume_mmio_write32(uintptr_t address, uint32_t value)
 {
     assert(address == LUME_BOARD_RP1_UART_BASE && value <= 255 && wire_bytes < sizeof(wire));
     wire[wire_bytes++] = (unsigned char)value;
-}
-
-static void lume_mmio_write32_relaxed(uintptr_t address, uint32_t value)
-{
-    (void)address;
-    (void)value;
-    assert(false);
 }
 
 int lume_usb_getc(void)
@@ -159,6 +170,7 @@ static void transport(void)
     full_polls = 100;
     lume_uart_transmit("one\r\ntwo\n", 9);
     assert(relaxations == 100 && register_reads == 109 && wire_bytes == 9);
+    assert(raw_checkpoints == 109 && raw_reads == 0);
     assert(!memcmp(wire, "one\r\ntwo\n", 9));
     assert(!display_calls && !usb_calls && !checkpoints);
     lume_uart_render("image\n", 6);

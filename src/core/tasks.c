@@ -18,6 +18,7 @@
 #include "lume/boot.h"
 #include "lume/worker.h"
 #include "lume/console_output.h"
+#include "lume/activity.h"
 #include "lume/thread.h"
 #include "lume/supervision.h"
 #include "lume/signal.h"
@@ -656,7 +657,7 @@ static void wake_tasks(void)
 
 static struct lume_context *wait_ready_task(void)
 {
-    extern void lume_net_poll(void);
+    extern void lume_net_poll_background(void);
     (void)account_switch(LUME_TASK_LIMIT);
     current_task = LUME_TASK_LIMIT;
     lume_mmu_switch(lume_mmu_root());
@@ -688,7 +689,7 @@ static struct lume_context *wait_ready_task(void)
         if (account_inside)
             account_start += elapsed;
         if (!lume_cpu_index() && !lume_worker_busy())
-            lume_net_poll();
+            lume_net_poll_background();
         /* Only the idle loop renews this lease after checking wake deadlines. An interrupt
          * inside a stalled driver cannot renew it. */
         lume_watchdog_progress();
@@ -1162,9 +1163,9 @@ static struct lume_context *task_interrupt(struct lume_context *frame, bool time
         return thread_slots[current_task].thread ? thread_finish(0)
                                                  : finish_program(process_status[current_task]);
     kernel_step();
-    extern void lume_net_poll(void);
+    extern void lume_net_poll_background(void);
     if (timer && !lume_cpu_index() && !lume_worker_busy())
-        lume_net_poll();
+        lume_net_poll_background();
     wake_tasks();
     if (timer)
         ++task_ticks;

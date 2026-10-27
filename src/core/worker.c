@@ -3,6 +3,7 @@
 #include "lume/early.h"
 #include "lume/counter.h"
 #include "lume/smp.h"
+#include "lume/activity.h"
 
 #define STACK_CANARY UINT64_C(0x6b65726e656c7370)
 extern uint64_t __worker_stack[], __worker_top[];
@@ -18,6 +19,7 @@ static unsigned remaining, handoff_cpu;
 static uint64_t handoff_turn;
 static bool handoff_pending;
 static bool initialized, running, waiting;
+static unsigned activity_saved;
 
 static bool expired(void)
 {
@@ -62,6 +64,7 @@ bool lume_worker_submit(void (*run)(void *), void *context)
         return false;
     function = run;
     argument = context;
+    activity_saved = LUME_ACTIVITY_WORKER;
     return true;
 }
 
@@ -84,7 +87,16 @@ bool lume_worker_resume(void)
     slice_started = lume_counter_read();
     running = true;
     ++resumes;
+    unsigned previous = lume_activity_enter(LUME_ACTIVITY_WORKER);
+    (void)lume_activity_switch(activity_saved);
     lume_fiber_switch(&caller, &worker);
+    activity_saved = lume_activity_switch(LUME_ACTIVITY_WORKER);
+    if (activity_saved >= LUME_ACTIVITY_COUNT)
+        activity_saved = LUME_ACTIVITY_WORKER;
+    if (previous == UINT32_MAX)
+        (void)lume_activity_switch(LUME_ACTIVITY_COUNT);
+    else
+        lume_activity_leave(previous);
     running = false;
     if (stack[0] != STACK_CANARY || stack[1] != STACK_CANARY)
         lume_fail("kernel worker stack overflow");

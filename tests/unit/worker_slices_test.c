@@ -2,6 +2,7 @@
 #define _XOPEN_SOURCE 700
 #endif
 #include "lume/worker.h"
+#include "lume/activity.h"
 #include <assert.h>
 #include <limits.h>
 #include <setjmp.h>
@@ -164,6 +165,12 @@ static uint64_t lume_smp_lock_turn(void)
     return lock_turn;
 }
 
+unsigned lume_cpu_count(void)
+{
+    return 4;
+}
+
+#include "../../src/core/activity.c"
 #include "../../src/core/worker.c"
 #undef stack
 
@@ -512,6 +519,41 @@ static void guard_failure(void)
     stats(1, 2, 0, 0, 1);
 }
 
+static void profiled_job(void *context)
+{
+    (void)context;
+    struct lume_activity_snapshot out;
+    T(!lume_activity_snapshot(LUME_ACTIVITY_START, &out));
+    (void)lume_activity_switch(LUME_ACTIVITY_WORKER);
+    ticks += 2;
+    unsigned previous = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    ticks += 3;
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    ticks += 5;
+    lume_activity_leave(previous);
+    ticks += 7;
+}
+
+static void profiling_across_suspension(void)
+{
+    contended = false;
+    test_cpu = 0;
+    frequency = 1000000;
+    lume_worker_start();
+    T(lume_worker_submit(profiled_job, NULL));
+    T(lume_worker_resume() && lume_worker_busy());
+    ticks += 1000;
+    struct lume_activity_snapshot out;
+    T(!lume_activity_snapshot(LUME_ACTIVITY_READ, &out));
+    T(out.rows[0][LUME_ACTIVITY_STORAGE].ticks == 3);
+    T(out.rows[0][LUME_ACTIVITY_WORKER].ticks == 2);
+    T(lume_worker_resume() && !lume_worker_busy());
+    ticks += 2000;
+    T(!lume_activity_snapshot(LUME_ACTIVITY_STOP, &out));
+    T(out.rows[0][LUME_ACTIVITY_STORAGE].ticks == 8);
+    T(out.rows[0][LUME_ACTIVITY_WORKER].ticks == 9);
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -543,6 +585,7 @@ int main(void)
     lume_worker_checkpoint(UINT_MAX);
     T(counter_reads == reads_before && contention_reads == contention_before &&
       !lume_worker_busy());
+    profiling_across_suspension();
     release_fiber(&worker);
 #ifdef _WIN32
     T(ConvertFiberToThread());

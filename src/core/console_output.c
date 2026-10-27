@@ -6,6 +6,10 @@
 static struct lume_ticket_lock serial;
 static bool initialized;
 
+__attribute__((weak)) void lume_console_receive_checkpoint(void)
+{
+}
+
 void lume_console_output_start(void)
 {
     initialized = true;
@@ -22,7 +26,10 @@ void lume_console_serial_wait(uint64_t ticket)
 {
     if (ticket)
         while (!lume_ticket_ready(&serial, (uint32_t)ticket))
+        {
+            lume_console_receive_checkpoint();
             lume_cpu_relax_ordered();
+        }
 }
 
 uint64_t lume_console_serial_lock(void)

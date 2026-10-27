@@ -3,6 +3,7 @@ KERNEL_C_aarch64 := \
     platform/raspberrypi5/boot_fdt.c \
     platform/raspberrypi5/boot_fdt_file.c \
     platform/raspberrypi5/boot_platform.c \
+    platform/raspberrypi5/uart_rx.c \
     src/storage/boot_storage.c \
     src/watchdog/boot_watchdog.c \
     src/security/credential.c \
@@ -32,6 +33,7 @@ KERNEL_C_aarch64 := \
     src/mm/pages.c \
     src/device/platform_driver.c \
     src/core/realtime.c \
+    src/core/activity.c \
     src/core/console_output.c \
     drivers/storage/sdio/sdio.c \
     arch/aarch64/smp/smp.c \

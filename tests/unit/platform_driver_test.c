@@ -4,6 +4,7 @@
 #include "lume/vfs.h"
 #include "lume/abi.h"
 #include "lume/console_output.h"
+#include "lume/activity.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +12,17 @@
 static unsigned references, other_references, pin_calls, fail_pin, received, fallback;
 static int owner, other_owner;
 static bool ready_other(void);
+
+unsigned lume_activity_enter(unsigned kind)
+{
+    assert(kind < LUME_ACTIVITY_COUNT);
+    return UINT32_MAX;
+}
+
+void lume_activity_leave(unsigned previous)
+{
+    assert(previous == UINT32_MAX);
+}
 
 _Noreturn void lume_fail(const char *why)
 {

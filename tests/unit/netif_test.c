@@ -2,10 +2,23 @@
  * fake backends. No CYW or lwIP implementation is substituted into the core. */
 #include "lume/net.h"
 #include "lume/wireless.h"
+#include "lume/activity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 static unsigned checks, polls, releases, dhcps;
+
+unsigned lume_activity_enter(unsigned kind)
+{
+    (void)kind;
+    return UINT32_MAX;
+}
+
+void lume_activity_leave(unsigned previous)
+{
+    (void)previous;
+}
+
 #define CHECK(x)                                                                                   \
     do                                                                                             \
     {                                                                                              \

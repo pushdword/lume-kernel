@@ -32,7 +32,7 @@ void lume_timer_start(uint64_t frequency)
     interval =
         (frequency / 1000) * SCHED_TICK_MS + ((frequency % 1000) * SCHED_TICK_MS + 999) / 1000;
     normal_interval = interval;
-    input_interval = frequency / 2000;
+    input_interval = frequency / 100;
     if (!input_interval)
         input_interval = 1;
     if (!interval)
@@ -67,7 +67,7 @@ void lume_timer_rearm(void)
 
 void lume_timer_idle(bool idle)
 {
-    /* A polled 115200-baud RX FIFO needs servicing within a millisecond. */
+    /* Device IRQs wake CPU0 before the next background input service. */
     interval = idle && !lume_cpu_index() ? input_interval : normal_interval;
     if (!interval)
         interval = 1;

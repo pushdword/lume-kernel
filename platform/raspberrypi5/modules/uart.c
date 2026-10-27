@@ -12,6 +12,8 @@
 #include "lume/vfs.h"
 #include "lume/abi.h"
 #include "lume/console_output.h"
+#include "../../../drivers/serial/pl011/uart_irq.h"
+#include "lume/uart_rx.h"
 
 struct binding
 {
@@ -19,13 +21,19 @@ struct binding
     unsigned instance;
 };
 
+static void input_stats(void)
+{
+    lume_uart_input_stats();
+    lume_value("UART_RX_INTERRUPTS", lume_uart_irq_count());
+}
+
 static const struct lume_platform_uart_ops operations = {
     .lume_console_getc = lume_console_getc,
     .lume_console_ready = lume_console_ready,
     .lume_console_putc = lume_console_putc,
     .lume_console_write = lume_console_write,
     .lume_uart_poll_input = lume_uart_poll_input,
-    .lume_uart_input_stats = lume_uart_input_stats,
+    .lume_uart_input_stats = input_stats,
     .lume_console_render = lume_uart_render,
     .lume_console_transmit = lume_uart_transmit,
 };
@@ -49,6 +57,11 @@ static int start(struct lume_hardware *hardware, void *context)
     struct binding *binding = context;
     int result = lume_platform_driver_register(LUME_PLATFORM_UART, &operations, sizeof(operations));
     binding->registered = !result;
+    if (!result)
+    {
+        lume_pi5_uart_rx_enable(true);
+        lume_value("UART_RX_IRQ", lume_uart_irq_start());
+    }
     return result;
 }
 
@@ -61,6 +74,8 @@ static int stop(struct lume_hardware *hardware, void *context)
     int result = lume_platform_driver_can_stop(LUME_PLATFORM_UART, &operations);
     if (result)
         return result;
+    lume_uart_irq_stop();
+    lume_pi5_uart_rx_enable(false);
     result = lume_platform_driver_unregister(LUME_PLATFORM_UART, &operations);
     if (!result)
         binding->registered = false;

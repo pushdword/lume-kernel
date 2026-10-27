@@ -3,6 +3,7 @@
  * adapter. */
 #include "lume/early.h"
 #include "lume/net.h"
+#include "lume/activity.h"
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"
@@ -162,11 +163,23 @@ void lume_net_release(uint32_t index)
     changed(a);
 }
 
+static uint64_t last_poll;
+static bool poll_valid;
+
+void lume_net_poll_background(void)
+{
+    if (!poll_valid || lume_clock_monotonic() - last_poll >= 10)
+        lume_net_poll();
+}
+
 void lume_net_poll(void)
 {
     if ((!started && !lume_net_start()) || polling)
         return;
     polling = true;
+    last_poll = lume_clock_monotonic();
+    poll_valid = true;
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_NETWORK);
     for (unsigned i = 0; i < lume_netif_count(); ++i)
         (void)attach(lume_netif_at(i));
     for (unsigned i = 0; i < adapter_count; ++i)
@@ -212,6 +225,7 @@ void lume_net_poll(void)
         if (adapters[i].device)
             changed(&adapters[i]);
     polling = false;
+    lume_activity_leave(activity);
 }
 
 int lume_net_detach(uint32_t index)

@@ -562,3 +562,16 @@ int main(void)
     printf("GEM netif lifecycle and frame path: %u total checks PASS\n", checks);
     return 0;
 }
+
+#include "lume/activity.h"
+
+unsigned lume_activity_enter(unsigned kind)
+{
+    (void)kind;
+    return UINT32_MAX;
+}
+
+void lume_activity_leave(unsigned previous)
+{
+    (void)previous;
+}

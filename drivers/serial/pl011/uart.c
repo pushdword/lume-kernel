@@ -9,6 +9,7 @@
 #include "lume/vfs.h"
 #include "lume/worker.h"
 #include "lume/console_output.h"
+#include "lume/uart_rx.h"
 
 /* Firmware configures the RP1 BAR with enable_rp1_uart=1 and pciex4_reset=0. GPIO14 drives TX
  * on physical pin 8. GPIO15 receives RX on physical pin 10. The driver inherits firmware
@@ -19,7 +20,7 @@
 static struct lume_uart_input input;
 static unsigned char input_queue[4096];
 static unsigned input_head, input_tail;
-static uint64_t input_dropped;
+static bool input_announced;
 
 uintptr_t lume_uart_base(void)
 {
@@ -28,9 +29,10 @@ uintptr_t lume_uart_base(void)
 
 int lume_uart_getc(void)
 {
-    if (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 4))
-        return -LUME_EAGAIN;
-    uint32_t v = lume_mmio_read32_relaxed(UART_BASE);
+    int result = lume_pi5_uart_rx_read();
+    if (result < 0)
+        return result;
+    uint32_t v = (uint32_t)result;
     if (v & 0xf00)
         return -LUME_EIO;
     return (int)(v & 255);
@@ -40,22 +42,21 @@ int lume_uart_getc(void)
  * ignored. The USB keyboard works independently of the serial adapter. */
 void lume_uart_poll_input(void)
 {
-    bool enabled = input.enabled;
-    for (unsigned i = 0; i < 128 && !(lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 4)); ++i)
+    for (unsigned i = 0; i < 128 && input_head - input_tail < sizeof(input_queue); ++i)
     {
-        uint32_t word = lume_mmio_read32_relaxed(UART_BASE);
-        if (word & 0xf00)
-            lume_mmio_write32_relaxed(UART_BASE + 4, 0);
-        int c = lume_uart_input_feed(&input, word);
+        int word = lume_pi5_uart_rx_read();
+        if (word < 0)
+            break;
+        int c = lume_uart_input_feed(&input, (uint32_t)word);
         if (c < 0)
             continue;
-        if (input_head - input_tail == sizeof(input_queue))
-            ++input_dropped;
-        else
-            input_queue[input_head++ & (sizeof(input_queue) - 1)] = (unsigned char)c;
+        input_queue[input_head++ & (sizeof(input_queue) - 1)] = (unsigned char)c;
     }
-    if (!enabled && input.enabled)
+    if (!input_announced && input.enabled)
+    {
+        input_announced = true;
         lume_puts("LUME UART INPUT ENABLED\n");
+    }
 }
 
 static int console_byte(void)
@@ -94,7 +95,8 @@ void lume_uart_input_stats(void)
     lume_value("UART_INPUT_ENABLED", input.enabled);
     lume_value("UART_INPUT_BYTES", input.bytes);
     lume_value("UART_INPUT_ERRORS", input.errors);
-    lume_value("UART_INPUT_DROPPED", input_dropped);
+    lume_value("UART_INPUT_DROPPED", lume_pi5_uart_rx_dropped());
+    lume_value("UART_RX_RAW_DROPPED", lume_pi5_uart_rx_dropped());
 }
 
 /* Console rendering requires serialized input and display state. */
@@ -126,14 +128,18 @@ void lume_uart_render(const char *data, size_t bytes)
     lume_display_write(data, bytes);
 }
 
-/* The payload already contains serial CRLF encoding. This callback only accesses TX. */
+/* The payload includes serial CRLF encoding. Raw RX checkpoints never enter console callbacks. */
 void lume_uart_transmit(const char *data, size_t bytes)
 {
     for (size_t i = 0; i < bytes; ++i)
     {
         while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
+        {
+            lume_pi5_uart_rx_checkpoint();
             lume_cpu_relax();
+        }
         lume_mmio_write32(UART_BASE, (unsigned char)data[i]);
+        lume_pi5_uart_rx_checkpoint();
     }
 }
 
