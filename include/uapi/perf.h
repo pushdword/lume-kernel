@@ -5,8 +5,8 @@
  * idle interval. These counters cannot determine cycle-accurate CPI or the percentage of time
  * blocked on I/O. Sleeping CPUs count as idle.
  *
- * Process CPU ticks exclude time spinning on the global lock. Ready time is recorded
- * separately. Lock-wait accounting starts after a failed CAS, and uncontended acquisition
+ * Process CPU ticks exclude time waiting for the global lock. Ready time is recorded
+ * separately. Legacy lock-wait accounting starts after a failed CAS, and uncontended acquisition
  * counts as kernel time. Kernel time is charged to the requesting process, including a child's
  * ELF load during its parent's spawn call. I/O polling counts as kernel time. Load, SD, zero
  * and copy totals include nested work and must not be added together.
@@ -25,7 +25,8 @@
  *
  * Native AArch64 and AMD64 use syscall 29 and version 2, with room for four CPUs. Version 1
  * is accepted only when at most two CPUs are online. Native counters cover process
- * lifetimes and continue without observers. Ready-time and detailed I/O totals are
+ * lifetimes and continue without observers. AArch64 lock-wait accounting starts when
+ * an acquisition must wait for an earlier ticket. Ready-time and detailed I/O totals are
  * currently zero on those ports. These fields do not measure their I/O latency.
  * LUME_PERF_THREAD in state marks a user thread. Its parent is the process ID,
  * and pid contains the low 32 bits of its generated thread handle. */

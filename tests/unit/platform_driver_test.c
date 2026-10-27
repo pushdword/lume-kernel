@@ -3,6 +3,7 @@
 #include "lume/sd.h"
 #include "lume/vfs.h"
 #include "lume/abi.h"
+#include "lume/console_output.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +11,25 @@
 static unsigned references, other_references, pin_calls, fail_pin, received, fallback;
 static int owner, other_owner;
 static bool ready_other(void);
+
+_Noreturn void lume_fail(const char *why)
+{
+    fprintf(stderr, "%s\n", why);
+    assert(false);
+    for (;;)
+    {
+    }
+}
+
+void lume_console_serial_wait(uint64_t ticket)
+{
+    assert(ticket == 17);
+}
+
+void lume_console_serial_unlock(uint64_t ticket)
+{
+    assert(ticket == 17);
+}
 
 int lume_module_pin(uintptr_t callback, void **out)
 {
@@ -199,9 +219,9 @@ int main(void)
     assert(lume_entropy(data, sizeof(data)) && data[0] == 0x5a);
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_ENTROPY, &random));
     assert(!references && !lume_entropy(data, sizeof(data)));
-    struct lume_platform_uart_ops uart = {getc_driver,  ready,       putc_driver,
-                                          write_driver, poll_driver, poll_driver};
-    for (unsigned i = 1; i <= 6; ++i)
+    struct lume_platform_uart_ops uart = {getc_driver, ready,       putc_driver,  write_driver,
+                                          poll_driver, poll_driver, write_driver, write_driver};
+    for (unsigned i = 1; i <= 8; ++i)
     {
         fail_pin = pin_calls + i;
         assert(lume_platform_driver_register(LUME_PLATFORM_UART, &uart, sizeof(uart)) ==
@@ -222,6 +242,42 @@ int main(void)
     assert(lume_platform_driver_unregister(LUME_PLATFORM_UART, &replacement) == -LUME_ENOENT);
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart));
     assert(lume_platform_driver_ready(LUME_PLATFORM_UART) && references == 1);
+    struct lume_console_output output;
+    char message[] = "a\nb\n";
+    lume_console_output_begin(&output);
+    lume_console_write(message, sizeof(message) - 1);
+    lume_console_output_end(&output);
+    assert(output.bytes == 6 && !memcmp(output.data, "a\r\nb\r\n", 6));
+    assert(output.provider && output.transmit == write_driver);
+    memset(message, 'X', sizeof(message));
+    assert(!memcmp(output.data, "a\r\nb\r\n", 6));
+    assert(lume_platform_driver_can_stop(LUME_PLATFORM_UART, &uart) == -LUME_EBUSY);
+    assert(lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart) == -LUME_EBUSY);
+    unsigned before = received;
+    output.ticket = 17;
+    lume_console_output_send(&output);
+    assert(received == before + 6 && references == 1);
+    lume_console_output_finish(&output);
+    assert(!output.provider);
+
+    struct
+    {
+        uint64_t before;
+        struct lume_console_output output;
+        uint64_t after;
+    } guarded = {.before = UINT64_C(0x123456789abcdef0), .after = UINT64_C(0xfedcba9876543210)};
+
+    char newlines[LUME_CONSOLE_OUTPUT_BYTES];
+    memset(newlines, '\n', sizeof(newlines));
+    lume_console_output_begin(&guarded.output);
+    lume_console_write(newlines, sizeof(newlines));
+    lume_console_output_end(&guarded.output);
+    assert(guarded.before == UINT64_C(0x123456789abcdef0));
+    assert(guarded.after == UINT64_C(0xfedcba9876543210));
+    assert(guarded.output.bytes == 128);
+    for (unsigned i = 0; i < 128; i += 2)
+        assert(guarded.output.data[i] == '\r' && guarded.output.data[i + 1] == '\n');
+    lume_console_output_finish(&guarded.output);
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart));
     assert(!references && !lume_platform_driver_ready(LUME_PLATFORM_UART));
     const struct lume_platform_sd_ops sd = {start,   configure, stop,  read_sector, write_sector,

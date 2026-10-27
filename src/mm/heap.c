@@ -65,6 +65,11 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
         return -LUME_ENOMEM;
     unsigned before = (unsigned)((old - HEAP_BASE + 4095) / 4096);
     unsigned after = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+    if (before == after)
+    {
+        ends[task] = end;
+        return (int64_t)end;
+    }
     unsigned added = before;
     for (; added < after; ++added)
     {

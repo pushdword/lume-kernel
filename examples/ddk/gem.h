@@ -559,6 +559,8 @@ _Static_assert(offsetof(struct gem_dma_descriptor, address_high) == 8, "GEM high
  * shorter than its allocation.
  */
 #define GEM_DMA_PAGE_BYTES 4096u
+/* Retain a burst while the polling caller is servicing another device. */
+#define GEM_RX_RING_ENTRIES 64u
 
 _Static_assert(GEM_FRAME_BUFFER_BYTES <= GEM_DMA_PAGE_BYTES, "GEM frame buffer allocation");
 _Static_assert(GEM_FRAME_BUFFER_BYTES % GEM_DMA_RX_BUFFER_UNIT_BYTES == 0,

@@ -11,6 +11,7 @@
 #include "lume/wifi.h"
 #include "lume/vfs.h"
 #include "lume/abi.h"
+#include "lume/console_output.h"
 
 struct binding
 {
@@ -25,6 +26,8 @@ static const struct lume_platform_uart_ops operations = {
     .lume_console_write = lume_console_write,
     .lume_uart_poll_input = lume_uart_poll_input,
     .lume_uart_input_stats = lume_uart_input_stats,
+    .lume_console_render = lume_uart_render,
+    .lume_console_transmit = lume_uart_transmit,
 };
 
 static int probe(struct lume_hardware *hardware, void *context)

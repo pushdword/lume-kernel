@@ -6,12 +6,114 @@
 #include "lume/external_file.h"
 #include "lume/file_modes.h"
 #include "lume/file_mode.h"
+#include "lume/poll.h"
+#include "lume/smp.h"
 #include <string.h>
 #define NODES 192u
 #define CAPACITY 4096u
 #define RAM_FILES 32u
 static unsigned char ram_data[RAM_FILES][CAPACITY];
 static bool ram_used[RAM_FILES];
+static uint64_t descriptor_sequence;
+static uint64_t poll_source_sequence;
+static uint32_t poll_pending;
+static struct lume_poll_source console_source;
+
+static struct
+{
+    struct
+    {
+        struct lume_poll_source *source;
+        uint64_t generation;
+    } links[LUME_FD_LIMIT * 2];
+
+    unsigned count;
+} poll_subscriptions[LUME_POLL_TASK_LIMIT];
+
+static bool poll_input_ready;
+
+bool lume_vfs_poll_input_ready(void)
+{
+    return poll_input_ready;
+}
+
+void lume_poll_source_notify(struct lume_poll_source *source)
+{
+    uint32_t changed = source->waiting & ~poll_pending;
+    poll_pending |= source->waiting;
+    if (changed)
+        lume_smp_wake();
+}
+
+void lume_poll_source_reset(struct lume_poll_source *source)
+{
+    lume_poll_source_notify(source);
+    if (!++poll_source_sequence)
+        ++poll_source_sequence;
+    *source = (struct lume_poll_source){.generation = poll_source_sequence};
+}
+
+void lume_vfs_poll_cancel(unsigned task)
+{
+    if (task >= LUME_POLL_TASK_LIMIT)
+        return;
+    uint32_t bit = UINT32_C(1) << task;
+    for (unsigned i = 0; i < poll_subscriptions[task].count; ++i)
+    {
+        struct lume_poll_source *source = poll_subscriptions[task].links[i].source;
+        if (source->generation == poll_subscriptions[task].links[i].generation)
+            source->waiting &= ~bit;
+    }
+    poll_subscriptions[task].count = 0;
+    poll_pending &= ~bit;
+}
+
+bool lume_vfs_poll_take(unsigned task)
+{
+    if (task >= LUME_POLL_TASK_LIMIT)
+        return false;
+    uint32_t bit = UINT32_C(1) << task;
+    bool ready = (poll_pending & bit) != 0;
+    poll_pending &= ~bit;
+    return ready;
+}
+
+static bool poll_subscribe_source(unsigned task, struct lume_poll_source *source)
+{
+    if (!source)
+        return true;
+    if (!source->generation)
+        return false;
+    uint32_t bit = UINT32_C(1) << task;
+    if (source->waiting & bit)
+        return true;
+    unsigned count = poll_subscriptions[task].count;
+    if (count == LUME_FD_LIMIT * 2)
+        return false;
+    poll_subscriptions[task].links[count].source = source;
+    poll_subscriptions[task].links[count].generation = source->generation;
+    ++poll_subscriptions[task].count;
+    source->waiting |= bit;
+    return true;
+}
+
+void lume_vfs_poll_input(bool ready)
+{
+    bool changed = poll_input_ready != ready;
+    poll_input_ready = ready;
+    if (changed && ready)
+        lume_poll_source_notify(&console_source);
+}
+
+static void bind_descriptor(struct lume_files *files, unsigned fd, int object, uint32_t flags)
+{
+    if (!++descriptor_sequence)
+        ++descriptor_sequence;
+    lume_poll_source_reset(&files->fd[fd].changed);
+    files->fd[fd].object = object;
+    files->fd[fd].flags = flags;
+    files->fd[fd].generation = descriptor_sequence;
+}
 
 /* Duplicated and inherited descriptors share one offset and access mode. Pipe endpoints
  * keep their channel alive until the last reference to each open description closes. */
@@ -26,12 +128,14 @@ static struct open_file
     uint64_t offset;
     const struct lume_file_ops *external;
     void *context;
+    void *storage_handle;
 } open_files[OPEN_FILES];
 
 static struct channel
 {
     unsigned readers, writers, head, count;
     struct lume_wait_queue readable, writable;
+    struct lume_poll_source changed;
     unsigned char data[LUME_PIPE_BYTES];
 } channels[PIPES];
 
@@ -57,6 +161,13 @@ static unsigned count;
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
+
+static bool storage_handles(void)
+{
+    return storage && storage->open && storage->read_handle && storage->write_handle &&
+           storage->resize_handle && storage->sync_handle && storage->close;
+}
+
 /* Boot installs dynamically allocated staging before loading programs. */
 static unsigned char default_program_buffer[65536];
 static void *program_buffer = default_program_buffer;
@@ -335,6 +446,15 @@ int lume_devfs_unregister_block(struct lume_block *b)
 
 void lume_vfs_init(const void *shell, size_t bytes)
 {
+    if (storage_handles())
+        for (unsigned i = 0; i < OPEN_FILES; ++i)
+            if (open_files[i].references && open_files[i].storage_handle)
+                (void)storage->close(open_files[i].storage_handle);
+    poll_pending = 0;
+    memset(poll_subscriptions, 0, sizeof(poll_subscriptions));
+    console_source = (struct lume_poll_source){0};
+    lume_poll_source_reset(&console_source);
+    poll_input_ready = false;
     lume_file_modes_reset();
     for (unsigned i = 0; i < OPEN_FILES; ++i)
         open_files[i] = (struct open_file){0};
@@ -401,15 +521,19 @@ void lume_files_init(struct lume_files *f)
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
         f->fd[i].object = -1;
     for (unsigned i = 0; i < 3; ++i)
-        f->fd[i].object = new_object(5, -1, i ? LUME_O_WRONLY : LUME_O_RDONLY);
+        bind_descriptor(f, i, new_object(5, -1, i ? LUME_O_WRONLY : LUME_O_RDONLY), 0);
 }
 
 void lume_files_clone(struct lume_files *out, const struct lume_files *in)
 {
     *out = *in;
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+    {
+        out->fd[i].changed = (struct lume_poll_source){0};
+        lume_poll_source_reset(&out->fd[i].changed);
         if (out->fd[i].object >= 0)
             ++open_files[out->fd[i].object].references;
+    }
 }
 
 void lume_files_inherit(struct lume_files *out, const struct lume_files *in)
@@ -431,6 +555,28 @@ static struct open_file *descriptor(struct lume_files *f, uint64_t fd)
     return fd < LUME_FD_MAX && f->fd[fd].object >= 0 ? &open_files[f->fd[fd].object] : 0;
 }
 
+bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
+{
+    struct open_file *file = descriptor(files, fd);
+    return file && file->references && !file->external && file->pipe < 0 &&
+           nodes[file->node].kind == LUME_NODE_CHAR && !nodes[file->node].block &&
+           nodes[file->node].device <= 2;
+}
+
+bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
+{
+    struct open_file *file = descriptor(files, fd);
+    return file && file->references && !file->external && file->pipe >= 0;
+}
+
+bool lume_vfs_storage_io(struct lume_files *files, uint64_t fd)
+{
+    struct open_file *file = descriptor(files, fd);
+    return file && file->references && !file->external && file->pipe < 0 &&
+           nodes[file->node].kind == LUME_NODE_FILE && nodes[file->node].persistent &&
+           !nodes[file->node].block;
+}
+
 int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, void *context,
                     unsigned flags)
 {
@@ -445,7 +591,7 @@ int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, v
     open_files[object].external = ops;
     open_files[object].context = context;
     open_files[object].status = flags & LUME_FD_NONBLOCK;
-    files->fd[fd] = (struct lume_fd){object, flags & LUME_FD_CLOEXEC};
+    bind_descriptor(files, fd, object, flags & LUME_FD_CLOEXEC);
     return (int)fd;
 }
 
@@ -471,7 +617,7 @@ int lume_vfs_install(struct lume_files *files, int object)
     for (unsigned i = 0; i < files->identity.limit[LUME_LIMIT_FILES].soft; ++i)
         if (files->fd[i].object < 0)
         {
-            files->fd[i] = (struct lume_fd){object, 0};
+            bind_descriptor(files, i, object, 0);
             return (int)i;
         }
     return -LUME_EMFILE;
@@ -548,7 +694,18 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     int object = new_object(index, -1, (uint32_t)flags);
     if (object < 0)
         return object;
-    f->fd[fd] = (struct lume_fd){object, 0};
+    if (n->persistent && n->kind == LUME_NODE_FILE && storage_handles())
+    {
+        int result =
+            storage->open(n->path, (unsigned)(flags & 3), &open_files[object].storage_handle);
+        if (result)
+        {
+            --n->references;
+            open_files[object] = (struct open_file){0};
+            return result;
+        }
+    }
+    bind_descriptor(f, (unsigned)fd, object, 0);
     return fd;
 }
 
@@ -557,6 +714,7 @@ int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
     struct open_file *d = descriptor(f, fd);
     if (!d)
         return -LUME_EBADF;
+    int result = 0;
     if (!--d->references)
     {
         if (d->external)
@@ -570,17 +728,23 @@ int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
                 --c->readers;
             lume_wait_wake(&c->readable);
             lume_wait_wake(&c->writable);
+            lume_poll_source_notify(&c->changed);
             if (!c->readers && !c->writers)
                 *c = (struct channel){0};
         }
         else
         {
+            if (d->storage_handle)
+            {
+                result = storage->close(d->storage_handle);
+                d->storage_handle = 0;
+            }
             --nodes[d->node].references;
             release_ram(&nodes[d->node]);
         }
     }
-    f->fd[fd] = (struct lume_fd){-1, 0};
-    return 0;
+    bind_descriptor(f, (unsigned)fd, -1, 0);
+    return result;
 }
 
 int64_t lume_vfs_open_compat(struct lume_files *f, const char *input, uint64_t flags)
@@ -687,6 +851,7 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
         c->head = (c->head + (unsigned)bytes) % LUME_PIPE_BYTES;
         c->count -= (unsigned)bytes;
         lume_wait_wake(&c->writable);
+        lume_poll_source_notify(&c->changed);
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
@@ -705,6 +870,7 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
             memset(data, 0, (size_t)bytes);
             return (int64_t)bytes;
         }
+        lume_vfs_poll_input(false);
         int c = lume_console_getc();
         if (c < 0)
             return c;
@@ -716,7 +882,9 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
         bytes = available;
     if (bytes && n->persistent)
     {
-        int r = storage->read(n->path, d->offset, data, (size_t)bytes);
+        int r = d->storage_handle
+                    ? storage->read_handle(d->storage_handle, d->offset, data, (size_t)bytes)
+                    : storage->read(n->path, d->offset, data, (size_t)bytes);
         if (r < 0)
             return r;
         bytes = (uint64_t)r;
@@ -757,6 +925,7 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
             c->data[(c->head + c->count + i) % LUME_PIPE_BYTES] = ((const unsigned char *)data)[i];
         c->count += (unsigned)bytes;
         lume_wait_wake(&c->readable);
+        lume_poll_source_notify(&c->changed);
         return (int64_t)bytes;
     }
     struct node *n = &nodes[d->node];
@@ -781,7 +950,9 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
         return -27;
     if (n->persistent)
     {
-        int r = storage->write(n->path, d->offset, data, (size_t)bytes);
+        int r = d->storage_handle
+                    ? storage->write_handle(d->storage_handle, d->offset, data, (size_t)bytes)
+                    : storage->write(n->path, d->offset, data, (size_t)bytes);
         if (r < 0)
             return r;
         d->offset += (uint64_t)r;
@@ -820,6 +991,8 @@ int64_t lume_vfs_sync(struct lume_files *f, uint64_t fd)
     if (d->pipe >= 0 || d->external)
         return -LUME_EINVAL;
     struct node *n = &nodes[d->node];
+    if (d->storage_handle)
+        return storage->sync_handle(d->storage_handle);
     return n->block ? lume_block_sync(n->block) : 0;
 }
 
@@ -971,7 +1144,9 @@ int64_t lume_vfs_stat_path(struct lume_files *f, const char *input, struct lume_
 int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
                            struct lume_file_mode_request *request, const char *input)
 {
-    if (files->identity.euid || files->identity.jailed)
+    if ((files->identity.euid || files->identity.jailed) &&
+        !(files->identity.jailed && operation == LUME_FILE_MODE_OPEN &&
+          request->flags == LUME_O_RDONLY))
         return -LUME_EPERM;
     if (request->version != LUME_FILE_MODE_VERSION || request->bytes != sizeof(*request) ||
         operation > LUME_FILE_MODE_MKDIR ||
@@ -1056,9 +1231,10 @@ int64_t lume_vfs_truncate(struct lume_files *f, uint64_t fd)
         return -LUME_EINVAL;
     if (n->persistent)
     {
-        if (!storage->resize)
+        if (!d->storage_handle && !storage->resize)
             return -LUME_ENOSYS;
-        int error = storage->resize(n->path, d->offset);
+        int error = d->storage_handle ? storage->resize_handle(d->storage_handle, d->offset)
+                                      : storage->resize(n->path, d->offset);
         if (error)
             return error;
     }
@@ -1187,7 +1363,7 @@ int64_t lume_vfs_dup2(struct lume_files *f, uint64_t from, uint64_t to)
     if (to >= f->identity.limit[LUME_LIMIT_FILES].soft)
         return -LUME_EBADF;
     (void)lume_vfs_close(f, to);
-    f->fd[to] = (struct lume_fd){f->fd[from].object, 0};
+    bind_descriptor(f, (unsigned)to, f->fd[from].object, 0);
     ++d->references;
     return (int64_t)to;
 }
@@ -1206,7 +1382,7 @@ struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *f, uint64_t fd, b
     return writing ? &channels[d->pipe].writable : &channels[d->pipe].readable;
 }
 
-static unsigned events(struct lume_files *f, int fd)
+static unsigned events(struct lume_files *f, int fd, bool sample_console)
 {
     if (fd < 0)
         return 0;
@@ -1219,8 +1395,9 @@ static unsigned events(struct lume_files *f, int fd)
     {
         if (nodes[d->node].block && nodes[d->node].block->device->state != LUME_DEVICE_READY)
             return LUME_POLLERR;
-        return ((d->flags & 3) != LUME_O_WRONLY && (nodes[d->node].kind != LUME_NODE_CHAR ||
-                                                    nodes[d->node].device || lume_console_ready())
+        return ((d->flags & 3) != LUME_O_WRONLY &&
+                        (nodes[d->node].kind != LUME_NODE_CHAR || nodes[d->node].device ||
+                         (sample_console ? lume_console_ready() : poll_input_ready))
                     ? LUME_POLLIN
                     : 0) |
                ((d->flags & 3) ? LUME_POLLOUT : 0);
@@ -1231,6 +1408,90 @@ static unsigned events(struct lume_files *f, int fd)
     return !c->readers                                      ? LUME_POLLERR
            : LUME_PIPE_BYTES - c->count >= LUME_PIPE_ATOMIC ? LUME_POLLOUT
                                                             : 0;
+}
+
+void lume_vfs_poll_prepare(struct lume_files *files, struct lume_poll_watch *watch)
+{
+    if (watch->count > LUME_FD_LIMIT)
+        watch->count = LUME_FD_LIMIT;
+    for (unsigned i = 0; i < watch->count; ++i)
+    {
+        int fd = watch->records[i].fd;
+        watch->records[i].revents = 0;
+        watch->generations[i] = fd >= 0 && fd < (int)LUME_FD_MAX && files->fd[fd].object >= 0
+                                    ? files->fd[fd].generation
+                                    : 0;
+    }
+}
+
+bool lume_vfs_poll_subscribe(struct lume_files *files, const struct lume_poll_watch *watch,
+                             unsigned task)
+{
+    if (task >= LUME_POLL_TASK_LIMIT || watch->count > LUME_FD_LIMIT)
+        return false;
+    lume_vfs_poll_cancel(task);
+    for (unsigned i = 0; i < watch->count; ++i)
+    {
+        int fd = watch->records[i].fd;
+        if (fd < 0 || fd >= (int)LUME_FD_MAX || files->fd[fd].object < 0 ||
+            files->fd[fd].generation != watch->generations[i])
+            continue;
+        struct open_file *file = &open_files[files->fd[fd].object];
+        struct lume_poll_source *source = 0;
+        if (file->external && file->external->source)
+            source = file->external->source(file->context);
+        else if (!file->external && file->pipe >= 0)
+            source = &channels[file->pipe].changed;
+        else if (!file->external && nodes[file->node].kind == LUME_NODE_CHAR &&
+                 !nodes[file->node].device && (watch->records[i].events & LUME_POLLIN))
+            source = &console_source;
+        if (!poll_subscribe_source(task, &files->fd[fd].changed) ||
+            !poll_subscribe_source(task, source))
+        {
+            lume_vfs_poll_cancel(task);
+            return false;
+        }
+    }
+    return true;
+}
+
+unsigned lume_vfs_poll_check(struct lume_files *files, struct lume_poll_watch *watch)
+{
+    unsigned ready = 0;
+    for (unsigned i = 0; i < watch->count && i < LUME_FD_LIMIT; ++i)
+    {
+        struct lume_pollfd *record = &watch->records[i];
+        int fd = record->fd;
+        unsigned result = 0;
+        if (fd >= 0)
+        {
+            if (fd >= (int)LUME_FD_MAX || files->fd[fd].object < 0 ||
+                files->fd[fd].generation != watch->generations[i])
+                result = LUME_POLLNVAL;
+            else
+                result = events(files, fd, false) &
+                         (record->events | LUME_POLLERR | LUME_POLLHUP | LUME_POLLNVAL);
+        }
+        record->revents = (uint16_t)result;
+        ready += result != 0;
+    }
+    return ready;
+}
+
+bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_poll_watch *watch)
+{
+    for (unsigned i = 0; i < watch->count && i < LUME_FD_LIMIT; ++i)
+    {
+        int fd = watch->records[i].fd;
+        if (fd < 0 || fd >= (int)LUME_FD_MAX || !(watch->records[i].events & LUME_POLLIN) ||
+            files->fd[fd].object < 0 || files->fd[fd].generation != watch->generations[i])
+            continue;
+        const struct open_file *file = &open_files[files->fd[fd].object];
+        if (!file->external && file->pipe < 0 && nodes[file->node].kind == LUME_NODE_CHAR &&
+            !nodes[file->node].device && (file->flags & 3) != LUME_O_WRONLY)
+            return true;
+    }
+    return false;
 }
 
 int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_request *r)
@@ -1273,7 +1534,7 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
         unsigned ready = 0;
         for (unsigned i = 0; i < r->count; ++i)
         {
-            p[i].revents = (uint16_t)(events(f, p[i].fd) &
+            p[i].revents = (uint16_t)(events(f, p[i].fd, true) &
                                       (p[i].events | LUME_POLLERR | LUME_POLLHUP | LUME_POLLNVAL));
             ready += p[i].revents != 0;
         }
@@ -1299,17 +1560,18 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
             ++channel;
         if (channel == PIPES)
             return -LUME_ENOMEM;
+        lume_poll_source_reset(&channels[channel].changed);
         int a = new_object(-1, (int)channel, LUME_O_RDONLY);
         if (a < 0)
             return a;
-        f->fd[first] = (struct lume_fd){a, r->flags & LUME_FD_CLOEXEC};
+        bind_descriptor(f, first, a, r->flags & LUME_FD_CLOEXEC);
         int b = new_object(-1, (int)channel, LUME_O_WRONLY);
         if (b < 0)
         {
             (void)lume_vfs_close(f, first);
             return b;
         }
-        f->fd[second] = (struct lume_fd){b, r->flags & LUME_FD_CLOEXEC};
+        bind_descriptor(f, second, b, r->flags & LUME_FD_CLOEXEC);
         open_files[a].status = open_files[b].status = r->flags & LUME_FD_NONBLOCK;
         r->fd = (int)first;
         r->other = (int)second;

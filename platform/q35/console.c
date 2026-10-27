@@ -3,6 +3,8 @@
 #include "lume/cpu.h"
 #include "lume/display.h"
 #include "lume/usb.h"
+#include "lume/worker.h"
+#include "lume/console_output.h"
 #define COM1 0x3f8
 static int pending = -1;
 
@@ -37,13 +39,23 @@ uintptr_t lume_uart_base(void)
     return COM1;
 }
 
+static void transmit(const char *data, size_t bytes)
+{
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        while (!(lume_in8(COM1 + 5) & 0x20))
+            lume_cpu_relax();
+        lume_out8(COM1, (unsigned char)data[i]);
+    }
+}
+
 void lume_putc(char c)
 {
+    uint64_t ticket = lume_console_serial_lock();
     if (c == '\n')
-        lume_putc('\r');
-    while (!(lume_in8(COM1 + 5) & 0x20))
-        lume_cpu_relax();
-    lume_out8(COM1, (unsigned char)c);
+        transmit("\r", 1);
+    transmit(&c, 1);
+    lume_console_serial_unlock(ticket);
 }
 
 void lume_puts(const char *p)
@@ -70,15 +82,24 @@ void lume_value(const char *name, uint64_t value)
 
 void lume_uart_flush(void)
 {
+    uint64_t ticket = lume_console_serial_lock();
     while (!(lume_in8(COM1 + 5) & 0x40))
         lume_cpu_relax();
+    lume_console_serial_unlock(ticket);
 }
 
 void lume_boot_console_write(const char *data, size_t bytes)
 {
-    for (size_t i = 0; i < bytes; ++i)
-        lume_putc(data[i]);
-    lume_display_write(data, bytes);
+    while (bytes)
+    {
+        size_t count = bytes < 64 ? bytes : 64;
+        for (size_t i = 0; i < count; ++i)
+            lume_putc(data[i]);
+        lume_display_write(data, count);
+        data += count;
+        bytes -= count;
+        lume_worker_checkpoint((unsigned)count);
+    }
 }
 
 static void console_putc(char c)
@@ -106,7 +127,8 @@ void lume_q35_console_start(void)
     lume_out8(COM1 + 2, 0xc7);
     lume_out8(COM1 + 4, 0x0b);
     static const struct lume_platform_uart_ops operations = {
-        input, ready, console_putc, lume_boot_console_write, poll_input, input_stats};
+        input,      ready,       console_putc,       lume_boot_console_write,
+        poll_input, input_stats, lume_display_write, transmit};
     if (lume_platform_driver_register(LUME_PLATFORM_UART, &operations, sizeof(operations)))
         lume_fail("serial console registration");
 }

@@ -95,8 +95,15 @@ int main(void)
     assert(lume_heap_brk(1, 0) == BASE && !allocated);
     assert(lume_heap_brk(1, BASE - 1) == -LUME_ENOMEM);
     assert(lume_heap_brk(1, LUME_HEAP_LIMIT + 1) == -LUME_ENOMEM);
+    assert(lume_heap_brk(1, BASE) == BASE && !allocated && !map_calls && !switched);
     assert(lume_heap_brk(1, BASE + 1) == BASE + 1 && allocated == 1);
+    unsigned original_switches = switched, original_maps = map_calls;
+    assert(lume_heap_brk(1, BASE + 4095) == BASE + 4095 && allocated == 1);
+    assert(lume_heap_brk(1, 0) == BASE + 4095);
+    assert(lume_heap_brk(1, BASE + 31) == BASE + 31 && allocated == 1);
+    assert(lume_heap_brk(1, 0) == BASE + 31);
     assert(lume_heap_brk(1, BASE + 4096) == BASE + 4096 && allocated == 1);
+    assert(switched == original_switches && map_calls == original_maps);
     assert(lume_heap_brk(2, BASE + 8193) == BASE + 8193 && allocated == 4);
     assert(mapped[0][0] && mapped[1][0] && mapped[0][0] != mapped[1][0]);
     struct lume_memory_snapshot snapshot;
@@ -121,6 +128,7 @@ int main(void)
     lume_heap_release(1);
     assert(!allocated);
     assert(map_calls && switched);
-    puts("PASS_HEAP isolation/bounds/shrink/allocation rollback/mapping rollback/release");
+    puts(
+        "PASS_HEAP isolation/bounds/in-page resize/shrink/allocation rollback/mapping rollback/release");
     return 0;
 }

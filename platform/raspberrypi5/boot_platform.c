@@ -5,6 +5,7 @@
 #include "lume/watchdog.h"
 #include "lume/platform_driver.h"
 #include "lume/hardware_platform.h"
+#include "lume/console_output.h"
 #define UART_BASE UINT64_C(0x1c00030000)
 
 /* Firmware leaves this console available before the module image can be read. */
@@ -15,11 +16,17 @@ uintptr_t lume_uart_base(void)
 
 void lume_putc(char c)
 {
+    uint64_t ticket = lume_console_serial_lock();
     if (c == '\n')
-        lume_putc('\r');
+    {
+        while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
+            lume_cpu_relax();
+        lume_mmio_write32(UART_BASE, '\r');
+    }
     while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
         lume_cpu_relax();
     lume_mmio_write32(UART_BASE, (unsigned char)c);
+    lume_console_serial_unlock(ticket);
 }
 
 void lume_puts(const char *s)
@@ -46,9 +53,11 @@ void lume_value(const char *name, uint64_t value)
 
 void lume_uart_flush(void)
 {
+    uint64_t ticket = lume_console_serial_lock();
     while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 3))
         lume_cpu_relax();
     lume_memory_complete();
+    lume_console_serial_unlock(ticket);
 }
 
 uint64_t lume_irq_save(void)

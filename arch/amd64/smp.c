@@ -1,5 +1,6 @@
 #include "lume/smp.h"
 static bool locked;
+static uint64_t lock_turn;
 
 unsigned lume_cpu_count(void)
 {
@@ -24,6 +25,7 @@ void lume_smp_lock(void)
     if (locked)
         lume_fail("recursive kernel lock");
     locked = true;
+    ++lock_turn;
 }
 
 void lume_smp_unlock(void)
@@ -38,7 +40,22 @@ bool lume_smp_owned(void)
     return locked;
 }
 
+bool lume_smp_contended(void)
+{
+    return false;
+}
+
+uint64_t lume_smp_lock_turn(void)
+{
+    return lock_turn;
+}
+
 uint64_t lume_smp_wait_ticks(void)
+{
+    return 0;
+}
+
+uint64_t lume_smp_wait_total(void)
 {
     return 0;
 }

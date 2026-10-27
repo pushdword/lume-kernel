@@ -21,7 +21,8 @@ enum
     LUME_FD_POLL,
     LUME_FD_SPAWN,
     LUME_FD_GETMODE,
-    LUME_FD_SETMODE
+    LUME_FD_SETMODE,
+    LUME_FD_WAIT
 };
 
 enum
@@ -61,6 +62,20 @@ struct lume_pollfd
     uint16_t events, revents;
 };
 
+#define LUME_POLL_VERSION 1u
+#define LUME_POLL_SIGNAL_EPOCH 1u
+
+/* WAIT uses a native-width buffer and a timeout duration in milliseconds.
+ * UINT64_MAX waits indefinitely. SIGNAL_EPOCH rejects a wait if a deliverable signal
+ * changed the supplied token. The token comes from the signal mask operation.
+ */
+struct lume_poll_request
+{
+    uint32_t version, bytes;
+    uint64_t buffer, timeout_ms, signal_epoch;
+    uint32_t count, flags;
+};
+
 struct lume_fd_info
 {
     uint32_t version, bytes, limit, open, objects, pipes, pipe_bytes, pipe_atomic;
@@ -68,4 +83,5 @@ struct lume_fd_info
 
 _Static_assert(sizeof(struct lume_fd_request) == 32, "FD request ABI");
 _Static_assert(sizeof(struct lume_pollfd) == 8, "pollfd ABI");
+_Static_assert(sizeof(struct lume_poll_request) == 40, "native poll request ABI");
 #endif

@@ -105,7 +105,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                         LUME_FEATURE_HARDWARE | LUME_FEATURE_MODULES | LUME_FEATURE_SUPERVISION |
                         LUME_FEATURE_FORK | LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM |
                         LUME_FEATURE_SOCKETS | LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS |
-                        LUME_FEATURE_FILE_MODES,
+                        LUME_FEATURE_FILE_MODES | LUME_FEATURE_EVENT_WAIT,
             .pointer_bits = 64,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,

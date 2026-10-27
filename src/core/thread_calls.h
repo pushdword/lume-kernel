@@ -5,6 +5,8 @@ static unsigned process_slot(unsigned task)
 
 static void thread_drop(unsigned task)
 {
+    kernel_cancel(task);
+    poll_cancel(task);
     unsigned owner = process_slot(task);
     uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
     for (unsigned i = 0; i < thread_pages[task]; ++i)
@@ -29,6 +31,11 @@ static void thread_drop(unsigned task)
 static struct lume_context *thread_finish(uint64_t result)
 {
     unsigned task = current_task, owner = process_slot(task);
+    if (!kernel_thread_exit_ready(task))
+    {
+        sched_charge(&policy, lume_cpu_index(), now());
+        return wait_ready_task();
+    }
     uint64_t tid = thread_id(thread_slots, task);
     if (!thread_slots[task].thread)
     {
@@ -57,7 +64,8 @@ static struct lume_context *thread_finish(uint64_t result)
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (thread_slots[i].thread && process_slot(i) == owner && states[i] && states[i] != 5)
             remaining = true;
-    if (!remaining && states[owner] != 2 && (main_thread_done[owner] || process_exiting[owner]))
+    if (!remaining && states[owner] != 2 && (main_thread_done[owner] || process_exiting[owner]) &&
+        !(kernel_owner == owner && lume_worker_busy()))
     {
         states[owner] = 1;
         sched_wake(&policy, owner, unit, 0);
@@ -73,7 +81,7 @@ static struct lume_context *process_terminate(unsigned status)
     process_status[owner] = status;
     process_exiting[owner] = true;
     thread_waiting[owner] = futex_address[owner] = 0;
-    if (states[owner] != 2)
+    if (states[owner] != 2 && !(kernel_owner == owner && lume_worker_busy()))
     {
         states[owner] = 1;
         sched_wake(&policy, owner, unit, 0);

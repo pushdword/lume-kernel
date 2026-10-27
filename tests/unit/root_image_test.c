@@ -4,6 +4,11 @@
 #include <string.h>
 
 static unsigned checks;
+
+void lume_smp_wake(void)
+{
+}
+
 #define CHECK(condition)                                                                           \
     do                                                                                             \
     {                                                                                              \

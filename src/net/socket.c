@@ -1,7 +1,9 @@
 #include "lume/external_file.h"
 #include "lume/socket.h"
+#include "lume/socket_file.h"
 #include "lume/io.h"
 #include "lume/net.h"
+#include "lume/poll.h"
 #include <string.h>
 
 #define SOCKETS 16u
@@ -15,12 +17,25 @@ extern int lume_stream_socket_local(unsigned, unsigned, unsigned char[4], unsign
 
 static struct tcp_file
 {
+    struct lume_poll_source source;
     bool used, listening, shutdown;
     unsigned owner, handle, local_port, peer_port, options;
     unsigned char local[4], peer[4];
 } tcp_files[SOCKETS];
 
 static unsigned owner_sequence;
+
+void lume_socket_stream_notify(unsigned owner, unsigned handle)
+{
+    for (unsigned i = 0; i < SOCKETS; ++i)
+        if (tcp_files[i].used && tcp_files[i].owner == owner && tcp_files[i].handle == handle)
+            lume_poll_source_notify(&tcp_files[i].source);
+}
+
+static struct lume_poll_source *tcp_source(void *context)
+{
+    return &((struct tcp_file *)context)->source;
+}
 
 struct local_ring
 {
@@ -41,6 +56,7 @@ struct local_end
 {
     struct local_pair *pair;
     unsigned side;
+    struct lume_poll_source source;
 };
 
 static struct local_pair
@@ -80,6 +96,7 @@ static void tcp_close(void *context)
         struct lume_stream_request request = {0};
         (void)stream(file, LUME_STREAM_CLOSE, &request);
     }
+    lume_poll_source_notify(&file->source);
     memset(file, 0, sizeof(*file));
 }
 
@@ -107,8 +124,8 @@ static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
     return stream(file, LUME_STREAM_SEND, &request);
 }
 
-static const struct lume_file_ops tcp_ops = {LUME_NODE_SOCKET, tcp_close, tcp_read, tcp_write,
-                                             tcp_poll};
+static const struct lume_file_ops tcp_ops = {LUME_NODE_SOCKET, tcp_close, tcp_read,
+                                             tcp_write,        tcp_poll,  tcp_source};
 
 static void discard_rights(struct local_ring *ring, uint64_t end)
 {
@@ -121,6 +138,17 @@ static void discard_rights(struct local_ring *ring, uint64_t end)
     }
 }
 
+static struct lume_poll_source *local_source(void *context)
+{
+    return &((struct local_end *)context)->source;
+}
+
+static void local_notify(struct local_pair *pair)
+{
+    lume_poll_source_notify(&pair->end[0].source);
+    lume_poll_source_notify(&pair->end[1].source);
+}
+
 static void local_close(void *context)
 {
     struct local_end *end = context;
@@ -129,6 +157,7 @@ static void local_close(void *context)
     pair->open[side] = false;
     discard_rights(&pair->ring[side], UINT64_MAX);
     memset(&pair->ring[side], 0, sizeof(pair->ring[side]));
+    local_notify(pair);
     if (!pair->open[side ^ 1])
         memset(pair, 0, sizeof(*pair));
 }
@@ -150,6 +179,7 @@ static int64_t local_read(void *context, void *data, uint64_t bytes)
     ring->count -= (unsigned)bytes;
     ring->consumed += bytes;
     discard_rights(ring, ring->consumed);
+    local_notify(pair);
     return (int64_t)bytes;
 }
 
@@ -174,6 +204,7 @@ static int64_t local_write(void *context, const void *data, uint64_t bytes)
             ((const unsigned char *)data)[i];
     ring->count += (unsigned)bytes;
     ring->produced += bytes;
+    local_notify(pair);
     return (int64_t)bytes;
 }
 
@@ -190,7 +221,7 @@ static unsigned local_poll(void *context)
 }
 
 static const struct lume_file_ops local_ops = {LUME_NODE_SOCKET, local_close, local_read,
-                                               local_write, local_poll};
+                                               local_write,      local_poll,  local_source};
 
 static struct tcp_file *allocate_tcp(void)
 {
@@ -200,6 +231,7 @@ static struct tcp_file *allocate_tcp(void)
             if (owner_sequence == 0x3fffffff)
                 return 0;
             tcp_files[i] = (struct tcp_file){.used = true, .owner = 0x40000000u | ++owner_sequence};
+            lume_poll_source_reset(&tcp_files[i].source);
             return &tcp_files[i];
         }
     return 0;
@@ -235,8 +267,10 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             struct local_pair *pair = &local_pairs[i];
             if (pair->open[0] || pair->open[1])
                 continue;
-            pair->end[0] = (struct local_end){pair, 0};
-            pair->end[1] = (struct local_end){pair, 1};
+            pair->end[0] = (struct local_end){.pair = pair, .side = 0};
+            pair->end[1] = (struct local_end){.pair = pair, .side = 1};
+            lume_poll_source_reset(&pair->end[0].source);
+            lume_poll_source_reset(&pair->end[1].source);
             pair->open[0] = pair->open[1] = true;
             int first = lume_vfs_attach(files, &local_ops, &pair->end[0], r->flags);
             int second =
@@ -264,6 +298,7 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             if (r->other != 1)
                 return -LUME_ENOSYS;
             pair->shutdown[end->side] = true;
+            local_notify(pair);
             return 0;
         }
         if (operation == LUME_SOCKET_SEND_FD)
@@ -285,6 +320,7 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             unsigned slot = (ring->rights_first + ring->rights_count++) % RIGHTS;
             ring->rights[slot].offset = offset;
             ring->rights[slot].object = object;
+            local_notify(pair);
             return result;
         }
         if (operation == LUME_SOCKET_RECEIVE_FD)
@@ -356,6 +392,7 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
                 memcpy(file->peer, r->address, 4);
                 file->peer_port = r->port;
             }
+            lume_poll_source_notify(&file->source);
         }
         return result;
     }
@@ -407,7 +444,10 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             return -LUME_ENOSYS;
         int result = stream(file, LUME_STREAM_SHUTDOWN_WRITE, &request);
         if (!result)
+        {
             file->shutdown = true;
+            lume_poll_source_notify(&file->source);
+        }
         return result;
     }
     return -LUME_ENOSYS;

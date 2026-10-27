@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "fat.h"
 #include "storage.h"
+#include "poll.h"
 #include <fd.h>
 #include "lume/credential.h"
 
@@ -24,6 +25,8 @@ struct lume_fd
 {
     int object;
     uint32_t flags;
+    uint64_t generation;
+    struct lume_poll_source changed;
 };
 
 struct lume_files
@@ -68,6 +71,9 @@ int lume_vfs_program(struct lume_files *, const char *, const void **, size_t *)
 int64_t lume_vfs_dup2(struct lume_files *, uint64_t, uint64_t);
 int64_t lume_vfs_fd_call(struct lume_files *, unsigned, struct lume_fd_request *);
 bool lume_vfs_pipe_wait(struct lume_files *, uint64_t);
+bool lume_vfs_pipe_io(struct lume_files *, uint64_t);
+bool lume_vfs_console_io(struct lume_files *, uint64_t);
+bool lume_vfs_storage_io(struct lume_files *, uint64_t);
 struct lume_wait_queue;
 struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *, uint64_t, bool writing);
 int64_t lume_vfs_mkdir(struct lume_files *, const char *);

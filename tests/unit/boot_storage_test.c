@@ -16,6 +16,11 @@ static unsigned deep_found;
 static bool fail_reads, fail_writes;
 static unsigned failed_reads, failed_writes;
 
+void lume_worker_checkpoint(unsigned bytes)
+{
+    (void)bytes;
+}
+
 void lume_puts(const char *text)
 {
     fputs(text, stderr);

@@ -116,7 +116,8 @@ bool lume_pi5_dma_start(void)
 bool lume_dma_map(const struct lume_dma_domain *domain, uint64_t physical, size_t bytes,
                   uint64_t *bus)
 {
-    T(domain == &lume_rp1_dma_domain && bytes == GEM_DMA_PAGE_BYTES);
+    T(domain == &lume_rp1_dma_domain &&
+      bytes == (physical == (uintptr_t)rx_frame ? sizeof(rx_frame) : GEM_DMA_PAGE_BYTES));
     T(!(physical & (GEM_DMA_PAGE_BYTES - 1)));
     ++map_calls;
     if (map_calls == fail_map)
@@ -168,9 +169,50 @@ static void reset_model(void)
 
 static void receive_frame(const void *data, unsigned bytes, uint32_t flags)
 {
-    memcpy(rx_frame, data, bytes);
-    rx.descriptor.control = bytes | flags;
-    rx.descriptor.address_low |= GEM_RX_OWNED;
+    memcpy(rx_frame[rx_index], data, bytes);
+    rx.descriptors[rx_index].control = bytes | flags;
+    rx.descriptors[rx_index].address_low |= GEM_RX_OWNED;
+}
+
+static void exercise_receive_bursts(void)
+{
+    unsigned char out[60];
+    T(rx_index == 0);
+    for (unsigned round = 0; round < 3; ++round)
+    {
+        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+        {
+            T(!(rx.descriptors[i].address_low & GEM_RX_OWNED));
+            T((rx.descriptors[i].address_low & ~3u) ==
+              (uint32_t)(layout.rx_frame_dma + i * GEM_DMA_PAGE_BYTES));
+            memset(rx_frame[i], (int)(round * GEM_RX_RING_ENTRIES + i), sizeof(out));
+            rx.descriptors[i].control = sizeof(out) | GEM_RX_START | GEM_RX_END;
+            rx.descriptors[i].address_low |= GEM_RX_OWNED;
+        }
+        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+        {
+            T(lume_example_gem_receive(out, sizeof(out)) == sizeof(out));
+            for (unsigned n = 0; n < sizeof(out); ++n)
+                T(out[n] == (unsigned char)(round * GEM_RX_RING_ENTRIES + i));
+            if (i + 1 < GEM_RX_RING_ENTRIES)
+                T(rx.descriptors[0].address_low & GEM_RX_OWNED);
+        }
+        T(rx_index == 0);
+        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+            T(!(rx.descriptors[i].address_low & GEM_RX_OWNED));
+        T(lume_example_gem_receive(out, sizeof(out)) == 0);
+    }
+    for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+    {
+        receive_frame(out, sizeof(out), GEM_RX_START | GEM_RX_END);
+        if (i + 1 == GEM_RX_RING_ENTRIES)
+            fail_sync = sync_calls + 3;
+        int result = lume_example_gem_receive(out, sizeof(out));
+        T(result == (i + 1 == GEM_RX_RING_ENTRIES ? -LUME_EIO : (int)sizeof(out)));
+    }
+    T(rx_index == GEM_RX_RING_ENTRIES);
+    fail_sync = 0;
+    T(lume_example_gem_receive(out, sizeof(out)) == 0 && rx_index == 0);
 }
 
 /* Exercise the real adapter and registry with the same MMIO and DMA model as the frame tests. */
@@ -324,7 +366,9 @@ int main(void)
     T(registers[GEM_TX_QUEUE_BASE_HIGH / 4] == 0x10);
     T(tx.descriptor.address_high == 0x10 && rx.descriptor.address_high == 0x10);
     T(tx.descriptor.control == (GEM_TX_USED | GEM_TX_WRAP));
-    T((rx.descriptor.address_low & 3) == GEM_RX_WRAP);
+    T((rx.descriptors[0].address_low & 3) == 0);
+    T((rx.descriptors[GEM_RX_RING_ENTRIES - 1].address_low & 3) == GEM_RX_WRAP);
+    exercise_receive_bursts();
     T(lume_example_gem_link());
     cfg_status = 0;
     T(!lume_example_gem_link());
@@ -356,11 +400,11 @@ int main(void)
     memset(out, 0xa5, sizeof(out));
     T(lume_example_gem_receive(out, sizeof(out)) == 1514);
     T(!memcmp(out, frame, 1514) && out[1514] == 0xa5);
-    T(!(rx.descriptor.address_low & GEM_RX_OWNED));
+    T(rx.descriptors[0].address_low & GEM_RX_OWNED);
     T(lume_example_gem_receive(out, sizeof(out)) == 0);
     receive_frame(frame, 100, GEM_RX_START | GEM_RX_END);
     T(lume_example_gem_receive(out, 60) == -LUME_E2BIG);
-    T(!(rx.descriptor.address_low & GEM_RX_OWNED));
+    T(rx.descriptors[1].address_low & GEM_RX_OWNED);
     receive_frame(frame, 60, GEM_RX_START);
     T(lume_example_gem_receive(out, sizeof(out)) == -LUME_EIO);
     receive_frame(frame, 1515, GEM_RX_START | GEM_RX_END);
@@ -402,6 +446,7 @@ int main(void)
     T(phy_expansion[0x0f05] == 0x5aa5);
     T(gem_device.resource_count == 2);
     T(tx_count == 2 && tx_index == 0);
+    exercise_receive_bursts();
     T(tx.descriptors[0].control == GEM_TX_USED);
     T(tx.descriptors[1].control == (GEM_TX_USED | GEM_TX_WRAP));
     T(lume_example_gem_transmit(frame, 60) == 0);

@@ -15,6 +15,14 @@ struct lume_storage_ops
     int (*remove)(const char *);
     int (*resize)(const char *, uint64_t);
     int (*rename)(const char *, const char *);
+    /* Use handle callbacks as a complete group for existing files and VFS offsets.
+     * A close attempt consumes the handle even when it reports an error. */
+    int (*open)(const char *, unsigned, void **);
+    int (*read_handle)(void *, uint64_t, void *, size_t);
+    int (*write_handle)(void *, uint64_t, const void *, size_t);
+    int (*resize_handle)(void *, uint64_t);
+    int (*close)(void *);
+    int (*sync_handle)(void *);
 };
 
 struct lume_volume

@@ -16,6 +16,16 @@ static bool writable;
 static unsigned reads, writes, denied, checks;
 static uint64_t sectors = 121503744;
 static struct lume_volume selected;
+
+void lume_smp_wake(void)
+{
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    (void)bytes;
+}
+
 #define CHECK(x)                                                                                   \
     do                                                                                             \
     {                                                                                              \

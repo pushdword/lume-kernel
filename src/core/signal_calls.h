@@ -30,7 +30,8 @@ static void signal_queue(unsigned owner, unsigned number)
         signal_ignored(owner, number))
         return;
     struct signal_state *s = &signals[owner];
-    ++s->epoch;
+    if (!(s->mask & (1u << number)))
+        ++s->epoch;
     s->pending |= 1u << number;
     if (number == 9)
     {
@@ -43,6 +44,7 @@ static void signal_queue(unsigned owner, unsigned number)
     {
         bool restart =
             (s->action[number].flags & (1u << 3)) && (pipe_wait[owner] || states[owner] == 3);
+        poll_interrupt(owner, &tasks[owner].context);
         if (pipe_wait[owner] && !restart)
             LUME_CONTEXT_PC(&tasks[owner].context) += LUME_SYSCALL_INSTRUCTION_BYTES;
         if (states[owner] == 3 && restart)
@@ -248,6 +250,7 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
             s->pending &= ~(1u << number);
             if (signal_ignored(owner, number))
                 continue;
+            poll_interrupt(owner, frame);
             if (!action.handler || number == 9 || s->depth == SIGNAL_DEPTH)
             {
                 exit_signals[owner] = number;

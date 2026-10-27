@@ -1,5 +1,6 @@
 #include "lume/vfs.h"
 #include "lume/wait.h"
+#include "lume/file_mode.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +8,11 @@ static unsigned checks;
 static unsigned console_calls;
 static char console_data[4096];
 static size_t console_bytes;
+
+void lume_smp_wake(void)
+{
+}
+
 #define T(x)                                                                                       \
     do                                                                                             \
     {                                                                                              \
@@ -32,6 +38,82 @@ void lume_console_write(const char *data, size_t bytes)
     ++console_calls;
 }
 
+static void jail_directory(void)
+{
+    struct lume_files files, inherited;
+    lume_files_init(&files);
+    T(lume_vfs_mkdir(&files, "/tmp/jail-directory") == 0);
+    T(lume_vfs_chroot(&files, "/tmp/jail-directory") == 0 && files.identity.jailed);
+    struct lume_file_mode_request request = {.version = LUME_FILE_MODE_VERSION,
+                                             .bytes = sizeof(request),
+                                             .mode = 0600,
+                                             .flags = LUME_O_RDONLY,
+                                             .descriptor_flags = LUME_FD_CLOEXEC,
+                                             .uid = UINT32_MAX,
+                                             .gid = UINT32_MAX};
+    struct lume_stat before, after;
+    int64_t mode = lume_vfs_stat_path(&files, "/", &before);
+    int fd = (int)lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/");
+    T(fd == 3);
+    struct lume_fd_request descriptor = {
+        .version = LUME_FD_VERSION, .bytes = sizeof(descriptor), .fd = fd};
+    T(lume_vfs_fd_call(&files, LUME_FD_GETFD, &descriptor) == LUME_FD_CLOEXEC);
+    T(lume_vfs_stat_path(&files, "/", &after) == mode && before.inode == after.inode);
+    struct lume_dirent entry;
+    T(lume_vfs_getdents(&files, fd, &entry, sizeof(entry)) == 0);
+    T(lume_vfs_getdents(&files, fd, &entry, sizeof(entry)) == 0);
+    T(lume_vfs_write(&files, fd, "x", 1) == -LUME_EBADF);
+    lume_files_inherit(&inherited, &files);
+    T(lume_vfs_stat(&inherited, fd, &after) == -LUME_EBADF);
+    lume_files_release(&inherited);
+    request.fd = fd;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_PATH, &request, "/") == -LUME_EPERM);
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_FD, &request, NULL) == -LUME_EPERM);
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_MKDIR, &request, "/new") == -LUME_EPERM);
+    T(lume_vfs_close(&files, fd) == 0);
+    const unsigned denied[] = {LUME_O_WRONLY,
+                               LUME_O_RDWR,
+                               LUME_O_CREAT,
+                               LUME_O_TRUNC,
+                               LUME_O_APPEND,
+                               LUME_O_EXCL,
+                               LUME_O_CREAT | LUME_O_RDWR};
+    for (unsigned i = 0; i < sizeof(denied) / sizeof(denied[0]); ++i)
+    {
+        request.flags = denied[i];
+        T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EPERM);
+        T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/new") == -LUME_EPERM);
+    }
+    request.flags = LUME_O_RDONLY;
+    const char *outside[] = {"/etc/motd", "/tmp", "/data", "../etc", "relative"};
+    for (unsigned i = 0; i < sizeof(outside) / sizeof(outside[0]); ++i)
+        T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, outside[i]) == -LUME_ENOENT);
+    request.version = 0;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EINVAL);
+    request.version = LUME_FILE_MODE_VERSION;
+    request.mode = UINT32_MAX;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EINVAL);
+    request.mode = 0600;
+    request.uid = 1;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EINVAL);
+    request.uid = UINT32_MAX;
+    request.gid = 1;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EINVAL);
+    request.gid = UINT32_MAX;
+    request.descriptor_flags = UINT32_MAX;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EINVAL);
+    request.descriptor_flags = LUME_FD_CLOEXEC;
+    files.identity.euid = 1;
+    fd = (int)lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/.././");
+    T(fd == 3 && lume_vfs_getdents(&files, fd, &entry, sizeof(entry)) == 0);
+    T(lume_vfs_close(&files, fd) == 0);
+    files.identity.jailed = false;
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EPERM);
+    files.identity.euid = 0;
+    T(lume_vfs_remove(&files, "/tmp/jail-directory", true) == 0);
+    lume_files_release(&files);
+}
+
 int main(void)
 {
     struct lume_files f, g;
@@ -39,6 +121,8 @@ int main(void)
     lume_vfs_init(elf, 3);
     lume_files_init(&f);
     lume_files_init(&g);
+    T(lume_vfs_console_io(&f, 0) && lume_vfs_console_io(&f, 1) && lume_vfs_console_io(&f, 2));
+    T(!lume_vfs_console_io(&f, LUME_FD_MAX) && !lume_vfs_storage_io(&f, 0));
     static const char output[] = {'a', 0, 'b', '\n', (char)0xc3, (char)0xa1};
     T(lume_vfs_write(&f, 1, output, sizeof(output)) == sizeof(output));
     T(console_calls == 1 && console_bytes == sizeof(output) &&
@@ -221,6 +305,7 @@ int main(void)
         T(lume_vfs_write(&f, request.other, b, 0) == 0);
         T(lume_vfs_close(&f, request.other) == 0);
     }
+    jail_directory();
     /* Exhaust finite RAM nodes, independently of open descriptor limits. */
     int result = 0;
     for (unsigned i = 0; i < 200; ++i)

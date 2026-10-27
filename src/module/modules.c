@@ -18,6 +18,7 @@
 #include "lume/netif.h"
 #include "lume/wireless.h"
 #include "lume/wpa.h"
+#include "lume/console_output.h"
 #include "lume/block.h"
 #include <string.h>
 #if defined(LUME_ARCH_AMD64)
@@ -109,6 +110,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_usb_inventory_remove)
 #endif
     EXPORT(lume_putc)
+    EXPORT(lume_console_serial_lock)
+    EXPORT(lume_console_serial_unlock)
     EXPORT(lume_puts)
     EXPORT(lume_secret_clear)
     EXPORT(lume_uart_poll_input)
@@ -125,6 +128,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_wireless_register)
     EXPORT(lume_wireless_unregister)
     EXPORT(lume_worker_pause)
+    EXPORT(lume_worker_busy)
+    EXPORT(lume_worker_checkpoint)
     EXPORT(lume_worker_stats)
     EXPORT(lume_worker_wait_bits)
     if (!strcmp(name, "lume_rp1_dma_domain"))

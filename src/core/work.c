@@ -2,7 +2,7 @@
 #include "lume/irq.h"
 #include "lume/abi.h"
 static struct lume_work *queue[LUME_WORK_LIMIT];
-static unsigned count;
+static unsigned head, count;
 static bool draining;
 
 bool lume_work_pending(void)
@@ -25,7 +25,8 @@ int lume_work_submit(struct lume_work *work)
             result = -LUME_ENOSPC;
         else
         {
-            queue[count++] = work;
+            queue[(head + count) % LUME_WORK_LIMIT] = work;
+            ++count;
             work->queued = true;
         }
     }
@@ -38,11 +39,11 @@ bool lume_work_cancel(struct lume_work *work)
     uint64_t flags = lume_irq_save();
     bool found = false;
     for (unsigned i = 0; i < count; ++i)
-        if (queue[i] == work)
+        if (queue[(head + i) % LUME_WORK_LIMIT] == work)
         {
             for (unsigned j = i + 1; j < count; ++j)
-                queue[j - 1] = queue[j];
-            --count;
+                queue[(head + j - 1) % LUME_WORK_LIMIT] = queue[(head + j) % LUME_WORK_LIMIT];
+            queue[(head + --count) % LUME_WORK_LIMIT] = 0;
             work->queued = false;
             found = true;
             break;
@@ -60,11 +61,11 @@ unsigned lume_work_drain(unsigned budget)
     while (done < budget)
     {
         uint64_t flags = lume_irq_save();
-        struct lume_work *work = count ? queue[0] : 0;
+        struct lume_work *work = count ? queue[head] : 0;
         if (work)
         {
-            for (unsigned i = 1; i < count; ++i)
-                queue[i - 1] = queue[i];
+            queue[head] = 0;
+            head = (head + 1) % LUME_WORK_LIMIT;
             --count;
             work->queued = false;
         }

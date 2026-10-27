@@ -11,6 +11,7 @@
 #include "lume/xhci_ring.h"
 #include "lume/abi.h"
 #include "lume/dma.h"
+#include "lume/worker.h"
 #if defined(LUME_ARCH_AMD64)
 #include "lume/usb_inventory.h"
 #include "lume/hardware_abi.h"
@@ -856,7 +857,8 @@ void lume_usb_poll(void)
         if (!h->running)
             continue;
         events(h);
-        scan_roots(h, false);
+        if (!lume_worker_busy())
+            scan_roots(h, false);
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &h->devices[slot];

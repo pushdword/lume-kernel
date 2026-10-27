@@ -7,6 +7,10 @@ extern struct lume_block lume_example_ram_block;
 int lume_example_ram_block_start(void);
 int lume_example_ram_block_stop(void);
 
+void lume_smp_wake(void)
+{
+}
+
 int lume_console_getc(void)
 {
     return -LUME_EAGAIN;

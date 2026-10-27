@@ -110,15 +110,17 @@ union descriptor_page
 {
     /* Provide named access to the descriptor words at the beginning of this allocation. */
     struct gem_dma_descriptor descriptor;
-    struct gem_dma_descriptor descriptors[2];
+    struct gem_dma_descriptor descriptors[GEM_RX_RING_ENTRIES];
     /* Reserve padding so this allocation cannot share a page with the next DMA object. */
     unsigned char page[GEM_DMA_PAGE_BYTES];
 };
+_Static_assert(GEM_RX_RING_ENTRIES * sizeof(struct gem_dma_descriptor) <= GEM_DMA_PAGE_BYTES,
+               "GEM receive descriptor allocation");
 /* Keep the TX descriptor alive for the kernel lifetime and start it on a 4096-byte boundary.
  * Static storage is initially zero.
  */
 _Alignas(GEM_DMA_PAGE_BYTES) static union descriptor_page tx;
-/* Allocate a separately aligned RX descriptor. DMA can update RX without sharing a cache line
+/* Allocate a separately aligned RX descriptor ring. DMA can update RX without sharing a cache line
  * with TX.
  */
 _Alignas(GEM_DMA_PAGE_BYTES) static union descriptor_page rx;
@@ -129,7 +131,8 @@ _Alignas(GEM_DMA_PAGE_BYTES) static unsigned char tx_frame[GEM_DMA_PAGE_BYTES];
 /* Allocate the RAM into which DMA writes received bytes. Software reads it only after RX
  * ownership returns to the CPU.
  */
-_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char rx_frame[GEM_DMA_PAGE_BYTES];
+_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char rx_frame[GEM_RX_RING_ENTRIES][GEM_DMA_PAGE_BYTES];
+static unsigned rx_index;
 /* Remember both CPU and DMA addresses of the four allocations, together with the current station
  * and PHY identifiers.
  */
@@ -492,28 +495,22 @@ static bool sync_descriptor(union descriptor_page *p, bool cpu)
                : lume_dma_sync_for_device(p, sizeof(*p), LUME_DMA_BIDIRECTIONAL);
 }
 
-/* Prepare the one-entry RX ring for another frame. Call this while the descriptor is CPU-owned
- * or before RX is first enabled.
+/* Recycle the ring only while every entry is CPU-owned, or before RX is enabled.
+ * Descriptors share cache lines. Retaining ownership until the whole ring has been consumed
+ * prevents a cache clean from overwriting a neighbouring DMA completion.
  */
 static bool receive_rearm(void)
 {
-    /* Prepare the entire isolated RX allocation for device writes. Cache cleaning/invalidation
-     * must finish before ownership is returned to DMA.
-     */
-    if (!lume_dma_sync_for_device(rx_frame, sizeof(rx_frame), LUME_DMA_FROM_DEVICE))
-        /* Report that the RX buffer could not be prepared safely. */
-        return false;
-    /* Replace the descriptor with a new aggregate value. Unspecified control and reserved words
-     * become zero.
-     */
-    rx.descriptor = (struct gem_dma_descriptor){
-        /* Keep the low address bits and set WRAP. OWNED stays zero, granting the RX slot to DMA.
-         * The buffer alignment leaves the flag bits available.
-         */
-        .address_low = (uint32_t)layout.rx_frame_dma | GEM_RX_WRAP,
-        /* Shift away the low 32 bits to store the upper half of the RX buffer DMA address. */
-        .address_high = (uint32_t)(layout.rx_frame_dma >> 32),
-    };
+    for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+    {
+        if (!lume_dma_sync_for_device(rx_frame[i], sizeof(rx_frame[i]), LUME_DMA_FROM_DEVICE))
+            return false;
+        uint64_t address = layout.rx_frame_dma + i * GEM_DMA_PAGE_BYTES;
+        rx.descriptors[i] = (struct gem_dma_descriptor){
+            .address_low = (uint32_t)address | (i + 1 == GEM_RX_RING_ENTRIES ? GEM_RX_WRAP : 0),
+            .address_high = (uint32_t)(address >> 32),
+        };
+    }
     /* Make the completed descriptor visible to the device after its frame buffer is prepared. */
     return sync_descriptor(&rx, false);
 }
@@ -686,6 +683,7 @@ static int start(struct lume_device *d)
     /* Publish the CPU-owned TX descriptor and initialize the RX descriptor as device-owned. Stop
      * initialization if either cache preparation fails.
      */
+    rx_index = 0;
     if (!sync_descriptor(&tx, false) || !receive_rearm())
         /* Report a failed hardware or cache preparation step. The DDK invokes stop to roll back
          * failed initialization.
@@ -875,6 +873,12 @@ int lume_example_gem_receive(void *data, size_t capacity)
     if (!data || capacity < GEM_FRAME_HEADER_BYTES)
         /* Reject the caller buffer without consuming a received frame. */
         return -LUME_EINVAL;
+    if (rx_index == GEM_RX_RING_ENTRIES)
+    {
+        if (!receive_rearm())
+            return -LUME_EIO;
+        rx_index = 0;
+    }
     /* Fetch the descriptor contents written by DMA before inspecting its RX ownership bit. */
     if (!sync_descriptor(&rx, true))
         /* Report inactive hardware or a failed descriptor/cache synchronization step. */
@@ -882,13 +886,13 @@ int lume_example_gem_receive(void *data, size_t capacity)
     /* A clear OWNED bit means the receive engine still owns this slot. No completed frame is
      * available for the CPU.
      */
-    if (!(rx.descriptor.address_low & GEM_RX_OWNED))
+    if (!(rx.descriptors[rx_index].address_low & GEM_RX_OWNED))
         /* Report that no frame is ready. This is a normal nonblocking polling result. */
         return 0;
     /* Copy the completion word after confirming CPU ownership. It contains frame-boundary flags
      * and a byte count.
      */
-    uint32_t status = rx.descriptor.control;
+    uint32_t status = rx.descriptors[rx_index].control;
     /* Mask away flags and retain the low 13 length bits. */
     size_t bytes = status & GEM_DESCRIPTOR_LENGTH;
     /* Remember either the number of copied bytes or a negative error while the common rearm path
@@ -916,7 +920,8 @@ int lume_example_gem_receive(void *data, size_t capacity)
     /* Invalidate stale cached RX bytes so the CPU sees the frame that the controller wrote into
      * RAM.
      */
-    else if (!lume_dma_sync_for_cpu(rx_frame, sizeof(rx_frame), LUME_DMA_FROM_DEVICE))
+    else if (!lume_dma_sync_for_cpu(rx_frame[rx_index], sizeof(rx_frame[rx_index]),
+                                    LUME_DMA_FROM_DEVICE))
         /* Record a receive-format or cache-access error. The completed slot will still be
          * consumed and rearmed.
          */
@@ -930,16 +935,17 @@ int lume_example_gem_receive(void *data, size_t capacity)
          */
         for (size_t i = 0; i < bytes; ++i)
             /* Move one received byte from driver-owned DMA storage into caller-owned memory. */
-            destination[i] = rx_frame[i];
+            destination[i] = rx_frame[rx_index][i];
         /* Record the complete received frame length as a positive result. */
         result = (int)bytes;
     }
-    /* Return the consumed slot and its frame buffer to DMA even when the frame was dropped for a
-     * format/capacity error.
-     */
-    if (!receive_rearm())
-        /* Report inactive hardware or a failed descriptor/cache synchronization step. */
-        return -LUME_EIO;
+    /* Retain consumed entries until the ring is entirely CPU-owned. */
+    if (++rx_index == GEM_RX_RING_ENTRIES)
+    {
+        if (!receive_rearm())
+            return -LUME_EIO;
+        rx_index = 0;
+    }
     /* Clear writable receive-status flags after consuming this completion. */
     write_mac_reg(GEM_RX_STATUS, UINT32_MAX);
     /* Refreshing enabled control reloads the model's cached RX descriptor

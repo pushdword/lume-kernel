@@ -32,6 +32,7 @@ KERNEL_C_aarch64 := \
     src/mm/pages.c \
     src/device/platform_driver.c \
     src/core/realtime.c \
+    src/core/console_output.c \
     drivers/storage/sdio/sdio.c \
     arch/aarch64/smp/smp.c \
     src/net/socket.c \

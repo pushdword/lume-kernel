@@ -1,6 +1,7 @@
 #include "lume/abi.h"
 #include "lume/early.h"
 #include "lume/net.h"
+#include "lume/socket_file.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include <string.h>
@@ -25,6 +26,11 @@ struct stream
 };
 static struct stream streams[16];
 static unsigned sequence;
+
+static void notify(struct stream *s)
+{
+    lume_socket_stream_notify(s->owner, s->handle);
+}
 
 bool lume_stream_busy(void)
 {
@@ -58,6 +64,16 @@ static void failed(void *context, err_t error)
         s->eof = true;
     else
         s->failed = true;
+    notify(s);
+}
+
+static err_t sent(void *context, struct tcp_pcb *pcb, u16_t bytes)
+{
+    struct stream *s = context;
+    (void)pcb;
+    (void)bytes;
+    notify(s);
+    return ERR_OK;
 }
 
 static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
@@ -67,6 +83,7 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
     if (!p)
     {
         s->eof = true;
+        notify(s);
         return ERR_OK;
     }
     if (error != ERR_OK || p->tot_len > sizeof(s->data) - s->count)
@@ -78,6 +95,7 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
             ++s->count;
         }
     pbuf_free(p);
+    notify(s);
     /* Advertise space only after userspace consumes these bytes. */
     return ERR_OK;
 }
@@ -88,6 +106,7 @@ static err_t connected(void *context, struct tcp_pcb *pcb, err_t error)
     struct stream *s = context;
     s->connected = error == ERR_OK;
     s->failed = error != ERR_OK;
+    notify(s);
     return ERR_OK;
 }
 
@@ -95,7 +114,10 @@ static void close_stream(struct stream *s)
 {
     for (unsigned i = 0; i < 16; ++i)
         if (streams[i].pending == s)
+        {
             streams[i].pending = 0;
+            notify(&streams[i]);
+        }
     if (s->pending)
         close_stream(s->pending);
     if (s->udp)
@@ -109,10 +131,12 @@ static void close_stream(struct stream *s)
         {
             tcp_recv(s->pcb, 0);
             tcp_err(s->pcb, 0);
+            tcp_sent(s->pcb, 0);
         }
         if (tcp_close(s->pcb) != ERR_OK)
             tcp_abort(s->pcb);
     }
+    notify(s);
     *s = (struct stream){0};
 }
 
@@ -131,7 +155,9 @@ static err_t accepted(void *context, struct tcp_pcb *pcb, err_t error)
     tcp_arg(pcb, s);
     tcp_recv(pcb, received);
     tcp_err(pcb, failed);
+    tcp_sent(pcb, sent);
     listener->pending = s;
+    notify(listener);
     return ERR_OK;
 }
 
@@ -153,6 +179,7 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
         s->packet[slot].count = p->tot_len;
         pbuf_copy_partial(p, s->packet[slot].data, p->tot_len, 0);
         ++s->packets;
+        notify(s);
     }
     pbuf_free(p);
 }
@@ -238,6 +265,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         tcp_arg(s->pcb, s);
         tcp_err(s->pcb, failed);
         tcp_recv(s->pcb, received);
+        tcp_sent(s->pcb, sent);
         if (tcp_connect(s->pcb, &address, (u16_t)r->port, connected) != ERR_OK)
         {
             close_stream(s);
@@ -267,7 +295,6 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         close_stream(s);
         return 0;
     }
-    lume_net_poll();
     if (op == LUME_STREAM_POLL)
     {
         unsigned flags = 0;
@@ -283,6 +310,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         r->count = flags;
         return (int)flags;
     }
+    lume_net_poll();
     if (op == LUME_STREAM_ACCEPT)
     {
         if (!s->listening)
@@ -303,6 +331,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         if (!s->write_closed && tcp_shutdown(s->pcb, 0, 1) != ERR_OK)
             return -LUME_EAGAIN;
         s->write_closed = true;
+        notify(s);
         return 0;
     }
     if (s->listening || (op != LUME_STREAM_SEND && op != LUME_STREAM_RECEIVE))

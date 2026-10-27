@@ -8,6 +8,11 @@ extern struct lume_block lume_example_ram_block;
 int lume_example_ram_block_start(void);
 int lume_example_ram_block_stop(void);
 static unsigned checks, read_calls, write_calls, fail_read, fail_write, sync_calls;
+
+void lume_smp_wake(void)
+{
+}
+
 #define T(condition)                                                                               \
     do                                                                                             \
     {                                                                                              \

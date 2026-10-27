@@ -61,6 +61,10 @@ struct lume_platform_uart_ops
     void (*lume_console_write)(const char *data, size_t bytes);
     void (*lume_uart_poll_input)(void);
     void (*lume_uart_input_stats)(void);
+    /* Rendering holds the kernel lock. Transmission receives encoded kernel bytes
+     * with IRQs masked and the kernel lock released. It must only access TX state. */
+    void (*lume_console_render)(const char *data, size_t bytes);
+    void (*lume_console_transmit)(const char *data, size_t bytes);
 };
 
 struct lume_platform_sd_ops

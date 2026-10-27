@@ -167,13 +167,41 @@ $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
 UAPI_ABI := $(if $(filter aarch64 amd64,$(ARCH)),include/abi/native,include/abi/$(ARCH))
 TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Iinclude/kernel -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
-TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs heap user-stack mmu elf-load font
+TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs poll heap user-stack mmu elf-load font memory
+TEST_NAMES += io-queue io-calls vfs-storage-handles
+.PHONY: check-console-calls
+check: check-console-calls
+check-console-calls: $(OUT)/tests/console-calls$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/console-calls$(HOSTEXE): tests/unit/console_calls_test.c src/core/console_calls.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+.PHONY: check-memory
+.PHONY: check-poll-wait
+check-poll-wait: $(OUT)/tests/poll-wait$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_calls.h src/core/poll_state.h src/core/signal_calls.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check: check-poll-wait
+check-memory: $(OUT)/tests/memory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/memory$(HOSTEXE): tests/unit/memory_test.c src/lib/memory.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -D_DEFAULT_SOURCE -fno-builtin -UNDEBUG "$<" -o "$@"
 .PHONY: check-boot-storage
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/fatfs $^ -o "$@"
 check-boot-storage: $(OUT)/tests/boot-storage$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
+.PHONY: check-storage-handles
+$(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/fatfs $^ -o "$@"
+check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
+	env "$<"
+check: check-storage-handles
 check-image: $(OUT)/tests/root-image$(HOSTEXE)
 	env "$(OUT)/tests/root-image$(HOSTEXE)" "$(ROOT_IMAGE)"
 $(OUT)/tests/root-image$(HOSTEXE): tests/unit/root_image_test.c src/fs/vfs/vfs.c src/fs/fat/fat.c src/storage/block.c
@@ -195,11 +223,16 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 	env "$(OUT)/tests/stream$(HOSTEXE)"
 	env "$(OUT)/tests/icmp$(HOSTEXE)"
 	env "$(OUT)/tests/vfs$(HOSTEXE)"
+	env "$(OUT)/tests/poll$(HOSTEXE)"
 	env "$(OUT)/tests/heap$(HOSTEXE)"
 	env "$(OUT)/tests/user-stack$(HOSTEXE)"
 	env "$(OUT)/tests/mmu$(HOSTEXE)"
 	env "$(OUT)/tests/elf-load$(HOSTEXE)"
 	env "$(OUT)/tests/font$(HOSTEXE)"
+	env "$(OUT)/tests/memory$(HOSTEXE)"
+	env "$(OUT)/tests/io-queue$(HOSTEXE)"
+	env "$(OUT)/tests/io-calls$(HOSTEXE)"
+	env "$(OUT)/tests/vfs-storage-handles$(HOSTEXE)"
 
 .PHONY: check-scheduler
 .PHONY: check-gem
@@ -225,6 +258,17 @@ $(OUT)/tests/icmp$(HOSTEXE): tests/unit/icmp_test.c src/net/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c
 $(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+$(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
+$(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+$(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
+$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
@@ -232,7 +276,7 @@ $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
@@ -395,3 +439,51 @@ endif
 $(OUT)/tests/q35-firmware$(HOSTEXE): tests/platform/q35/firmware_test.c platform/q35/firmware.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-work-queue
+check-work-queue: $(OUT)/tests/work-queue$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/work-queue$(HOSTEXE): tests/unit/work_queue_test.c src/core/work.c include/ddk/lume/work.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/work_queue_test.c src/core/work.c -o "$@"
+check: check-work-queue
+
+.PHONY: check-worker-slices
+check-worker-slices: $(OUT)/tests/worker-slices$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/worker.c src/core/worker_check.c src/core/work.c include/kernel/lume/worker.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/core/work.c -o "$@"
+check: check-worker-slices
+
+.PHONY: check-usb-poll
+check-usb-poll: $(OUT)/tests/usb-poll$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/usb-poll$(HOSTEXE): tests/unit/usb_poll_test.c drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c -o "$@"
+check: check-usb-poll
+
+.PHONY: check-ticket-lock
+check-ticket-lock: $(OUT)/tests/ticket-lock$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/ticket-lock$(HOSTEXE): tests/unit/ticket_lock_test.c include/kernel/lume/ticket_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel "$<" $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
+check: check-ticket-lock
+
+.PHONY: check-smp-lock
+check-smp-lock: $(OUT)/tests/smp-lock$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/smp-lock$(HOSTEXE): tests/unit/smp_lock_test.c arch/amd64/smp.c arch/amd64/include/kernel/lume/smp.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check: check-smp-lock
+
+.PHONY: check-console-output
+check-console-output: $(OUT)/tests/console-output$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/console-output$(HOSTEXE): tests/unit/console_output_test.c src/core/console_output.c drivers/serial/pl011/uart.c include/kernel/lume/console_output.h include/kernel/lume/ticket_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
+check: check-console-output

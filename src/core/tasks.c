@@ -17,11 +17,14 @@
 #include "lume/work.h"
 #include "lume/boot.h"
 #include "lume/worker.h"
+#include "lume/console_output.h"
 #include "lume/thread.h"
 #include "lume/supervision.h"
 #include "lume/signal.h"
 #include <string.h>
 #include "thread_state.h"
+#include "poll_state.h"
+#include "io_queue.h"
 #ifndef LUME_BOOT_TIMEOUT_SECONDS
 #define LUME_BOOT_TIMEOUT_SECONDS 0
 #endif
@@ -45,7 +48,7 @@ static struct cpu_state
     uint64_t user, kernel, idle, sample_started, sample_last;
     uint64_t lock, trap_at;
     unsigned sample_owner;
-    bool running_user, inside_call, waiting_idle;
+    bool running_user, inside_call, waiting_idle, transmitting;
 } cpus[LUME_CPU_LIMIT];
 
 #define local cpus[lume_cpu_index()]
@@ -77,6 +80,9 @@ static unsigned kernel_owner = LUME_TASK_LIMIT;
 static bool kernel_launch;
 static int64_t kernel_result;
 static unsigned kernel_deferred;
+static struct io_queue kernel_queue;
+static bool kernel_deferred_turn;
+static bool kernel_console_scope;
 static struct thread_state thread_slots[LUME_TASK_LIMIT];
 static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static unsigned thread_pages[LUME_TASK_LIMIT];
@@ -85,6 +91,7 @@ static unsigned process_status[LUME_TASK_LIMIT];
 static unsigned service_root[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
 static unsigned exit_signals[LUME_TASK_LIMIT];
+static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 
 extern int64_t lume_supervision_call(unsigned, unsigned, struct lume_supervision_request *);
 extern void lume_supervision_release(unsigned);
@@ -286,6 +293,13 @@ void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
         out->cores[c].counter = (uint32_t)at;
         out->cores[c].ticks[LUME_PERF_USER] = (uint32_t)(cpus[c].user + extra_user);
         out->cores[c].ticks[LUME_PERF_KERNEL] = (uint32_t)cpus[c].kernel;
+        if (cpus[c].transmitting)
+        {
+            uint64_t waiting = lume_smp_wait_start(c);
+            extra_lock = waiting >= cpus[c].sample_started && waiting < at ? at - waiting : 0;
+            out->cores[c].ticks[LUME_PERF_KERNEL] +=
+                (uint32_t)(at - cpus[c].sample_started - extra_lock);
+        }
         if (cpus[c].running_user)
         {
             uint64_t trap = __atomic_load_n(&cpus[c].trap_at, __ATOMIC_ACQUIRE);
@@ -313,6 +327,15 @@ void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
         p->kernel_ticks = (uint32_t)kernel_ticks[i];
         p->lock_ticks = (uint32_t)lock_ticks[i];
         for (unsigned c = 0; c < lume_cpu_count(); ++c)
+            if (cpus[c].transmitting && cpus[c].sample_owner == i)
+            {
+                uint64_t at = counter(), waiting = lume_smp_wait_start(c);
+                uint64_t locked =
+                    waiting >= cpus[c].sample_started && waiting < at ? at - waiting : 0;
+                p->kernel_ticks += (uint32_t)(at - cpus[c].sample_started - locked);
+                p->lock_ticks += (uint32_t)locked;
+            }
+        for (unsigned c = 0; c < lume_cpu_count(); ++c)
             if (cpus[c].running_user && cpus[c].current == i)
             {
                 uint64_t at = counter();
@@ -337,6 +360,12 @@ static bool child_running;
 static int pick_task(void)
 {
     unsigned excluded = lume_cpu_index() ? (1u | 1u << 2) : 0;
+    if (public_mode && io_queue_granted(&kernel_queue, lume_clock_monotonic()))
+    {
+        unsigned task = kernel_queue.grant.task;
+        if (states[task] == 1 && !(excluded & (1u << task)))
+            return (int)task;
+    }
     return sched_pick(&policy, lume_cpu_index(), states, excluded, unit);
 }
 
@@ -349,6 +378,8 @@ static int fork_program(struct lume_context *);
 static unsigned process_slot(unsigned);
 static void signal_queue(unsigned, unsigned);
 static void signal_inherit(unsigned, unsigned, bool);
+static void poll_cancel(unsigned);
+static void poll_interrupt(unsigned, struct lume_context *);
 
 static uint32_t wait_status(unsigned task, bool posix)
 {
@@ -356,102 +387,31 @@ static uint32_t wait_status(unsigned task, bool posix)
                  : exit_codes[task];
 }
 
-static void kernel_call(void *context)
+static void kernel_console_send(struct lume_console_output *output)
 {
-    (void)context;
-    unsigned task = kernel_owner;
-    unsigned process = process_slot(task);
-    extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
-    kernel_result = LUME_CONTEXT_REG(&tasks[task].context, 8) == LUME_SYS_FORK
-                        ? fork_program(&tasks[task].context)
-                    : kernel_launch ? start_program(&tasks[task].context)
-                                    : lume_public_call(&tasks[process].files, &tasks[task].context,
-                                                       process + 1);
+    unsigned task = current_task;
+    uint64_t before = lume_smp_wait_total();
+    output->ticket = lume_console_serial_reserve();
+    local.transmitting = true;
+    lume_smp_unlock();
+    lume_console_output_send(output);
+    lume_smp_lock();
+    local.transmitting = false;
+    uint64_t waited = lume_smp_wait_total() - before;
+    local.lock += waited;
+    lock_ticks[task] += waited;
+    if (account_inside)
+        account_start += waited;
+    lume_console_output_finish(output);
 }
 
-static void kernel_work(void *context)
-{
-    (void)context;
-    kernel_deferred += lume_work_drain(8);
-}
-
-static void kernel_step(void)
-{
-    if (!public_mode)
-        return;
-    unsigned previous = current_task;
-    if (!lume_worker_busy() && kernel_owner == LUME_TASK_LIMIT && lume_work_pending())
-        (void)lume_worker_submit(kernel_work, 0);
-    if (lume_worker_busy())
-    {
-        unsigned owner = kernel_owner;
-        current_task = owner < LUME_TASK_LIMIT ? owner : previous;
-        bool change_root = owner != previous;
-        if (change_root)
-            lume_mmu_switch(owner < LUME_TASK_LIMIT ? lume_mmu_task_root(owner) : lume_mmu_root());
-        uint64_t began = counter();
-        (void)lume_worker_resume();
-        uint64_t elapsed = counter() - began;
-        total_kernel_ticks += elapsed;
-        if (owner < LUME_TASK_LIMIT)
-            kernel_ticks[owner] += elapsed;
-        if (account_inside)
-            account_start += elapsed;
-        current_task = previous;
-        if (change_root)
-            lume_mmu_switch(previous < LUME_TASK_LIMIT ? lume_mmu_task_root(previous)
-                                                       : lume_mmu_root());
-    }
-    if (lume_worker_busy())
-        return;
-    if (kernel_owner < LUME_TASK_LIMIT)
-    {
-        unsigned task = kernel_owner;
-        struct lume_context *frame = &tasks[task].context;
-        kernel_owner = LUME_TASK_LIMIT;
-        kernel_wait[task] = false;
-        if (kernel_launch && kernel_result >= 0 &&
-            LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
-        {
-            /* start_program recorded the synchronous parent's wait target. */
-            states[task] = 3;
-        }
-        else if (!kernel_launch && kernel_result == -LUME_EAGAIN &&
-                 (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_READ ||
-                  LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WRITE) &&
-                 lume_vfs_pipe_wait(&tasks[process_slot(task)].files, LUME_CONTEXT_REG(frame, 0)))
-        {
-            LUME_CONTEXT_PC(frame) -= LUME_SYSCALL_INSTRUCTION_BYTES;
-            pipe_wait[task] = true;
-            pipe_queues[task] = lume_vfs_pipe_queue(
-                &tasks[process_slot(task)].files, LUME_CONTEXT_REG(frame, 0),
-                LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WRITE);
-            if (!lume_wait_subscribe(pipe_queues[task], task))
-                lume_fail("pipe wait registration");
-            input_wait[task] = false;
-            wake_at[task] = UINT64_MAX;
-            states[task] = 4;
-        }
-        else
-        {
-            if (!context_replaced[task])
-                LUME_CONTEXT_REG(frame, 0) = (uint64_t)kernel_result;
-            states[task] = 1;
-            sched_wake(&policy, task, unit, 0);
-        }
-        lume_watchdog_progress();
-    }
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (kernel_wait[i])
-        {
-            kernel_wait[i] = false;
-            states[i] = 1;
-            sched_wake(&policy, i, unit, 0);
-        }
-}
+#include "console_calls.h"
+#include "io_calls.h"
 
 static void release_program(unsigned task)
 {
+    kernel_cancel(task);
+    poll_cancel(task);
     lume_supervision_release(task + 1);
     lume_wait_cancel(pipe_queues[task], task);
     pipe_queues[task] = 0;
@@ -495,6 +455,10 @@ static void request_exit(unsigned owner, unsigned status)
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] && states[i] != 5 && process_slot(i) == owner && states[i] != 2)
         {
+            kernel_cancel(i);
+            if (kernel_owner == i && lume_worker_busy())
+                continue;
+            poll_cancel(i);
             lume_wait_cancel(pipe_queues[i], i);
             pipe_queues[i] = 0;
             pipe_wait[i] = input_wait[i] = false;
@@ -540,6 +504,11 @@ static struct lume_context *finish_program(unsigned status)
     process_status[task] = status;
     bool running = false;
     process_exiting[task] = true;
+    if (!kernel_cleanup_ready(task))
+    {
+        sched_charge(&policy, lume_cpu_index(), now());
+        return wait_ready_task();
+    }
     if (!service_drained(task) || process_busy(task))
     {
         sched_charge(&policy, lume_cpu_index(), now());
@@ -605,6 +574,7 @@ static struct lume_context *finish_program(unsigned status)
 }
 
 #include "signal_calls.h"
+#include "poll_calls.h"
 
 static uint32_t now(void)
 {
@@ -623,12 +593,15 @@ static struct lume_context *select_task(unsigned next)
     pipe_wait[next] = false;
     current_task = next;
     context_replaced[next] = false;
+    if (thread_slots[next].thread && process_exiting[process_slot(next)])
+        return thread_finish(0);
     if (!thread_slots[next].thread && (process_exiting[next] || main_thread_done[next]))
         return finish_program(process_status[next]);
     core_masks[next] |= 1u << lume_cpu_index();
     ++dispatches[next];
     ++local.dispatches;
     states[next] = 2;
+    io_queue_arm(&kernel_queue, next, lume_clock_monotonic(), SCHED_TICK_MS);
     sched_enter(&policy, lume_cpu_index(), (int)next, now(), unit, LUME_SCHED_QUANTUM);
     lume_mmu_switch(lume_mmu_task_root(next));
     return &tasks[next].context;
@@ -638,6 +611,7 @@ static void wake_tasks(void)
 {
     extern void lume_tasks_signal_timers(void);
     lume_tasks_signal_timers();
+    poll_console_pump();
     extern bool lume_console_ready(void);
     uint64_t at = lume_clock_monotonic();
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
@@ -645,7 +619,16 @@ static void wake_tasks(void)
         {
             if (kernel_wait[i] || thread_waiting[i])
                 continue;
-            bool ready = input_wait[i] && lume_console_ready();
+            if (poll_waits[i].active)
+            {
+                if (poll_wake(i, at))
+                {
+                    states[i] = 1;
+                    sched_wake(&policy, i, unit, 0);
+                }
+                continue;
+            }
+            bool ready = input_wait[i] && kernel_console_ready();
             if (pipe_wait[i])
             {
                 if (!lume_wait_take(pipe_queues[i], i))
@@ -690,6 +673,7 @@ static struct lume_context *wait_ready_task(void)
             return select_task((unsigned)next);
         }
         uint64_t began = counter();
+        uint64_t lock_before = lume_smp_wait_total();
         sched_enter(&policy, lume_cpu_index(), -1, now(), unit, LUME_SCHED_QUANTUM);
         lume_timer_idle(true);
         idle_wait = true;
@@ -698,7 +682,7 @@ static struct lume_context *wait_ready_task(void)
         lume_smp_lock();
         idle_wait = false;
         uint64_t elapsed = counter() - began;
-        uint64_t waited = lume_smp_wait_ticks();
+        uint64_t waited = lume_smp_wait_total() - lock_before;
         total_idle_ticks += elapsed - waited;
         local.lock += waited;
         if (account_inside)
@@ -724,6 +708,7 @@ static struct lume_context *kernel_begin(struct lume_context *frame, bool launch
             LUME_CONTEXT_REG(&tasks[task].context, i) = LUME_CONTEXT_REG(frame, i);
     kernel_owner = task;
     kernel_launch = launch;
+    kernel_deferred_turn = true;
     kernel_wait[task] = true;
     states[task] = 4;
     sched_charge(&policy, lume_cpu_index(), now());
@@ -1238,6 +1223,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     unsigned task = current_task;
     unsigned process = process_slot(task);
     bool svc = lume_arch_is_syscall(esr, true);
+    bool console_call = false, pipe_call = false;
     bool independent =
         svc && (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_ABI ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_GETPID ||
@@ -1247,16 +1233,44 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_PROBE ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_CPU ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SLEEP ||
+                (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FD &&
+                 (LUME_CONTEXT_REG(frame, 0) == LUME_FD_POLL ||
+                  LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT)) ||
                 (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_TERMINAL &&
                  LUME_CONTEXT_REG(frame, 0) == 5));
     if (public_mode)
     {
-        kernel_step();
-        if (lume_worker_busy() && !independent)
+        bool admitted = io_queue_claim(&kernel_queue, task, lume_clock_monotonic());
+        kernel_step_admit(!admitted);
+        console_call = svc && kernel_console_call(frame);
+        pipe_call = svc && kernel_pipe_call(frame);
+        independent = independent || console_call || pipe_call ||
+                      (svc && kernel_fd_query_call(frame)) ||
+                      (svc && kernel_console_available() &&
+                       LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SIGNAL &&
+                       LUME_CONTEXT_REG(frame, 0) == LUME_SIGNAL_SEND);
+        if (!independent &&
+            (lume_worker_busy() || kernel_queue.count ||
+             io_queue_granted(&kernel_queue, lume_clock_monotonic())) &&
+            !admitted)
         {
             tasks[task].context = *frame;
-            if (lume_arch_is_syscall(esr, true))
+            bool direct =
+                !process_exiting[process] && svc &&
+                io_queue_direct((unsigned)LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER));
+            if (direct)
+            {
+                ++tasks[task].calls;
+                ++local.calls;
+                if (!task)
+                    shell_calls |= UINT64_C(1)
+                                   << LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+                lume_watchdog_enter_call();
+            }
+            else if (svc)
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
+            if (!io_queue_push(&kernel_queue, task, !direct))
+                lume_fail("I/O queue capacity");
             kernel_wait[task] = true;
             states[task] = 4;
             sched_charge(&policy, lume_cpu_index(), now());
@@ -1310,6 +1324,21 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         shell_calls |= UINT64_C(1) << LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     if (public_mode)
         lume_watchdog_enter_call();
+    if (console_call)
+    {
+        struct lume_context *result = kernel_console_result(frame);
+        if (!active)
+            return NULL;
+        if (process_exiting[process])
+            return thread_slots[task].thread ? thread_finish(0)
+                                             : finish_program(process_status[process]);
+        return result;
+    }
+    if (pipe_call)
+        return kernel_pipe_result(frame);
+    if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FD &&
+        (LUME_CONTEXT_REG(frame, 0) == LUME_FD_POLL || LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT))
+        return poll_call(frame);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_THREAD)
         return thread_call(frame);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SUPERVISE)
@@ -1633,6 +1662,10 @@ bool lume_shell_start(uint64_t frequency, bool script)
     for (unsigned i = 0; i < LUME_CPU_LIMIT; ++i)
         cpus[i] = (struct cpu_state){.current = LUME_TASK_LIMIT};
     lume_worker_start();
+    kernel_queue = (struct io_queue){0};
+    lume_console_output_start();
+    kernel_deferred_turn = false;
+    kernel_console_scope = false;
     kernel_owner = LUME_TASK_LIMIT;
     kernel_deferred = 0;
     elf_mode = true;
@@ -1654,6 +1687,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         context_replaced[i] = false;
         lume_supervision_release(i + 1);
         thread_slots[i] = (struct thread_state){.process = i};
+        poll_cancel(i);
         observers[i] = false;
         input_wait[i] = false;
         pipe_wait[i] = false;

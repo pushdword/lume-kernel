@@ -7,6 +7,8 @@
 #include "lume/usb.h"
 #include "lume/uart_input.h"
 #include "lume/vfs.h"
+#include "lume/worker.h"
+#include "lume/console_output.h"
 
 /* Firmware configures the RP1 BAR with enable_rp1_uart=1 and pciex4_reset=0. GPIO14 drives TX
  * on physical pin 8. GPIO15 receives RX on physical pin 10. The driver inherits firmware
@@ -95,8 +97,7 @@ void lume_uart_input_stats(void)
     lume_value("UART_INPUT_DROPPED", input_dropped);
 }
 
-/* The boot assembly uses lume_putc before BSS initialization. Only the VFS
- * console, entered after kernel initialization, may inspect display state. */
+/* Console rendering requires serialized input and display state. */
 void lume_console_putc(char c)
 {
     lume_console_write(&c, 1);
@@ -106,9 +107,8 @@ void lume_console_write(const char *data, size_t bytes)
 {
     while (bytes)
     {
-        size_t count = bytes < LUME_DISPLAY_BATCH ? bytes : LUME_DISPLAY_BATCH;
-        lume_uart_poll_input();
-        lume_display_write(data, count);
+        size_t count = bytes < 64 ? bytes : 64;
+        lume_uart_render(data, count);
         for (size_t i = 0; i < count; ++i)
         {
             lume_uart_poll_input();
@@ -116,16 +116,34 @@ void lume_console_write(const char *data, size_t bytes)
         }
         data += count;
         bytes -= count;
+        lume_worker_checkpoint((unsigned)count);
+    }
+}
+
+void lume_uart_render(const char *data, size_t bytes)
+{
+    lume_uart_poll_input();
+    lume_display_write(data, bytes);
+}
+
+/* The payload already contains serial CRLF encoding. This callback only accesses TX. */
+void lume_uart_transmit(const char *data, size_t bytes)
+{
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
+            lume_cpu_relax();
+        lume_mmio_write32(UART_BASE, (unsigned char)data[i]);
     }
 }
 
 void lume_putc(char c)
 {
+    uint64_t ticket = lume_console_serial_lock();
     if (c == '\n')
-        lume_putc('\r');
-    while (lume_mmio_read32_relaxed(UART_BASE + 0x18) & (1u << 5))
-        lume_cpu_relax();
-    lume_mmio_write32(UART_BASE, (unsigned char)c);
+        lume_uart_transmit("\r", 1);
+    lume_uart_transmit(&c, 1);
+    lume_console_serial_unlock(ticket);
 }
 
 void lume_puts(const char *s)

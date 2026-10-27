@@ -4,6 +4,7 @@
 #include "lume/early.h"
 #include "lume/dma.h"
 #include "lume/usb.h"
+#include "lume/console_output.h"
 #include <string.h>
 
 static struct lume_fdt firmware;
@@ -43,7 +44,10 @@ static struct provider
     union operations operations;
     bool mounted;
     unsigned bindings;
+    unsigned active;
 } providers[LUME_PLATFORM_DRIVER_COUNT];
+
+static struct lume_console_output *console_capture;
 
 static size_t operation_bytes(unsigned kind)
 {
@@ -143,8 +147,8 @@ int lume_platform_driver_can_stop(unsigned kind, const void *operations)
     if (provider->source != operations)
         return -LUME_ENOENT;
     /* Active CPU services and mounted storage outlive an individual device operation. */
-    if (provider->mounted || kind == LUME_PLATFORM_IRQ || kind == LUME_PLATFORM_TIMER ||
-        kind == LUME_PLATFORM_WATCHDOG || kind == LUME_PLATFORM_DMA)
+    if (provider->active || provider->mounted || kind == LUME_PLATFORM_IRQ ||
+        kind == LUME_PLATFORM_TIMER || kind == LUME_PLATFORM_WATCHDOG || kind == LUME_PLATFORM_DMA)
         return -LUME_EBUSY;
     return 0;
 }
@@ -361,12 +365,68 @@ void lume_console_putc(char c)
 void lume_console_write(const char *data, size_t bytes)
 {
     struct provider *provider = providers + LUME_PLATFORM_UART;
+    struct lume_console_output *output = console_capture;
+    if (output && provider->source)
+    {
+        if (output->provider || bytes > LUME_CONSOLE_OUTPUT_BYTES || provider->active == UINT32_MAX)
+            lume_fail("console output capture bounds");
+        if (!bytes)
+            return;
+        ++provider->active;
+        output->provider = provider;
+        output->transmit = provider->operations.uart.lume_console_transmit;
+        memcpy(output->data, data, bytes);
+        provider->operations.uart.lume_console_render(output->data, bytes);
+        size_t encoded = bytes;
+        for (size_t i = 0; i < bytes; ++i)
+            encoded += output->data[i] == '\n';
+        output->bytes = encoded;
+        while (bytes)
+        {
+            char c = output->data[--bytes];
+            output->data[--encoded] = c;
+            if (c == '\n')
+                output->data[--encoded] = '\r';
+        }
+        return;
+    }
     if (!provider->source)
     {
         lume_boot_console_write(data, bytes);
         return;
     }
     provider->operations.uart.lume_console_write(data, bytes);
+}
+
+void lume_console_output_begin(struct lume_console_output *output)
+{
+    if (console_capture)
+        lume_fail("nested console output capture");
+    *output = (struct lume_console_output){0};
+    console_capture = output;
+}
+
+void lume_console_output_end(struct lume_console_output *output)
+{
+    if (console_capture != output)
+        lume_fail("console output capture ownership");
+    console_capture = NULL;
+}
+
+void lume_console_output_send(const struct lume_console_output *output)
+{
+    lume_console_serial_wait(output->ticket);
+    output->transmit(output->data, output->bytes);
+    lume_console_serial_unlock(output->ticket);
+}
+
+void lume_console_output_finish(struct lume_console_output *output)
+{
+    struct provider *provider = output->provider;
+    if (!provider || !provider->active)
+        lume_fail("console output provider ownership");
+    --provider->active;
+    output->provider = NULL;
 }
 
 void lume_uart_poll_input(void)

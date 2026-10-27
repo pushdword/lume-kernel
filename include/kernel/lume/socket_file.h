@@ -3,4 +3,5 @@
 #include "vfs.h"
 #include "lume/socket.h"
 int64_t lume_socket_call(struct lume_files *, unsigned, struct lume_socket_request *);
+void lume_socket_stream_notify(unsigned owner, unsigned handle);
 #endif
