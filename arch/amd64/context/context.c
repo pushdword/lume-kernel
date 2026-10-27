@@ -3,6 +3,7 @@
 #include "lume/heap.h"
 #include "lume/counter.h"
 #include "lume/irq.h"
+#include "lume/activity.h"
 #include <string.h>
 extern unsigned char __trap_top[], __fault_top[];
 extern uintptr_t lume_isr_table[];
@@ -131,7 +132,9 @@ struct lume_context *lume_amd64_exception(struct lume_context *frame, uint64_t v
     if (vector >= 32 && vector < 48)
     {
         unsigned irq = (unsigned)vector - 32;
+        unsigned activity = lume_activity_enter(LUME_ACTIVITY_IRQ);
         (void)lume_irq_dispatch((unsigned)vector);
+        lume_activity_leave(activity);
         next = irq == 0 ? lume_tasks_irq(frame) : lume_tasks_device_irq(frame);
     }
     else if (user && lume_tasks_active())
