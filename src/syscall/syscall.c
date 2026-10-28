@@ -87,10 +87,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return (int64_t)b;
     }
     case LUME_SYS_CPU:
-        return b || n || a > 2 ? -LUME_EINVAL
-               : a == 2        ? LUME_SCHED_QUANTUM
-               : a             ? lume_cpu_index()
-                               : lume_cpu_count();
+        if (b || n || a > 2)
+            return -LUME_EINVAL;
+        return a == 2 ? LUME_SCHED_QUANTUM : a ? lume_cpu_index() : lume_cpu_count();
     case LUME_SYS_CAP_DROP:
         return b || n ? -LUME_EINVAL : lume_task_drop_capabilities(pid, a);
     case LUME_SYS_FEATURES:

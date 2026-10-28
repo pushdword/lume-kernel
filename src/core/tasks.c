@@ -1217,6 +1217,8 @@ struct lume_context *lume_tasks_device_irq(struct lume_context *frame)
     return task_interrupt(frame, false);
 }
 
+#include "query_calls.h"
+
 struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, uint64_t far)
 {
     if (!active || (LUME_CONTEXT_STATUS(frame) & 15) != 0)
@@ -1224,6 +1226,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     unsigned task = current_task;
     unsigned process = process_slot(task);
     bool svc = lume_arch_is_syscall(esr, true);
+    if (public_mode && svc && !process_exiting[process] && kernel_query_call(frame, process))
+        return frame;
     bool console_call = false, pipe_call = false;
     bool independent =
         svc && (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_ABI ||
@@ -1261,12 +1265,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                 io_queue_direct((unsigned)LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER));
             if (direct)
             {
-                ++tasks[task].calls;
-                ++local.calls;
-                if (!task)
-                    shell_calls |= UINT64_C(1)
-                                   << LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
-                lume_watchdog_enter_call();
+                kernel_record_call(frame, task);
             }
             else if (svc)
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
@@ -1319,12 +1318,13 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     }
     if (!lume_arch_is_syscall(esr, public_mode))
         return NULL;
-    ++tasks[task].calls;
-    ++local.calls;
-    if (public_mode && !task && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) < 64)
-        shell_calls |= UINT64_C(1) << LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     if (public_mode)
-        lume_watchdog_enter_call();
+        kernel_record_call(frame, task);
+    else
+    {
+        ++tasks[task].calls;
+        ++local.calls;
+    }
     if (console_call)
     {
         struct lume_context *result = kernel_console_result(frame);

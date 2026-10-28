@@ -12,19 +12,8 @@ static unsigned configured = 1, online = 1;
 static unsigned apic_ids[LUME_CPU_LIMIT];
 static unsigned char cpu_indices[256];
 static bool auxiliary_index, started;
-static struct lume_ticket_lock kernel_lock;
 static unsigned ready[LUME_CPU_LIMIT], stopped[LUME_CPU_LIMIT];
 static uint64_t tlb_generation, tlb_ack[LUME_CPU_LIMIT];
-
-static struct
-{
-    _Alignas(128) uint64_t wait_start;
-    uint64_t waited, acquires, contentions, max_wait_ticks, total_wait_ticks;
-    uint32_t ticket;
-    bool held;
-} lock_cpus[LUME_CPU_LIMIT];
-
-_Static_assert(sizeof(lock_cpus[0]) == 128, "per-CPU lock metadata size");
 
 static unsigned hardware_id(void)
 {
@@ -87,78 +76,22 @@ void lume_smp_tlb_flush(void)
         }
 }
 
-void lume_smp_lock(void)
+static void kernel_lock_wait(void)
 {
-    unsigned cpu = lume_cpu_index();
-    if (cpu >= LUME_CPU_LIMIT || lock_cpus[cpu].held)
-        lume_fail("invalid kernel lock acquisition");
-    __atomic_store_n(&lock_cpus[cpu].wait_start, 0, __ATOMIC_RELEASE);
-    uint32_t ticket = lume_ticket_reserve(&kernel_lock);
-    bool waiting = false;
-    uint64_t began = 0;
-    while (!lume_ticket_ready(&kernel_lock, ticket))
-    {
-        if (!waiting)
-        {
-            began = lume_counter_read();
-            __atomic_store_n(&lock_cpus[cpu].wait_start, began, __ATOMIC_RELEASE);
-            ++lock_cpus[cpu].contentions;
-            waiting = true;
-        }
-        lume_smp_tlb_service();
-        lume_cpu_relax_ordered();
-    }
     lume_smp_tlb_service();
-    uint64_t waited = waiting ? lume_counter_read() - began : 0;
-    lock_cpus[cpu].waited = waited;
-    lock_cpus[cpu].total_wait_ticks += waited;
-    if (waited > lock_cpus[cpu].max_wait_ticks)
-        lock_cpus[cpu].max_wait_ticks = waited;
-    ++lock_cpus[cpu].acquires;
-    lock_cpus[cpu].ticket = ticket;
-    lock_cpus[cpu].held = true;
+    lume_cpu_relax_ordered();
 }
 
-void lume_smp_unlock(void)
+static void kernel_lock_acquired(void)
 {
-    unsigned cpu = lume_cpu_index();
-    if (cpu >= LUME_CPU_LIMIT || !lock_cpus[cpu].held)
-        lume_fail("kernel lock ownership");
-    lock_cpus[cpu].held = false;
-    __atomic_store_n(&lock_cpus[cpu].wait_start, 0, __ATOMIC_RELEASE);
-    lume_ticket_release(&kernel_lock, lock_cpus[cpu].ticket);
+    lume_smp_tlb_service();
 }
 
-bool lume_smp_owned(void)
+static void kernel_lock_released(void)
 {
-    unsigned cpu = lume_cpu_index();
-    return cpu < LUME_CPU_LIMIT && lock_cpus[cpu].held;
 }
 
-bool lume_smp_contended(void)
-{
-    return lume_smp_owned() && lume_ticket_contended(&kernel_lock);
-}
-
-uint64_t lume_smp_lock_turn(void)
-{
-    return lock_cpus[lume_cpu_index()].acquires;
-}
-
-uint64_t lume_smp_wait_ticks(void)
-{
-    return lock_cpus[lume_cpu_index()].waited;
-}
-
-uint64_t lume_smp_wait_total(void)
-{
-    return lock_cpus[lume_cpu_index()].total_wait_ticks;
-}
-
-uint64_t lume_smp_wait_start(unsigned cpu)
-{
-    return cpu < LUME_CPU_LIMIT ? __atomic_load_n(&lock_cpus[cpu].wait_start, __ATOMIC_ACQUIRE) : 0;
-}
+#include "smp_lock.h"
 
 void lume_smp_wake(void)
 {

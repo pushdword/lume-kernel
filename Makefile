@@ -484,10 +484,18 @@ check: check-ticket-lock
 .PHONY: check-smp-lock
 check-smp-lock: $(OUT)/tests/smp-lock$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/smp-lock$(HOSTEXE): tests/unit/smp_lock_test.c arch/amd64/smp.c arch/amd64/include/kernel/lume/smp.h
+$(OUT)/tests/smp-lock$(HOSTEXE): tests/unit/smp_lock_test.c src/core/smp_lock.h include/kernel/lume/ticket_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
+check: check-smp-lock
+
+.PHONY: check-query-calls
+check-query-calls: $(OUT)/tests/query-calls$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/query-calls$(HOSTEXE): tests/unit/query_calls_test.c src/core/query_calls.h src/core/thread_state.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
-check: check-smp-lock
+check: check-query-calls
 
 .PHONY: check-console-output
 check-console-output: $(OUT)/tests/console-output$(HOSTEXE)
