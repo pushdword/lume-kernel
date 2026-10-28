@@ -228,6 +228,10 @@ int main(void)
     assert(!lume_hardware_info(3, &info) && info.state == LUME_HARDWARE_UNSUPPORTED);
     clear();
     assert(!lume_driver_unregister(&driver) && !lume_resource_claim_count());
+    bytes = fixture(0);
+    fdt_set_version(tree, 4);
+    fdt_set_last_comp_version(tree, 0);
+    assert(fdt_check_full(tree, bytes) < 0);
     puts("FDT_INVENTORY_PASS translated resources, IRQ domains, properties and rollback");
     return 0;
 }
