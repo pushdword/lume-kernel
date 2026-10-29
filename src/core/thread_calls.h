@@ -91,6 +91,10 @@ static struct lume_context *process_terminate(unsigned status)
 
 static int64_t thread_create(const struct lume_thread_request *r)
 {
+#if defined(LUME_ARCH_I686)
+    (void)r;
+    return -LUME_ENOSYS;
+#else
     unsigned owner = process_slot(current_task), task = LUME_TASK_LIMIT;
     uint64_t physical;
     if (!r->entry ||
@@ -173,6 +177,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
     sched_wake(&policy, task, unit, 0);
     lume_smp_wake();
     return (int64_t)tid;
+#endif
 }
 
 static struct lume_context *thread_call(struct lume_context *frame)

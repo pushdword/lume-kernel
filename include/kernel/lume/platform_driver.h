@@ -97,6 +97,7 @@ struct lume_platform_display_ops
     void (*lume_display_write)(const char *data, size_t bytes);
     void (*lume_display_clear)(void);
     void (*lume_display_stop)(void);
+    int64_t (*lume_display_video)(unsigned action, unsigned value, const unsigned char *font);
 };
 
 struct lume_platform_entropy_ops

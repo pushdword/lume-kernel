@@ -47,7 +47,8 @@ static struct cpu_state
     unsigned current, ticks, switch_count, idle_irqs;
     unsigned calls, dispatches, interrupts;
     uint64_t user, kernel, idle, sample_started, sample_last;
-    uint64_t lock, trap_at;
+    uint64_t lock;
+    _Alignas(8) uint64_t trap_at;
     unsigned sample_owner;
     bool running_user, inside_call, waiting_idle, transmitting;
 } cpus[LUME_CPU_LIMIT];
@@ -840,14 +841,15 @@ static int start_program(struct lume_context *frame)
     if (error)
         return error;
     uint64_t argv = request.argv, pointers[LUME_ARG_MAX + 1];
-    if (!lume_user_buffer(argv, (argc + 1u) * 8, false))
+    if (!lume_user_buffer(argv, (argc + 1u) * sizeof(uintptr_t), false))
         return -LUME_EFAULT;
     for (unsigned i = 0; i <= argc; ++i)
     {
         pointers[i] = 0;
-        for (unsigned k = 0; k < 8; ++k)
-            pointers[i] |= (uint64_t)*(const unsigned char *)(uintptr_t)(argv + i * 8 + k)
-                           << (k * 8);
+        for (unsigned k = 0; k < sizeof(uintptr_t); ++k)
+            pointers[i] |=
+                (uint64_t)*(const unsigned char *)(uintptr_t)(argv + i * sizeof(uintptr_t) + k)
+                << (k * 8);
     }
     if (pointers[argc])
         return -LUME_E2BIG;
@@ -862,13 +864,15 @@ static int start_program(struct lume_context *frame)
     }
     char environment[LUME_ENV_BYTES];
     unsigned env_offsets[LUME_ENV_MAX], env_used = 0;
-    if (request.envc && !lume_user_buffer(request.envp, (uint64_t)request.envc * 8, false))
+    if (request.envc &&
+        !lume_user_buffer(request.envp, (uint64_t)request.envc * sizeof(uintptr_t), false))
         return -LUME_EFAULT;
     for (unsigned i = 0; i < request.envc; ++i)
     {
         uint64_t pointer = 0;
-        for (unsigned j = 0; j < 8; ++j)
-            pointer |= (uint64_t)*(const unsigned char *)(uintptr_t)(request.envp + i * 8 + j)
+        for (unsigned j = 0; j < sizeof(uintptr_t); ++j)
+            pointer |= (uint64_t)*(const unsigned char *)(uintptr_t)(request.envp +
+                                                                     i * sizeof(uintptr_t) + j)
                        << (j * 8);
         env_offsets[i] = env_used;
         error = user_string(pointer, environment + env_used, sizeof(environment) - env_used, &n);

@@ -1,7 +1,9 @@
 #include "lume/q35.h"
 #include "lume/acpi.h"
 #include "lume/firmware.h"
+#if !defined(LUME_ARCH_I686)
 #include "lume/apic.h"
+#endif
 #include <string.h>
 #define EARLY_LIMIT UINT64_C(0x40000000)
 static struct lume_acpi acpi;
@@ -65,7 +67,11 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
         !early(modules, count * 16))
         return false;
     *memory = (struct lume_fdt){.cpu_count = 1};
+#if defined(LUME_ARCH_I686)
+    memcpy(memory->model, "PCI PC i686", 12);
+#else
     memcpy(memory->model, "QEMU q35 AMD64", 15);
+#endif
     memory->reserved[memory->reserved_count++] = (struct lume_range){info, 88};
     memory->reserved[memory->reserved_count++] = (struct lume_range){map, bytes};
     memory->reserved[memory->reserved_count++] = (struct lume_range){modules, count * 16};
@@ -108,6 +114,8 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
             memory->initrd_end = end;
         }
     }
+
+#if !defined(LUME_ARCH_I686)
     if (acpi.cpus > 1)
     {
         if (!contains_ram(memory, LUME_AP_TRAMPOLINE, 4096))
@@ -118,6 +126,8 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
                 return false;
         memory->reserved[memory->reserved_count++] = (struct lume_range){LUME_AP_TRAMPOLINE, 4096};
     }
+
+#endif
     return memory->ram_count &&
            contains_ram(memory, (uintptr_t)__image_start, __image_end - __image_start);
 }

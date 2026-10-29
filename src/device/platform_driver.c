@@ -6,6 +6,7 @@
 #include "lume/usb.h"
 #include "lume/console_output.h"
 #include "lume/activity.h"
+#include "lume/video_control.h"
 #include <string.h>
 
 static struct lume_fdt firmware;
@@ -100,7 +101,7 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
         void *current = NULL;
         memcpy(&callback, (const unsigned char *)operations + offset, sizeof(callback));
         int result = callback ? lume_module_pin(callback, &current) : -LUME_EINVAL;
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
         extern unsigned char __image_start[], __text_end[];
         if (result == -LUME_ENOENT && callback >= (uintptr_t)__image_start &&
             callback < (uintptr_t)__text_end)
@@ -644,6 +645,20 @@ void lume_display_stop(void)
         return;
     }
     provider->operations.display.lume_display_stop();
+}
+
+int64_t lume_display_video(unsigned action, unsigned value, const unsigned char *font)
+{
+    struct provider *provider = providers + LUME_PLATFORM_DISPLAY;
+    if (!provider->source)
+        return -LUME_ENOSYS;
+    return provider->operations.display.lume_display_video(action, value, font);
+}
+
+unsigned lume_display_geometry(void)
+{
+    int64_t geometry = lume_display_video(LUME_VIDEO_CELLS, 0, NULL);
+    return geometry > 0 ? (unsigned)geometry : 80u | 25u << 16;
 }
 
 bool lume_entropy(void *data, size_t bytes)

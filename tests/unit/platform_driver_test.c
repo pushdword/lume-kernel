@@ -1,4 +1,6 @@
 #include "lume/platform_driver.h"
+#include "lume/display.h"
+#include "lume/video_control.h"
 #include "lume/early.h"
 #include "lume/sd.h"
 #include "lume/vfs.h"
@@ -205,6 +207,12 @@ static bool allow(uint64_t f, uint64_t n)
     return f && n;
 }
 
+static int64_t video_driver(unsigned action, unsigned value, const unsigned char *font)
+{
+    assert(!value && !font);
+    return action == LUME_VIDEO_CELLS ? 100 | 37u << 16 : -LUME_ENOSYS;
+}
+
 int main(void)
 {
     assert(lume_keyboard_getc() == -LUME_EAGAIN);
@@ -292,6 +300,15 @@ int main(void)
     lume_console_output_finish(&guarded.output);
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart));
     assert(!references && !lume_platform_driver_ready(LUME_PLATFORM_UART));
+    struct lume_platform_display_ops display = {start,       putc_driver, write_driver,
+                                                poll_driver, poll_driver, video_driver};
+    assert(lume_display_video(LUME_VIDEO_CELLS, 0, NULL) == -LUME_ENOSYS);
+    assert(!lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &display, sizeof(display)));
+    assert(references == 1);
+    display.lume_display_video = NULL;
+    assert(lume_display_geometry() == (100 | 37u << 16));
+    assert(!lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &display));
+    assert(!references && lume_display_geometry() == (80 | 25u << 16));
     const struct lume_platform_sd_ops sd = {start,   configure, stop,  read_sector, write_sector,
                                             sectors, allow,     allow, poll_driver};
     assert(!lume_platform_driver_register(LUME_PLATFORM_SD, &sd, sizeof(sd)));

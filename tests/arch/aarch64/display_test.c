@@ -27,6 +27,16 @@ __attribute__((noinline)) void lume_display_test_finish(void)
         }                                                                                          \
     } while (0)
 
+_Noreturn void lume_fail(const char *why)
+{
+    (void)why;
+    lume_display_test_result.failure = __LINE__;
+    lume_display_test_finish();
+    for (;;)
+    {
+    }
+}
+
 void lume_uart_poll_input(void)
 {
     ++lume_display_test_result.polls;

@@ -1,5 +1,6 @@
 #include "core.h"
 #include "terminal.h"
+#include "console_font.h"
 #ifndef LUME_CONSOLE_HOST_TEST
 #include "../../../src/compat/legacy32/r32/uart_queue.h"
 #else
@@ -48,6 +49,9 @@ unsigned console_kernel_take(unsigned char *out, unsigned capacity)
 static unsigned video, extended, keyboard, last_present, cursor_visible, cursor_at, cursor_cell,
     focus;
 static unsigned position[2], available[2];
+static unsigned selected_font;
+static unsigned char custom_font[256][16];
+static unsigned custom_loaded;
 static struct terminal screen[2];
 /* queue_lock protects input processing. Input processing does not access an active renderer. */
 static unsigned render_active, input_focus, cached_geometry[2];
@@ -344,25 +348,68 @@ unsigned console_tty_supported(unsigned tty)
     return tty == 0 || (tty == 1 && video);
 }
 
+static void upload_font(const unsigned char *font, unsigned face)
+{
+    volatile uint32_t *ram = (volatile uint32_t *)0xf0017000u;
+    for (unsigned i = 0; i < 1024; ++i)
+    {
+        uint32_t word = 0;
+        for (unsigned byte = 0; byte < 4; ++byte)
+        {
+            unsigned offset = i * 4 + byte, bits = 0;
+            if (font)
+                bits = font[offset];
+            else
+                for (unsigned x = 0; x < 8; ++x)
+                    if (console_font_ink(face, offset / 16, x, offset % 16, 8, 16, 0))
+                        bits |= 0x80u >> x;
+            word |= (uint32_t)bits << (byte * 8);
+        }
+        ram[i] = word;
+    }
+}
+
 int console_video(unsigned action, unsigned value, const unsigned char *font)
 {
-    if (action == 0)
-        return extended ? 3
-               : video  ? 1
-                        : 0; /* These display modes are supported without EDID discovery. */
-    if (action >= 3 && action <= 5)
+    unsigned indexed = action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_PIXELS ||
+                       action == LUME_VIDEO_MODE_SELECT || action == LUME_VIDEO_FONT_CELL ||
+                       action == LUME_VIDEO_FONT_FACE || action == LUME_VIDEO_FONT_SELECT;
+    if (!indexed && action != LUME_VIDEO_UPLOAD && value)
+        return -22;
+    unsigned count = extended ? 2 : video ? 1 : 0;
+    if (action == LUME_VIDEO_LEGACY_MODES)
+        return count ? (1u << count) - 1 : 0;
+    if (action == LUME_VIDEO_MODE_COUNT)
+        return value ? -22 : (int)count;
+    if (action == LUME_VIDEO_MODE_PIXELS)
+        return value >= count ? -22 : value ? 1024 | 768u << 16 : 800 | 600u << 16;
+    if (action == LUME_VIDEO_CELLS)
+        return value ? -22 : (int)console_geometry();
+    if (action == LUME_VIDEO_FONT_COUNT)
+        return value ? -22 : extended ? 3 + (int)custom_loaded : 0;
+    if (action == LUME_VIDEO_FONT_CURRENT)
+        return value ? -22 : extended ? (int)selected_font : -95;
+    if (action == LUME_VIDEO_FONT_CELL || action == LUME_VIDEO_FONT_FACE)
     {
-        if (!video)
-            return -95;
-        return (int)*(volatile uint32_t *)(uintptr_t)(action == 3   ? 0xf0010014u
-                                                      : action == 4 ? 0xf001000cu
-                                                                    : 0xf0010004u);
+        if (!extended || value >= 3 + custom_loaded)
+            return -22;
+        return action == LUME_VIDEO_FONT_CELL ? 8 | 16u << 16 : value;
     }
+    if (action >= LUME_VIDEO_FRAMES && action <= LUME_VIDEO_STATUS)
+    {
+        if (!video || value)
+            return -95;
+        return (int)*(volatile uint32_t *)(uintptr_t)(action == LUME_VIDEO_FRAMES   ? 0xf0010014u
+                                                      : action == LUME_VIDEO_PIXELS ? 0xf001000cu
+                                                                                    : 0xf0010004u);
+    }
+    if (action == LUME_VIDEO_MODE_SELECT && count == 1 && !value)
+        return 0;
     if (!extended)
         return -95;
-    if (action == 1)
+    if (action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_SELECT)
     {
-        if (value > 1)
+        if (value >= count)
             return -22;
         cursor_hide();
         *(volatile uint32_t *)0xf0010010u = 1 | (value << 1);
@@ -370,18 +417,25 @@ int console_video(unsigned action, unsigned value, const unsigned char *font)
         cursor_show();
         return 0;
     }
-    if (action == 2)
+    if (action == LUME_VIDEO_UPLOAD)
     {
-        volatile uint32_t *ram = (volatile uint32_t *)0xf0017000u;
-        for (unsigned i = 0; i < 1024; i++)
-        {
-            const unsigned char *p = font + i * 4;
-            ram[i] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-                     ((uint32_t)p[3] << 24);
-        }
+        if (!font)
+            return -22;
+        for (unsigned i = 0; i < 4096; ++i)
+            ((unsigned char *)custom_font)[i] = font[i];
+        custom_loaded = 1;
+        value = 3;
+        action = LUME_VIDEO_FONT_SELECT;
+    }
+    if (action == LUME_VIDEO_FONT_SELECT)
+    {
+        if (value >= 3 + custom_loaded)
+            return -22;
+        upload_font(value == 3 ? (const unsigned char *)custom_font : 0, value);
+        selected_font = value;
         return 0;
     }
-    return -22;
+    return -95;
 }
 
 void kputs(const char *s)

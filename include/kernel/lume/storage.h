@@ -30,6 +30,8 @@ struct lume_volume
     uint64_t first, count;
 };
 
+#define LUME_PC_DISK_ID UINT32_C(0x364d554c)
+#define LUME_PC_DATA_FIRST UINT64_C(131072)
 #define LUME_Q35_DISK_ID UINT32_C(0x354d554c)
 #define LUME_CARD_DISK_ID UINT32_C(0x324d554c)
 #define LUME_CARD_BOOT_FIRST UINT64_C(2048)

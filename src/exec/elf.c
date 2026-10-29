@@ -26,42 +26,57 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
 {
     const unsigned char *b = data;
     *plan = (struct lume_elf_plan){0};
-    if (size < 64 || b[0] != 0x7f || b[1] != 'E' || b[2] != 'L' || b[3] != 'F' || b[4] != 2 ||
-        b[5] != 1 || b[6] != 1 || b[7] != 0 || b[8] != 0 || le16(b + 16) != 2 ||
-        le16(b + 18) != LUME_ELF_MACHINE || le32(b + 20) != 1 || le32(b + 48) != 0 ||
-        le16(b + 52) != 64 || le16(b + 54) != 56)
+#if defined(LUME_ARCH_I686)
+    const unsigned elf_class = 1, ehsize = 52, phsize = 32;
+    if (size < ehsize || le32(b + 36) != 0 || le16(b + 40) != ehsize || le16(b + 42) != phsize)
+        return false;
+    unsigned headers = le16(b + 44);
+    uint64_t phoff = le32(b + 28), entry = le32(b + 24);
+#else
+    const unsigned elf_class = 2, ehsize = 64, phsize = 56;
+    if (size < ehsize || le32(b + 48) != 0 || le16(b + 52) != ehsize || le16(b + 54) != phsize)
         return false;
     unsigned headers = le16(b + 56);
     uint64_t phoff = le64(b + 32), entry = le64(b + 24);
-    if (!headers || headers > 16 || phoff < 64 || !bounded(phoff, (uint64_t)headers * 56, size))
+#endif
+    if (b[0] != 0x7f || b[1] != 'E' || b[2] != 'L' || b[3] != 'F' || b[4] != elf_class ||
+        b[5] != 1 || b[6] != 1 || b[7] != 0 || b[8] != 0 || le16(b + 16) != 2 ||
+        le16(b + 18) != LUME_ELF_MACHINE || le32(b + 20) != 1 || !headers || headers > 16 ||
+        phoff < ehsize || !bounded(phoff, (uint64_t)headers * phsize, size))
         return false;
     bool executable_entry = false;
     bool tls_seen = false;
     uint64_t tls_offset = 0;
     for (unsigned n = 0; n < headers; ++n)
     {
-        const unsigned char *h = b + phoff + n * 56;
+        const unsigned char *h = b + phoff + n * phsize;
+#if defined(LUME_ARCH_I686)
+        unsigned type = le32(h), flags = le32(h + 24);
+        uint64_t offset = le32(h + 4), address = le32(h + 8), file = le32(h + 16),
+                 memory = le32(h + 20), align = le32(h + 28);
+#else
         unsigned type = le32(h), flags = le32(h + 4);
+        uint64_t offset = le64(h + 8), address = le64(h + 16), file = le64(h + 32),
+                 memory = le64(h + 40), align = le64(h + 48);
+#endif
         if (type == 7)
         {
             if (tls_seen)
                 return false;
             tls_seen = true;
-            uint64_t address = le64(h + 16), file = le64(h + 32), memory = le64(h + 40),
-                     align = le64(h + 48);
             if (!memory && !file)
                 continue;
             if (!align)
                 align = 1;
-            if (!memory || memory > 65536 || file > memory || !bounded(le64(h + 8), file, size) ||
+            if (!memory || memory > 65536 || file > memory || !bounded(offset, file, size) ||
                 address < LUME_ELF_BASE || !bounded(address, memory, LUME_ELF_LIMIT) ||
-                align > 64 || (align & (align - 1)) || ((address - le64(h + 8)) & (align - 1)))
+                align > 64 || (align & (align - 1)) || ((address - offset) & (align - 1)))
                 return false;
             plan->tls_address = address;
             plan->tls_file = file;
             plan->tls_size = memory;
             plan->tls_align = align;
-            tls_offset = le64(h + 8);
+            tls_offset = offset;
             continue;
         }
         if (type == 0 || type == 4 || type == 6)
@@ -74,8 +89,7 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
         }
         if (type != 1 || plan->count == LUME_ELF_SEGMENTS)
             return false;
-        struct lume_elf_segment s = {le64(h + 8), le64(h + 16), le64(h + 32), le64(h + 40), flags};
-        uint64_t align = le64(h + 48);
+        struct lume_elf_segment s = {offset, address, file, memory, flags};
         if ((flags & ~7u) || !(flags & 4) || (flags & 3) == 3 || !s.memory_size ||
             s.file_size > s.memory_size || !bounded(s.offset, s.file_size, size) ||
             s.address < LUME_ELF_BASE || !bounded(s.address, s.memory_size, LUME_ELF_LIMIT) ||

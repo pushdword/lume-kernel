@@ -108,6 +108,8 @@ KERNEL_C_aarch64 := \
 
 KERNEL_C_x32 := \
     src/terminal/terminal.c \
+    src/terminal/font5x7.c \
+    src/terminal/font8x16.c \
     arch/x32/kernel/kernel.c \
     arch/x32/kernel/pages.c \
     src/compat/legacy32/x32/fat.c \
@@ -126,6 +128,8 @@ KERNEL_C_x32 := \
 
 KERNEL_C_r32 := \
     src/terminal/terminal.c \
+    src/terminal/font5x7.c \
+    src/terminal/font8x16.c \
     arch/r32/kernel/kernel.c \
     arch/r32/kernel/pages.c \
     src/compat/legacy32/r32/fat.c \

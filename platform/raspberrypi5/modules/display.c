@@ -27,6 +27,7 @@ static const struct lume_platform_display_ops operations = {
     .lume_display_write = lume_display_write,
     .lume_display_clear = lume_display_clear,
     .lume_display_stop = lume_display_stop,
+    .lume_display_video = lume_display_video,
 };
 
 static int probe(struct lume_hardware *hardware, void *context)

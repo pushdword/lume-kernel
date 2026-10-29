@@ -1,5 +1,15 @@
 #include "lume/q35.h"
+#if defined(LUME_ARCH_I686)
+#include "lume/hardware.h"
+#include "lume/abi.h"
+
+struct q35_binding
+{
+    bool registered;
+};
+#else
 #include "lume/q35_module.h"
+#endif
 #include "lume/platform_driver.h"
 #include "lume/counter.h"
 #include "lume/cpu.h"
@@ -193,4 +203,12 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     return 0;
 }
 
+#if defined(LUME_ARCH_I686)
+int lume_pc_keyboard_start(void)
+{
+    static struct q35_binding binding;
+    return module_start(NULL, &binding);
+}
+#else
 Q35_MODULE("q35-ps2", LUME_HARDWARE_ID_BOARD, "qemu,ps2-keyboard", 1u << LUME_RESOURCE_IOPORT);
+#endif

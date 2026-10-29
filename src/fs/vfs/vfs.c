@@ -477,7 +477,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
     nodes[count - 1].device = 2;
     add("/bin/sh", LUME_NODE_FILE, shell, bytes, false);
     static const char motd[] =
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_I686)
+        "LumeOS i686 / PCI PC\nNative ABI 1.0. COM1 and PS/2 console.\n";
+#elif defined(LUME_ARCH_AMD64)
         "LumeOS AMD64 / QEMU q35\nNative ABI 1.0. COM1 serial console.\n";
 #else
         "LumeOS AArch64 / Raspberry Pi 5\nNative ABI 1.0. GPIO UART console.\n";

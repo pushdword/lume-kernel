@@ -5,6 +5,10 @@
 #include "lume/usb.h"
 #include "lume/worker.h"
 #include "lume/console_output.h"
+#if defined(LUME_ARCH_I686)
+#include "lume/serial.h"
+#include "lume/video.h"
+#endif
 #include "lume/smp.h"
 #define COM1 0x3f8
 static int pending = -1;
@@ -17,15 +21,21 @@ static int input(void)
         pending = -1;
         return value;
     }
+#if defined(LUME_ARCH_I686)
+    int serial = lume_pc_uart_getc();
+    if (serial >= 0)
+        return serial;
+#else
     if (lume_in8(COM1 + 5) & 1)
         return lume_in8(COM1);
+#endif
     int value = lume_keyboard_getc();
     return value >= 0 ? value : lume_usb_getc();
 }
 
 unsigned lume_q35_console_geometry(void)
 {
-    return lume_platform_driver_ready(LUME_PLATFORM_DISPLAY) ? 84u | 36u << 16 : 80u | 25u << 16;
+    return lume_display_geometry();
 }
 
 static bool ready(void)
@@ -121,11 +131,17 @@ static void console_putc(char c)
 
 static void poll_input(void)
 {
+#if defined(LUME_ARCH_I686)
+    lume_pc_uart_poll();
+#endif
     (void)ready();
 }
 
 static void input_stats(void)
 {
+#if defined(LUME_ARCH_I686)
+    lume_pc_uart_stats();
+#endif
 }
 
 void lume_q35_console_start(void)

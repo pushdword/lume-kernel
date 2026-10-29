@@ -151,11 +151,13 @@ int lume_q35_hardware_start(void)
     int result = lume_hardware_services(&services);
     if (result)
         return result;
+#if !defined(LUME_ARCH_I686)
     result = lume_module_memory_start();
     if (!result)
         result = lume_platform_modules_start();
     if (result)
         return result;
+#endif
     struct lume_hardware_identity identity = {.kind = LUME_HARDWARE_ID_BOARD};
     memcpy(identity.value, "qemu,q35", 9);
     struct lume_hardware_description board = {.origin = LUME_HARDWARE_BOARD,

@@ -13,6 +13,8 @@
 #include "lume/kernel_memory.h"
 #include "lume/socket_file.h"
 #include "lume/file_mode.h"
+#include "lume/display.h"
+#include "lume/video_control.h"
 #include <string.h>
 
 extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
@@ -42,7 +44,13 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_GETPID:
         return pid;
     case LUME_SYS_TLS:
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_I686)
+        if (b || n || (a & 3) || !lume_user_buffer(a, 8, true) ||
+            *(const uint32_t *)(uintptr_t)a != a)
+            return -LUME_EINVAL;
+        LUME_CONTEXT_TLS(c) = a;
+        return 0;
+#elif defined(LUME_ARCH_AMD64)
         if (b || n || (a & 7) || !lume_user_buffer(a, 16, true) ||
             *(const uint64_t *)(uintptr_t)a != a)
             return -LUME_EINVAL;
@@ -106,13 +114,17 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                         LUME_FEATURE_FORK | LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM |
                         LUME_FEATURE_SOCKETS | LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS |
                         LUME_FEATURE_FILE_MODES | LUME_FEATURE_EVENT_WAIT,
-            .pointer_bits = 64,
+            .pointer_bits = sizeof(uintptr_t) * 8,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
             .task_limit = LUME_TASK_LIMIT,
             .ddk_version = LUME_DDK_VERSION,
             .boot_profile = LUME_BOOT_PROFILE,
             .capabilities = lume_task_capabilities(pid)};
+#if defined(LUME_ARCH_I686)
+        ((struct lume_system_features *)(uintptr_t)a)->features &=
+            ~(LUME_FEATURE_THREADS | LUME_FEATURE_MODULES | LUME_FEATURE_RANDOM);
+#endif
         return 0;
     }
     case LUME_SYS_PROBE:
@@ -183,13 +195,13 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         extern bool lume_console_ready(void);
         if (!a)
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
         {
             extern unsigned lume_q35_console_geometry(void);
             return lume_q35_console_geometry();
         }
 #else
-            return 65 | (24 << 16);
+            return lume_display_geometry();
 #endif
         if (a == 1)
             return lume_console_ready();
@@ -210,6 +222,30 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EAGAIN;
         }
         return -LUME_EINVAL;
+    }
+    case LUME_SYS_VIDEO:
+    {
+        if (a > UINT32_MAX || n)
+            return -LUME_EINVAL;
+        if ((a == LUME_VIDEO_LEGACY_SELECT || a == LUME_VIDEO_MODE_SELECT ||
+             a == LUME_VIDEO_FONT_SELECT || a == LUME_VIDEO_UPLOAD) &&
+            !lume_task_capable(pid, LUME_CAP_DRIVER_ADMIN))
+            return -LUME_EPERM;
+        if (a == LUME_VIDEO_UPLOAD)
+        {
+            if (!lume_user_buffer(b, 4096, false))
+                return -LUME_EFAULT;
+            unsigned char *font = lume_kernel_allocate(4096);
+            if (!font)
+                return -LUME_ENOMEM;
+            memcpy(font, (const void *)(uintptr_t)b, 4096);
+            int64_t result = lume_display_video((unsigned)a, 0, font);
+            lume_kernel_free(font);
+            return result;
+        }
+        if (b > UINT32_MAX)
+            return -LUME_EINVAL;
+        return lume_display_video((unsigned)a, (unsigned)b, NULL);
     }
     case LUME_SYS_MEMORY:
         if (b != sizeof(struct lume_memory_snapshot))

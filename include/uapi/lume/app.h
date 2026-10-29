@@ -3,7 +3,7 @@
 #define LUME_API_H
 #include <stdint.h>
 #ifndef LUME_APP_SUFFIX
-#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #define LUME_APP_SUFFIX ""
 #elif defined(LUME_ARCH_R32)
 #define LUME_APP_SUFFIX ".r32"
@@ -82,7 +82,7 @@ struct lume_process_info
 struct lume_directory_entry
 {
     uint32_t size, mode;
-#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     char name[48];
 #else
     char name[16];
@@ -100,7 +100,7 @@ enum
 };
 
 #define LUME_FILE_CHUNK 256u
-#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #define LUME_FDS 16u
 #define LUME_FILE_IO_LIMIT 65536u
 #define LUME_ARGS 256u
@@ -146,7 +146,7 @@ enum
 struct lume_stat
 {
     uint32_t size, mode, uid, gid;
-#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     uint64_t inode;
 #endif
 };

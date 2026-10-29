@@ -52,6 +52,20 @@ bool lume_volume_select(const unsigned char p[512], uint64_t sectors, struct lum
         return true;
     }
 #endif
+#if defined(LUME_ARCH_I686)
+    if (u32(p + 440) == LUME_PC_DISK_ID)
+    {
+        if (sectors > UINT32_MAX || sectors <= LUME_PC_DATA_FIRST + 65536 || p[444] || p[445] ||
+            !partition(p + 446, false, LUME_PC_DATA_FIRST,
+                       (uint32_t)(sectors - LUME_PC_DATA_FIRST)))
+            return false;
+        for (unsigned i = 462; i < 510; ++i)
+            if (p[i])
+                return false;
+        *out = (struct lume_volume){LUME_PC_DATA_FIRST, sectors - LUME_PC_DATA_FIRST};
+        return true;
+    }
+#endif
     if (u32(p + 440) == LUME_CARD_DISK_ID)
         return dedicated(p, sectors, out);
     if (u32(p + 440) != 0xb8d65c68 || sectors != 121503744)

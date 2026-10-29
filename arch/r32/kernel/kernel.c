@@ -1928,7 +1928,12 @@ static int syscall(unsigned slot)
         break;
     }
     case LUME_VIDEO:
-        if (p->uid)
+        if (c)
+        {
+            result = -22;
+            break;
+        }
+        if (p->uid && (a == 1 || a == 2 || a == 13 || a == 17))
         {
             result = -13;
             break;
@@ -1940,7 +1945,7 @@ static int syscall(unsigned slot)
         }
         if (a == 2)
             user_copy_from(slot, syscall_buffer, b, 4096);
-        if (a == 1 || a == 2)
+        if (a == 1 || a == 2 || a == 13 || a == 17)
         {
             console_render_begin();
             unlock_kernel();

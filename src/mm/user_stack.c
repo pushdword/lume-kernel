@@ -44,11 +44,11 @@ bool lume_stack_build(const uint64_t *pages, unsigned argc, const char *const *a
         environment_bytes += sizes[argc + i];
     }
     size_t strings = LUME_STACK_PAGES * 4096u - argument_bytes - environment_bytes;
-    size_t position = (strings - (argc + envc + 9u) * 8u) & ~(size_t)15;
+    size_t position = (strings - (argc + envc + 9u) * sizeof(uintptr_t)) & ~(size_t)15;
     size_t words = position;
-    uint64_t value = argc;
-    write_bytes(pages, words, &value, 8);
-    words += 8;
+    uintptr_t value = argc;
+    write_bytes(pages, words, &value, sizeof(value));
+    words += sizeof(value);
     for (unsigned group = 0; group < 2; ++group)
     {
         unsigned count = group ? envc : argc;
@@ -56,17 +56,17 @@ bool lume_stack_build(const uint64_t *pages, unsigned argc, const char *const *a
         for (unsigned i = 0; i < count; ++i)
         {
             value = LUME_USER_STACK + strings;
-            write_bytes(pages, words, &value, 8);
-            words += 8;
+            write_bytes(pages, words, &value, sizeof(value));
+            words += sizeof(value);
             size_t bytes = sizes[(group ? argc : 0) + i];
             write_bytes(pages, strings, items[i], bytes);
             strings += bytes;
         }
         value = 0;
-        write_bytes(pages, words, &value, 8);
-        words += 8;
+        write_bytes(pages, words, &value, sizeof(value));
+        words += sizeof(value);
     }
-    const uint64_t auxiliary[] = {6, 4096, 9, entry, 0, 0};
+    const uintptr_t auxiliary[] = {6, 4096, 9, entry, 0, 0};
     write_bytes(pages, words, auxiliary, sizeof(auxiliary));
     *stack = LUME_USER_STACK + position;
     return true;

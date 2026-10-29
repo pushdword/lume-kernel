@@ -1,5 +1,12 @@
 #include "lume/early.h"
-#define MAX_PAGES (UINT64_C(0x200000000) / 4096)
+#if defined(LUME_ARCH_I686)
+#define PHYSICAL_LIMIT UINT64_C(0x80000000)
+#define IMAGE_BLOCK UINT64_C(0x400000)
+#else
+#define PHYSICAL_LIMIT UINT64_C(0x200000000)
+#define IMAGE_BLOCK UINT64_C(0x200000)
+#endif
+#define MAX_PAGES (PHYSICAL_LIMIT / 4096)
 static uint64_t used[MAX_PAGES / 64], managed[MAX_PAGES / 64], free_count;
 static uint64_t cursor;
 static uint64_t total_count;
@@ -14,7 +21,7 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
 {
     /* The image's split 2 MiB window has unmapped slack and a stack guard.
      * Reserve the whole window, rather than handing those holes to alloc(). */
-    uint64_t image_end = (image_limit + 0x1fffff) & ~UINT64_C(0x1fffff);
+    uint64_t image_end = (image_limit + IMAGE_BLOCK - 1) & ~(IMAGE_BLOCK - 1);
     free_count = 0;
     cursor = 0;
     for (unsigned i = 0; i < MAX_PAGES / 64; ++i)
@@ -24,14 +31,14 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
     }
     for (unsigned r = 0; r < fdt->ram_count; ++r)
     {
-        if (fdt->ram[r].base >= 0x200000000)
+        if (fdt->ram[r].base >= PHYSICAL_LIMIT)
             continue;
         uint64_t start = (fdt->ram[r].base + 0x1fffff) & ~UINT64_C(0x1fffff);
         uint64_t end = (fdt->ram[r].base + fdt->ram[r].size) & ~UINT64_C(0x1fffff);
         if (start < 0x200000)
             start = 0x200000;
-        if (end > 0x200000000)
-            end = 0x200000000;
+        if (end > PHYSICAL_LIMIT)
+            end = PHYSICAL_LIMIT;
         for (uint64_t p = start; p < end; p += 4096)
         {
             bool reserve =
@@ -85,7 +92,7 @@ uint64_t lume_pages_alloc_span(unsigned count)
 
 uint64_t lume_page_alloc(uint64_t minimum)
 {
-    if (!free_count || minimum >= 0x200000000)
+    if (!free_count || minimum >= PHYSICAL_LIMIT)
         return 0;
     uint64_t first = (minimum + 4095) / 4096;
     if (!first)
@@ -113,7 +120,7 @@ uint64_t lume_page_alloc(uint64_t minimum)
 
 bool lume_page_free(uint64_t page)
 {
-    if (!page || page >= 0x200000000 || (page & 4095))
+    if (!page || page >= PHYSICAL_LIMIT || (page & 4095))
         return false;
     uint64_t p = page / 4096, mask = UINT64_C(1) << (p & 63);
     if (!(managed[p / 64] & mask) || !(used[p / 64] & mask))

@@ -16,6 +16,9 @@
 #include "lume/dma.h"
 #include "terminal.h"
 #include "font5x7.h"
+#include "console_font.h"
+#include "lume/abi.h"
+#include <string.h>
 #define RP1 LUME_BOARD_RP1_BASE
 #define DSI (RP1 + 0x134000)
 #define DMA (RP1 + 0x130000)
@@ -29,7 +32,29 @@
 static uint32_t *fb;
 static uint64_t frequency, framebuffer[FRAME_PAGES];
 static struct terminal terminal;
-static uint32_t cells[65 * 24], shown[65 * 24];
+static uint32_t cells[132 * 48], shown[132 * 48];
+static unsigned columns = 65, rows = 24, font_index = 7;
+static unsigned char custom_font[256][16];
+static struct console_font_bitmap font_bitmap;
+static unsigned prepared_font = UINT32_MAX;
+static bool custom_loaded;
+
+static unsigned font_cell(void)
+{
+    return font_index == CONSOLE_FONT_COUNT ? 8 | 16u << 16 : console_font_cell(font_index);
+}
+
+static void prepare_font(void)
+{
+    if (prepared_font == font_index)
+        return;
+    unsigned cell = font_cell();
+    unsigned face =
+        font_index == CONSOLE_FONT_COUNT ? LUME_VIDEO_CUSTOM : console_font_face(font_index);
+    console_font_prepare(&font_bitmap, face, cell & 65535, cell >> 16, custom_font);
+    prepared_font = font_index;
+}
+
 static bool enabled;
 static bool dma_active, dma_idle = true;
 
@@ -360,72 +385,35 @@ static void draw(char c, unsigned x, unsigned y, uint32_t color)
                         fb[(y + b * 2 + dy) * WIDTH + x + a * 2 + dx] = color;
 }
 
-static const uint32_t colors[16] = {0x102030, 0xaa3333, 0x33aa55, 0xaa9955, 0x5577cc, 0xaa55aa,
-                                    0x33aaaa, 0xe8eef4, 0x666666, 0xff5555, 0x55ff77, 0xffff55,
-                                    0x7799ff, 0xff77ff, 0x55ffff, 0xffffff};
+static const uint32_t colors[16] = {0x102030, 0x5577cc, 0x33aa55, 0x33aaaa, 0xaa3333, 0xaa55aa,
+                                    0xaa9955, 0xe8eef4, 0x666666, 0x7799ff, 0x55ff77, 0x55ffff,
+                                    0xff5555, 0xff77ff, 0xffff55, 0xffffff};
 
 static void render_cell(unsigned value, unsigned at)
 {
-    uint32_t code = value & 255;
-    unsigned x = 8 + (at % 65) * 12, y = 48 + (at / 65) * 18;
+    unsigned cell = font_cell(), cw = cell & 65535, ch = cell >> 16;
+    unsigned x = 8 + at % columns * cw, y = 48 + at / columns * ch;
     uint32_t foreground = colors[(value >> 8) & 15], background = colors[(value >> 12) & 15];
-    if (value & 0x10000)
+    for (unsigned row = 0; row < ch; ++row)
     {
-        uint32_t swap = foreground;
-        foreground = background;
-        background = swap;
-    }
-    char c = code < 128 ? (char)code : '?';
-    unsigned accent = 0;
-    if (code == 0xe7 || code == 0xc7)
-    {
-        c = code == 0xe7 ? 'c' : 'C';
-        accent = 4;
-    }
-
-    static const struct
-    {
-        uint32_t code;
-        char base;
-        unsigned accent;
-    } latin[] = {{0xe1, 'a', 1}, {0xe9, 'e', 1}, {0xed, 'i', 1}, {0xf3, 'o', 1}, {0xfa, 'u', 1},
-                 {0xe0, 'a', 2}, {0xe8, 'e', 2}, {0xec, 'i', 2}, {0xf2, 'o', 2}, {0xf9, 'u', 2},
-                 {0xe2, 'a', 3}, {0xea, 'e', 3}, {0xee, 'i', 3}, {0xf4, 'o', 3}, {0xfb, 'u', 3},
-                 {0xe3, 'a', 5}, {0xf5, 'o', 5}, {0xc1, 'A', 1}, {0xc9, 'E', 1}, {0xcd, 'I', 1},
-                 {0xd3, 'O', 1}, {0xda, 'U', 1}, {0xc0, 'A', 2}, {0xc3, 'A', 5}, {0xd5, 'O', 5}};
-
-    for (unsigned i = 0; i < sizeof(latin) / sizeof(latin[0]); ++i)
-        if (code == latin[i].code)
+        for (unsigned column = 0; column < cw; ++column)
         {
-            c = latin[i].base;
-            accent = latin[i].accent;
+            bool ink = !!(font_bitmap.rows[value & 255][row] & (UINT32_C(1) << column));
+            if (value & 0x10000)
+                ink = !ink;
+            fb[(y + row) * WIDTH + x + column] = ink ? foreground : background;
         }
-    for (unsigned b = 0; b < 18; ++b)
-        for (unsigned a = 0; a < 12; ++a)
-            fb[(y + b) * WIDTH + x + a] = background;
-    draw(c, x, y + 2, foreground);
-    if (accent)
-    {
-        unsigned ay = accent == 4 ? y + 16 : y;
-        for (unsigned a = 0; a < 4; ++a)
-        {
-            unsigned ax = accent == 1   ? 6 - a
-                          : accent == 2 ? 2 + a
-                          : accent == 3 ? (a < 2 ? 2 + a : 6 - a)
-                                        : a + 2;
-            fb[ay * WIDTH + x + ax] = foreground;
-        }
+        clean(fb + (y + row) * WIDTH + x, cw * 4);
     }
-    for (unsigned b = 0; b < 18; ++b)
-        clean(fb + (y + b) * WIDTH + x, 12 * 4);
 }
 
 void lume_display_clear(void)
 {
     if (!enabled)
         return;
-    terminal_start(&terminal, cells, 65, 24);
-    for (unsigned i = 0; i < 65 * 24; ++i)
+    prepare_font();
+    terminal_start(&terminal, cells, columns, rows);
+    for (unsigned i = 0; i < columns * rows; ++i)
     {
         shown[i] = cells[i];
         render_cell(cells[i], i);
@@ -442,6 +430,7 @@ void lume_display_write(const char *data, size_t bytes)
 {
     if (!enabled || !bytes)
         return;
+    prepare_font();
     while (bytes)
     {
         size_t count = bytes < LUME_DISPLAY_BATCH ? bytes : LUME_DISPLAY_BATCH;
@@ -449,8 +438,8 @@ void lume_display_write(const char *data, size_t bytes)
         terminal_begin(&terminal);
         terminal_write(&terminal, (const unsigned char *)data, (unsigned)count);
         terminal_end(&terminal);
-        unsigned cursor = terminal.row * 65 + terminal.column;
-        for (unsigned i = 0; i < 65 * 24; ++i)
+        unsigned cursor = terminal.row * columns + terminal.column;
+        for (unsigned i = 0; i < columns * rows; ++i)
         {
             unsigned cell = cells[i] | (!terminal.cursor_hidden && i == cursor ? 0x10000 : 0);
             if (cell != shown[i])
@@ -526,8 +515,9 @@ bool lume_display_start(uint64_t freq)
     stage = "backlight";
     if (!panel_write(0x86, 180))
         goto fail;
-    terminal_start(&terminal, cells, 65, 24);
-    for (unsigned i = 0; i < 65 * 24; ++i)
+    prepare_font();
+    terminal_start(&terminal, cells, columns, rows);
+    for (unsigned i = 0; i < columns * rows; ++i)
         shown[i] = UINT32_MAX;
     enabled = true;
     lume_puts("LUME MIPI NATIVE SCANOUT READY 800x480\n");
@@ -565,4 +555,74 @@ bool lume_display_release(void)
     fb = NULL;
     frequency = 0;
     return true;
+}
+
+int64_t lume_display_video(unsigned action, unsigned value, const unsigned char *font)
+{
+    if (!enabled)
+        return -LUME_ENOSYS;
+    bool indexed = action == LUME_VIDEO_MODE_PIXELS || action == LUME_VIDEO_MODE_SELECT ||
+                   action == LUME_VIDEO_FONT_CELL || action == LUME_VIDEO_FONT_FACE ||
+                   action == LUME_VIDEO_FONT_SELECT;
+    if (!indexed && value)
+        return -LUME_EINVAL;
+    unsigned count = CONSOLE_FONT_COUNT + custom_loaded;
+    switch (action)
+    {
+    case LUME_VIDEO_LEGACY_MODES:
+        return 0;
+    case LUME_VIDEO_MODE_COUNT:
+        return 1;
+    case LUME_VIDEO_MODE_PIXELS:
+        return value ? -(int64_t)LUME_EINVAL : WIDTH | HEIGHT << 16;
+    case LUME_VIDEO_MODE_SELECT:
+        return value ? -LUME_EINVAL : 0;
+    case LUME_VIDEO_FONT_COUNT:
+        return count;
+    case LUME_VIDEO_FONT_CELL:
+        return value >= count                ? -(int64_t)LUME_EINVAL
+               : value == CONSOLE_FONT_COUNT ? 8 | 16u << 16
+                                             : console_font_cell(value);
+    case LUME_VIDEO_FONT_FACE:
+        return value >= count                ? -(int64_t)LUME_EINVAL
+               : value == CONSOLE_FONT_COUNT ? LUME_VIDEO_CUSTOM
+                                             : console_font_face(value);
+    case LUME_VIDEO_FONT_CURRENT:
+        return font_index;
+    case LUME_VIDEO_UPLOAD:
+        if (!font)
+            return -LUME_EINVAL;
+        memcpy(custom_font, font, sizeof(custom_font));
+        prepared_font = UINT32_MAX;
+        custom_loaded = true;
+        value = CONSOLE_FONT_COUNT;
+        /* fall through */
+    case LUME_VIDEO_FONT_SELECT:
+        if (value >= CONSOLE_FONT_COUNT + custom_loaded)
+            return -LUME_EINVAL;
+        font_index = value;
+        columns = (WIDTH - 16) / (font_cell() & 65535);
+        rows = (HEIGHT - 48) / (font_cell() >> 16);
+        for (unsigned y = 48; y < HEIGHT; ++y)
+        {
+            for (unsigned x = 0; x < WIDTH; ++x)
+                fb[y * WIDTH + x] = colors[0];
+            clean(fb + y * WIDTH, WIDTH * 4);
+            lume_uart_poll_input();
+        }
+        lume_display_clear();
+        return 0;
+    case LUME_VIDEO_PIXELS:
+        return WIDTH | HEIGHT << 16;
+    case LUME_VIDEO_PITCH:
+        return WIDTH * 4;
+    case LUME_VIDEO_DEPTH:
+        return 32;
+    case LUME_VIDEO_MEMORY:
+        return FRAME_BYTES;
+    case LUME_VIDEO_CELLS:
+        return columns | rows << 16;
+    default:
+        return -LUME_ENOSYS;
+    }
 }

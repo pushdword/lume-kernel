@@ -3,7 +3,7 @@ SHELL := sh
 
 ARCH ?= x32
 CPU ?= $(if $(filter aarch64,$(ARCH)),cortex-a76,)
-BOARD ?= $(if $(filter amd64,$(ARCH)),q35,$(if $(filter aarch64,$(ARCH)),raspberrypi5,tang25k))
+BOARD ?= $(if $(filter i686,$(ARCH)),pc,$(if $(filter amd64,$(ARCH)),q35,$(if $(filter aarch64,$(ARCH)),raspberrypi5,tang25k)))
 SDK ?=
 PROFILE ?= $(if $(filter amd64,$(ARCH)),normal,diagnostic)
 DEBUG ?= 0
@@ -33,7 +33,9 @@ HOSTEXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 TOOLBIN = $(if $(strip $(SDK)),$(SDK)/bin/,)
 include mk/kernel.mk
 COMMON_FLAGS := -ffreestanding -fno-builtin -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections
-ifeq ($(ARCH),amd64)
+ifeq ($(ARCH),i686)
+include mk/i686.mk
+else ifeq ($(ARCH),amd64)
 ifneq ($(BOARD),q35)
 $(error AMD64 requires BOARD=q35)
 endif
@@ -167,7 +169,7 @@ $(OUT)/image-tool$(HOSTEXE): tools/image.cpp
 	$(HOSTCXX) $(HOSTCXXFLAGS) "$<" -o "$@"
 $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 	"$(OUT)/image-tool$(HOSTEXE)" r32-kernel "$<" "$@"
-UAPI_ABI := $(if $(filter aarch64 amd64,$(ARCH)),include/abi/native,include/abi/$(ARCH))
+UAPI_ABI := $(if $(filter aarch64 amd64 i686,$(ARCH)),include/abi/native,include/abi/$(ARCH))
 TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Iinclude/kernel -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs poll heap user-stack mmu elf-load font memory
 TEST_NAMES += io-queue io-calls vfs-storage-handles
@@ -310,9 +312,9 @@ $(OUT)/tests/font$(HOSTEXE): tests/unit/font_test.c src/terminal/font5x7.c
 ifeq ($(ARCH),aarch64)
 .PHONY: display-test-image
 display-test-image: $(OUT)/tests/display.elf
-$(OUT)/tests/display.elf: tests/arch/aarch64/display_test.c drivers/display/rp1_dsi/display.c src/terminal/terminal.c src/terminal/font5x7.c src/lib/memory.c platform/raspberrypi5/kernel.ld src/terminal/terminal.h src/terminal/font5x7.h include/kernel/lume/display.h $(OUT)/configuration Makefile
+$(OUT)/tests/display.elf: tests/arch/aarch64/display_test.c drivers/display/rp1_dsi/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c src/lib/memory.c platform/raspberrypi5/kernel.ld src/terminal/terminal.h src/terminal/font5x7.h include/kernel/lume/display.h $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"
-	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,platform/raspberrypi5/kernel.ld tests/arch/aarch64/display_test.c src/terminal/terminal.c src/terminal/font5x7.c src/lib/memory.c src/dma/dma.c arch/aarch64/dma.c platform/raspberrypi5/dma.c -o "$@"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,platform/raspberrypi5/kernel.ld tests/arch/aarch64/display_test.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c src/lib/memory.c src/dma/dma.c arch/aarch64/dma.c platform/raspberrypi5/dma.c -o "$@"
 endif
 
 .PHONY: check-hardware
