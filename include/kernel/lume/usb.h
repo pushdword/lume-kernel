@@ -8,7 +8,7 @@ struct lume_usb_interface
 {
     uint8_t configuration, interface, endpoint, interval;
     uint16_t packet;
-    bool keyboard, hub;
+    bool keyboard, hub, mouse;
 };
 
 bool lume_usb_configuration(const uint8_t *, size_t, struct lume_usb_interface *);
@@ -24,7 +24,7 @@ struct lume_hid
 {
     uint8_t previous[8], queue[256];
     unsigned head, tail, dropped, reports, characters;
-    bool caps;
+    bool caps, graphics;
     uint8_t repeat_key, modifiers;
     uint32_t repeat_at, dead;
 };
@@ -32,4 +32,5 @@ struct lume_hid
 void lume_hid_report(struct lume_hid *, const uint8_t *, size_t, uint32_t ms);
 void lume_hid_repeat(struct lume_hid *, uint32_t ms);
 int lume_hid_getc(struct lume_hid *);
+void lume_hid_mouse_report(const uint8_t *, size_t, uint32_t ms);
 #endif

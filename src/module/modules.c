@@ -16,6 +16,7 @@
 #include "lume/worker.h"
 #include "lume/usb.h"
 #include "lume/display.h"
+#include "lume/graphics_device.h"
 #include "lume/watchdog.h"
 #include "lume/storage.h"
 #include "lume/vfs.h"
@@ -92,6 +93,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_block_write)
     EXPORT(lume_clock_millis)
     EXPORT(lume_display_write)
+    EXPORT(lume_graphics_input)
+    EXPORT(lume_graphics_input_owned)
     EXPORT(lume_entropy)
     EXPORT(lume_fail)
     EXPORT(lume_files_init)

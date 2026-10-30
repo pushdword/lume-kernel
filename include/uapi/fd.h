@@ -22,7 +22,8 @@ enum
     LUME_FD_SPAWN,
     LUME_FD_GETMODE,
     LUME_FD_SETMODE,
-    LUME_FD_WAIT
+    LUME_FD_WAIT,
+    LUME_FD_PATH
 };
 
 enum
@@ -64,10 +65,13 @@ struct lume_pollfd
 
 #define LUME_POLL_VERSION 1u
 #define LUME_POLL_SIGNAL_EPOCH 1u
+#define LUME_POLL_TTY_READ 2u
 
 /* WAIT uses a native-width buffer and a timeout duration in milliseconds.
  * UINT64_MAX waits indefinitely. SIGNAL_EPOCH rejects a wait if a deliverable signal
  * changed the supplied token. The token comes from the signal mask operation.
+ * TTY_READ requires SIGNAL_EPOCH and one POLLIN record. It rechecks terminal
+ * process-group access whenever a blocking read wait resumes.
  */
 struct lume_poll_request
 {

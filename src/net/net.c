@@ -71,7 +71,9 @@ static err_t initialize(struct netif *n)
     lume_netif_info(n->state, &i);
     n->name[0] = i.kind == LUME_IF_WIFI ? 'w' : 'e';
     n->name[1] = i.kind == LUME_IF_WIFI ? 'l' : 'n';
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_I686)
+    n->hostname = "lume-i686";
+#elif defined(LUME_ARCH_AMD64)
     n->hostname = "lume-q35";
 #else
     n->hostname = "lume-pi5";

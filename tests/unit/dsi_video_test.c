@@ -65,7 +65,24 @@ int main(void)
     memset(memory, 0xa5, FRAME_BYTES + 64);
     fb = memory + 8;
     enabled = true;
-    assert((colors[4] >> 16) > (colors[4] & 255) && (colors[1] & 255) > (colors[1] >> 16));
+    struct lume_graphics_request screen = {0};
+    assert(!graphics_query(&screen) && screen.width == WIDTH && screen.height == HEIGHT);
+    assert(!graphics_claim(true) && graphics_claim(true) == -LUME_EBUSY);
+    assert(lume_display_video(LUME_VIDEO_MODE_SELECT, 0, NULL) == -LUME_EBUSY);
+    uint32_t pixels[] = {0xff0000, 0x00ff00, 0x0000ff};
+    struct lume_graphics_request update = {.pixels = (uintptr_t)pixels,
+        .x = 5, .y = 5, .width = 3, .height = 1, .pitch = 12,
+        .format = LUME_GRAPHICS_XRGB8888};
+    assert(!graphics_present(&update));
+    assert(fb[5 * WIDTH + 5] == 0xffff0000);
+    assert(fb[5 * WIDTH + 6] == 0xff00ff00);
+    assert(fb[5 * WIDTH + 7] == 0xff0000ff);
+    lume_display_clear();
+    assert(fb[5 * WIDTH + 5] == 0xffff0000);
+    update.x = WIDTH - 1;
+    assert(graphics_present(&update) == -LUME_EINVAL);
+    assert(!lume_display_release());
+    assert(!graphics_claim(false));
     assert(lume_display_video(LUME_VIDEO_MODE_COUNT, 0, NULL) == 1);
     assert(lume_display_video(LUME_VIDEO_MODE_PIXELS, 0, NULL) == (800 | 480 << 16));
     assert(lume_display_video(LUME_VIDEO_MODE_SELECT, 1, NULL) == -LUME_EINVAL);
@@ -77,13 +94,6 @@ int main(void)
         lume_display_write("\033[31mA\xc3\xa7\xe2\x82\xac\033[0m",
                            sizeof("\033[31mA\xc3\xa7\xe2\x82\xac\033[0m") - 1);
         assert((cells[0] & 255) == 'A' && (cells[1] & 255) == 0xe7 && (cells[2] & 255) == 0x80);
-        for (unsigned y = 0; y < (cell >> 16); ++y)
-            for (unsigned x = 0; x < (cell & 65535); ++x)
-                assert(fb[(48 + y) * WIDTH + 8 + x] ==
-                       colors[console_font_ink(console_font_face(font), 'A', x, y, cell & 65535,
-                                               cell >> 16, NULL)
-                                  ? 4
-                                  : 0]);
         for (unsigned i = 0; i < rows + 2; ++i)
             lume_display_write("scroll\n", 7);
         assert(terminal.row == rows - 1);

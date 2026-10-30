@@ -1,5 +1,6 @@
 #include "lume/usb.h"
 #include "lume/dma.h"
+#include "lume/graphics_device.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,17 @@
 #define LUME_ARCH_CPU_H
 #define LUME_COUNTER_H
 #define LUME_MMIO_H
+
+bool lume_graphics_input_owned(void)
+{
+    return false;
+}
+
+void lume_graphics_input(const struct lume_input_event *event)
+{
+    (void)event;
+    abort();
+}
 
 static bool worker_busy;
 static uint64_t ticks = 1000000;

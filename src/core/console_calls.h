@@ -81,7 +81,8 @@ static bool kernel_console_call(struct lume_context *frame)
     return ((number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
             lume_vfs_console_io(&tasks[process_slot(current_task)].files,
                                 LUME_CONTEXT_REG(frame, 0))) ||
-           (number == LUME_SYS_TERMINAL && LUME_CONTEXT_REG(frame, 0) == 1);
+           (number == LUME_SYS_TERMINAL && LUME_CONTEXT_REG(frame, 0) == 1 &&
+            lume_vfs_console_io(&tasks[process_slot(current_task)].files, 0));
 }
 
 static struct lume_context *kernel_console_result(struct lume_context *frame)

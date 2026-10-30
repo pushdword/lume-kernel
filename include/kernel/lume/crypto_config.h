@@ -3,4 +3,7 @@
 #define MBEDTLS_AES_C
 #define MBEDTLS_SHA1_C
 #define MBEDTLS_PLATFORM_ZEROIZE_ALT
+#if defined(LUME_ARCH_I686)
+#define MBEDTLS_CTR_DRBG_C
+#endif
 #endif

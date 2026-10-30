@@ -31,6 +31,12 @@ static struct
 } poll_subscriptions[LUME_POLL_TASK_LIMIT];
 
 static bool poll_input_ready;
+static int (*terminal_open)(struct lume_files *, const char *, uint64_t);
+
+void lume_vfs_terminal_open(int (*callback)(struct lume_files *, const char *, uint64_t))
+{
+    terminal_open = callback;
+}
 
 bool lume_vfs_poll_input_ready(void)
 {
@@ -634,6 +640,12 @@ void lume_vfs_drop(int object)
 
 int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
 {
+    if (terminal_open)
+    {
+        int fd = terminal_open(f, input, flags);
+        if (fd != -LUME_ENOSYS)
+            return fd;
+    }
     const uint64_t allowed = 3 | LUME_O_CREAT | LUME_O_TRUNC | LUME_O_APPEND | LUME_O_EXCL;
     if ((flags & ~allowed) || (flags & 3) == 3 ||
         (!(flags & 3) && (flags & (LUME_O_TRUNC | LUME_O_APPEND))))
@@ -1181,6 +1193,8 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
         files->fd[fd].flags = request->descriptor_flags & LUME_FD_CLOEXEC;
         struct open_file *description = descriptor(files, (unsigned)fd);
         description->status = request->descriptor_flags & LUME_FD_NONBLOCK;
+        if (description->external)
+            return fd;
         index = description->node;
     }
     else if (operation == LUME_FILE_MODE_MKDIR)
@@ -1501,6 +1515,20 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
     if (r->version != LUME_FD_VERSION || r->bytes != sizeof(*r))
         return -LUME_EINVAL;
     struct open_file *d = descriptor(f, (unsigned)r->fd);
+    if (op == LUME_FD_PATH)
+    {
+        if (!d)
+            return -LUME_EBADF;
+        if (r->other || r->flags || r->timeout_ms)
+            return -LUME_EINVAL;
+        if (d->node < 0 || nodes[d->node].kind != LUME_NODE_DIR || f->identity.jailed)
+            return -LUME_ENOTDIR;
+        size_t bytes = length(nodes[d->node].path) + 1;
+        if (r->count < bytes)
+            return -LUME_ENAMETOOLONG;
+        copy((void *)(uintptr_t)r->buffer, nodes[d->node].path, bytes);
+        return 0;
+    }
     if (op == LUME_FD_GETMODE || op == LUME_FD_SETMODE)
     {
         if (!d)

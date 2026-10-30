@@ -52,8 +52,9 @@ enum lume_syscall
     LUME_SYS_RUN_ACTIONS = 36,
     LUME_SYS_CAP_DROP = 37,
     /* CPU takes COUNT=0, INDEX=1 or QUANTUM_MS=2 in x0, with zero x1/x2.
-     * WAIT takes a PID or zero in x0 and a blocking flag in x1. Zero preserves
-     * nonblocking behavior. Its result packs the PID above a 32-bit exit status. */
+     * WAIT takes a PID, zero for any child, or a negative process group in x0.
+     * The x1 flags are defined in lume/process.h. The x2 argument selects POSIX
+     * status encoding when set to one. The result packs the PID above the status. */
     LUME_SYS_CPU = 38,
     LUME_SYS_THREAD = 39,
     LUME_SYS_HARDWARE = 40,
@@ -71,6 +72,8 @@ enum lume_syscall
     /* VIDEO actions and packed dimensions are defined in lume/video_control.h.
      * Mutations require driver administration. The third argument is zero. */
     LUME_SYS_VIDEO = 51,
+    LUME_SYS_GRAPHICS = 52,
+    LUME_SYS_TTY = 53,
 };
 
 enum
@@ -135,7 +138,7 @@ enum
 
 #define LUME_PATH_MAX 128u
 #define LUME_NAME_MAX 47u
-#define LUME_FD_MAX 16u
+#define LUME_FD_MAX 32u
 #define LUME_FILE_IO_MAX 65536u
 
 struct lume_stat

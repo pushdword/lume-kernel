@@ -1,5 +1,6 @@
 #include "lume/abi.h"
 #include "lume/signal.h"
+#include "lume/process.h"
 #include "lume/vfs.h"
 #include "lume/wait.h"
 #include "poll_state.h"
@@ -34,6 +35,8 @@ static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 static unsigned states[LUME_TASK_LIMIT], parents[LUME_TASK_LIMIT], exit_signals[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT], kernel_wait[LUME_TASK_LIMIT];
 static unsigned wait_target[LUME_TASK_LIMIT];
+static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
+static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
 static uint64_t thread_waiting[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT];
 static struct lume_wait_queue queue;
@@ -45,11 +48,43 @@ static uint64_t clock_ms, denied, generation = 1;
 static unsigned readiness, notify_during_scan;
 static bool signal_during_scan;
 static bool active = true, public_mode = true, worker_busy, input_ready;
-static bool cached_input, subscribe_allowed;
+static bool cached_input, subscribe_allowed, graphics_owned;
+static unsigned input_samples;
+static unsigned tty_access_checks;
+static int tty_access_result;
+
+int lume_tty_access(struct lume_files *files, unsigned owner, unsigned fd, bool writing)
+{
+    assert(files == &tasks[0].files && owner == 1 && fd == 3 && !writing);
+    ++tty_access_checks;
+    return tty_access_result;
+}
+
+bool lume_graphics_input_owned(void)
+{
+    return graphics_owned;
+}
 
 static unsigned process_slot(unsigned task)
 {
     return task;
+}
+
+static void child_state_event(unsigned task, unsigned event)
+{
+    child_events[task] = event;
+}
+
+static bool signal_group_orphaned(unsigned session, unsigned group)
+{
+    (void)session;
+    (void)group;
+    return false;
+}
+
+static bool process_busy(unsigned task)
+{
+    return kernel_wait[task];
 }
 
 static unsigned lume_cpu_index(void)
@@ -96,7 +131,10 @@ static void lume_watchdog_progress(void)
 static bool kernel_console_ready(void)
 {
     if (!lume_worker_busy())
+    {
+        ++input_samples;
         lume_vfs_poll_input(input_ready);
+    }
     return cached_input;
 }
 
@@ -248,6 +286,10 @@ static void reset(void)
     memset(states, 0, sizeof(states));
     memset(pipe_wait, 0, sizeof(pipe_wait));
     memset(kernel_wait, 0, sizeof(kernel_wait));
+    memset(process_stopped, 0, sizeof(process_stopped));
+    memset(process_adopted, 0, sizeof(process_adopted));
+    memset(child_events, 0, sizeof(child_events));
+    memset(stop_signals, 0, sizeof(stop_signals));
     queue = (struct lume_wait_queue){0};
     memset(watched, 0, sizeof(watched));
     clock_ms = 100;
@@ -255,6 +297,10 @@ static void reset(void)
     notify_during_scan = progress = wakes = current_task = 0;
     worker_busy = input_ready = cached_input = signal_during_scan = false;
     subscribe_allowed = true;
+    graphics_owned = false;
+    input_samples = 0;
+    tty_access_checks = 0;
+    tty_access_result = 0;
     generation = 1;
     states[0] = 2;
     signal_inherit(0, 0, false);
@@ -435,6 +481,56 @@ static void check_console(void)
     poll_console_pump();
     assert(queue.ready == 1);
     poll_cancel(0);
+    graphics_owned = true;
+    unsigned before = input_samples;
+    poll_console_pump();
+    assert(input_samples == before + 1);
+    worker_busy = true;
+    poll_console_pump();
+    assert(input_samples == before + 1);
+}
+
+static void check_tty_read_wait(void)
+{
+    struct lume_pollfd record = {.fd = 3, .events = LUME_POLLIN};
+    struct lume_poll_request request = {.version = LUME_POLL_VERSION,
+                                        .bytes = sizeof(request),
+                                        .buffer = (uintptr_t)&record,
+                                        .count = 1,
+                                        .timeout_ms = UINT64_MAX,
+                                        .flags = LUME_POLL_SIGNAL_EPOCH | LUME_POLL_TTY_READ};
+    reset();
+    struct lume_context frame = frame_for(&request);
+    assert(poll_call(&frame) == &suspended && tty_access_checks == 1);
+    signal_queue(0, 18);
+    assert(states[0] == 1 && poll_waits[0].active);
+    process_stopped[0] = true;
+    signal_queue(0, 19);
+    assert(!process_stopped[0] && poll_waits[0].active);
+    tty_access_result = -LUME_EAGAIN;
+    frame = replay();
+    assert(poll_call(&frame) == &frame && (int64_t)frame.x[0] == -LUME_EAGAIN);
+    assert(tty_access_checks == 2 && !poll_waits[0].active && !queue.waiting);
+
+    reset();
+    request.flags = LUME_POLL_SIGNAL_EPOCH;
+    tty_access_result = -LUME_EIO;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &suspended && !tty_access_checks);
+    poll_cancel(0);
+
+    reset();
+    request.flags |= LUME_POLL_TTY_READ;
+    readiness = LUME_POLLNVAL;
+    tty_access_result = -LUME_EIO;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && frame.x[0] == 1 && !tty_access_checks);
+    assert(record.revents == LUME_POLLNVAL);
+
+    reset();
+    record.events = LUME_POLLOUT;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && (int64_t)frame.x[0] == -LUME_EINVAL);
 }
 
 static void check_validation(void)
@@ -565,6 +661,7 @@ int main(void)
     check_waits();
     check_signals();
     check_console();
+    check_tty_read_wait();
     check_validation();
     check_copyout_owner();
     check_targeted_wakes();

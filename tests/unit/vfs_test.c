@@ -226,15 +226,16 @@ int main(void)
     fd = (int)lume_vfs_open(&f, "/tmp/a/b/file", LUME_O_CREAT | LUME_O_RDWR);
     T(fd >= 3);
     T(lume_vfs_write(&f, fd, "data", 4) == 4);
-    T(lume_vfs_dup2(&f, fd, 15) == 15);
-    T(lume_vfs_dup2(&f, 99, 15) == -LUME_EBADF);
+    unsigned last_fd = LUME_FD_MAX - 1;
+    T(lume_vfs_dup2(&f, fd, last_fd) == last_fd);
+    T(lume_vfs_dup2(&f, 99, last_fd) == -LUME_EBADF);
     T(lume_vfs_remove(&f, "/tmp/a/b", true) == -LUME_ENOTEMPTY);
     T(lume_vfs_remove(&f, "/tmp/a/b/file", true) == -LUME_ENOTDIR);
     T(lume_vfs_remove(&f, "/tmp/a/b/file", false) == 0);
     T(lume_vfs_open(&f, "/tmp/a/b/file", 0) == -LUME_ENOENT);
-    T(lume_vfs_seek(&f, 15, 0, 0) == 0 && lume_vfs_read(&f, 15, b, 4) == 4 &&
+    T(lume_vfs_seek(&f, last_fd, 0, 0) == 0 && lume_vfs_read(&f, last_fd, b, 4) == 4 &&
       !memcmp(b, "data", 4));
-    T(lume_vfs_close(&f, 15) == 0 && lume_vfs_close(&f, fd) == 0);
+    T(lume_vfs_close(&f, last_fd) == 0 && lume_vfs_close(&f, fd) == 0);
     T(lume_vfs_remove(&f, "/tmp/a/b", true) == 0 && lume_vfs_remove(&f, "/tmp/a", true) == 0);
     T(lume_vfs_remove(&f, "/tmp", true) == -LUME_EROFS);
     fd = (int)lume_vfs_open(&f, "/tmp/shared", LUME_O_CREAT | LUME_O_RDWR);

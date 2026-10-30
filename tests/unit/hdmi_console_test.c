@@ -4,6 +4,7 @@
 #include "../../drivers/display/bcm2712_hdmi/console.c"
 
 static const struct lume_platform_display_ops *registered;
+static const struct lume_platform_graphics_ops *registered_graphics;
 static int register_error, unregister_error;
 static unsigned flushes;
 static bool dma_failure;
@@ -12,6 +13,12 @@ static size_t memory_bytes;
 
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
+    if (kind == LUME_PLATFORM_GRAPHICS)
+    {
+        assert(bytes == sizeof(*registered_graphics));
+        registered_graphics = ops;
+        return 0;
+    }
     assert(kind == LUME_PLATFORM_DISPLAY && bytes == sizeof(*registered));
     if (register_error)
         return register_error;
@@ -22,11 +29,23 @@ int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 
 int lume_platform_driver_unregister(unsigned kind, const void *ops)
 {
+    if (kind == LUME_PLATFORM_GRAPHICS)
+    {
+        assert(ops == registered_graphics);
+        registered_graphics = NULL;
+        return 0;
+    }
     assert(kind == LUME_PLATFORM_DISPLAY && ops == registered);
     if (unregister_error)
         return unregister_error;
     registered = NULL;
     return 0;
+}
+
+int lume_platform_driver_can_stop(unsigned kind, const void *ops)
+{
+    assert(kind == LUME_PLATFORM_DISPLAY && ops == registered);
+    return unregister_error;
 }
 
 bool lume_dma_sync_for_device(const void *data, size_t bytes, enum lume_dma_direction direction)
@@ -59,6 +78,26 @@ int main(void)
     register_error = 0;
     assert(!hdmi_console_attach((uintptr_t)canvas, 160, 128, 16, 0, 336, sizeof(canvas)));
     assert(registered && registered->lume_display_start(0));
+    struct lume_graphics_request screen = {0};
+    assert(registered_graphics && !registered_graphics->query(&screen));
+    assert(screen.width == 160 && screen.height == 128 && screen.pitch == 640);
+    assert(!registered_graphics->claim(true));
+    assert(hdmi_console_detach() == -LUME_EBUSY);
+    assert(video(LUME_VIDEO_FONT_SELECT, 0, NULL) == -LUME_EBUSY);
+    uint32_t pixels[] = {0xff0000, 0x00ff00, 0x0000ff};
+    struct lume_graphics_request update = {.pixels = (uintptr_t)pixels,
+        .x = 5, .y = 5, .width = 3, .height = 1, .pitch = 12,
+        .format = LUME_GRAPHICS_XRGB8888};
+    assert(!registered_graphics->present(&update));
+    assert(((uint16_t *)(canvas + 5 * 336))[5] == 0x001f);
+    assert(((uint16_t *)(canvas + 5 * 336))[6] == 0x07e0);
+    assert(((uint16_t *)(canvas + 5 * 336))[7] == 0xf800);
+    write("hidden", 6);
+    assert(((uint16_t *)(canvas + 5 * 336))[5] == 0x001f);
+    update.x = 159;
+    assert(registered_graphics->present(&update) == -LUME_EINVAL);
+    assert(!registered_graphics->claim(false));
+    clear();
     assert(video(LUME_VIDEO_CELLS, 0, NULL) == (10 | 4 << 16));
     assert(video(LUME_VIDEO_PIXELS, 0, NULL) == (160 | 128 << 16));
     assert(video(LUME_VIDEO_MODE_SELECT, 1, NULL) == -LUME_EINVAL);

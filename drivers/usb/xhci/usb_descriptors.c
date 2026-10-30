@@ -9,7 +9,7 @@ bool lume_usb_configuration(const uint8_t *p, size_t bytes, struct lume_usb_inte
     if (total != bytes)
         return false;
     out->configuration = p[5];
-    bool keyboard = false;
+    unsigned input = 0;
     uint8_t interface = 0;
     for (size_t offset = 9; offset < bytes;)
     {
@@ -21,7 +21,7 @@ bool lume_usb_configuration(const uint8_t *p, size_t bytes, struct lume_usb_inte
             if (d[0] < 9)
                 return false;
             interface = d[2];
-            keyboard = !d[3] && d[5] == 3 && d[6] == 1 && d[7] == 1;
+            input = !d[3] && d[5] == 3 && d[6] == 1 && (d[7] == 1 || d[7] == 2) ? d[7] : 0;
             if (!d[3] && d[5] == 9)
                 out->hub = true;
         }
@@ -30,10 +30,12 @@ bool lume_usb_configuration(const uint8_t *p, size_t bytes, struct lume_usb_inte
             if (d[0] < 7)
                 return false;
             unsigned packet = (d[4] | ((unsigned)d[5] << 8));
-            if (keyboard && !out->keyboard && (d[2] & 0x80) && (d[2] & 15) && !(d[2] & 0x70) &&
-                (d[3] & 3) == 3 && packet >= 8 && packet <= 64 && d[6])
+            if (input && !out->keyboard && !out->mouse && (d[2] & 0x80) && (d[2] & 15) &&
+                !(d[2] & 0x70) && (d[3] & 3) == 3 && packet >= (input == 1 ? 8u : 3u) &&
+                packet <= 64 && d[6])
             {
-                out->keyboard = true;
+                out->keyboard = input == 1;
+                out->mouse = input == 2;
                 out->interface = interface;
                 out->endpoint = d[2];
                 out->packet = (uint16_t)packet;

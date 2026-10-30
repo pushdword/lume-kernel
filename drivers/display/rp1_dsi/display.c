@@ -19,6 +19,8 @@
 #include "console_font.h"
 #include "lume/abi.h"
 #include <string.h>
+#include "lume/platform_driver.h"
+#include "../framebuffer.h"
 #define RP1 LUME_BOARD_RP1_BASE
 #define DSI (RP1 + 0x134000)
 #define DMA (RP1 + 0x130000)
@@ -55,7 +57,7 @@ static void prepare_font(void)
     prepared_font = font_index;
 }
 
-static bool enabled;
+static bool enabled, graphics_owned;
 static bool dma_active, dma_idle = true;
 
 static void delay(unsigned us)
@@ -391,6 +393,8 @@ static const uint32_t colors[16] = {0x102030, 0x5577cc, 0x33aa55, 0x33aaaa, 0xaa
 
 static void render_cell(unsigned value, unsigned at)
 {
+    if (graphics_owned)
+        return;
     unsigned cell = font_cell(), cw = cell & 65535, ch = cell >> 16;
     unsigned x = 8 + at % columns * cw, y = 48 + at / columns * ch;
     uint32_t foreground = colors[(value >> 8) & 15], background = colors[(value >> 12) & 15];
@@ -540,6 +544,8 @@ fail:
 
 bool lume_display_release(void)
 {
+    if (graphics_owned)
+        return false;
     if (!frequency)
         return true;
     lume_display_stop();
@@ -561,6 +567,9 @@ int64_t lume_display_video(unsigned action, unsigned value, const unsigned char 
 {
     if (!enabled)
         return -LUME_ENOSYS;
+    if (graphics_owned && (action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_SELECT ||
+                           action == LUME_VIDEO_FONT_SELECT || action == LUME_VIDEO_UPLOAD))
+        return -LUME_EBUSY;
     bool indexed = action == LUME_VIDEO_MODE_PIXELS || action == LUME_VIDEO_MODE_SELECT ||
                    action == LUME_VIDEO_FONT_CELL || action == LUME_VIDEO_FONT_FACE ||
                    action == LUME_VIDEO_FONT_SELECT;
@@ -626,3 +635,51 @@ int64_t lume_display_video(unsigned action, unsigned value, const unsigned char 
         return -LUME_ENOSYS;
     }
 }
+
+static int graphics_query(struct lume_graphics_request *request)
+{
+    if (!enabled)
+        return -LUME_ENOSYS;
+    request->width = WIDTH;
+    request->height = HEIGHT;
+    request->pitch = WIDTH * 4;
+    request->format = LUME_GRAPHICS_XRGB8888;
+    return 0;
+}
+
+static int graphics_claim(bool acquire)
+{
+    if (!enabled)
+        return -LUME_ENOSYS;
+    if (acquire && graphics_owned)
+        return -LUME_EBUSY;
+    graphics_owned = acquire;
+    if (!acquire)
+    {
+        for (unsigned i = 0; i < WIDTH * HEIGHT; ++i)
+            fb[i] = colors[0];
+        clean(fb, FRAME_BYTES);
+        unsigned cursor = terminal.row * columns + terminal.column;
+        for (unsigned i = 0; i < columns * rows; ++i)
+        {
+            unsigned cell = cells[i] | (!terminal.cursor_hidden && i == cursor ? 0x10000 : 0);
+            shown[i] = cell;
+            render_cell(cell, i);
+        }
+    }
+    return 0;
+}
+
+static int graphics_present(const struct lume_graphics_request *request)
+{
+    if (!enabled || !graphics_owned)
+        return -LUME_EBADF;
+    int result = lume_framebuffer_present((uintptr_t)fb, WIDTH, HEIGHT, WIDTH * 4, 32, 1, request);
+    if (!result)
+        for (unsigned y = 0; y < request->height; ++y)
+            clean(fb + (request->y + y) * WIDTH + request->x, request->width * 4);
+    return result;
+}
+
+const struct lume_platform_graphics_ops lume_dsi_graphics_operations = {
+    graphics_query, graphics_claim, graphics_present};

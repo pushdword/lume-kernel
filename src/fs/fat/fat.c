@@ -126,6 +126,8 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
     if (depth > 8)
         return false;
     uint32_t slow = c, fast = c;
+    char long_name[256] = {0};
+    unsigned sequence = 0, checksum = 0;
     for (uint32_t hops = 0; hops < f->clusters; ++hops)
     {
         const unsigned char *p = cluster(f, c);
@@ -136,13 +138,71 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
             const unsigned char *e = p + i;
             if (!e[0])
                 return true;
-            if (e[0] == 0xe5 || e[0] == '.' || (e[11] & 0x08) || (e[11] & 0x0f) == 0x0f)
+            if (e[0] == 0xe5)
+            {
+                sequence = 0;
                 continue;
+            }
+            if (e[11] == 0x0f)
+            {
+                unsigned ordinal = e[0] & 31;
+                if (e[0] & 0x40)
+                {
+                    for (unsigned k = 0; k < sizeof(long_name); ++k)
+                        long_name[k] = 0;
+                    sequence = ordinal;
+                    checksum = e[13];
+                }
+                if (!sequence || ordinal != sequence || ordinal > 20 || e[12] || u16(e + 26) ||
+                    e[13] != checksum || (e[0] & 0xa0))
+                {
+                    sequence = 0;
+                    long_name[0] = 0;
+                    continue;
+                }
+                static const unsigned char offsets[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+                for (unsigned k = 0; k < 13; ++k)
+                {
+                    unsigned index = (ordinal - 1) * 13 + k;
+                    unsigned character = u16(e + offsets[k]);
+                    if (index < 255 && character >= 32 && character < 127 && character != '/' &&
+                        character != '\\')
+                        long_name[index] = (char)character;
+                    else if (character && character != 0xffff)
+                    {
+                        sequence = 0;
+                        long_name[0] = 0;
+                        break;
+                    }
+                }
+                if (sequence)
+                    --sequence;
+                continue;
+            }
+            unsigned actual = 0;
+            for (unsigned k = 0; k < 11; ++k)
+                actual = ((actual >> 1) | (actual << 7)) + e[k], actual &= 255;
+            bool use_long = !sequence && long_name[0] && actual == checksum;
+            sequence = 0;
+            if (e[0] == '.' || (e[11] & 0x08))
+            {
+                long_name[0] = 0;
+                continue;
+            }
             unsigned n = length;
             if (n && n < 126)
                 path[n++] = '/';
-            for (unsigned k = 0; k < 11; ++k)
+            for (unsigned k = 0; k < (use_long ? 255u : 11u); ++k)
             {
+                if (use_long)
+                {
+                    if (!long_name[k])
+                        break;
+                    if (n >= 126)
+                        return false;
+                    path[n++] = long_name[k];
+                    continue;
+                }
                 if (e[k] == ' ')
                     continue;
                 if (k == 8)
@@ -155,6 +215,7 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
                     return false;
                 path[n++] = e[k] >= 'A' && e[k] <= 'Z' ? (char)(e[k] + 32) : (char)e[k];
             }
+            long_name[0] = 0;
             path[n] = 0;
             if (n == length)
                 return false;

@@ -4,8 +4,7 @@
 /* Pixel and cell dimensions pack width in bits 0..15 and height in bits 16..31.
  * Catalogue indices are local to the active controller and are not persistent IDs.
  * Queries take zero unless an index is required. The final syscall argument is zero.
- * Font upload consumes 4096 bytes containing 256 MSB-first 8x16 glyphs.
- * Glyph indices use Latin-1 with the euro sign in slot 0x80. */
+ * Font upload consumes 4096 bytes containing 256 MSB-first 8x16 glyphs. */
 enum lume_video_action
 {
     LUME_VIDEO_LEGACY_MODES = 0,

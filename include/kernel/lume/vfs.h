@@ -45,6 +45,7 @@ void lume_files_clone(struct lume_files *, const struct lume_files *);
 void lume_files_inherit(struct lume_files *, const struct lume_files *);
 void lume_files_release(struct lume_files *);
 int64_t lume_vfs_open(struct lume_files *, const char *, uint64_t flags);
+void lume_vfs_terminal_open(int (*)(struct lume_files *, const char *, uint64_t));
 int64_t lume_vfs_open_compat(struct lume_files *, const char *, uint64_t flags);
 int64_t lume_vfs_remove_compat(struct lume_files *, const char *, bool);
 int64_t lume_vfs_stat_inode(uint64_t, struct lume_stat *);

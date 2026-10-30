@@ -14,6 +14,7 @@
 #include "lume/vfs.h"
 #include "lume/abi.h"
 bool lume_display_release(void);
+extern const struct lume_platform_graphics_ops lume_dsi_graphics_operations;
 
 struct binding
 {
@@ -53,8 +54,18 @@ static int start(struct lume_hardware *hardware, void *context)
     if (result)
         return result;
     if (!lume_display_start(lume_counter_frequency()))
-        return -LUME_ENOENT;
-    return 0;
+        result = -LUME_ENOENT;
+    else
+        result =
+            lume_platform_driver_register(LUME_PLATFORM_GRAPHICS, &lume_dsi_graphics_operations,
+                                          sizeof(lume_dsi_graphics_operations));
+    if (result)
+    {
+        (void)lume_display_release();
+        (void)lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+        binding->registered = false;
+    }
+    return result;
 }
 
 static int stop(struct lume_hardware *hardware, void *context)
@@ -64,10 +75,16 @@ static int stop(struct lume_hardware *hardware, void *context)
     if (!binding->registered)
         return 0;
     int result = lume_platform_driver_can_stop(LUME_PLATFORM_DISPLAY, &operations);
+    if (!result)
+        result =
+            lume_platform_driver_can_stop(LUME_PLATFORM_GRAPHICS, &lume_dsi_graphics_operations);
     if (result)
         return result;
     if (!lume_display_release())
         return -LUME_EIO;
+    result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &lume_dsi_graphics_operations);
+    if (result)
+        return result;
     result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
     if (!result)
         binding->registered = false;

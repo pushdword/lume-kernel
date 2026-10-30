@@ -4,6 +4,7 @@
 #include "lume/platform_driver.h"
 #include "lume/storage.h"
 #include "lume/sd.h"
+#include "lume/worker.h"
 #define DATA 0x1f0
 #define CONTROL 0x3f6
 static uint64_t capacity, allowed_first, allowed_count;
@@ -96,35 +97,34 @@ static bool write_sector(uint64_t sector, const void *buffer)
     return true;
 }
 
-#if defined(LUME_SD_MAX_SECTORS)
-static bool block_range(uint64_t sector, unsigned count, const void *buffer)
-{
-    return buffer && count && count <= LUME_SD_MAX_SECTORS && sector < capacity &&
-           count <= capacity - sector && (uintptr_t)buffer <= UINTPTR_MAX - (uintptr_t)count * 512;
-}
-
 static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 {
-    if (!block_range(sector, count, buffer))
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+        count > capacity - sector)
         return false;
     for (unsigned i = 0; i < count; ++i)
-        if (!read_sector(sector + i, (unsigned char *)buffer + i * 512))
+    {
+        if (!read_sector(sector + i, (unsigned char *)buffer + (size_t)i * 512))
             return false;
+        lume_worker_checkpoint(512);
+    }
     return true;
 }
 
 static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
 {
-    if (!block_range(sector, count, buffer) || !allowed_count || sector < allowed_first ||
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+        count > capacity - sector || !allowed_count || sector < allowed_first ||
         sector - allowed_first >= allowed_count || count > allowed_count - (sector - allowed_first))
         return false;
     for (unsigned i = 0; i < count; ++i)
-        if (!write_sector(sector + i, (const unsigned char *)buffer + i * 512))
+    {
+        if (!write_sector(sector + i, (const unsigned char *)buffer + (size_t)i * 512))
             return false;
+        lume_worker_checkpoint(512);
+    }
     return true;
 }
-
-#endif
 
 static bool start(uint64_t frequency)
 {
@@ -201,12 +201,8 @@ int lume_pc_ide_register(void)
     if (!capacity || capacity > UINT64_C(0x10000000))
         return -5;
     static const struct lume_platform_sd_ops operations = {
-        start,       configure,    stop,       read_sector, write_sector,
-        sectors,     allow,        allow_boot, stats,
-#if defined(LUME_SD_MAX_SECTORS)
-        read_blocks, write_blocks,
-#endif
-    };
+        start, configure,  stop,  read_sector, write_sector, sectors,
+        allow, allow_boot, stats, read_blocks, write_blocks};
     int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
         stats();

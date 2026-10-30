@@ -7,6 +7,17 @@
 #undef interface
 #include "../../../drivers/usb/xhci/usb.c"
 #include "lume/hardware.h"
+#include "lume/graphics_device.h"
+bool lume_graphics_input_owned(void)
+{
+    return false;
+}
+
+void lume_graphics_input(const struct lume_input_event *event)
+{
+    (void)event;
+    abort();
+}
 static unsigned char *arena;
 static bool used[128], fail_command;
 static unsigned live, freed;

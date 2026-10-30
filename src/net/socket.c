@@ -223,6 +223,8 @@ static unsigned local_poll(void *context)
 static const struct lume_file_ops local_ops = {LUME_NODE_SOCKET, local_close, local_read,
                                                local_write,      local_poll,  local_source};
 
+#include "unix_socket.h"
+
 static struct tcp_file *allocate_tcp(void)
 {
     for (unsigned i = 0; i < SOCKETS; ++i)
@@ -241,11 +243,23 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
                          struct lume_socket_request *r)
 {
     if (r->version != LUME_SOCKET_VERSION || r->bytes != sizeof(*r) || r->reserved ||
-        r->reserved2 || operation > LUME_SOCKET_OPTION ||
+        r->reserved2 || operation > LUME_SOCKET_PENDING ||
         r->flags & ~(LUME_FD_CLOEXEC | LUME_FD_NONBLOCK))
         return -LUME_EINVAL;
     if (operation == LUME_SOCKET_CREATE)
     {
+        if (r->family == 1 && r->type == 1)
+        {
+            struct named_socket *socket = named_allocate();
+            if (!socket)
+                return -LUME_ENOMEM;
+            int fd = lume_vfs_attach(files, &named_ops, socket, r->flags);
+            if (fd < 0)
+                named_close(socket);
+            else
+                r->fd = fd;
+            return fd < 0 ? fd : 0;
+        }
         if (r->family != 2 || r->type != 1)
             return -LUME_ENOSYS;
         struct tcp_file *file = allocate_tcp();
@@ -289,10 +303,30 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
         return -LUME_ENOMEM;
     }
     struct local_end *end = lume_vfs_external(files, (unsigned)r->fd, &local_ops);
+    struct named_socket *named = lume_vfs_external(files, (unsigned)r->fd, &named_ops);
+    if (named)
+    {
+        if (operation == LUME_SOCKET_PENDING)
+        {
+            if (!named->end)
+                return -LUME_EINVAL;
+            r->count = named->end->pair->ring[named->end->side].count;
+            return 0;
+        }
+        if (operation != LUME_SOCKET_SEND_FD && operation != LUME_SOCKET_RECEIVE_FD &&
+            operation != LUME_SOCKET_SHUTDOWN)
+            return named_operation(files, named, operation, r);
+        end = named->end;
+    }
     if (end)
     {
         struct local_pair *pair = end->pair;
         struct local_ring *ring = &pair->ring[end->side ^ 1];
+        if (operation == LUME_SOCKET_PENDING)
+        {
+            r->count = pair->ring[end->side].count;
+            return 0;
+        }
         if (operation == LUME_SOCKET_SHUTDOWN)
         {
             if (r->other != 1)
@@ -305,7 +339,8 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
         {
             if (r->count != 1 || ring->rights_count == RIGHTS || ring->count == LUME_PIPE_BYTES)
                 return -LUME_EAGAIN;
-            if (lume_vfs_external(files, (unsigned)r->other, &local_ops))
+            if (lume_vfs_external(files, (unsigned)r->other, &local_ops) ||
+                lume_vfs_external(files, (unsigned)r->other, &named_ops))
                 return -LUME_ENOSYS;
             int object = lume_vfs_hold(files, (unsigned)r->other);
             if (object < 0)
@@ -326,9 +361,9 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
         if (operation == LUME_SOCKET_RECEIVE_FD)
         {
             ring = &pair->ring[end->side];
-            if (r->count != 1)
-                return -LUME_EINVAL;
             r->other = -1;
+            if (!r->count)
+                return 0;
             if (ring->rights_count && ring->rights[ring->rights_first].offset == ring->consumed)
             {
                 int fd = lume_vfs_install(files, ring->rights[ring->rights_first].object);
@@ -338,7 +373,14 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
                 ring->rights_first = (ring->rights_first + 1) % RIGHTS;
                 --ring->rights_count;
             }
-            return local_read(end, (void *)(uintptr_t)r->buffer, 1);
+            uint64_t bytes = r->count;
+            if (ring->rights_count)
+            {
+                uint64_t available = ring->rights[ring->rights_first].offset - ring->consumed;
+                if (bytes > available)
+                    bytes = available;
+            }
+            return local_read(end, (void *)(uintptr_t)r->buffer, bytes);
         }
         return -LUME_ENOSYS;
     }

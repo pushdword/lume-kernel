@@ -22,6 +22,8 @@
 #include "lume/thread.h"
 #include "lume/supervision.h"
 #include "lume/signal.h"
+#include "lume/process.h"
+#include "lume/tty_device.h"
 #include <string.h>
 #include "thread_state.h"
 #include "poll_state.h"
@@ -93,6 +95,9 @@ static unsigned process_status[LUME_TASK_LIMIT];
 static unsigned service_root[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
 static unsigned exit_signals[LUME_TASK_LIMIT];
+static bool process_stopped[LUME_TASK_LIMIT];
+static bool process_adopted[LUME_TASK_LIMIT];
+static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
 static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 
 extern int64_t lume_supervision_call(unsigned, unsigned, struct lume_supervision_request *);
@@ -174,7 +179,8 @@ int64_t lume_service_call(unsigned pid, unsigned op, void *data, uint64_t bytes)
     return -LUME_EINVAL;
 }
 
-static unsigned parents[LUME_TASK_LIMIT], exit_codes[LUME_TASK_LIMIT], wait_target[LUME_TASK_LIMIT];
+static unsigned parents[LUME_TASK_LIMIT], exit_codes[LUME_TASK_LIMIT];
+static int64_t wait_target[LUME_TASK_LIMIT];
 static bool owned[LUME_TASK_LIMIT];
 static char task_names[LUME_TASK_LIMIT][24];
 static uint64_t user_ticks[LUME_TASK_LIMIT], kernel_ticks[LUME_TASK_LIMIT];
@@ -260,7 +266,9 @@ int lume_task_info(unsigned task, struct lume_task_info *out)
     *out = (struct lume_task_info){.pid = task + 1,
                                    .parent = task ? parents[task] + 1 : 0,
                                    .uid = tasks[thread_slots[task].process].files.identity.uid,
-                                   .state = state == 4   ? 5
+                                   .state = process_stopped[thread_slots[task].process]
+                                                ? LUME_PROCESS_STOPPED
+                                            : state == 4 ? 5
                                             : state == 5 ? 4
                                                          : state,
                                    .runs = dispatches[task],
@@ -362,6 +370,9 @@ static bool child_running;
 static int pick_task(void)
 {
     unsigned excluded = lume_cpu_index() ? (1u | 1u << 2) : 0;
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (process_stopped[thread_slots[i].process] && !process_exiting[thread_slots[i].process])
+            excluded |= 1u << i;
     if (public_mode && io_queue_granted(&kernel_queue, lume_clock_monotonic()))
     {
         unsigned task = kernel_queue.grant.task;
@@ -382,6 +393,44 @@ static void signal_queue(unsigned, unsigned);
 static void signal_inherit(unsigned, unsigned, bool);
 static void poll_cancel(unsigned);
 static void poll_interrupt(unsigned, struct lume_context *);
+static unsigned task_group(unsigned);
+static void signal_orphaned_groups(void);
+static bool signal_group_orphaned(unsigned, unsigned);
+static bool signal_child_notify(unsigned);
+void lume_tasks_tty_signal(unsigned, unsigned, unsigned);
+
+static bool wait_matches(unsigned parent, unsigned child, int64_t target)
+{
+    if (thread_slots[child].thread || parents[child] != parent)
+        return false;
+    if (target >= 0)
+        return !target || (uint64_t)target == child + 1;
+    return (uint64_t)(-(target + 1)) + 1 == task_group(child);
+}
+
+static void child_state_event(unsigned child, unsigned event)
+{
+    unsigned parent = parents[child];
+    child_events[child] = event;
+    if (signal_child_notify(parent))
+        signal_queue(parent, 20);
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] == 3 && process_slot(i) == parent &&
+            wait_matches(parent, child, wait_target[i]) &&
+            LUME_CONTEXT_REG(&tasks[i].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WAIT &&
+            LUME_CONTEXT_REG(&tasks[i].context, 2) &&
+            (LUME_CONTEXT_REG(&tasks[i].context, 1) & event))
+        {
+            child_events[child] = 0;
+            wait_target[i] = 0;
+            states[i] = 1;
+            LUME_CONTEXT_REG(&tasks[i].context, 0) =
+                ((uint64_t)(child + 1) << 32) |
+                (event == LUME_WAIT_STOPPED ? stop_signals[child] << 8 | 0x7fu : 0xffffu);
+            sched_wake(&policy, i, unit, 0);
+            break;
+        }
+}
 
 static uint32_t wait_status(unsigned task, bool posix)
 {
@@ -412,6 +461,8 @@ static void kernel_console_send(struct lume_console_output *output)
 
 static void release_program(unsigned task)
 {
+    extern void lume_graphics_release(unsigned);
+    lume_graphics_release(task + 1);
     kernel_cancel(task);
     poll_cancel(task);
     lume_supervision_release(task + 1);
@@ -451,6 +502,8 @@ static bool process_busy(unsigned owner)
 
 static void request_exit(unsigned owner, unsigned status)
 {
+    process_stopped[owner] = false;
+    child_events[owner] = 0;
     if (!process_exiting[owner])
         process_status[owner] = status;
     process_exiting[owner] = true;
@@ -548,11 +601,15 @@ static struct lume_context *finish_program(unsigned status)
                 reaper != task && reaper < LUME_TASK_LIMIT && states[reaper] && states[reaper] != 5
                     ? reaper
                     : 0;
+            process_adopted[i] = true;
         }
+    signal_orphaned_groups();
     unsigned waiter = LUME_TASK_LIMIT;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] == 3 && process_slot(i) == parent &&
-            (wait_target[i] == task + 1 || !wait_target[i]))
+            wait_matches(parent, task, wait_target[i]) &&
+            (!(LUME_CONTEXT_REG(&tasks[i].context, 1) & LUME_WAIT_ORPHANED) ||
+             process_adopted[task]))
         {
             waiter = i;
             break;
@@ -576,6 +633,90 @@ static struct lume_context *finish_program(unsigned status)
 }
 
 #include "signal_calls.h"
+
+static unsigned task_group(unsigned task)
+{
+    return signals[task].group ? signals[task].group : 1;
+}
+
+static bool signal_group_orphaned(unsigned session, unsigned group)
+{
+    for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && states[i] != 5 && !thread_slots[i].thread &&
+            signals[i].session == session && task_group(i) == group)
+        {
+            unsigned parent = parents[i];
+            if (states[parent] && states[parent] != 5 && signals[parent].session == session &&
+                task_group(parent) != group)
+                return false;
+        }
+    return true;
+}
+
+static void signal_orphaned_groups(void)
+{
+    for (unsigned child = 1; child < LUME_TASK_LIMIT; ++child)
+    {
+        if (!states[child] || !process_stopped[child] || thread_slots[child].thread)
+            continue;
+        unsigned group = task_group(child), session = signals[child].session;
+        if (signal_group_orphaned(session, group))
+            for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
+                if (states[i] && states[i] != 5 && !thread_slots[i].thread &&
+                    signals[i].session == session && task_group(i) == group)
+                {
+                    signal_queue(i, 1);
+                    signal_queue(i, 19);
+                }
+    }
+}
+
+int lume_tasks_tty_background(unsigned pid, unsigned session, unsigned foreground, unsigned number)
+{
+    if (!pid || pid > LUME_TASK_LIMIT || !session || !foreground)
+        return 0;
+    unsigned owner = pid - 1;
+    struct signal_state *state = signals + owner;
+    if (state->session != session || state->group == foreground)
+        return 0;
+    if ((state->mask & (1u << number)) || state->action[number].handler == 1)
+        return number == 21 ? -LUME_EIO : 0;
+    if (signal_group_orphaned(session, state->group))
+        return -LUME_EIO;
+    lume_tasks_tty_signal(session, state->group, number);
+    return signal_default_stop(owner, number) ? -LUME_EAGAIN : -4;
+}
+
+unsigned lume_tasks_tty_session(unsigned pid)
+{
+    return pid && pid <= LUME_TASK_LIMIT && states[pid - 1] ? signals[pid - 1].session : 0;
+}
+
+unsigned lume_tasks_tty_group(unsigned pid)
+{
+    return pid && pid <= LUME_TASK_LIMIT && states[pid - 1] ? signals[pid - 1].group : 0;
+}
+
+bool lume_tasks_tty_group_valid(unsigned pid, unsigned group)
+{
+    unsigned session = lume_tasks_tty_session(pid);
+    for (unsigned i = 0; session && group && i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && !thread_slots[i].thread && signals[i].session == session &&
+            signals[i].group == group)
+            return true;
+    return false;
+}
+
+void lume_tasks_tty_signal(unsigned session, unsigned group, unsigned number)
+{
+    if (!session || !group || !number || number >= LUME_SIGNAL_COUNT)
+        return;
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (states[i] && !thread_slots[i].thread && signals[i].session == session &&
+            signals[i].group == group)
+            signal_queue(i, number);
+}
+
 #include "poll_calls.h"
 
 static uint32_t now(void)
@@ -997,6 +1138,14 @@ static int start_program(struct lume_context *frame)
         main_thread_done[owner] = false;
         context_replaced[owner] = true;
         signal_inherit(owner, owner, true);
+        const char *name = path;
+        for (const char *p = path; *p; ++p)
+            if (*p == '/')
+                name = p + 1;
+        unsigned length = 0;
+        for (; name[length] && length + 1 < sizeof(task_names[owner]); ++length)
+            task_names[owner][length] = name[length];
+        task_names[owner][length] = 0;
         ++program_runs;
         return 0;
     }
@@ -1418,15 +1567,18 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return process_terminate((unsigned)LUME_CONTEXT_REG(frame, 0) & 255);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WAIT)
     {
-        if (LUME_CONTEXT_REG(frame, 1) > 1 || LUME_CONTEXT_REG(frame, 2) > 1)
+        if ((LUME_CONTEXT_REG(frame, 1) & ~(uint64_t)(LUME_WAIT_BLOCK | LUME_WAIT_STOPPED |
+                                                      LUME_WAIT_CONTINUED | LUME_WAIT_ORPHANED)) ||
+            LUME_CONTEXT_REG(frame, 2) > 1)
         {
             LUME_CONTEXT_REG(frame, 0) = (uint64_t)-LUME_EINVAL;
             return frame;
         }
         bool found = false;
         for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
-            if (i != 2 && !thread_slots[i].thread && states[i] && parents[i] == process &&
-                (!LUME_CONTEXT_REG(frame, 0) || LUME_CONTEXT_REG(frame, 0) == i + 1))
+            if (i != 2 && states[i] &&
+                wait_matches(process, i, (int64_t)LUME_CONTEXT_REG(frame, 0)) &&
+                (!(LUME_CONTEXT_REG(frame, 1) & LUME_WAIT_ORPHANED) || process_adopted[i]))
             {
                 found = true;
                 if (states[i] == 5)
@@ -1436,11 +1588,20 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                         ((uint64_t)(i + 1) << 32) | wait_status(i, LUME_CONTEXT_REG(frame, 2) != 0);
                     return frame;
                 }
+                unsigned event = child_events[i] & (unsigned)LUME_CONTEXT_REG(frame, 1);
+                if (event && LUME_CONTEXT_REG(frame, 2))
+                {
+                    child_events[i] = 0;
+                    LUME_CONTEXT_REG(frame, 0) =
+                        ((uint64_t)(i + 1) << 32) |
+                        (event == LUME_WAIT_STOPPED ? stop_signals[i] << 8 | 0x7fu : 0xffffu);
+                    return frame;
+                }
             }
-        if (found && LUME_CONTEXT_REG(frame, 1))
+        if (found && (LUME_CONTEXT_REG(frame, 1) & LUME_WAIT_BLOCK))
         {
             tasks[task].context = *frame;
-            wait_target[task] = (unsigned)LUME_CONTEXT_REG(frame, 0);
+            wait_target[task] = (int64_t)LUME_CONTEXT_REG(frame, 0);
             states[task] = 3;
             sched_charge(&policy, lume_cpu_index(), now());
             return wait_ready_task();
@@ -1703,6 +1864,9 @@ bool lume_shell_start(uint64_t frequency, bool script)
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
     {
         owned[i] = false;
+        process_stopped[i] = false;
+        process_adopted[i] = false;
+        child_events[i] = stop_signals[i] = 0;
         wait_target[i] = 0;
         task_names[i][0] = 0;
     }
@@ -1743,7 +1907,11 @@ bool lume_shell_start(uint64_t frequency, bool script)
     states[0] = 1;
     sched_new(&policy, 0, 1);
     sched_wake(&policy, 0, unit, 0);
-    if (!script && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY)
+    bool services = !script && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY;
+#if defined(LUME_ARCH_I686)
+    services = false;
+#endif
+    if (services)
     {
         if (lume_vfs_program(&tasks[0].files, "/bin/netd", &elf, &bytes))
             return false;
@@ -1771,7 +1939,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         capabilities[2] = LUME_CAP_NET_ADMIN | LUME_CAP_SERVICE;
         lume_puts("LUME NET SERVICE EL0 PID3\n");
     }
-    if (!script && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && !start_supervisor())
+    if (services && !start_supervisor())
         lume_puts("LUME SERVICE SUPERVISOR UNAVAILABLE\n");
     active = true;
     lume_smp_lock();

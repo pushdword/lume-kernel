@@ -59,7 +59,7 @@ int main(void)
     capable = true;
     assert(lume_io_call(7, false, LUME_BOOT_WRITE, user_pointer, sizeof(boot)) == 17);
     unsigned before = boot_calls;
-    assert(lume_io_call(7, false, LUME_BOOT_CONFIRM + 1, user_pointer, sizeof(boot)) ==
+    assert(lume_io_call(7, false, LUME_BOOT_CAPABILITIES + 1, user_pointer, sizeof(boot)) ==
            -LUME_EINVAL);
     assert(lume_io_call(7, false, UINT64_MAX, user_pointer, sizeof(boot)) == -LUME_EINVAL);
     assert(lume_io_call(7, false, LUME_BOOT_INFO, user_pointer, sizeof(boot) - 1) == -LUME_EINVAL);

@@ -80,6 +80,8 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!storage || !lume_vfs_mount_storage(storage))
         lume_fail("IDE data volume");
     lume_value("PERSISTENT_VOLUME_READY", 1);
+    extern int lume_pc_entropy_start(void);
+    lume_value("PC_ENTROPY_READY", lume_pc_entropy_start() == 0);
     lume_puts("LUME i686 INTERACTIVE CONSOLE READY\n");
     static const char greeting[] = "Lume i686 interactive console ready.\n";
     lume_display_write(greeting, sizeof(greeting) - 1);

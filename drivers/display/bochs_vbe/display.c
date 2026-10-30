@@ -3,6 +3,7 @@
 #include "lume/display.h"
 #include "lume/platform_driver.h"
 #include "lume/abi.h"
+#include "lume/graphics.h"
 #include "terminal.h"
 #include "console_font.h"
 #include <string.h>
@@ -15,7 +16,7 @@ static const unsigned modes[] = {800 | 600u << 16,  1024 | 768u << 16,  640 | 48
 static volatile uint32_t *framebuffer;
 static struct terminal terminal;
 static uint32_t cells[MAX_COLUMNS * MAX_ROWS], shown[MAX_COLUMNS * MAX_ROWS];
-static bool enabled, custom_loaded;
+static bool enabled, custom_loaded, graphics_owned;
 static uint32_t pci, address, video_bytes;
 static unsigned width, height, max_width, max_height, columns, rows;
 static unsigned font_index = CONSOLE_FONT_DEFAULT;
@@ -88,6 +89,8 @@ static void glyph(unsigned character, unsigned x, unsigned y, uint32_t foregroun
 
 static void refresh(void)
 {
+    if (graphics_owned)
+        return;
     unsigned cursor = terminal.row * columns + terminal.column;
     for (unsigned i = 0; i < columns * rows; ++i)
     {
@@ -112,7 +115,7 @@ static void clear(void)
     refresh();
 }
 
-static void redraw(void)
+static void paint_background(void)
 {
     prepare_font();
     columns = (width - 16) / (font_cell() & 65535);
@@ -125,6 +128,11 @@ static void redraw(void)
     for (unsigned i = 0; i < sizeof(title) - 1; ++i)
         glyph(title[i], 8 + i * 12, 3, palette[11], palette[0], false);
     font_index = saved_font;
+}
+
+static void redraw(void)
+{
+    paint_background();
     clear();
 }
 
@@ -219,6 +227,9 @@ static int64_t video_control(unsigned action, unsigned value, const unsigned cha
 {
     if (!enabled)
         return -LUME_ENOSYS;
+    if (graphics_owned && (action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_SELECT ||
+                           action == LUME_VIDEO_FONT_SELECT || action == LUME_VIDEO_UPLOAD))
+        return -LUME_EBUSY;
     bool indexed = action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_PIXELS ||
                    action == LUME_VIDEO_MODE_SELECT || action == LUME_VIDEO_FONT_CELL ||
                    action == LUME_VIDEO_FONT_FACE || action == LUME_VIDEO_FONT_SELECT;
@@ -294,6 +305,57 @@ static int64_t video_control(unsigned action, unsigned value, const unsigned cha
 static const struct lume_platform_display_ops operations = {start, display_putc, write,
                                                             clear, stop,         video_control};
 
+static int graphics_query(struct lume_graphics_request *request)
+{
+    if (!enabled)
+        return -LUME_ENOSYS;
+    request->width = width;
+    request->height = height;
+    request->pitch = width * 4;
+    request->format = LUME_GRAPHICS_XRGB8888;
+    return 0;
+}
+
+static int graphics_claim(bool acquire)
+{
+    if (!enabled)
+        return -LUME_ENOSYS;
+    if (acquire && graphics_owned)
+        return -LUME_EBUSY;
+    graphics_owned = acquire;
+    if (!acquire)
+    {
+        paint_background();
+        for (unsigned i = 0; i < columns * rows; ++i)
+            shown[i] = UINT32_MAX;
+        refresh();
+    }
+    return 0;
+}
+
+static int graphics_present(const struct lume_graphics_request *request)
+{
+    if (!enabled || !graphics_owned)
+        return -LUME_EBADF;
+    if (request->format != LUME_GRAPHICS_XRGB8888 || !request->width || !request->height ||
+        request->x > width || request->y > height || request->width > width - request->x ||
+        request->height > height - request->y || (uint64_t)request->width * 4 > request->pitch)
+        return -LUME_EINVAL;
+    const unsigned char *source = (const void *)(uintptr_t)request->pixels;
+    for (unsigned y = 0; y < request->height; ++y)
+    {
+        const uint32_t *row = (const void *)(source + (uint64_t)y * request->pitch);
+        volatile uint32_t *target = framebuffer + (request->y + y) * width + request->x;
+        for (unsigned x = 0; x < request->width; ++x)
+            target[x] = row[x];
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return 0;
+}
+
+static const struct lume_platform_graphics_ops graphics_operations = {
+    graphics_query, graphics_claim, graphics_present};
+
 static int module_start(struct lume_hardware *hardware, void *context)
 {
     struct q35_binding *binding = context;
@@ -303,6 +365,13 @@ static int module_start(struct lume_hardware *hardware, void *context)
     if (!start(0))
         return -LUME_ENOENT;
     result = lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
+    if (!result)
+    {
+        result = lume_platform_driver_register(LUME_PLATFORM_GRAPHICS, &graphics_operations,
+                                               sizeof(graphics_operations));
+        if (result)
+            (void)lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+    }
     binding->registered = !result;
     return result;
 }
@@ -313,7 +382,10 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     struct q35_binding *binding = context;
     if (binding->registered)
     {
-        int result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+        int result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
+        if (result)
+            return result;
+        result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
         if (result)
             return result;
         binding->registered = false;

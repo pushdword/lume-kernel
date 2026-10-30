@@ -14,12 +14,16 @@ struct q35_binding
 #include "lume/counter.h"
 #include "lume/cpu.h"
 #include "lume/usb.h"
+#include "lume/graphics_device.h"
 #include <string.h>
 
 static struct lume_hid keyboard;
 static unsigned char report[8];
 static bool extended, enabled;
 static unsigned pause_bytes;
+static bool mouse_enabled, input_graphical;
+static unsigned mouse_bytes;
+static unsigned char mouse_packet[3];
 static const unsigned char usages[128] = {
     [1] = 41,  [2] = 30,  [3] = 31,  [4] = 32,  [5] = 33,  [6] = 34,  [7] = 35,  [8] = 36,
     [9] = 37,  [10] = 38, [11] = 39, [12] = 45, [13] = 46, [14] = 42, [15] = 43, [16] = 20,
@@ -46,6 +50,43 @@ static bool controller_write(bool command, unsigned byte)
     return true;
 }
 
+static bool mouse_command(unsigned command)
+{
+    if (!controller_write(true, 0xd4) || !controller_write(false, command))
+        return false;
+    uint64_t deadline = lume_counter_read() + lume_counter_frequency() / 20;
+    while (lume_counter_read() < deadline)
+    {
+        unsigned status = lume_in8(0x64);
+        if (status & 1)
+        {
+            unsigned value = lume_in8(0x60);
+            if ((status & 0x20) && !(status & 0xc0))
+                return value == 0xfa;
+        }
+        lume_cpu_relax();
+    }
+    return false;
+}
+
+static void mouse_byte(unsigned byte)
+{
+    if (!mouse_enabled || (!mouse_bytes && !(byte & 8)))
+        return;
+    mouse_packet[mouse_bytes++] = (unsigned char)byte;
+    if (mouse_bytes != sizeof(mouse_packet))
+        return;
+    mouse_bytes = 0;
+    if (mouse_packet[0] & 0xc0)
+        return;
+    int x = (int)mouse_packet[1] - (mouse_packet[0] & 0x10 ? 256 : 0);
+    int y = (int)mouse_packet[2] - (mouse_packet[0] & 0x20 ? 256 : 0);
+    struct lume_input_event event = {.type = LUME_INPUT_POINTER, .x = x, .y = -y,
+                                      .buttons = mouse_packet[0] & 7,
+                                      .milliseconds = lume_clock_millis()};
+    lume_graphics_input(&event);
+}
+
 static bool keyboard_start(void)
 {
     if (!controller_write(true, 0xad))
@@ -56,6 +97,15 @@ static bool keyboard_start(void)
     if (!controller_write(true, 0x60) || !controller_write(false, 0x64) ||
         !controller_write(true, 0xae) || !controller_write(false, 0xf4))
         return false;
+    mouse_bytes = 0;
+    mouse_enabled = controller_write(true, 0xa8) && controller_write(true, 0x60) &&
+                    controller_write(false, 0x44) && mouse_command(0xf6) && mouse_command(0xf4);
+    if (!mouse_enabled)
+    {
+        (void)controller_write(true, 0xa7);
+        (void)controller_write(true, 0x60);
+        (void)controller_write(false, 0x64);
+    }
     enabled = true;
     lume_puts("LUME PS2 KEYBOARD READY PT\n");
     return true;
@@ -98,14 +148,26 @@ static void keyboard_poll(void)
 {
     if (!enabled)
         return;
+    bool graphical = lume_graphics_input_owned();
+    if (graphical != input_graphical)
+    {
+        memset(&keyboard, 0, sizeof(keyboard));
+        memset(report, 0, sizeof(report));
+        input_graphical = graphical;
+    }
     for (unsigned i = 0; i < 128; ++i)
     {
         unsigned status = lume_in8(0x64);
         if (!(status & 1))
             break;
         unsigned scan = lume_in8(0x60);
-        if (status & 0xe0)
+        if (status & 0xc0)
             continue;
+        if (status & 0x20)
+        {
+            mouse_byte(scan);
+            continue;
+        }
         if (scan == 0xe0)
         {
             extended = true;
@@ -129,6 +191,21 @@ static void keyboard_poll(void)
                             : !extended && scan == 0x36 ? 32
                                                         : 0;
         unsigned usage = extended ? extended_usage(scan) : usages[scan];
+        if (graphical)
+        {
+            unsigned code = modifier == 1 ? 224 : modifier == 16 ? 228
+                            : modifier == 4 ? 226 : modifier == 64 ? 230
+                            : modifier == 2 ? 225 : modifier == 32 ? 229 : usage;
+            if (code)
+            {
+                struct lume_input_event event = {.type = LUME_INPUT_KEY, .code = code,
+                                                  .x = !release,
+                                                  .milliseconds = lume_clock_millis()};
+                lume_graphics_input(&event);
+            }
+            extended = false;
+            continue;
+        }
         extended = false;
         if (modifier)
             report[0] = release ? report[0] & ~modifier : report[0] | modifier;
@@ -157,12 +234,15 @@ static void keyboard_poll(void)
         }
         lume_hid_report(&keyboard, report, sizeof(report), lume_clock_millis());
     }
-    lume_hid_repeat(&keyboard, lume_clock_millis());
+    if (!graphical)
+        lume_hid_repeat(&keyboard, lume_clock_millis());
 }
 
 static int keyboard_getc(void)
 {
     keyboard_poll();
+    if (lume_graphics_input_owned())
+        return -LUME_EAGAIN;
     return lume_hid_getc(&keyboard);
 }
 

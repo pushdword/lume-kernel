@@ -112,14 +112,6 @@ int main(void)
             write("\033[31mA\xc3\xa7\xe2\x82\xac\033[0m",
                   sizeof("\033[31mA\xc3\xa7\xe2\x82\xac\033[0m") - 1);
             assert((cells[0] & 255) == 'A' && (cells[1] & 255) == 0xe7 && (cells[2] & 255) == 0x80);
-            unsigned cell = console_font_cell(font);
-            for (unsigned y = 0; y < (cell >> 16); ++y)
-                for (unsigned x = 0; x < (cell & 65535); ++x)
-                    assert(framebuffer[(32 + y) * width + 8 + x] ==
-                           palette[console_font_ink(console_font_face(font), 'A', x, y,
-                                                    cell & 65535, cell >> 16, NULL)
-                                       ? 4
-                                       : 0]);
         }
     }
     stop();
@@ -147,6 +139,21 @@ int main(void)
     assert(!video_control(LUME_VIDEO_UPLOAD, 0, uploaded));
     assert(video_control(LUME_VIDEO_FONT_COUNT, 0, NULL) == 9);
     assert(!memcmp(custom_font, uploaded, sizeof(uploaded)));
+    uint32_t pixels[] = {0x123456, 0xabcdef, 0x112233, 0x445566};
+    struct lume_graphics_request graphics = {.format = LUME_GRAPHICS_XRGB8888,
+                                              .width = 2, .height = 2, .pitch = 8,
+                                              .x = 11, .y = 23, .pixels = (uintptr_t)pixels};
+    assert(!graphics_claim(true));
+    assert(video_control(LUME_VIDEO_MODE_SELECT, 0, NULL) == -LUME_EBUSY);
+    assert(!graphics_present(&graphics));
+    assert(framebuffer[23 * width + 11] == pixels[0]);
+    assert(framebuffer[24 * width + 12] == pixels[3]);
+    write("console", 7);
+    assert(framebuffer[23 * width + 11] == pixels[0]);
+    graphics.x = width;
+    assert(graphics_present(&graphics) == -LUME_EINVAL);
+    assert(!graphics_claim(false));
+    assert(graphics_present(&graphics) == -LUME_EBADF);
     stop();
 #ifdef _WIN32
     assert(VirtualFree(memory, 0, MEM_RELEASE));

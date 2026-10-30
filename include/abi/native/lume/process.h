@@ -66,6 +66,16 @@ struct lume_memory_snapshot
 
 enum
 {
+    LUME_WAIT_BLOCK = 1u,
+    LUME_WAIT_STOPPED = 2u,
+    LUME_WAIT_CONTINUED = 4u,
+    LUME_WAIT_ORPHANED = 8u
+};
+
+#define LUME_PROCESS_STOPPED 6u
+
+enum
+{
     LUME_FS_SYNC,
     LUME_FS_TRUNCATE,
     LUME_FS_RENAME,

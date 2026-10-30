@@ -3,11 +3,14 @@
 #include "lume/cpu.h"
 #include "lume/irq.h"
 #include "lume/platform_driver.h"
+#include "lume/graphics_device.h"
 #include "lume/abi.h"
 #include "scheduler_config.h"
 #include "lume/pci.h"
 #include "lume/smp.h"
+#if defined(LUME_ARCH_AMD64)
 #include "lume/apic.h"
+#endif
 static uint64_t frequency, epoch;
 static uint16_t masks = 0xffff;
 
@@ -48,6 +51,8 @@ static void timer_irq(unsigned irq, void *context)
     (void)irq;
     (void)context;
     lume_uart_poll_input();
+    if (lume_graphics_input_owned())
+        lume_keyboard_poll();
     lume_q35_hardware_tick();
 }
 
@@ -101,11 +106,13 @@ uint64_t lume_q35_counter_value(uint64_t raw)
 static void timer_start(uint64_t hz)
 {
     (void)hz;
+#if defined(LUME_ARCH_AMD64)
     if (lume_cpu_index())
     {
         lume_apic_timer_start();
         return;
     }
+#endif
     uint32_t divisor = 1193182u * SCHED_TICK_MS / 1000;
     if (!divisor || divisor > 65535)
         lume_fail("PIT scheduler interval");
@@ -117,11 +124,13 @@ static void timer_start(uint64_t hz)
 
 static void timer_stop(void)
 {
+#if defined(LUME_ARCH_AMD64)
     if (lume_cpu_index())
     {
         lume_apic_timer_stop();
         return;
     }
+#endif
     (void)lume_irq_enable(32, false);
 }
 
@@ -146,13 +155,21 @@ void lume_q35_clock_start(void)
     lume_out8(0x43, 0xb0);
     lume_out8(0x42, 0xff);
     lume_out8(0x42, 0xff);
+#if defined(LUME_ARCH_I686)
+    (void)lume_counter_read();
+#else
     __asm__ volatile("lfence" : : : "memory");
+#endif
     uint64_t begin = lume_tsc_read();
     lume_out8(0x61, (gate & ~2u) | 1u);
     unsigned remaining = 100000000;
     while (!(lume_in8(0x61) & 0x20) && --remaining)
         lume_cpu_relax();
+#if defined(LUME_ARCH_I686)
+    (void)lume_counter_read();
+#else
     __asm__ volatile("lfence" : : : "memory");
+#endif
     uint64_t elapsed = lume_tsc_read() - begin;
     lume_out8(0x61, gate);
     if (!remaining || elapsed > UINT64_MAX / 1193182)

@@ -37,6 +37,7 @@ union operations
     struct lume_platform_entropy_ops entropy;
     struct lume_platform_wifi_ops wifi;
     struct lume_platform_keyboard_ops keyboard;
+    struct lume_platform_graphics_ops graphics;
 };
 
 static struct provider
@@ -77,6 +78,8 @@ static size_t operation_bytes(unsigned kind)
         return sizeof(struct lume_platform_wifi_ops);
     case LUME_PLATFORM_KEYBOARD:
         return sizeof(struct lume_platform_keyboard_ops);
+    case LUME_PLATFORM_GRAPHICS:
+        return sizeof(struct lume_platform_graphics_ops);
     default:
         return 0;
     }
@@ -632,6 +635,29 @@ bool lume_display_start(uint64_t frequency)
     if (!provider->source)
         return false;
     return provider->operations.display.lume_display_start(frequency);
+}
+
+int lume_platform_graphics_query(struct lume_graphics_request *request)
+{
+    struct provider *provider = providers + LUME_PLATFORM_GRAPHICS;
+    return provider->source ? provider->operations.graphics.query(request) : -LUME_ENOSYS;
+}
+
+int lume_platform_graphics_claim(bool acquire)
+{
+    struct provider *provider = providers + LUME_PLATFORM_GRAPHICS;
+    if (!provider->source)
+        return -LUME_ENOSYS;
+    int result = provider->operations.graphics.claim(acquire);
+    if (!result)
+        provider->active = acquire;
+    return result;
+}
+
+int lume_platform_graphics_present(const struct lume_graphics_request *request)
+{
+    struct provider *provider = providers + LUME_PLATFORM_GRAPHICS;
+    return provider->source ? provider->operations.graphics.present(request) : -LUME_ENOSYS;
 }
 
 void lume_display_putc(char c)

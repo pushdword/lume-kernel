@@ -1,4 +1,6 @@
 KERNEL_C_aarch64 := \
+    src/device/graphics.c \
+    src/device/tty.c \
     src/storage/block.c \
     platform/raspberrypi5/boot_fdt.c \
     platform/raspberrypi5/boot_fdt_file.c \

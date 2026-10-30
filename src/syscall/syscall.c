@@ -13,9 +13,12 @@
 #include "lume/kernel_memory.h"
 #include "lume/socket_file.h"
 #include "lume/file_mode.h"
+#include "lume/io_call.h"
 #include "lume/display.h"
 #include "lume/video_control.h"
-#include "lume/io_call.h"
+#include "lume/graphics_device.h"
+#include "lume/tty_device.h"
+#include "lume/platform_driver.h"
 #include <string.h>
 
 extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
@@ -124,7 +127,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             .capabilities = lume_task_capabilities(pid)};
 #if defined(LUME_ARCH_I686)
         ((struct lume_system_features *)(uintptr_t)a)->features &=
-            ~(LUME_FEATURE_THREADS | LUME_FEATURE_MODULES | LUME_FEATURE_RANDOM);
+            ~(LUME_FEATURE_THREADS | LUME_FEATURE_MODULES);
+        if (!lume_platform_driver_ready(LUME_PLATFORM_ENTROPY))
+            ((struct lume_system_features *)(uintptr_t)a)->features &= ~LUME_FEATURE_RANDOM;
 #endif
         return 0;
     }
@@ -194,6 +199,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_heap_brk(pid, a);
     case LUME_SYS_TERMINAL:
     {
+        int64_t terminal = lume_tty_terminal(files, (unsigned)a);
+        if (terminal != -25)
+            return terminal;
         extern bool lume_console_ready(void);
         if (!a)
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
@@ -247,6 +255,28 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         if (b > UINT32_MAX)
             return -LUME_EINVAL;
         return lume_display_video((unsigned)a, (unsigned)b, NULL);
+    }
+    case LUME_SYS_GRAPHICS:
+    {
+        if (a > LUME_GRAPHICS_PRESENT || n != sizeof(struct lume_graphics_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        struct lume_graphics_request request = *(const struct lume_graphics_request *)(uintptr_t)b;
+        int result = lume_graphics_call(files, pid, (unsigned)a, &request);
+        *(struct lume_graphics_request *)(uintptr_t)b = request;
+        return result;
+    }
+    case LUME_SYS_TTY:
+    {
+        if (a > LUME_TTY_OPEN || n != sizeof(struct lume_tty_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        struct lume_tty_request request = *(const struct lume_tty_request *)(uintptr_t)b;
+        int result = lume_tty_call(files, pid, (unsigned)a, &request);
+        *(struct lume_tty_request *)(uintptr_t)b = request;
+        return result;
     }
     case LUME_SYS_MEMORY:
         if (b != sizeof(struct lume_memory_snapshot))
@@ -416,11 +446,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_dup2(files, a, b);
     case LUME_SYS_FD:
     {
-        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_SETMODE)
+        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_PATH)
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
         struct lume_fd_request request = *(const struct lume_fd_request *)(uintptr_t)b;
+        if (a == LUME_FD_PATH && (request.count > LUME_PATH_MAX ||
+            !lume_user_buffer(request.buffer, request.count, true)))
+            return -LUME_EFAULT;
         if (a == LUME_FD_POLL && request.count > LUME_FD_LIMIT)
             return -LUME_EINVAL;
         if (a == LUME_FD_INFO &&
@@ -436,13 +469,22 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_SOCKET:
     {
-        if (a > LUME_SOCKET_OPTION || n != sizeof(struct lume_socket_request))
+        if (a > LUME_SOCKET_PENDING || n != sizeof(struct lume_socket_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
         struct lume_socket_request request = *(const struct lume_socket_request *)(uintptr_t)b;
         if (request.count > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
+        if (request.family == 1 && (a == LUME_SOCKET_BIND || a == LUME_SOCKET_CONNECT ||
+                                   a == LUME_SOCKET_LOCAL || a == LUME_SOCKET_PEER))
+        {
+            if (request.count > LUME_PATH_MAX)
+                return -LUME_EINVAL;
+            if (!lume_user_buffer(request.buffer, request.count,
+                                  a == LUME_SOCKET_LOCAL || a == LUME_SOCKET_PEER))
+                return -LUME_EFAULT;
+        }
         if (a == LUME_SOCKET_SEND_FD && !lume_user_buffer(request.buffer, request.count, false))
             return -LUME_EFAULT;
         if (a == LUME_SOCKET_RECEIVE_FD && !lume_user_buffer(request.buffer, request.count, true))
@@ -490,9 +532,19 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                               LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) != LUME_SYS_WRITE))
             return -LUME_EFAULT;
         if (LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_READ)
+        {
+            int access = n ? lume_tty_access(files, pid, (unsigned)a, false) : 0;
+            if (access)
+                return access;
             return lume_vfs_read(files, a, (void *)(uintptr_t)b, n);
+        }
         if (LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WRITE)
+        {
+            int access = n ? lume_tty_access(files, pid, (unsigned)a, true) : 0;
+            if (access)
+                return access;
             return lume_vfs_write(files, a, (const void *)(uintptr_t)b, n);
+        }
         return lume_vfs_getdents(files, a, (void *)(uintptr_t)b, n);
     default:
         return -LUME_ENOSYS;

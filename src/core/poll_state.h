@@ -7,6 +7,6 @@ struct poll_wait_state
     struct lume_poll_watch watch;
     uint64_t request, output, deadline, signal_epoch;
     unsigned operation;
-    bool active, check_epoch;
+    bool active, check_epoch, tty_read;
 };
 #endif

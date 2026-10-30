@@ -17,6 +17,7 @@ enum lume_platform_driver_kind
     LUME_PLATFORM_ENTROPY = 8,
     LUME_PLATFORM_WIFI = 9,
     LUME_PLATFORM_KEYBOARD = 10,
+    LUME_PLATFORM_GRAPHICS = 11,
     LUME_PLATFORM_DRIVER_COUNT
 };
 
@@ -106,6 +107,19 @@ struct lume_platform_entropy_ops
 {
     bool (*lume_entropy)(void *data, size_t bytes);
 };
+
+struct lume_graphics_request;
+
+struct lume_platform_graphics_ops
+{
+    int (*query)(struct lume_graphics_request *);
+    int (*claim)(bool);
+    int (*present)(const struct lume_graphics_request *);
+};
+
+int lume_platform_graphics_query(struct lume_graphics_request *);
+int lume_platform_graphics_claim(bool);
+int lume_platform_graphics_present(const struct lume_graphics_request *);
 
 struct lume_platform_wifi_ops
 {

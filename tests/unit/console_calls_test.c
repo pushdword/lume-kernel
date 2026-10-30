@@ -21,7 +21,7 @@ static struct
 
 static unsigned kernel_owner, current_task, process_owner[LUME_TASK_LIMIT];
 static unsigned samples, calls, buffer_checks, progress;
-static bool busy, kernel_console_scope, ready, cached;
+static bool busy, kernel_console_scope, ready, cached, terminal_descriptor;
 static uint64_t denied, checked_bytes;
 static bool checked_write;
 static struct lume_console_output *capture;
@@ -75,7 +75,7 @@ bool lume_vfs_poll_input_ready(void)
 bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
 {
     assert(files == &tasks[process_slot(current_task)].files);
-    return fd < 3 || fd == 9;
+    return (fd < 3 && !terminal_descriptor) || fd == 9;
 }
 
 bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
@@ -258,6 +258,9 @@ static void readiness_and_io(void)
     assert(!kernel_console_call(&call));
     busy = false;
     assert(kernel_console_call(&call));
+    terminal_descriptor = true;
+    assert(!kernel_console_call(&call));
+    terminal_descriptor = false;
     kernel_console_result(&call);
     assert(call.x[0] == 1 && samples == 2 && progress == 6);
 }

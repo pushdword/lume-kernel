@@ -17,6 +17,11 @@ static struct signal_state
     uint32_t saved_mask[SIGNAL_DEPTH];
 } signals[LUME_TASK_LIMIT];
 
+static bool signal_child_notify(unsigned parent)
+{
+    return !(signals[parent].action[20].flags & 1u);
+}
+
 static bool signal_ignored(unsigned owner, unsigned number)
 {
     uint64_t handler = signals[owner].action[number].handler;
@@ -24,13 +29,43 @@ static bool signal_ignored(unsigned owner, unsigned number)
                                          number == 23 || number == 28));
 }
 
+static bool signal_default_stop(unsigned owner, unsigned number)
+{
+    return number == 17 || (!signals[owner].action[number].handler &&
+                            (number == 18 || number == 21 || number == 22));
+}
+
+static uint32_t signal_interrupt_pending(unsigned owner)
+{
+    uint32_t pending = signals[owner].pending & ~signals[owner].mask;
+    const unsigned stops[] = {17, 18, 21, 22};
+    for (unsigned i = 0; i < sizeof(stops) / sizeof(*stops); ++i)
+        if (signal_default_stop(owner, stops[i]))
+            pending &= ~(1u << stops[i]);
+    return pending;
+}
+
 static void signal_queue(unsigned owner, unsigned number)
 {
-    if (owner >= LUME_TASK_LIMIT || !states[owner] || states[owner] == 5 ||
-        signal_ignored(owner, number))
+    if (owner >= LUME_TASK_LIMIT || !states[owner] || states[owner] == 5)
         return;
     struct signal_state *s = &signals[owner];
-    if (!(s->mask & (1u << number)))
+    if (number == 19)
+    {
+        s->pending &= ~((1u << 17) | (1u << 18) | (1u << 21) | (1u << 22));
+        if (process_stopped[owner])
+        {
+            process_stopped[owner] = false;
+            child_state_event(owner, LUME_WAIT_CONTINUED);
+            lume_smp_wake();
+        }
+    }
+    else if (number == 17 || number == 18 || number == 21 || number == 22)
+        s->pending &= ~(1u << 19);
+    if (signal_ignored(owner, number))
+        return;
+    bool stopping = signal_default_stop(owner, number);
+    if (!(s->mask & (1u << number)) && !stopping)
         ++s->epoch;
     s->pending |= 1u << number;
     if (number == 9)
@@ -42,8 +77,15 @@ static void signal_queue(unsigned owner, unsigned number)
              ((states[owner] == 4 && !thread_waiting[owner]) ||
               (states[owner] == 3 && LUME_CONTEXT_REG(&tasks[owner].context, 8) == LUME_SYS_WAIT)))
     {
-        bool restart =
-            (s->action[number].flags & (1u << 3)) && (pipe_wait[owner] || states[owner] == 3);
+        if (stopping && poll_waits[owner].active)
+        {
+            states[owner] = 1;
+            sched_wake(&policy, owner, unit, 0);
+            lume_smp_wake();
+            return;
+        }
+        bool restart = (stopping || (s->action[number].flags & (1u << 3))) &&
+                       (pipe_wait[owner] || states[owner] == 3);
         poll_interrupt(owner, &tasks[owner].context);
         if (pipe_wait[owner] && !restart)
             LUME_CONTEXT_PC(&tasks[owner].context) += LUME_SYSCALL_INSTRUCTION_BYTES;
@@ -79,6 +121,9 @@ static void signal_inherit(unsigned child, unsigned parent, bool exec)
     struct signal_state *s = &signals[child], *p = &signals[parent];
     if (child != parent)
     {
+        process_stopped[child] = false;
+        process_adopted[child] = false;
+        child_events[child] = stop_signals[child] = 0;
         memcpy(s->action, p->action, sizeof(s->action));
         s->mask = p->mask;
         s->session = p->session ? p->session : 1;
@@ -177,8 +222,6 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     {
         if (r.number >= LUME_SIGNAL_COUNT)
             return -LUME_EINVAL;
-        if (r.number == 17 || r.number == 18 || r.number == 19 || r.number == 21 || r.number == 22)
-            return -LUME_ENOSYS;
         bool found = false, permitted = false;
         unsigned caller_uid = tasks[owner].files.identity.euid;
         for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
@@ -238,9 +281,18 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
 struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
 {
     if (!frame || !active || !public_mode || (LUME_CONTEXT_STATUS(frame) & 15) ||
-        current_task >= LUME_TASK_LIMIT || thread_slots[current_task].thread)
+        current_task >= LUME_TASK_LIMIT)
         return frame;
-    unsigned owner = current_task;
+    unsigned owner = process_slot(current_task);
+    if (process_stopped[owner])
+    {
+        tasks[current_task].context = *frame;
+        states[current_task] = 1;
+        sched_charge(&policy, lume_cpu_index(), now());
+        return lume_tasks_deliver_signals(wait_ready_task());
+    }
+    if (thread_slots[current_task].thread)
+        return frame;
     struct signal_state *s = &signals[owner];
     uint32_t pending = s->pending & ~s->mask;
     for (unsigned number = 1; number < LUME_SIGNAL_COUNT; ++number)
@@ -250,6 +302,23 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
             s->pending &= ~(1u << number);
             if (signal_ignored(owner, number))
                 continue;
+            if (number == 17 || (!action.handler && (number == 18 || number == 21 || number == 22)))
+            {
+                if (number != 17 && signal_group_orphaned(s->session, s->group))
+                    continue;
+                if (process_busy(owner))
+                {
+                    s->pending |= 1u << number;
+                    return frame;
+                }
+                process_stopped[owner] = true;
+                stop_signals[owner] = number;
+                child_state_event(owner, LUME_WAIT_STOPPED);
+                tasks[current_task].context = *frame;
+                states[current_task] = 1;
+                sched_charge(&policy, lume_cpu_index(), now());
+                return lume_tasks_deliver_signals(wait_ready_task());
+            }
             poll_interrupt(owner, frame);
             if (!action.handler || number == 9 || s->depth == SIGNAL_DEPTH)
             {

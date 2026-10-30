@@ -1,3 +1,5 @@
+#include "lume/graphics_device.h"
+
 static void poll_cancel(unsigned task)
 {
     lume_vfs_poll_cancel(task);
@@ -22,7 +24,7 @@ static bool poll_signal_changed(unsigned task)
 {
     unsigned process = process_slot(task);
     return !thread_slots[task].thread &&
-           ((signals[process].pending & ~signals[process].mask) ||
+           (signal_interrupt_pending(process) ||
             (poll_waits[task].check_epoch &&
              poll_waits[task].signal_epoch != signals[process].epoch));
 }
@@ -31,6 +33,11 @@ static void poll_console_pump(void)
 {
     if (lume_cpu_index())
         return;
+    if (lume_graphics_input_owned())
+    {
+        (void)kernel_console_ready();
+        return;
+    }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] == 4 && poll_waits[i].active &&
             lume_vfs_poll_console(&tasks[process_slot(i)].files, &poll_waits[i].watch))
@@ -78,7 +85,9 @@ static struct lume_context *poll_call(struct lume_context *frame)
                 return poll_result(frame, -LUME_EFAULT);
             memcpy(&request, (const void *)(uintptr_t)address, sizeof(request));
             if (request.version != LUME_POLL_VERSION || request.bytes != sizeof(request) ||
-                (request.flags & ~LUME_POLL_SIGNAL_EPOCH) ||
+                (request.flags & ~(LUME_POLL_SIGNAL_EPOCH | LUME_POLL_TTY_READ)) ||
+                ((request.flags & LUME_POLL_TTY_READ) &&
+                 (!(request.flags & LUME_POLL_SIGNAL_EPOCH) || request.count != 1)) ||
                 (!(request.flags & LUME_POLL_SIGNAL_EPOCH) && request.signal_epoch))
                 return poll_result(frame, -LUME_EINVAL);
         }
@@ -118,9 +127,12 @@ static struct lume_context *poll_call(struct lume_context *frame)
             .signal_epoch = request.signal_epoch,
             .operation = operation,
             .active = true,
-            .check_epoch = (request.flags & LUME_POLL_SIGNAL_EPOCH) != 0};
+            .check_epoch = (request.flags & LUME_POLL_SIGNAL_EPOCH) != 0,
+            .tty_read = (request.flags & LUME_POLL_TTY_READ) != 0};
         wait->watch.count = request.count;
         memcpy(wait->watch.records, (const void *)(uintptr_t)request.buffer, bytes);
+        if (wait->tty_read && wait->watch.records[0].events != LUME_POLLIN)
+            return poll_result(frame, -LUME_EINVAL);
         lume_vfs_poll_prepare(&tasks[process].files, &wait->watch);
     }
     else if (wait->operation != operation || wait->request != address)
@@ -135,6 +147,13 @@ static struct lume_context *poll_call(struct lume_context *frame)
     unsigned ready = lume_vfs_poll_check(&tasks[process].files, &wait->watch);
     if (poll_signal_changed(task))
         return poll_result(frame, -4);
+    if (wait->tty_read && !(wait->watch.records[0].revents & LUME_POLLNVAL))
+    {
+        int access = lume_tty_access(&tasks[process].files, process + 1,
+                                     (unsigned)wait->watch.records[0].fd, false);
+        if (access)
+            return poll_result(frame, access);
+    }
     if (ready || lume_clock_monotonic() >= wait->deadline)
         return poll_result(frame, ready);
     tasks[task].context = *frame;

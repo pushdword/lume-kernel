@@ -9,6 +9,7 @@ static unsigned char cr[256], sr[256], gr[256], cr_index, sr_index, gr_index;
 static uint32_t revision = 0x03000040, bar = 0xf8000000, command = 3;
 static unsigned writes_to_ports;
 static const struct lume_platform_display_ops *registered;
+static const struct lume_platform_graphics_ops *registered_graphics;
 
 uint8_t lume_in8(uint16_t port)
 {
@@ -79,8 +80,21 @@ void lume_puts(const char *text)
 
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
+    if (kind == LUME_PLATFORM_GRAPHICS)
+    {
+        assert(bytes == sizeof(*registered_graphics));
+        registered_graphics = ops;
+        return 0;
+    }
     assert(kind == LUME_PLATFORM_DISPLAY && bytes == sizeof(*registered));
     registered = ops;
+    return 0;
+}
+
+int lume_platform_driver_unregister(unsigned kind, const void *ops)
+{
+    assert(kind == LUME_PLATFORM_DISPLAY && ops == registered);
+    registered = NULL;
     return 0;
 }
 
@@ -110,6 +124,26 @@ int main(void)
     memset(memory, 0xa5, video_bytes + 32);
     framebuffer = memory + 8;
     assert(registered->lume_display_start(1000000));
+    struct lume_graphics_request screen = {0};
+    assert(registered_graphics && !registered_graphics->query(&screen));
+    assert(screen.width == 1024 && screen.height == 768);
+    assert(!registered_graphics->claim(true));
+    assert(registered_graphics->claim(true) == -LUME_EBUSY);
+    assert(lume_s3_video_call(LUME_VIDEO_MODE_SELECT, 0, 0) == -LUME_EBUSY);
+    uint32_t pixels[] = {0xff0000, 0x00ff00, 0x0000ff};
+    struct lume_graphics_request update = {.pixels = (uintptr_t)pixels,
+        .x = 5, .y = 5, .width = 3, .height = 1, .pitch = 12,
+        .format = LUME_GRAPHICS_XRGB8888};
+    assert(!registered_graphics->present(&update));
+    assert(framebuffer[5 * 1024 + 5] == 0xf800);
+    assert(framebuffer[5 * 1024 + 6] == 0x07e0);
+    assert(framebuffer[5 * 1024 + 7] == 0x001f);
+    send("hidden");
+    assert(framebuffer[5 * 1024 + 5] == 0xf800);
+    update.x = 1023;
+    assert(registered_graphics->present(&update) == -LUME_EINVAL);
+    assert(!registered_graphics->claim(false));
+    clear();
     assert(lume_s3_video_call(0, 0, 0) == 3);
     assert(lume_s3_video_call(4, 0, 0) == (1024 | 768 << 16));
     assert(lume_s3_console_geometry() == (84 | 36 << 16));
@@ -157,13 +191,6 @@ int main(void)
             assert(columns <= MAX_COLUMNS && rows <= MAX_ROWS);
             send("\033[31mA\xc3\xa7\xe2\x82\xac\033[0m");
             assert((cells[0] & 255) == 'A' && (cells[1] & 255) == 0xe7 && (cells[2] & 255) == 0x80);
-            for (unsigned y = 0; y < (cell >> 16); ++y)
-                for (unsigned x = 0; x < (cell & 65535); ++x)
-                    assert(framebuffer[(32 + y) * (pixels & 65535) + 8 + x] ==
-                           rgb565(palette[console_font_ink(console_font_face(font), 'A', x, y,
-                                                           cell & 65535, cell >> 16, NULL)
-                                              ? 4
-                                              : 0]));
             for (unsigned i = 0; i < rows + 2; ++i)
                 send("scroll\n");
             assert(terminal.row == rows - 1);

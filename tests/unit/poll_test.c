@@ -266,6 +266,11 @@ int main(void)
     T(!lume_vfs_stat(&files, rights.other, &metadata) && metadata.kind == LUME_NODE_FILE);
     lume_vfs_poll_cancel(15);
     T(!lume_vfs_close(&files, rights.other));
+    T(lume_vfs_write(&files, rights_writer, "bulk-message", 12) == 12);
+    rights.count = 12;
+    rights.other = -1;
+    T(lume_socket_call(&files, LUME_SOCKET_RECEIVE_FD, &rights) == 12);
+    T(rights.other == -1 && !memcmp(bytes, "bulk-message", 12));
     T(!lume_vfs_close(&files, transferred));
     T(!lume_vfs_close(&files, rights_reader) && !lume_vfs_close(&files, rights_writer));
     lume_vfs_poll_cancel(8);
@@ -325,6 +330,69 @@ int main(void)
 
     for (unsigned i = 0; i < LUME_POLL_TASK_LIMIT; ++i)
         lume_vfs_poll_cancel(i);
+    lume_files_release(&files);
+    lume_files_init(&files);
+    struct lume_socket_request listener = {.version = LUME_SOCKET_VERSION,
+                                            .bytes = sizeof(listener), .family = 1, .type = 1};
+    T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &listener));
+    char socket_name[] = "/tmp/.X11-unix/X0";
+    listener.buffer = (uintptr_t)socket_name;
+    listener.count = sizeof(socket_name);
+    T(!lume_socket_call(&files, LUME_SOCKET_BIND, &listener));
+    listener.count = 3;
+    T(!lume_socket_call(&files, LUME_SOCKET_LISTEN, &listener));
+    struct lume_poll_watch pending = watch(&files, listener.fd, LUME_POLLIN, 10);
+    for (unsigned connection = 0; connection < 3; ++connection)
+    {
+        struct lume_socket_request client = {.version = LUME_SOCKET_VERSION,
+                                              .bytes = sizeof(client), .family = 1, .type = 1};
+        T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &client));
+        client.buffer = (uintptr_t)socket_name;
+        client.count = sizeof(socket_name);
+        T(!lume_socket_call(&files, LUME_SOCKET_CONNECT, &client));
+        T(lume_vfs_poll_check(&files, &pending) == 1);
+        T(!lume_socket_call(&files, LUME_SOCKET_ACCEPT, &listener));
+        int server = listener.other;
+        T(lume_vfs_write(&files, client.fd, "X11", 3) == 3);
+        T(lume_vfs_read(&files, server, bytes, 3) == 3 && !memcmp(bytes, "X11", 3));
+        T(!lume_vfs_close(&files, client.fd));
+        T(lume_vfs_read(&files, server, bytes, 3) == 0);
+        T(!lume_vfs_close(&files, server));
+    }
+    lume_vfs_poll_cancel(10);
+    listener.count = 1;
+    T(!lume_socket_call(&files, LUME_SOCKET_LISTEN, &listener));
+    struct lume_socket_request queued[2];
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        queued[i] = (struct lume_socket_request){.version = LUME_SOCKET_VERSION,
+            .bytes = sizeof(queued[i]), .family = 1, .type = 1};
+        T(!lume_socket_call(&files, LUME_SOCKET_CREATE, queued + i));
+        queued[i].buffer = (uintptr_t)socket_name;
+        queued[i].count = sizeof(socket_name);
+    }
+    T(!lume_socket_call(&files, LUME_SOCKET_CONNECT, queued));
+    T(lume_socket_call(&files, LUME_SOCKET_CONNECT, queued + 1) == -LUME_EAGAIN);
+    struct lume_poll_watch connecting = watch(&files, queued[1].fd, LUME_POLLOUT, 11);
+    T(!lume_vfs_poll_check(&files, &connecting));
+    T(!lume_socket_call(&files, LUME_SOCKET_ACCEPT, &listener));
+    T(lume_vfs_poll_take(11));
+    T(lume_vfs_poll_check(&files, &connecting) == 1);
+    T(!lume_vfs_close(&files, listener.other));
+    T(!lume_vfs_close(&files, queued[0].fd));
+    T(!lume_socket_call(&files, LUME_SOCKET_CONNECT, queued + 1));
+    T(!lume_socket_call(&files, LUME_SOCKET_ACCEPT, &listener));
+    T(!lume_vfs_close(&files, listener.other));
+    T(!lume_vfs_close(&files, queued[1].fd));
+    lume_vfs_poll_cancel(11);
+    T(!lume_vfs_close(&files, listener.fd));
+    listener = (struct lume_socket_request){.version = LUME_SOCKET_VERSION,
+                                            .bytes = sizeof(listener), .family = 1, .type = 1};
+    T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &listener));
+    listener.buffer = (uintptr_t)socket_name;
+    listener.count = sizeof(socket_name);
+    T(!lume_socket_call(&files, LUME_SOCKET_BIND, &listener));
+    T(!lume_vfs_close(&files, listener.fd));
     lume_files_release(&files);
     for (unsigned i = 0; i < LUME_POLL_TASK_LIMIT; ++i)
         T(!lume_vfs_poll_take(i));

@@ -5,13 +5,14 @@
 #include "terminal.h"
 #include "console_font.h"
 #include <string.h>
+#include "../framebuffer.h"
 
 static struct
 {
     uintptr_t memory;
     size_t bytes;
     unsigned width, height, depth, order, pitch, columns, rows, font;
-    bool enabled, registered, custom_loaded;
+    bool enabled, registered, custom_loaded, graphics_owned;
     unsigned char custom[256][16];
     struct console_font_bitmap bitmap;
     struct terminal terminal;
@@ -74,6 +75,8 @@ static void render_cell(unsigned at, unsigned value)
 
 static bool render(void)
 {
+    if (console.graphics_owned)
+        return true;
     unsigned size = cell_size(console.font), width = size & 65535, height = size >> 16;
     unsigned cursor = console.terminal.row * console.columns + console.terminal.column;
     for (unsigned row = 0; row < console.rows; ++row)
@@ -110,9 +113,10 @@ static void clear(void)
 {
     if (!console.enabled)
         return;
-    for (unsigned y = 0; y < console.height; ++y)
-        memset((void *)(console.memory + (size_t)y * console.pitch), 0,
-               console.width * (console.depth / 8));
+    if (!console.graphics_owned)
+        for (unsigned y = 0; y < console.height; ++y)
+            memset((void *)(console.memory + (size_t)y * console.pitch), 0,
+                   console.width * (console.depth / 8));
     terminal_start(&console.terminal, console.cells, console.columns, console.rows);
     for (unsigned i = 0; i < console.columns * console.rows; ++i)
         console.shown[i] = UINT32_MAX;
@@ -162,6 +166,10 @@ static int64_t video(unsigned action, unsigned value, const unsigned char *font)
 {
     if (!console.enabled)
         return -LUME_ENOSYS;
+    if (console.graphics_owned &&
+        (action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_SELECT ||
+         action == LUME_VIDEO_FONT_SELECT || action == LUME_VIDEO_UPLOAD))
+        return -LUME_EBUSY;
     bool indexed = action == LUME_VIDEO_MODE_PIXELS || action == LUME_VIDEO_MODE_SELECT ||
                    action == LUME_VIDEO_FONT_CELL || action == LUME_VIDEO_FONT_FACE ||
                    action == LUME_VIDEO_FONT_SELECT;
@@ -221,6 +229,61 @@ static int64_t video(unsigned action, unsigned value, const unsigned char *font)
 static const struct lume_platform_display_ops operations = {start, console_putc, write,
                                                             clear, stop,         video};
 
+static int graphics_query(struct lume_graphics_request *request)
+{
+    if (!console.enabled)
+        return -LUME_ENOSYS;
+    request->width = console.width;
+    request->height = console.height;
+    request->pitch = console.width * 4;
+    request->format = LUME_GRAPHICS_XRGB8888;
+    return 0;
+}
+
+static int graphics_claim(bool acquire)
+{
+    if (!console.enabled)
+        return -LUME_ENOSYS;
+    if (acquire && console.graphics_owned)
+        return -LUME_EBUSY;
+    console.graphics_owned = acquire;
+    if (!acquire)
+    {
+        for (unsigned y = 0; y < console.height; ++y)
+            memset((void *)(console.memory + (size_t)y * console.pitch), 0,
+                   console.width * (console.depth / 8));
+        if (!lume_dma_sync_for_device((void *)console.memory,
+                                      (size_t)console.pitch * console.height, LUME_DMA_TO_DEVICE))
+            return -LUME_EIO;
+        for (unsigned i = 0; i < console.columns * console.rows; ++i)
+            console.shown[i] = UINT32_MAX;
+        return render() ? 0 : -LUME_EIO;
+    }
+    return 0;
+}
+
+static int graphics_present(const struct lume_graphics_request *request)
+{
+    if (!console.enabled || !console.graphics_owned)
+        return -LUME_EBADF;
+    int result = lume_framebuffer_present(console.memory, console.width, console.height,
+                                          console.pitch, console.depth, console.order, request);
+    if (result)
+        return result;
+    for (unsigned y = 0; y < request->height; ++y)
+    {
+        uintptr_t row = console.memory + (size_t)(request->y + y) * console.pitch +
+                        request->x * (console.depth / 8);
+        if (!lume_dma_sync_for_device((const void *)row, request->width * (console.depth / 8),
+                                      LUME_DMA_TO_DEVICE))
+            return -LUME_EIO;
+    }
+    return 0;
+}
+
+static const struct lume_platform_graphics_ops graphics_operations = {
+    graphics_query, graphics_claim, graphics_present};
+
 int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsigned depth,
                         unsigned order, unsigned pitch, size_t bytes)
 {
@@ -235,6 +298,13 @@ int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsig
         lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
     if (result)
         return result;
+    result = lume_platform_driver_register(LUME_PLATFORM_GRAPHICS, &graphics_operations,
+                                           sizeof(graphics_operations));
+    if (result)
+    {
+        (void)lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+        return result;
+    }
     console.memory = memory;
     console.width = width;
     console.height = height;
@@ -245,6 +315,7 @@ int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsig
     console.font = 2;
     console.registered = console.enabled = true;
     console.custom_loaded = false;
+    console.graphics_owned = false;
     geometry();
     clear();
     if (console.enabled)
@@ -257,7 +328,13 @@ int hdmi_console_detach(void)
 {
     if (!console.registered)
         return 0;
-    int result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+    if (console.graphics_owned)
+        return -LUME_EBUSY;
+    int result = lume_platform_driver_can_stop(LUME_PLATFORM_DISPLAY, &operations);
+    if (!result)
+        result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
+    if (!result)
+        result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
     if (result)
         return result;
     console.registered = console.enabled = false;
