@@ -54,8 +54,15 @@ enum
     LUME_BOOT_WRITE,
     LUME_BOOT_VERIFY,
     LUME_BOOT_ACTIVATE,
-    LUME_BOOT_ABORT
+    LUME_BOOT_ABORT,
+    LUME_BOOT_CAPABILITIES,
+    LUME_BOOT_CONFIRM
 };
+
+/* CAPABILITIES returns flags in total. Trial updates require a matching boot volume. */
+#define LUME_BOOT_CAP_RESTART_GUARD 1u
+#define LUME_BOOT_CAP_TRIAL 2u
+#define LUME_BOOT_STATE_TRIAL 1u
 
 struct lume_boot_request
 {

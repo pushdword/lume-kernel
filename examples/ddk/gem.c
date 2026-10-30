@@ -23,6 +23,7 @@
 #include <lume/device.h>
 /* Import DMA address translation and cache synchronization operations. */
 #include <lume/dma.h>
+#include <lume/early.h>
 /* Import ordered reads and writes of hardware registers. A plain pointer assignment would not
  * express all required ordering.
  */
@@ -114,6 +115,7 @@ union descriptor_page
     /* Reserve padding so this allocation cannot share a page with the next DMA object. */
     unsigned char page[GEM_DMA_PAGE_BYTES];
 };
+
 _Static_assert(GEM_RX_RING_ENTRIES * sizeof(struct gem_dma_descriptor) <= GEM_DMA_PAGE_BYTES,
                "GEM receive descriptor allocation");
 /* Keep the TX descriptor alive for the kernel lifetime and start it on a 4096-byte boundary.
@@ -158,6 +160,8 @@ static uint32_t network_config;
 static bool phy_link_known;
 static unsigned tx_index, tx_count;
 static uint64_t tx_expected, tx_observed;
+static uint32_t tx_started;
+static bool tx_recovering;
 
 /* Read one 32-bit MAC register. The caller supplies an offset in bytes rather than a full
  * address.
@@ -669,6 +673,7 @@ static int start(struct lume_device *d)
     tx_index = 0;
     tx_count = physical_rp1 ? 2 : 1;
     tx_expected = tx_observed = 0;
+    tx_recovering = false;
     if (physical_rp1)
         (void)read_mac_reg(GEM_TX_FRAMES);
     for (unsigned i = 0; i < tx_count; ++i)
@@ -732,9 +737,32 @@ static int start(struct lume_device *d)
     return 0;
 }
 
-/* Poll the single TX slot. Success means that the CPU may reuse it. EAGAIN means the controller
- * still owns it.
- */
+static int recover_transmit(void)
+{
+    tx_recovering = true;
+    write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_HALT);
+    unsigned polls = 0;
+    while (read_mac_reg(GEM_TX_STATUS) & GEM_TX_STATUS_ACTIVE)
+        if (++polls == GEM_POLL_LIMIT)
+            return -LUME_EAGAIN;
+    /* DMA must stop before descriptors or the queue address change. RX remains enabled. */
+    write_mac_reg(GEM_NETWORK_CONTROL, control & ~GEM_CONTROL_TX_ENABLE);
+    for (unsigned i = 0; i < tx_count; ++i)
+        tx.descriptors[i].control = GEM_TX_USED | (i + 1 == tx_count ? GEM_TX_WRAP : 0);
+    if (!sync_descriptor(&tx, false))
+        return -LUME_EAGAIN;
+    tx_index = 0;
+    tx_expected = tx_observed = 0;
+    (void)read_mac_reg(GEM_TX_FRAMES);
+    write_mac_reg(GEM_TX_QUEUE_BASE_HIGH, (uint32_t)(layout.tx_descriptor_dma >> 32));
+    write_mac_reg(GEM_TX_QUEUE_BASE, (uint32_t)layout.tx_descriptor_dma);
+    write_mac_reg(GEM_TX_STATUS, UINT32_MAX);
+    tx_pending = tx_recovering = false;
+    write_mac_reg(GEM_NETWORK_CONTROL, control);
+    return -LUME_EIO;
+}
+
+/* Poll the single TX slot. EAGAIN retains DMA ownership. EIO reports a failed frame. */
 int lume_example_gem_tx_complete(void)
 {
     /* Require an active controller and fetch the descriptor state written by DMA before testing
@@ -745,6 +773,14 @@ int lume_example_gem_tx_complete(void)
         return -LUME_EIO;
     if (physical_rp1)
         tx_observed += read_mac_reg(GEM_TX_FRAMES);
+    if (physical_rp1 && tx_pending)
+    {
+        uint32_t status = read_mac_reg(GEM_TX_STATUS);
+        bool owned = (tx.descriptors[tx_index].control & GEM_TX_USED) != 0;
+        if (tx_recovering || (status & GEM_TX_STATUS_ERRORS) ||
+            (!owned && (uint32_t)(lume_clock_millis() - tx_started) >= 1000))
+            return recover_transmit();
+    }
     /* A clear USED bit means DMA still owns the descriptor. The CPU must not overwrite its frame
      * buffer yet.
      */
@@ -849,7 +885,10 @@ int lume_example_gem_transmit(const void *data, size_t bytes)
     /* Remember that a completion must be collected before the next reuse of this TX slot. */
     tx_pending = true;
     if (physical_rp1)
+    {
+        tx_started = lume_clock_millis();
         ++tx_expected;
+    }
     /* Add the one-shot transmit-start request to the persistent enable bits and notify the
      * controller to start processing the TX queue.
      */

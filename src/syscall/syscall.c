@@ -15,6 +15,7 @@
 #include "lume/file_mode.h"
 #include "lume/display.h"
 #include "lume/video_control.h"
+#include "lume/io_call.h"
 #include <string.h>
 
 extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
@@ -355,30 +356,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_BOOT:
     {
         bool stream = LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_STREAM;
-        if (!stream && a != LUME_BOOT_INFO && !lume_task_capable(pid, LUME_CAP_BOOT_UPDATE))
-            return -LUME_EPERM;
-        size_t bytes =
-            stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
-        if (n != bytes || a > (stream ? LUME_ICMP_ECHO_CLOSE : LUME_BOOT_ABORT))
-            return -LUME_EINVAL;
-        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
-            return -LUME_EFAULT;
-
-        union
-        {
-            struct lume_stream_request stream;
-            struct lume_boot_request boot;
-        } request;
-
-        unsigned char *p = (void *)&request;
-        unsigned char *user = (void *)(uintptr_t)b;
-        for (size_t i = 0; i < bytes; ++i)
-            p[i] = user[i];
-        int result = stream ? lume_stream_call(pid, (unsigned)a, &request.stream)
-                            : lume_boot_call(pid, (unsigned)a, &request.boot);
-        for (size_t i = 0; i < bytes; ++i)
-            user[i] = p[i];
-        return result;
+        return lume_io_call(pid, stream, a, b, n);
     }
     case LUME_SYS_NETCTL:
     {

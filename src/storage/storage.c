@@ -63,12 +63,14 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
     const struct lume_volume *v = drive_volume(drive);
     if (!v || !count || sector >= v->count || count > v->count - sector)
         return RES_PARERR;
-    for (UINT i = 0; i < count; ++i)
+    for (UINT i = 0; i < count;)
     {
-        bool result = lume_sd_read(v->first + sector + i, out + (size_t)i * 512);
-        lume_worker_checkpoint(512);
+        UINT group = count - i < LUME_SD_MAX_SECTORS ? count - i : LUME_SD_MAX_SECTORS;
+        bool result = lume_sd_read_blocks(v->first + sector + i, group, out + (size_t)i * 512);
+        lume_worker_checkpoint(group * 512);
         if (!result)
             return RES_ERROR;
+        i += group;
     }
     return RES_OK;
 }
@@ -79,12 +81,14 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
     if (!v || !(drive == 0 ? mounted : boot_mounted) || !count || sector >= v->count ||
         count > v->count - sector)
         return RES_PARERR;
-    for (UINT i = 0; i < count; ++i)
+    for (UINT i = 0; i < count;)
     {
-        bool result = lume_sd_write(v->first + sector + i, data + (size_t)i * 512);
-        lume_worker_checkpoint(512);
+        UINT group = count - i < LUME_SD_MAX_SECTORS ? count - i : LUME_SD_MAX_SECTORS;
+        bool result = lume_sd_write_blocks(v->first + sector + i, group, data + (size_t)i * 512);
+        lume_worker_checkpoint(group * 512);
         if (!result)
             return RES_ERROR;
+        i += group;
     }
     return RES_OK;
 }
@@ -97,7 +101,8 @@ DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
     switch (command)
     {
     case CTRL_SYNC:
-        return RES_OK; /* Every CMD24 waits until card ready. */
+        /* Successful writes include card readiness verification. */
+        return lume_sd_sectors() ? RES_OK : RES_ERROR;
     case GET_SECTOR_COUNT:
         *(LBA_t *)data = (LBA_t)v->count;
         return RES_OK;

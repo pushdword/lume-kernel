@@ -197,6 +197,16 @@ static bool write_sector(uint64_t s, const void *p)
     return true;
 }
 
+static bool read_blocks(uint64_t s, unsigned n, void *p)
+{
+    return n && read_sector(s, p);
+}
+
+static bool write_blocks(uint64_t s, unsigned n, const void *p)
+{
+    return n && write_sector(s, p);
+}
+
 static uint64_t sectors(void)
 {
     return 8192;
@@ -309,8 +319,9 @@ int main(void)
     assert(lume_display_geometry() == (100 | 37u << 16));
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &display));
     assert(!references && lume_display_geometry() == (80 | 25u << 16));
-    const struct lume_platform_sd_ops sd = {start,   configure, stop,  read_sector, write_sector,
-                                            sectors, allow,     allow, poll_driver};
+    const struct lume_platform_sd_ops sd = {start,        configure,   stop,        read_sector,
+                                            write_sector, sectors,     allow,       allow,
+                                            poll_driver,  read_blocks, write_blocks};
     assert(!lume_platform_driver_register(LUME_PLATFORM_SD, &sd, sizeof(sd)));
     assert(lume_sd_allow_volume(2048, 4096));
     assert(lume_platform_driver_can_stop(LUME_PLATFORM_SD, &sd) == -LUME_EBUSY);

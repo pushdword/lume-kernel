@@ -1,7 +1,6 @@
 #include "lume/cpu.h"
-/* The BCM2712 SDHCI driver uses PIO transfers and issues single-sector commands. It does not
- * use DMA or SD Express. Writes start disabled. After volume validation, writes are limited to
- * that Lume volume and cannot address the MBR. */
+/* The BCM2712 SDHCI driver uses bounded PIO sector groups with Auto CMD12 termination.
+ * Writes start disabled and remain confined to validated Lume partitions. */
 #include "lume/early.h"
 #include "lume/mmio.h"
 #include "lume/counter.h"
@@ -28,7 +27,7 @@ static uint64_t frequency, capacity, write_first, write_count;
 static uint64_t boot_first, boot_count;
 static uint32_t rca;
 static uint64_t reads, writes, errors, rejected;
-static bool ready;
+static bool ready, transferring;
 
 static uint32_t rd(unsigned reg)
 {
@@ -108,10 +107,14 @@ static bool event(uint32_t mask, unsigned ms)
                 (void)lume_worker_wait_bits(&pending, mask | 0xffff8000u,
                                             start + frequency * ms / 1000);
         }
+        else if (!lume_worker_pause(lume_counter_read() + frequency / 1000))
+            lume_cpu_relax_ordered();
     } while (lume_counter_read() - start < frequency * ms / 1000);
     lume_irq_restore(flags);
     lume_value("SD_ERROR_INTERRUPT", status);
     lume_value("SD_ERROR_PRESENT", rd(0x24));
+    if (status & (1u << 24))
+        lume_value("SD_ERROR_AUTO_CMD", rd(0x3c) & 0xffffu);
     ++errors;
     ready = false;
     if (interrupt_mode)
@@ -127,7 +130,7 @@ static bool event(uint32_t mask, unsigned ms)
 
 static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t *response)
 {
-    uint32_t inhibit = 1u | ((flags & ((1u << 21) | (1u << 16))) ? 2u : 0u);
+    uint32_t inhibit = 1u | ((index != 12 && (flags & ((1u << 21) | (1u << 16)))) ? 2u : 0u);
     if (!wait_register(0x24, inhibit, 0, 1000))
     {
         lume_value("SD_INHIBIT_CMD", index);
@@ -172,7 +175,7 @@ static bool clock_rate(unsigned divider)
 
 static bool initialize(uint64_t hz)
 {
-    ready = false;
+    ready = transferring = false;
     capacity = write_first = write_count = 0;
     boot_first = boot_count = 0;
     rca = 0;
@@ -310,13 +313,17 @@ bool lume_sd_start(uint64_t hz)
                                   .resource_count = resources[1].base ? 2 : 1,
 #endif
                                   .ops = &operations};
-    block = (struct lume_block){
-        .device = &device, .ops = &block_operations, .sector_bytes = 512, .max_sectors = 128};
+    block = (struct lume_block){.device = &device,
+                                .ops = &block_operations,
+                                .sector_bytes = 512,
+                                .max_sectors = LUME_SD_MAX_SECTORS};
     return lume_device_attach(&device) == 0;
 }
 
 bool lume_sd_stop(void)
 {
+    if (transferring)
+        return false;
     return device.state == LUME_DEVICE_OFF || lume_device_detach(&device) == 0;
 }
 
@@ -352,93 +359,131 @@ bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count)
     return true;
 }
 
-static bool transfer(uint64_t sector, void *data, bool write)
+static void abort_transfer(void)
 {
-    if (!ready || sector >= capacity || sector > UINT32_MAX)
+    bool use_interrupts = interrupt_mode;
+    wr(0x38, 0);
+    if (use_interrupts)
+        (void)lume_irq_enable((unsigned)resources[1].base, false);
+    interrupt_mode = false;
+    /* Reset the host command and data paths before issuing an abort command. */
+    wr(0x2c, rd(0x2c) | (3u << 25));
+    if (wait_register(0x2c, 3u << 25, 0, 1000))
+        (void)command(12, 0, (3u << 16) | CHECKS | (3u << 22), NULL);
+    interrupt_mode = use_interrupts;
+    ready = false;
+}
+
+static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
+{
+    if (!ready || transferring || !data || !count || count > LUME_SD_MAX_SECTORS ||
+        sector >= capacity || count > capacity - sector || sector > UINT32_MAX ||
+        count - 1 > UINT32_MAX - sector)
         return false;
-    bool data_allowed = write_count && sector >= write_first && sector - write_first < write_count;
-    bool boot_allowed = boot_count && sector >= boot_first && sector - boot_first < boot_count;
+    bool data_allowed = write_count && sector >= write_first &&
+                        sector - write_first < write_count &&
+                        count <= write_count - (sector - write_first);
+    bool boot_allowed = boot_count && sector >= boot_first && sector - boot_first < boot_count &&
+                        count <= boot_count - (sector - boot_first);
     if (write && !data_allowed && !boot_allowed)
     {
         ++rejected;
         return false;
     }
-    wr(4, (1u << 16) | 512u);
+    transferring = true;
+    wr(4, (count << 16) | 512u);
     uint32_t response;
     uint32_t flags = RESPONSE | CHECKS | (1u << 21) | (write ? 0u : 16u);
-    if (!command(write ? 24 : 17, (uint32_t)sector, flags, &response))
-        return false;
+    if (count > 1)
+        flags |= 2u | 4u | 32u;
+    unsigned index = write ? (count > 1 ? 25 : 24) : (count > 1 ? 18 : 17);
+    if (!command(index, (uint32_t)sector, flags, &response))
+        goto failed;
     if (response & 0xfdffe008u)
     {
         lume_value("SD_CARD_ERROR", response);
         ++errors;
-        ready = false;
-        return false;
+        goto failed;
     }
-    if (!event(write ? 16u : 32u, 1000))
-        return false;
     unsigned char *p = data;
-    for (unsigned i = 0; i < 512; i += 4)
+    for (unsigned block = 0; block < count; ++block)
     {
-        if (write)
-            wr(0x20, (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 |
-                         (uint32_t)p[i + 3] << 24);
-        else
+        if (!event(write ? 16u : 32u, 1000))
+            goto failed;
+        for (unsigned i = 0; i < 512; i += 4)
         {
-            uint32_t v = rd(0x20);
-            for (unsigned j = 0; j < 4; ++j)
-                p[i + j] = (unsigned char)(v >> (j * 8));
+            if (write)
+                wr(0x20, (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 |
+                             (uint32_t)p[i + 3] << 24);
+            else
+            {
+                uint32_t v = rd(0x20);
+                for (unsigned j = 0; j < 4; ++j)
+                    p[i + j] = (unsigned char)(v >> (j * 8));
+            }
         }
+        p += 512;
+        lume_watchdog_progress();
+        lume_watchdog_poll();
+        lume_worker_checkpoint(512);
     }
     if (!event(2, 2000))
-        return false;
-    if (write)
+        goto failed;
+    if (write || count > 1)
     {
         uint64_t start = lume_counter_read();
         do
         {
             if (!command(13, rca, RESPONSE | CHECKS, &response))
-                return false;
+                goto failed;
             if (response & 0xfdffe008u)
             {
                 ++errors;
-                ready = false;
-                return false;
+                goto failed;
             }
             if ((response & 0x1f00) == 0x900)
             {
-                ++writes;
-                return true;
+                break;
             }
-        } while (lume_counter_read() - start < frequency * 2);
-        ++errors;
-        ready = false;
-        return false;
+            if (lume_counter_read() - start >= frequency * 2)
+            {
+                ++errors;
+                goto failed;
+            }
+            delay(1000);
+        } while (true);
     }
-    ++reads;
+    if (write)
+        writes += count;
+    else
+        reads += count;
+    transferring = false;
     return true;
+failed:
+    if (count > 1)
+        abort_transfer();
+    ready = transferring = false;
+    return false;
 }
 
 bool lume_sd_read(uint64_t sector, void *data)
 {
-    bool complete = lume_block_read(&block, sector, 1, data) == 0;
-    if (complete)
-    {
-        lume_watchdog_progress();
-        lume_watchdog_poll();
-    }
-    return complete;
+    return lume_sd_read_blocks(sector, 1, data);
 }
 
 bool lume_sd_write(uint64_t sector, const void *data)
 {
-    bool complete = lume_block_write(&block, sector, 1, data) == 0;
-    if (complete)
-    {
-        lume_watchdog_progress();
-        lume_watchdog_poll();
-    }
-    return complete;
+    return lume_sd_write_blocks(sector, 1, data);
+}
+
+bool lume_sd_read_blocks(uint64_t sector, unsigned count, void *data)
+{
+    return lume_block_read(&block, sector, count, data) == 0;
+}
+
+bool lume_sd_write_blocks(uint64_t sector, unsigned count, const void *data)
+{
+    return lume_block_write(&block, sector, count, data) == 0;
 }
 
 void lume_sd_stats(void)
@@ -454,24 +499,18 @@ void lume_sd_stats(void)
 static int block_read(struct lume_block *b, uint64_t sector, unsigned count, void *data)
 {
     (void)b;
-    for (unsigned i = 0; i < count; ++i)
-        if (!transfer(sector + i, (unsigned char *)data + (size_t)i * 512, false))
-            return -LUME_EIO;
-    return 0;
+    return transfer(sector, count, data, false) ? 0 : -LUME_EIO;
 }
 
 static int block_write(struct lume_block *b, uint64_t sector, unsigned count, const void *data)
 {
     (void)b;
-    for (unsigned i = 0; i < count; ++i)
-        if (!transfer(sector + i, (unsigned char *)data + (size_t)i * 512, true))
-            return -LUME_EIO;
-    return 0;
+    return transfer(sector, count, (void *)data, true) ? 0 : -LUME_EIO;
 }
 
 static int block_sync(struct lume_block *b)
 {
     (void)b;
-    return ready ? 0 : -LUME_EIO;
+    return ready && !transferring ? 0 : -LUME_EIO;
 }
 static const struct lume_block_ops block_operations = {block_read, block_write, block_sync};

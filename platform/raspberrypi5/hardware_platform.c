@@ -7,6 +7,8 @@
 #include "lume/fdt_inventory.h"
 #include "lume/module_memory.h"
 #include "lume/modules.h"
+#include "lume/fdt_irq.h"
+#include "lume/irq.h"
 #include <libfdt.h>
 #include <string.h>
 
@@ -48,8 +50,15 @@ void lume_kernel_free(void *memory)
 static int validate_resource(const struct lume_resource *resource)
 {
     if (resource->kind == LUME_RESOURCE_IRQ)
-        return !resource->domain && resource->base >= 16 && resource->base < 1020 ? 0
-                                                                                  : -LUME_ENOSYS;
+    {
+        if (!resource->domain)
+            return resource->base >= 16 && resource->base < LUME_IRQ_LIMIT ? 0 : -LUME_ENOSYS;
+        if (resource->base >= LUME_IRQ_DOMAIN_LINES || resource->size != 1 ||
+            resource->flags > LUME_IRQ_EDGE)
+            return -LUME_EINVAL;
+        struct lume_irq_info info;
+        return lume_irq_domain_info(resource->domain, (unsigned)resource->base, &info);
+    }
     if (resource->kind != LUME_RESOURCE_MMIO)
         return -LUME_ENOSYS;
     uint64_t cursor = resource->base, end = resource->base + resource->size;
@@ -65,39 +74,6 @@ static int validate_resource(const struct lume_resource *resource)
             return -LUME_EINVAL;
         cursor = next;
     }
-    return 0;
-}
-
-static int decode_interrupt(const void *tree, int controller, const uint32_t *cells, unsigned count,
-                            struct lume_resource *resource)
-{
-    if (count == 2 && !fdt_node_check_compatible(tree, controller, "simple-bus"))
-    {
-        const char *name = fdt_get_name(tree, controller, NULL);
-        uint32_t domain = lume_hardware_firmware_id(tree, (uint64_t)controller);
-        if (!name || strcmp(name, "rp1") || !domain || cells[0] >= 64 ||
-            (cells[1] != 1 && cells[1] != 4 && cells[1] != 8))
-            return -LUME_ENOSYS;
-        *resource = (struct lume_resource){.base = cells[0],
-                                           .size = 1,
-                                           .kind = LUME_RESOURCE_IRQ,
-                                           .flags = cells[1] == 1,
-                                           .domain = domain};
-        return 0;
-    }
-    if (count != 3 || fdt_node_check_compatible(tree, controller, "arm,gic-400") || cells[0] > 1 ||
-        (cells[0] == 0 && cells[1] >= 988) || (cells[0] == 1 && cells[1] >= 16) ||
-        (cells[2] & ~(cells[0] ? 0xff0fu : 0x0fu)) ||
-        ((cells[2] & 15) != 1 && (cells[2] & 15) != 4 && (cells[2] & 15) != 8))
-        return -LUME_ENOSYS;
-    struct lume_resource distributor;
-    if (lume_fdt_mmio_resource(tree, controller, 0, &distributor) ||
-        distributor.base != UINT64_C(0x107fff9000))
-        return -LUME_ENOSYS;
-    *resource = (struct lume_resource){.base = cells[1] + (cells[0] ? 16u : 32u),
-                                       .size = 1,
-                                       .kind = LUME_RESOURCE_IRQ,
-                                       .flags = (cells[2] & 15) == 1};
     return 0;
 }
 
@@ -127,7 +103,7 @@ int lume_platform_hardware_start(const void *tree, size_t bytes)
                                                            .free = lume_kernel_free,
                                                            .validate_resource = validate_resource,
                                                            .dma_domain = dma_domain};
-    static const struct lume_fdt_inventory_ops ops = {.interrupt = decode_interrupt};
+    static const struct lume_fdt_inventory_ops ops = {.interrupt = lume_pi5_fdt_interrupt};
     int result = lume_hardware_services(&services);
     if (result)
         return result;

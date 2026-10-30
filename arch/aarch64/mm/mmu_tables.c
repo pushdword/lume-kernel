@@ -104,9 +104,11 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     pcie_l2[7] = UINT64_C(0x1000e00000) | AF | PXN | UXN | 1; /* BCM2712 SDHCI */
     pcie_l2[8] = UINT64_C(0x1001000000) | AF | PXN | UXN | 1; /* Separate Wi-Fi SDIO host */
     root[UINT64_C(0x107fff9000) >> 30] = table(soc_l2);
+    soc_l2[(UINT64_C(0x107c013880) >> 21) & 511] = UINT64_C(0x107c000000) | AF | PXN | UXN | 1;
     soc_l2[(UINT64_C(0x107fff9000) >> 21) & 511] = UINT64_C(0x107fe00000) | AF | PXN | UXN | 1;
     soc_l2[(UINT64_C(0x107d508500) >> 21) & 511] = UINT64_C(0x107d400000) | AF | PXN | UXN | 1;
     soc_l2[(UINT64_C(0x107d208000) >> 21) & 511] = UINT64_C(0x107d200000) | AF | PXN | UXN | 1;
+    soc_l2[(UINT64_C(0x107c701400) >> 21) & 511] = UINT64_C(0x107c600000) | AF | PXN | UXN | 1;
     root[UINT64_C(0x1c00030000) >> 30] = table(rp1_l2);
     rp1_l2[0] = UINT64_C(0x1c00000000) | AF | PXN | UXN | 1;
     rp1_l2[1] = UINT64_C(0x1c00200000) | AF | PXN | UXN | 1;
@@ -316,6 +318,25 @@ static void module_flush(void)
 #ifdef __aarch64__
     __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
 #endif
+}
+
+bool lume_mmu_video_mapping(uint64_t physical, size_t bytes)
+{
+    if (physical < BLOCK || physical >= UINT64_C(0x40000000) || !bytes ||
+        bytes > UINT64_C(0x40000000) - physical)
+        return false;
+    uint64_t first = physical & ~(BLOCK - 1);
+    uint64_t end = (physical + bytes + BLOCK - 1) & ~(BLOCK - 1);
+    for (uint64_t p = first; p < end; p += BLOCK)
+    {
+        uint64_t entry = ram_l2[0][p / BLOCK];
+        if (entry && entry != (p | NORMAL | PXN | UXN | 1))
+            return false;
+    }
+    for (uint64_t p = first; p < end; p += BLOCK)
+        ram_l2[0][p / BLOCK] = p | NORMAL | PXN | UXN | 1;
+    module_flush();
+    return true;
 }
 
 bool lume_mmu_module_prepare(uint64_t physical, size_t bytes)

@@ -78,6 +78,8 @@ struct lume_platform_sd_ops
     bool (*lume_sd_allow_volume)(uint64_t first, uint64_t count);
     bool (*lume_sd_allow_boot_volume)(uint64_t first, uint64_t count);
     void (*lume_sd_stats)(void);
+    bool (*lume_sd_read_blocks)(uint64_t sector, unsigned count, void *data);
+    bool (*lume_sd_write_blocks)(uint64_t sector, unsigned count, const void *data);
 };
 
 struct lume_platform_usb_ops

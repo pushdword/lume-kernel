@@ -1,6 +1,7 @@
 #include "lume/abi.h"
 #include "lume/boot_storage.h"
 #include "lume/storage.h"
+#include "sd_blocks_mock.h"
 #include "ff.h"
 #include <assert.h>
 #include <stdio.h>
@@ -108,7 +109,7 @@ bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count)
 
 static const char config_text[] = "[all]\nkernel=lurecov.img\ninitramfs lumeroot.fat 0x08000000\n";
 
-static void configuration(bool selected)
+static void check_configuration(bool selected)
 {
     FIL f;
     UINT n;
@@ -125,7 +126,7 @@ static void configuration(bool selected)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 5);
+    assert(argc == 5 || (argc == 6 && !strcmp(argv[5], "activation-failure")));
     FILE *f = fopen(argv[1], "rb");
     assert(f && fread(mbr, 1, 512, f) == 512);
     fclose(f);
@@ -161,7 +162,14 @@ int main(int argc, char **argv)
     assert(f_write(&file, config_text, sizeof(config_text) - 1, &n) == FR_OK &&
            n == sizeof(config_text) - 1);
     assert(f_close(&file) == FR_OK);
+#ifdef LUME_BOOT_STORAGE_TRIAL_TEST
+    assert(f_open(&file, "1:/tryboot.txt", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK);
+    assert(f_write(&file, config_text, sizeof(config_text) - 1, &n) == FR_OK);
+    assert(f_close(&file) == FR_OK);
+#endif
     request.version = LUME_IO_VERSION;
+    assert(lume_boot_call(2, LUME_BOOT_CAPABILITIES, &request) == 0 &&
+           (request.total & LUME_BOOT_CAP_RESTART_GUARD));
     assert(lume_boot_call(2, LUME_BOOT_INFO, &request) == 0 && !request.active);
     assert(lume_boot_call(2, LUME_BOOT_ACTIVATE, &request) == -LUME_EPERM);
     request.total = 1048576;
@@ -175,17 +183,20 @@ int main(int argc, char **argv)
     request.offset = 4096;
     assert(lume_boot_call(2, LUME_BOOT_WRITE, &request) == -LUME_EINVAL);
     lume_boot_release(2);
-    configuration(false);
+    check_configuration(false);
     f = fopen(argv[4], "rb");
     assert(f);
     fseek(f, 0, SEEK_END);
     request.total = (uint32_t)ftell(f);
     rewind(f);
     assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == 0);
+    assert(lume_boot_call(2, LUME_BOOT_ABORT, &request) == 0);
+    check_configuration(false);
+    assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == 0);
     while ((request.count = (uint32_t)fread(request.data, 1, sizeof(request.data), f)))
         assert(lume_boot_call(2, LUME_BOOT_WRITE, &request) == (int)request.count);
     fclose(f);
-    configuration(false);
+    check_configuration(false);
     int result;
     do
     {
@@ -193,9 +204,41 @@ int main(int argc, char **argv)
     } while (result == 1);
     assert(result == 0);
     assert(lume_boot_call(3, LUME_BOOT_ACTIVATE, &request) == -LUME_EPERM);
-    configuration(false);
+    check_configuration(false);
+    if (argc == 6)
+    {
+        fail_writes = true;
+        assert(lume_boot_call(2, LUME_BOOT_ACTIVATE, &request) == -LUME_EIO);
+        fail_writes = false;
+        lume_boot_release(2);
+        assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+        assert(lume_boot_call(3, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+        fclose(volumes[0]);
+        fclose(volumes[1]);
+        puts("PASS failed boot selection requires a restart before another slot write");
+        return 0;
+    }
     assert(lume_boot_call(2, LUME_BOOT_ACTIVATE, &request) == 0 && request.active == 1);
-    configuration(true);
+#ifdef LUME_BOOT_STORAGE_TRIAL_TEST
+    check_configuration(false);
+    assert(arm_calls == 1);
+    assert(lume_boot_call(2, LUME_BOOT_CONFIRM, &request) == -LUME_EBUSY);
+    /* A reboot clears volatile ownership and consumes the firmware trial flag. */
+    owner = phase = 0;
+    selection_attempted = false;
+    trial_running = true;
+    assert(lume_boot_call(2, LUME_BOOT_INFO, &request) == 0 && request.active == 1 &&
+           request.total == LUME_BOOT_STATE_TRIAL);
+    assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+    trial_match = false;
+    assert(lume_boot_call(2, LUME_BOOT_CONFIRM, &request) == -LUME_EIO);
+    check_configuration(false);
+    trial_match = true;
+    assert(lume_boot_call(2, LUME_BOOT_CONFIRM, &request) == 0 && request.active == 1);
+    assert(!trial_running);
+    assert(lume_boot_call(2, LUME_BOOT_CONFIRM, &request) == -LUME_EBUSY);
+#endif
+    check_configuration(true);
     unsigned char original[4096], changed[4096], recovered[4096];
     memset(original, 0x35, sizeof(original));
     memset(changed, 0xa7, sizeof(changed));
@@ -220,12 +263,12 @@ int main(int argc, char **argv)
     assert(data_ops->remove("/data/io-fault.bin") == 0);
     assert(lume_boot_call(2, LUME_BOOT_INFO, &request) == 0 && request.active == 1);
     request.total = 1048576;
-    assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == 0);
-    assert(lume_boot_call(2, LUME_BOOT_ABORT, &request) == 0);
-    configuration(true);
+    assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+    assert(lume_boot_call(3, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+    check_configuration(true);
     fclose(volumes[0]);
     fclose(volumes[1]);
     puts(
-        "PASS native FatFs slot write, readback, activation, abort, ownership, ordering and injected I/O failures");
+        "PASS native FatFs slot write, readback, activation, restart guard, abort, ownership, ordering and injected I/O failures");
     return 0;
 }

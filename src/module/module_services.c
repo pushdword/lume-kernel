@@ -11,27 +11,37 @@ enum
     BLOCK,
     INTERRUPT,
     WORK,
-    NETWORK
+    NETWORK,
+    INTERRUPT_DOMAIN,
+    DOMAIN_INTERRUPT
 };
 
 static struct registration
 {
     unsigned kind, irq;
+    uint32_t domain;
     void *object, *owner;
     struct lume_work work;
 } registrations[REGISTRATIONS];
 
-static struct registration *find(unsigned kind, const void *object)
+static struct registration *find_key(unsigned kind, const void *object, uint32_t domain)
 {
     for (unsigned i = 0; i < REGISTRATIONS; ++i)
-        if (registrations[i].kind == kind && registrations[i].object == object)
+        if (registrations[i].kind == kind && registrations[i].object == object &&
+            registrations[i].domain == domain)
             return registrations + i;
     return NULL;
 }
 
-static int reserve(unsigned kind, void *object, uintptr_t callback, struct registration **out)
+static struct registration *find(unsigned kind, const void *object)
 {
-    if (find(kind, object))
+    return find_key(kind, object, 0);
+}
+
+static int reserve_key(unsigned kind, void *object, uint32_t domain, uintptr_t callback,
+                       struct registration **out)
+{
+    if (find_key(kind, object, domain))
         return -LUME_EBUSY;
     for (unsigned i = 0; i < REGISTRATIONS; ++i)
         if (!registrations[i].kind)
@@ -40,12 +50,17 @@ static int reserve(unsigned kind, void *object, uintptr_t callback, struct regis
             int result = lume_module_pin(callback, &owner);
             if (result)
                 return result;
-            registrations[i] =
-                (struct registration){.kind = kind, .object = object, .owner = owner};
+            registrations[i] = (struct registration){
+                .kind = kind, .object = object, .domain = domain, .owner = owner};
             *out = registrations + i;
             return 0;
         }
     return -LUME_ENOSPC;
+}
+
+static int reserve(unsigned kind, void *object, uintptr_t callback, struct registration **out)
+{
+    return reserve_key(kind, object, 0, callback, out);
 }
 
 static void release(struct registration *r)
@@ -127,6 +142,89 @@ int lume_module_irq_unregister(unsigned irq, void *context)
     uint64_t flags = lume_irq_save();
     struct registration *r = find(INTERRUPT, (void *)(uintptr_t)(irq + 1));
     int result = r ? lume_irq_unregister(irq, context) : -LUME_ENOENT;
+    if (!result)
+        release(r);
+    lume_irq_restore(flags);
+    return result;
+}
+
+static int domain_callback(void *expected, uintptr_t callback)
+{
+    void *owner = NULL;
+    int result = lume_module_pin(callback, &owner);
+    if (result)
+        return result;
+    result = owner == expected ? 0 : -LUME_EINVAL;
+    lume_module_unpin(owner);
+    return result;
+}
+
+int lume_module_irq_domain_register(uint32_t id, unsigned lines,
+                                    const struct lume_irq_domain_ops *ops, void *context)
+{
+    if (!id || !lines || lines > LUME_IRQ_DOMAIN_LINES || !ops || !ops->configure || !ops->enable)
+        return -LUME_EINVAL;
+    uint64_t flags = lume_irq_save();
+    struct registration *r;
+    int result = reserve(INTERRUPT_DOMAIN, (void *)(uintptr_t)id, (uintptr_t)ops->configure, &r);
+    if (!result)
+    {
+        struct lume_irq_domain_ops copy = *ops;
+        result = domain_callback(r->owner, (uintptr_t)copy.enable);
+        if (!result && copy.acknowledge)
+            result = domain_callback(r->owner, (uintptr_t)copy.acknowledge);
+        if (!result)
+            result = lume_irq_domain_register(id, lines, &copy, context);
+        if (result)
+            release(r);
+    }
+    lume_irq_restore(flags);
+    return result;
+}
+
+int lume_module_irq_domain_unregister(uint32_t id, void *context)
+{
+    if (!id)
+        return -LUME_EINVAL;
+    uint64_t flags = lume_irq_save();
+    struct registration *r = find(INTERRUPT_DOMAIN, (void *)(uintptr_t)id);
+    int result = r ? lume_irq_domain_unregister(id, context) : -LUME_ENOENT;
+    if (!result)
+        release(r);
+    lume_irq_restore(flags);
+    return result;
+}
+
+int lume_module_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger,
+                                   lume_irq_handler handler, void *context)
+{
+    if (!id)
+        return lume_module_irq_register(irq, trigger, handler, context);
+    if (!handler || trigger > LUME_IRQ_EDGE || irq >= LUME_IRQ_DOMAIN_LINES)
+        return -LUME_EINVAL;
+    uint64_t flags = lume_irq_save();
+    struct registration *r;
+    int result =
+        reserve_key(DOMAIN_INTERRUPT, (void *)(uintptr_t)(irq + 1), id, (uintptr_t)handler, &r);
+    if (!result)
+    {
+        result = lume_irq_domain_request(id, irq, trigger, handler, context);
+        if (result)
+            release(r);
+    }
+    lume_irq_restore(flags);
+    return result;
+}
+
+int lume_module_irq_domain_release(uint32_t id, unsigned irq, void *context)
+{
+    if (!id)
+        return lume_module_irq_unregister(irq, context);
+    if (irq >= LUME_IRQ_DOMAIN_LINES)
+        return -LUME_EINVAL;
+    uint64_t flags = lume_irq_save();
+    struct registration *r = find_key(DOMAIN_INTERRUPT, (void *)(uintptr_t)(irq + 1), id);
+    int result = r ? lume_irq_domain_release(id, irq, context) : -LUME_ENOENT;
     if (!result)
         release(r);
     lume_irq_restore(flags);

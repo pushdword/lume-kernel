@@ -30,6 +30,8 @@ static const struct lume_platform_sd_ops operations = {
     .lume_sd_allow_volume = lume_sd_allow_volume,
     .lume_sd_allow_boot_volume = lume_sd_allow_boot_volume,
     .lume_sd_stats = lume_sd_stats,
+    .lume_sd_read_blocks = lume_sd_read_blocks,
+    .lume_sd_write_blocks = lume_sd_write_blocks,
 };
 
 static int probe(struct lume_hardware *hardware, void *context)

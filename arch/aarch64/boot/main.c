@@ -21,6 +21,7 @@
 #include "lume/hardware.h"
 #include "lume/kernel_memory.h"
 #include "lume/activity.h"
+#include "lume/boot_trial.h"
 #include <libfdt.h>
 
 #ifndef LUME_BUILD_ID
@@ -222,6 +223,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_putc('\n');
     lume_value("DTB_SIZE", fdt.size);
     lume_puts("LUME CHECK FDT PI5 PASS\n");
+    lume_boot_trial_context((const void *)(uintptr_t)dtb, (const void *)(uintptr_t)fdt.initrd_start,
+                            (size_t)(fdt.initrd_end - fdt.initrd_start));
 
     expected_break = 1;
     __asm__ volatile("brk #0x4c55" ::: "memory");

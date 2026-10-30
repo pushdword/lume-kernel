@@ -21,13 +21,15 @@ static bool dedicated(const unsigned char p[512], uint64_t sectors, struct lume_
     for (unsigned i = 0; i < 440; ++i)
         if (p[i])
             return false;
-    if (!partition(p + 446, true, LUME_CARD_BOOT_FIRST, LUME_CARD_BOOT_SECTORS) ||
-        !partition(p + 462, false, LUME_CARD_DATA_FIRST, sectors - LUME_CARD_DATA_FIRST))
+    uint32_t data_count = u32(p + 474);
+    if (data_count < 65536 || data_count > sectors - LUME_CARD_DATA_FIRST ||
+        !partition(p + 446, true, LUME_CARD_BOOT_FIRST, LUME_CARD_BOOT_SECTORS) ||
+        !partition(p + 462, false, LUME_CARD_DATA_FIRST, data_count))
         return false;
     for (unsigned i = 478; i < 510; ++i)
         if (p[i])
             return false;
-    *out = (struct lume_volume){LUME_CARD_DATA_FIRST, sectors - LUME_CARD_DATA_FIRST};
+    *out = (struct lume_volume){LUME_CARD_DATA_FIRST, data_count};
     return true;
 }
 

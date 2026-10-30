@@ -3,6 +3,7 @@ KERNEL_C_aarch64 := \
     platform/raspberrypi5/boot_fdt.c \
     platform/raspberrypi5/boot_fdt_file.c \
     platform/raspberrypi5/boot_platform.c \
+    platform/raspberrypi5/boot_trial.c \
     platform/raspberrypi5/uart_rx.c \
     src/storage/boot_storage.c \
     src/watchdog/boot_watchdog.c \
@@ -13,12 +14,15 @@ KERNEL_C_aarch64 := \
     src/exec/elf.c \
     src/fs/fat/fat.c \
     platform/raspberrypi5/fdt.c \
+    platform/raspberrypi5/fdt_irq.c \
     src/security/file_modes.c \
     platform/raspberrypi5/hardware_platform.c \
+    platform/raspberrypi5/firmware.c \
     src/mm/heap.c \
     drivers/input/usb_hid/hid_keyboard.c \
     src/net/icmp.c \
     src/device/irq.c \
+    src/device/irq_domain.c \
     arch/aarch64/boot/main.c \
     src/lib/memory.c \
     src/module/module_boot.c \
@@ -30,6 +34,7 @@ KERNEL_C_aarch64 := \
     src/net/net_compat.c \
     src/net/net_control.c \
     src/net/netif.c \
+    src/net/route.c \
     src/mm/pages.c \
     src/device/platform_driver.c \
     src/core/realtime.c \
@@ -42,6 +47,7 @@ KERNEL_C_aarch64 := \
     src/net/stream.c \
     src/core/supervision.c \
     src/syscall/syscall.c \
+    src/syscall/io.c \
     src/core/tasks.c \
     drivers/usb/xhci/usb_descriptors.c \
     src/mm/user_stack.c \

@@ -2,6 +2,7 @@
 #include "lume/sd.h"
 #include "lume/abi.h"
 #include "lume/worker.h"
+#include "sd_blocks_mock.h"
 #include "ff.h"
 #include "diskio.h"
 #include <assert.h>
@@ -27,16 +28,16 @@ void lume_worker_checkpoint(unsigned bytes)
     last_checkpoint = bytes;
     one_byte_checkpoints += bytes == 1;
     directory_checkpoints += bytes == sizeof(FILINFO);
-    assert(pending_transfers <= 1);
+    assert(pending_transfers <= LUME_SD_MAX_SECTORS);
     if (pending_transfers)
-        assert(bytes == 512);
+        assert(bytes >= pending_transfers * 512 && bytes <= LUME_SD_MAX_SECTORS * 512);
     pending_transfers = 0;
 }
 
 static void transfer_started(void)
 {
     if (track_transfers)
-        assert(++pending_transfers == 1);
+        assert(++pending_transfers <= LUME_SD_MAX_SECTORS);
 }
 
 #define T(expression)                                                                              \
@@ -327,15 +328,25 @@ static bool checkpoint_visit(const char *path, bool directory, uint64_t bytes, v
 
 static bool checkpoints(const struct lume_storage_ops *ops)
 {
-    unsigned char data[4096];
+    unsigned char data[(LUME_SD_MAX_SECTORS + 1) * 512];
     track_transfers = true;
     unsigned calls = checkpoint_calls, bytes = checkpoint_bytes;
     T(disk_read(0, data, DATA_SECTORS - 8, 8) == RES_OK);
-    T(checkpoint_calls - calls == 8 && checkpoint_bytes - bytes == sizeof(data));
+    T(checkpoint_calls - calls == 1 && checkpoint_bytes - bytes == 8 * 512);
     calls = checkpoint_calls;
     bytes = checkpoint_bytes;
     T(disk_write(0, data, DATA_SECTORS - 8, 8) == RES_OK);
-    T(checkpoint_calls - calls == 8 && checkpoint_bytes - bytes == sizeof(data));
+    T(checkpoint_calls - calls == 1 && checkpoint_bytes - bytes == 8 * 512);
+    calls = checkpoint_calls;
+    bytes = checkpoint_bytes;
+    T(disk_read(0, data, DATA_SECTORS - LUME_SD_MAX_SECTORS - 1, LUME_SD_MAX_SECTORS + 1) ==
+      RES_OK);
+    T(checkpoint_calls - calls == 2 && checkpoint_bytes - bytes == sizeof(data));
+    calls = checkpoint_calls;
+    bytes = checkpoint_bytes;
+    T(disk_write(0, data, DATA_SECTORS - LUME_SD_MAX_SECTORS - 1, LUME_SD_MAX_SECTORS + 1) ==
+      RES_OK);
+    T(checkpoint_calls - calls == 2 && checkpoint_bytes - bytes == sizeof(data));
     fail_reads = true;
     calls = checkpoint_calls;
     T(disk_read(0, data, DATA_SECTORS - 8, 8) == RES_ERROR);

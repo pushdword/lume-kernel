@@ -36,6 +36,8 @@ int main(void)
     assert(volume.first > LUME_CARD_BOOT_FIRST);
     for (unsigned byte = 0; byte < sizeof(mbr); ++byte)
     {
+        if (byte >= 474 && byte < 478)
+            continue;
         mbr[byte] ^= 1;
         assert(!lume_volume_select(mbr, sectors, &volume));
         assert(!volume.first && !volume.count);
@@ -44,7 +46,15 @@ int main(void)
         mbr[byte] ^= 1;
     }
     assert(!lume_volume_select(mbr, sectors - 1, &volume));
-    assert(!lume_volume_select(mbr, sectors + 1, &volume));
+    assert(lume_volume_select(mbr, sectors + 1, &volume));
+    entry(mbr + 462, false, LUME_CARD_DATA_FIRST, 131072);
+    assert(lume_volume_select(mbr, sectors, &volume) && volume.count == 131072);
+    assert(lume_volume_select(mbr, LUME_CARD_DATA_FIRST + 131072, &volume));
+    assert(!lume_volume_select(mbr, LUME_CARD_DATA_FIRST + 131071, &volume));
+    entry(mbr + 462, false, LUME_CARD_DATA_FIRST, 65535);
+    assert(!lume_volume_select(mbr, sectors, &volume));
+    entry(mbr + 462, false, LUME_CARD_DATA_FIRST, UINT32_MAX);
+    assert(!lume_volume_select(mbr, sectors, &volume));
     assert(!lume_volume_select(mbr, UINT64_MAX, &volume));
     memset(mbr, 0, sizeof(mbr));
     put(mbr + 440, 0xb8d65c68);

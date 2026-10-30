@@ -18,6 +18,8 @@
 #define LWIP_STATS 0
 #define LWIP_DEBUG 0
 #define LWIP_NETIF_HOSTNAME 1
+#define LWIP_HOOK_FILENAME "lume/lwip_hooks.h"
+#define LWIP_HOOK_IP4_ROUTE_SRC(source, destination) lume_ip4_route_src(source, destination)
 #define MEM_ALIGNMENT 8
 #define MEM_SIZE (256 * 1024)
 #define PBUF_POOL_SIZE 64

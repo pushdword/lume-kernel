@@ -100,6 +100,22 @@ int main(void)
     CHECK(lume_mmu_translate(root, 0x107d208000, true, false, false, &pa) && pa == 0x107d208000);
     CHECK(!lume_mmu_translate(root, 0x107d208000, false, true, false, &pa));
     CHECK(!lume_mmu_translate(root, 0x107d208000, false, false, true, &pa));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x107d510600)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x107c701400)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x107c013880)));
+    CHECK(!lume_mmu_translate(root, UINT64_C(0x107c013880), false, true, false, &pa));
+    CHECK(!lume_mmu_translate(root, UINT64_C(0x107c013880), false, false, true, &pa));
+    CHECK(lume_mmu_video_mapping(0x3fc00000, 0x200000));
+    CHECK(lume_mmu_translate(root, 0x3fc01000, true, false, false, &pa) && pa == 0x3fc01000);
+    CHECK(!lume_mmu_translate(root, 0x3fc01000, false, true, false, &pa));
+    CHECK(!lume_mmu_translate(root, 0x3fc01000, false, false, true, &pa));
+    CHECK(!lume_mmu_video_mapping(layout.start, 4096));
+    CHECK(!lume_mmu_video_mapping(0x3ffff000, 8192));
+    CHECK(lume_mmu_translate(root, UINT64_C(0x107c7200ff), true, false, false, &pa) &&
+          pa == UINT64_C(0x107c7200ff));
+    CHECK(!lume_mmu_translate(root, UINT64_C(0x107c701400), false, true, false, &pa));
+    CHECK(!lume_mmu_translate(root, UINT64_C(0x107c701400), false, false, true, &pa));
+    CHECK(!lume_mmu_device_mapping(UINT64_C(0x107c800000)));
     CHECK(lume_mmu_translate(root, 0x1c00200000, true, false, false, &pa) && pa == 0x1c00200000);
     CHECK(lume_mmu_translate(root, 0x1c00300000, true, false, false, &pa) && pa == 0x1c00300000);
     CHECK(!lume_mmu_translate(root, 0x1c00300000, false, true, false, &pa));

@@ -172,7 +172,7 @@ $(OUT)/lume.r32k: $(OUT)/lume.elf $(OUT)/image-tool$(HOSTEXE)
 UAPI_ABI := $(if $(filter aarch64 amd64 i686,$(ARCH)),include/abi/native,include/abi/$(ARCH))
 TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Iinclude/kernel -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs poll heap user-stack mmu elf-load font memory
-TEST_NAMES += io-queue io-calls vfs-storage-handles
+TEST_NAMES += io-queue io-calls vfs-storage-handles ip4-route
 .PHONY: check-console-calls
 check: check-console-calls
 check-console-calls: $(OUT)/tests/console-calls$(HOSTEXE)
@@ -194,18 +194,45 @@ $(OUT)/tests/memory$(HOSTEXE): tests/unit/memory_test.c src/lib/memory.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -D_DEFAULT_SOURCE -fno-builtin -UNDEBUG "$<" -o "$@"
 .PHONY: check-boot-storage
-$(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c
+.PHONY: check-io-call
+$(OUT)/tests/io-call$(HOSTEXE): tests/unit/io_call_test.c src/syscall/io.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/fatfs $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+check-io-call: $(OUT)/tests/io-call$(HOSTEXE)
+	env "$<"
+
+$(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 check-boot-storage: $(OUT)/tests/boot-storage$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
-.PHONY: check-storage-handles
-$(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c
+.PHONY: check-boot-trial
+$(OUT)/tests/boot-trial$(HOSTEXE): tests/unit/boot_trial_test.c tests/unit/boot_storage_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/fatfs $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/boot_storage_test.c,$(filter %.c,$^)) -o "$@"
+check-boot-trial: $(OUT)/tests/boot-trial$(HOSTEXE)
+	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
+.PHONY: check-storage-handles
+$(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
 	env "$<"
 check: check-storage-handles
+.PHONY: check-sdhci
+$(OUT)/tests/sdhci$(HOSTEXE): tests/unit/sdhci_test.c drivers/storage/sdhci/sd.c include/kernel/lume/sd.h src/storage/block.c src/storage/volume.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/sdhci_test.c src/storage/block.c src/storage/volume.c -o "$@"
+check-sdhci: $(OUT)/tests/sdhci$(HOSTEXE)
+	env "$<"
+check: check-sdhci
+.PHONY: check-sd-provider
+$(OUT)/tests/sd-provider$(HOSTEXE): tests/unit/sd_provider_test.c src/device/platform_driver.c include/kernel/lume/platform_driver.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/sd_provider_test.c src/device/platform_driver.c -o "$@"
+check-sd-provider: $(OUT)/tests/sd-provider$(HOSTEXE)
+	env "$<"
+check: check-sd-provider
 check-image: $(OUT)/tests/root-image$(HOSTEXE)
 	env "$(OUT)/tests/root-image$(HOSTEXE)" "$(ROOT_IMAGE)"
 $(OUT)/tests/root-image$(HOSTEXE): tests/unit/root_image_test.c src/fs/vfs/vfs.c src/fs/fat/fat.c src/storage/block.c
@@ -237,11 +264,13 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 	env "$(OUT)/tests/io-queue$(HOSTEXE)"
 	env "$(OUT)/tests/io-calls$(HOSTEXE)"
 	env "$(OUT)/tests/vfs-storage-handles$(HOSTEXE)"
+	env "$(OUT)/tests/ip4-route$(HOSTEXE)"
 
 .PHONY: check-scheduler
 .PHONY: check-gem
 check-gem: $(OUT)/tests/gem$(HOSTEXE)
 	env "$<"
+$(OUT)/tests/gem$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/gem$(HOSTEXE): examples/ddk/gem_test.c examples/ddk/gem.c examples/ddk/gem.h examples/ddk/gem_netif.c include/ddk/lume/netif.h src/device/resource.c src/device/device.c src/net/netif.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) examples/ddk/gem_test.c src/device/resource.c src/device/device.c src/net/netif.c -o "$@"
@@ -261,6 +290,13 @@ $(OUT)/tests/watchdog$(HOSTEXE): tests/unit/watchdog_test.c src/watchdog/watchdo
 $(OUT)/tests/icmp$(HOSTEXE): tests/unit/icmp_test.c src/net/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c
+HOST_LWIP_C := $(filter vendor/lwip/%,$(KERNEL_C_aarch64))
+$(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c include/kernel/lwipopts.h include/kernel/lume/lwip_hooks.h $(HOST_LWIP_C)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include tests/unit/ip4_route_test.c src/net/route.c $(HOST_LWIP_C) -o "$@"
+.PHONY: check-ip4-route
+check-ip4-route: $(OUT)/tests/ip4-route$(HOSTEXE)
+	env "$<"
 $(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
@@ -280,7 +316,7 @@ $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
@@ -363,9 +399,22 @@ endif
 .PHONY: check-module-services
 check-module-services: $(OUT)/tests/module-services$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/module-services$(HOSTEXE): tests/unit/module_services_test.c src/module/module_services.c src/device/device.c src/device/resource.c src/device/irq.c src/core/work.c
+$(OUT)/tests/module-services$(HOSTEXE): tests/unit/module_services_test.c src/module/module_services.c src/device/device.c src/device/resource.c src/device/irq.c src/device/irq_domain.c src/core/work.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-irq-domain check-pi5-fdt-irq
+check-irq-domain: $(OUT)/tests/irq-domain$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/irq-domain$(HOSTEXE): tests/unit/irq_domain_test.c src/device/irq.c src/device/irq_domain.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(if $(filter Windows_NT,$(OS)),,-pthread) $^ -o "$@"
+check-pi5-fdt-irq: $(OUT)/tests/pi5-fdt-irq$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/pi5-fdt-irq$(HOSTEXE): tests/platform/raspberrypi5/fdt_irq_test.c platform/raspberrypi5/fdt_irq.c vendor/libfdt/fdt.c vendor/libfdt/fdt_ro.c vendor/libfdt/fdt_sw.c vendor/libfdt/fdt_check.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -D_POSIX_C_SOURCE=200809L $(TEST_CPPFLAGS) -Ivendor/libfdt $^ -o "$@"
+check: check-irq-domain check-pi5-fdt-irq
 
 .PHONY: check-fdt-pcie
 check-fdt-pcie: $(OUT)/tests/fdt-pcie$(HOSTEXE)
@@ -385,7 +434,15 @@ check-platform-drivers: $(OUT)/tests/platform-driver$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/device/platform_driver.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-virtio-block-groups
+check-virtio-block-groups: $(OUT)/tests/virtio-block-groups$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c include/kernel/lume/platform_driver.h include/kernel/lume/sd.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+check: check-virtio-block-groups
 
 .PHONY: check-q35
 check-q35: $(OUT)/tests/q35-pci$(HOSTEXE) $(OUT)/tests/q35-virtio$(HOSTEXE) $(OUT)/tests/q35-acpi$(HOSTEXE) $(OUT)/tests/q35-bus$(HOSTEXE) $(OUT)/tests/q35-firmware$(HOSTEXE)

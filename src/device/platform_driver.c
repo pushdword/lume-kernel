@@ -265,6 +265,11 @@ bool lume_watchdog_boot(void)
 
 void lume_watchdog_poll(void)
 {
+#if defined(__aarch64__)
+    extern bool lume_boot_trial_progress(void);
+    if (!lume_boot_trial_progress())
+        return;
+#endif
     struct provider *provider = providers + LUME_PLATFORM_WATCHDOG;
     if (!provider->source)
     {
@@ -501,6 +506,28 @@ bool lume_sd_write(uint64_t sector, const void *data)
         return false;
     unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
     bool result = provider->operations.sd.lume_sd_write(sector, data);
+    lume_activity_leave(activity);
+    return result;
+}
+
+bool lume_sd_read_blocks(uint64_t sector, unsigned count, void *data)
+{
+    struct provider *provider = providers + LUME_PLATFORM_SD;
+    if (!provider->source)
+        return false;
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_read_blocks(sector, count, data);
+    lume_activity_leave(activity);
+    return result;
+}
+
+bool lume_sd_write_blocks(uint64_t sector, unsigned count, const void *data)
+{
+    struct provider *provider = providers + LUME_PLATFORM_SD;
+    if (!provider->source)
+        return false;
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_write_blocks(sector, count, data);
     lume_activity_leave(activity);
     return result;
 }

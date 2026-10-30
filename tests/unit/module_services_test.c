@@ -6,12 +6,22 @@
 
 static unsigned references, callbacks, opens;
 static bool network_busy, repeat;
+static uintptr_t rejected_callback, foreign_callback;
+static unsigned foreign_references;
 static struct lume_block block;
 static struct lume_work work;
 
 int lume_module_pin(uintptr_t callback, void **owner)
 {
     assert(callback);
+    if (callback == rejected_callback)
+        return -LUME_ENOEXEC;
+    if (callback == foreign_callback)
+    {
+        *owner = &foreign_references;
+        ++foreign_references;
+        return 0;
+    }
     *owner = &references;
     references++;
     return 0;
@@ -19,6 +29,12 @@ int lume_module_pin(uintptr_t callback, void **owner)
 
 void lume_module_unpin(void *owner)
 {
+    if (owner == &foreign_references)
+    {
+        assert(foreign_references);
+        --foreign_references;
+        return;
+    }
     assert(owner == &references && references);
     references--;
 }
@@ -55,6 +71,84 @@ static void interrupt(unsigned irq, void *context)
 {
     assert(irq == 42 && context == &references && references);
     callbacks++;
+}
+
+static int domain_configure(void *context, unsigned irq, unsigned trigger)
+{
+    assert(context == &work && irq == 1 && trigger == LUME_IRQ_EDGE);
+    return 0;
+}
+
+static void domain_enable(void *context, unsigned irq, bool enabled)
+{
+    assert(context == &work && irq == 1);
+    (void)enabled;
+}
+
+static void domain_acknowledge(void *context, unsigned irq)
+{
+    assert(context == &work && irq == 1 && references);
+}
+
+static void domain_handler(unsigned irq, void *context)
+{
+    assert(irq == 1 && context == &references && references == 2);
+    assert(lume_module_irq_domain_release(27, irq, context) == -LUME_EBUSY);
+    assert(references == 2);
+}
+
+static void domain_services(void)
+{
+    const struct lume_irq_domain_ops domain_ops = {domain_configure, domain_enable,
+                                                   domain_acknowledge};
+    assert(lume_module_irq_domain_register(0, 32, &domain_ops, &work) == -LUME_EINVAL);
+    rejected_callback = (uintptr_t)domain_enable;
+    assert(lume_module_irq_domain_register(27, 32, &domain_ops, &work) == -LUME_ENOEXEC);
+    assert(!references && !lume_irq_domain_available(27));
+    rejected_callback = (uintptr_t)domain_acknowledge;
+    assert(lume_module_irq_domain_register(27, 32, &domain_ops, &work) == -LUME_ENOEXEC);
+    assert(!references);
+    rejected_callback = 0;
+    foreign_callback = (uintptr_t)domain_enable;
+    assert(lume_module_irq_domain_register(27, 32, &domain_ops, &work) == -LUME_EINVAL);
+    assert(!references && !foreign_references);
+    foreign_callback = 0;
+    assert(!lume_module_irq_domain_register(27, 32, &domain_ops, &work) && references == 1);
+    assert(lume_module_irq_domain_register(27, 32, &domain_ops, &work) == -LUME_EBUSY);
+    assert(references == 1);
+    assert(lume_module_irq_domain_request(27, 32, LUME_IRQ_EDGE, domain_handler, &references) ==
+           -LUME_EINVAL);
+    assert(references == 1);
+    assert(lume_module_irq_domain_request(99, 1, LUME_IRQ_EDGE, domain_handler, &references) ==
+           -LUME_EAGAIN);
+    assert(references == 1);
+    assert(!lume_module_irq_domain_request(27, 1, LUME_IRQ_EDGE, domain_handler, &references));
+    assert(references == 2);
+    assert(lume_module_irq_domain_unregister(27, &work) == -LUME_EBUSY && references == 2);
+    assert(lume_module_irq_domain_unregister(27, &block) == -LUME_EPERM && references == 2);
+    assert(lume_module_irq_domain_release(27, 1, &block) == -LUME_EPERM && references == 2);
+    assert(!lume_irq_domain_enable(27, 1, true));
+    assert(lume_irq_domain_dispatch(27, 1));
+    assert(!lume_module_irq_domain_release(27, 1, &references) && references == 1);
+    assert(!lume_module_irq_domain_unregister(27, &work) && !references);
+    assert(lume_module_irq_domain_unregister(27, &work) == -LUME_ENOENT);
+
+    assert(!lume_module_irq_domain_register(27, 32, &domain_ops, &work));
+    assert(!lume_module_irq_domain_register(37, 32, &domain_ops, &work));
+    assert(!lume_module_irq_domain_request(27, 1, LUME_IRQ_EDGE, domain_handler, &references));
+    assert(!lume_module_irq_domain_request(37, 1, LUME_IRQ_EDGE, domain_handler, &references));
+    assert(references == 4);
+    assert(!lume_module_irq_domain_release(27, 1, &references) && references == 3);
+    struct lume_irq_info info;
+    assert(!lume_irq_domain_info(37, 1, &info) && info.registered);
+    assert(!lume_module_irq_domain_release(37, 1, &references) && references == 2);
+    assert(!lume_module_irq_domain_unregister(27, &work) && references == 1);
+    assert(!lume_module_irq_domain_unregister(37, &work) && !references);
+
+    assert(!lume_module_irq_domain_request(0, 42, LUME_IRQ_LEVEL, interrupt, &references));
+    assert(references == 1);
+    assert(!lume_module_irq_domain_release(0, 42, &references) && !references);
+    assert(!foreign_references);
 }
 
 int lume_devfs_register_block(struct lume_block *b)
@@ -172,6 +266,7 @@ int main(void)
     assert(lume_module_netif_unregister(5) == -LUME_EBUSY && references == 1);
     network_busy = false;
     assert(!lume_module_netif_unregister(5) && !references);
+    domain_services();
     puts("PASS_MODULE_SERVICES block=8 IRQ=retained work=cancel,resubmit network=busy");
     return 0;
 }

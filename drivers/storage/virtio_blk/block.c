@@ -1,6 +1,8 @@
 #include "lume/virtio.h"
 #include "lume/q35_module.h"
 #include "lume/platform_driver.h"
+#include "lume/sd.h"
+#include "lume/worker.h"
 #include <string.h>
 static struct lume_virtio device;
 static struct lume_virtqueue queue;
@@ -50,6 +52,37 @@ static bool write_sector(uint64_t sector, const void *buffer)
     return transfer(1, sector, (void *)buffer) && transfer(4, 0, NULL);
 }
 
+static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
+{
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+        count > capacity - sector)
+        return false;
+    unsigned char *bytes = buffer;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        if (!read_sector(sector + i, bytes + (size_t)i * 512))
+            return false;
+        lume_worker_checkpoint(512);
+    }
+    return true;
+}
+
+static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
+{
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+        count > capacity - sector || !allowed_count || sector < allowed_first ||
+        sector - allowed_first >= allowed_count || count > allowed_count - (sector - allowed_first))
+        return false;
+    const unsigned char *bytes = buffer;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        if (!write_sector(sector + i, bytes + (size_t)i * 512))
+            return false;
+        lume_worker_checkpoint(512);
+    }
+    return true;
+}
+
 static uint64_t sectors(void)
 {
     return capacity;
@@ -97,7 +130,8 @@ static void stats(void)
 }
 
 static const struct lume_platform_sd_ops operations = {
-    start, configure, stop, read_sector, write_sector, sectors, allow, allow_boot, stats};
+    start, configure,  stop,  read_sector, write_sector, sectors,
+    allow, allow_boot, stats, read_blocks, write_blocks};
 
 static int module_start(struct lume_hardware *hardware, void *context)
 {

@@ -18,6 +18,13 @@ static unsigned phy_shadow_select;
 static unsigned checks, sync_calls, fail_sync, map_calls, fail_map;
 static unsigned tx_complete_after;
 static unsigned mdio_commands, fail_mdio_at, phy_vendor_accesses;
+static uint32_t milliseconds;
+
+uint32_t lume_clock_millis(void)
+{
+    return milliseconds;
+}
+
 const unsigned led_modes[2] = {0u, 8u};
 static bool dma_available = true, dma_submitted;
 const struct lume_dma_domain lume_rp1_dma_domain = {0, UINT64_C(0x1000000000),
@@ -477,6 +484,49 @@ int main(void)
     T(lume_example_gem_tx_complete() == 0);
     T(tx_index == 1 && (tx.descriptors[0].control & GEM_TX_USED));
     T(tx_observed == tx_expected && tx_expected == 3);
+    unsigned rx_position = rx_index;
+    uint32_t rx_address = rx.descriptors[rx_position].address_low;
+    uint32_t rx_control = rx.descriptors[rx_position].control;
+    unsigned phy_accesses = mdio_commands;
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    registers[GEM_TX_STATUS / 4] = 0;
+    milliseconds += 999;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    milliseconds += 1;
+    T(lume_example_gem_tx_complete() == -LUME_EIO);
+    T(!tx_pending && tx_index == 0 && tx_observed == tx_expected);
+    T(registers[GEM_TX_QUEUE_BASE / 4] == (uint32_t)layout.tx_descriptor_dma);
+    T(registers[GEM_NETWORK_CONTROL / 4] == control);
+    T(rx_index == rx_position && rx.descriptors[rx_position].address_low == rx_address &&
+      rx.descriptors[rx_position].control == rx_control);
+    T(mdio_commands == phy_accesses);
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN | GEM_TX_STATUS_ACTIVE;
+    uint32_t pending_descriptor = tx.descriptors[tx_index].control;
+    registers[GEM_TX_QUEUE_BASE / 4] = (uint32_t)layout.tx_descriptor_dma + 16;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(tx_pending && tx.descriptors[tx_index].control == pending_descriptor);
+    T(registers[GEM_TX_QUEUE_BASE / 4] == (uint32_t)layout.tx_descriptor_dma + 16);
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN;
+    T(lume_example_gem_tx_complete() == -LUME_EIO);
+    T(!tx_pending && tx_index == 0);
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    tx.descriptors[0].control |= GEM_TX_USED;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(lume_example_gem_tx_complete() == 0);
+    milliseconds = UINT32_MAX - 499;
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    registers[GEM_TX_STATUS / 4] = 0;
+    milliseconds += 1000;
+    fail_sync = sync_calls + 2;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN && tx_pending);
+    fail_sync = 0;
+    T(lume_example_gem_tx_complete() == -LUME_EIO && !tx_pending);
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    milliseconds += 1000;
+    tx.descriptors[0].control |= GEM_TX_USED;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(lume_example_gem_tx_complete() == 0 && tx_index == 1);
     T(((registers[GEM_NETWORK_CONFIG / 4] >> 18) & 7) == 5);
     T(((registers[GEM_NETWORK_CONFIG / 4] >> 21) & 3) == 2);
     T((registers[GEM_DMA_CONFIG / 4] & 0x700) == 0x700);

@@ -1,11 +1,14 @@
 #include "lume/abi.h"
 #include "lume/boot_storage.h"
+#include "lume/boot_trial.h"
 #include "ff.h"
 #include <string.h>
 
 static FIL image;
 static unsigned owner, phase, target, config_bytes, config_position;
 static uint32_t total, offset, written_crc, read_crc;
+/* A boot selection attempt blocks BEGIN until the kernel restarts. */
+static bool selection_attempted;
 static unsigned char config[512], buffer[LUME_IO_BYTES];
 static const char *const slots[] = {"1:/lumeroot.fat", "1:/lumeslot.fat"};
 
@@ -20,11 +23,12 @@ static uint32_t crc(uint32_t value, const unsigned char *p, unsigned count)
     return value;
 }
 
-static int configuration(unsigned char out[512], unsigned *bytes, unsigned *position)
+static int read_configuration(const char *path, unsigned char out[512], unsigned *bytes,
+                              unsigned *position)
 {
     FIL file;
     UINT n = 0;
-    if (f_open(&file, "1:/config.txt", FA_READ) != FR_OK)
+    if (f_open(&file, path, FA_READ) != FR_OK)
         return -LUME_EIO;
     bool ok = f_size(&file) < 512 && f_read(&file, out, 512, &n) == FR_OK;
     if (f_close(&file) != FR_OK || !ok)
@@ -51,6 +55,78 @@ static int configuration(unsigned char out[512], unsigned *bytes, unsigned *posi
     return active;
 }
 
+static int configuration(unsigned char out[512], unsigned *bytes, unsigned *position)
+{
+    return read_configuration("1:/config.txt", out, bytes, position);
+}
+
+static bool trial_volume(void)
+{
+    unsigned char text[512];
+    unsigned bytes, position;
+    return lume_boot_trial_supported() &&
+           read_configuration("1:/tryboot.txt", text, &bytes, &position) >= 0;
+}
+
+static bool write_configuration(const char *path, const unsigned char *text, unsigned bytes)
+{
+    FIL file;
+    UINT count = 0;
+    if (f_open(&file, path, FA_WRITE) != FR_OK)
+        return false;
+    bool ok = f_size(&file) == bytes && f_write(&file, text, bytes, &count) == FR_OK &&
+              count == bytes && f_sync(&file) == FR_OK;
+    if (f_close(&file) != FR_OK)
+        ok = false;
+    unsigned char actual[512];
+    unsigned size, position;
+    return ok && read_configuration(path, actual, &size, &position) >= 0 && size == bytes &&
+           !memcmp(actual, text, bytes);
+}
+
+static int confirm(struct lume_boot_request *r)
+{
+    if (!lume_boot_trial_running() || owner || selection_attempted)
+        return -LUME_EBUSY;
+    unsigned char stable[512], trial[512];
+    unsigned bytes, position, trial_bytes, trial_position;
+    int active = configuration(stable, &bytes, &position);
+    int next = read_configuration("1:/tryboot.txt", trial, &trial_bytes, &trial_position);
+    if (active < 0 || next < 0 || active == next || bytes != trial_bytes ||
+        position != trial_position)
+        return -LUME_EINVAL;
+    memcpy(stable + position, slots[next] + 3, 12);
+    if (memcmp(stable, trial, bytes))
+        return -LUME_EINVAL;
+    FIL file;
+    if (f_open(&file, slots[next], FA_READ) != FR_OK)
+        return -LUME_EIO;
+    uint32_t size = f_size(&file), checksum = UINT32_MAX, read = 0;
+    bool ok = size >= 1048576 && size <= 64 * 1024 * 1024 && !(size & 511);
+    while (ok && read < size)
+    {
+        UINT count = size - read > sizeof(buffer) ? sizeof(buffer) : size - read, got = 0;
+        ok = f_read(&file, buffer, count, &got) == FR_OK && got == count;
+        if (ok)
+        {
+            checksum = crc(checksum, buffer, count);
+            read += count;
+        }
+    }
+    if (f_close(&file) != FR_OK)
+        ok = false;
+    if (!ok || !lume_boot_trial_matches(size, ~checksum))
+        return -LUME_EIO;
+    selection_attempted = true;
+    if (!write_configuration("1:/config.txt", trial, bytes))
+        return -LUME_EIO;
+    lume_boot_trial_accept();
+    r->active = (unsigned)next;
+    r->total = size;
+    r->crc = ~checksum;
+    return 0;
+}
+
 void lume_boot_release(unsigned pid)
 {
     if (owner == pid)
@@ -63,22 +139,36 @@ void lume_boot_release(unsigned pid)
 
 int lume_boot_call(unsigned pid, unsigned op, struct lume_boot_request *r)
 {
-    if (r->version != LUME_IO_VERSION || op > LUME_BOOT_ABORT || r->count > LUME_IO_BYTES)
+    if (r->version != LUME_IO_VERSION || op > LUME_BOOT_CONFIRM || r->count > LUME_IO_BYTES)
         return -LUME_EINVAL;
+    if (op == LUME_BOOT_CAPABILITIES)
+    {
+        r->total = LUME_BOOT_CAP_RESTART_GUARD;
+        if (lume_storage_boot_mount() && trial_volume())
+            r->total |= LUME_BOOT_CAP_TRIAL;
+        return 0;
+    }
     if (!lume_storage_boot_mount())
         return -LUME_EROFS;
+    if (op == LUME_BOOT_CONFIRM)
+        return confirm(r);
     if (op == LUME_BOOT_INFO || op == LUME_BOOT_BEGIN)
     {
-        if (owner && op == LUME_BOOT_BEGIN)
+        if ((owner || selection_attempted || lume_boot_trial_running()) && op == LUME_BOOT_BEGIN)
             return -LUME_EBUSY;
         unsigned char text[512];
         unsigned bytes, position;
         int active = configuration(text, &bytes, &position);
+        if (op == LUME_BOOT_INFO && lume_boot_trial_running())
+            active = read_configuration("1:/tryboot.txt", text, &bytes, &position);
         if (active < 0)
             return active;
         r->active = (unsigned)active;
         if (op == LUME_BOOT_INFO)
+        {
+            r->total = lume_boot_trial_running() ? LUME_BOOT_STATE_TRIAL : 0;
             return 0;
+        }
         if (r->total < 1024 * 1024 || r->total > 64 * 1024 * 1024 || (r->total & 511))
             return -LUME_EINVAL;
         target = 1u - (unsigned)active;
@@ -179,15 +269,10 @@ int lume_boot_call(unsigned pid, unsigned op, struct lume_boot_request *r)
         position != config_position || memcmp(config, text, bytes))
         return -LUME_EBUSY;
     memcpy(text + position, slots[target] + 3, 12);
-    FIL file;
-    UINT n = 0;
-    if (f_open(&file, "1:/config.txt", FA_WRITE) != FR_OK)
-        return -LUME_EIO;
-    bool ok = f_write(&file, text, bytes, &n) == FR_OK && n == bytes && f_sync(&file) == FR_OK;
-    if (f_close(&file) != FR_OK)
-        ok = false;
-    active = configuration(text, &bytes, &position);
-    if (!ok || active != (int)target)
+    selection_attempted = true;
+    bool trial = trial_volume();
+    const char *path = trial ? "1:/tryboot.txt" : "1:/config.txt";
+    if (!write_configuration(path, text, bytes) || (trial && !lume_boot_trial_arm()))
         return -LUME_EIO;
     r->active = target;
     r->crc = ~read_crc;
