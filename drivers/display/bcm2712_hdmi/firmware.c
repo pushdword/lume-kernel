@@ -128,6 +128,9 @@ static int framebuffer_start(struct lume_hardware *hardware, void *context)
     /* Pi 5 firmware can echo a requested depth without changing the scanout format. */
     if (depth == 32 && width && pitch >= (uint64_t)width * 2 && pitch < (uint64_t)width * 4)
         depth = 16;
+    /* RGB565 component order is opposite to the packed 32-bit color order. */
+    if (depth == 16)
+        order ^= 1;
     lume_value("HDMI_FB_PHYSICAL", physical);
     lume_value("HDMI_FB_BYTES", bytes);
     lume_value("HDMI_FB_WIDTH", width);

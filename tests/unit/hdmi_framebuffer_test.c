@@ -8,6 +8,7 @@ static bool fail_blank;
 static bool mode_active;
 static int map_result = -LUME_EBUSY, attach_result, detach_result;
 static unsigned attaches, detaches;
+static unsigned reported_depth = 32, reported_order, expected_order = 1;
 
 int hdmi_hsm_acquire(bool *held)
 {
@@ -83,8 +84,8 @@ int lume_pi5_firmware_property(uint32_t *message, size_t bytes)
         message[5] = 1920;
         message[6] = 1080;
         message[9] = message[13] = UINT32_C(0x80000004);
-        message[10] = 32;
-        message[14] = 0;
+        message[10] = reported_depth;
+        message[14] = reported_order;
         return 0;
     case 0x00040001:
         message[4] = UINT32_C(0x80000008);
@@ -125,7 +126,7 @@ int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsig
                         unsigned order, unsigned pitch, size_t bytes)
 {
     assert(memory == 0x3f800000 && width == 1920 && height == 1080 && depth == 16);
-    assert(order == 0 && pitch == 3840 && bytes == 4147200);
+    assert(order == expected_order && pitch == 3840 && bytes == 4147200);
     ++attaches;
     return attach_result;
 }
@@ -158,5 +159,12 @@ int main(void)
     detach_result = 0;
     assert(!framebuffer_stop(NULL, &a) && !owner && !a.allocated && !a.console_registered);
     assert(!hdmi_firmware_active() && requests == before && !blanks && !leases);
+    reported_depth = 16;
+    assert(!framebuffer_start(NULL, &a) && a.console_registered);
+    assert(!framebuffer_stop(NULL, &a) && !owner);
+    reported_order = 1;
+    expected_order = 0;
+    assert(!framebuffer_start(NULL, &a) && a.console_registered);
+    assert(!framebuffer_stop(NULL, &a) && !owner);
     puts("PASS HDMI framebuffer ownership and firmware scanout preservation");
 }
