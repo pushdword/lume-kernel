@@ -30,6 +30,13 @@ int lume_boot_call(unsigned pid, unsigned operation, struct lume_boot_request *r
     ++boot_calls;
     owner_seen = pid;
     operation_seen = operation;
+    if (operation == LUME_BOOT_CONFIRM)
+    {
+        assert(request->offset == 0x1234 && request->crc == 0x89abcdef);
+        request->active = 0;
+        request->crc = 0x76543210;
+        return 43;
+    }
     request->total = LUME_BOOT_CAP_RESTART_GUARD;
     request->data[0] = 0x7a;
     return operation == LUME_BOOT_WRITE ? 17 : 0;
@@ -55,11 +62,18 @@ int main(void)
     assert(lume_io_call(7, false, LUME_BOOT_INFO, user_pointer, sizeof(boot)) == 0);
     for (unsigned operation = LUME_BOOT_BEGIN; operation <= LUME_BOOT_ABORT; ++operation)
         assert(lume_io_call(7, false, operation, user_pointer, sizeof(boot)) == -LUME_EPERM);
+    assert(lume_io_call(7, false, LUME_BOOT_CONFIRM, user_pointer, sizeof(boot)) == -LUME_EPERM);
     assert(boot_calls == 2);
     capable = true;
     assert(lume_io_call(7, false, LUME_BOOT_WRITE, user_pointer, sizeof(boot)) == 17);
+    boot.offset = 0x1234;
+    boot.active = 1;
+    boot.crc = 0x89abcdef;
+    assert(lume_io_call(7, false, LUME_BOOT_CONFIRM, user_pointer, sizeof(boot)) == 43);
+    assert(owner_seen == 7 && operation_seen == LUME_BOOT_CONFIRM);
+    assert(boot.active == 0 && boot.crc == 0x76543210);
     unsigned before = boot_calls;
-    assert(lume_io_call(7, false, LUME_BOOT_CAPABILITIES + 1, user_pointer, sizeof(boot)) ==
+    assert(lume_io_call(7, false, LUME_BOOT_CONFIRM + 1, user_pointer, sizeof(boot)) ==
            -LUME_EINVAL);
     assert(lume_io_call(7, false, UINT64_MAX, user_pointer, sizeof(boot)) == -LUME_EINVAL);
     assert(lume_io_call(7, false, LUME_BOOT_INFO, user_pointer, sizeof(boot) - 1) == -LUME_EINVAL);

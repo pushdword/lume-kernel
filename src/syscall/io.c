@@ -11,7 +11,7 @@ int64_t lume_io_call(unsigned pid, bool stream, uint64_t operation, uint64_t poi
         !lume_task_capable(pid, LUME_CAP_BOOT_UPDATE))
         return -LUME_EPERM;
     size_t bytes = stream ? sizeof(struct lume_stream_request) : sizeof(struct lume_boot_request);
-    if (n != bytes || operation > (stream ? LUME_ICMP_ECHO_CLOSE : LUME_BOOT_CAPABILITIES))
+    if (n != bytes || operation > (stream ? LUME_ICMP_ECHO_CLOSE : LUME_BOOT_CONFIRM))
         return -LUME_EINVAL;
     if (!lume_user_buffer(pointer, n, false) || !lume_user_buffer(pointer, n, true))
         return -LUME_EFAULT;
