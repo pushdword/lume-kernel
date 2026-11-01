@@ -270,6 +270,14 @@ static int graphics_present(const struct lume_graphics_request *request)
                                           console.pitch, console.depth, console.order, request);
     if (result)
         return result;
+    if (request->width * (console.depth / 8) == console.pitch)
+    {
+        uintptr_t first = console.memory + (size_t)request->y * console.pitch;
+        return lume_dma_sync_for_device((const void *)first,
+                                        (size_t)request->height * console.pitch, LUME_DMA_TO_DEVICE)
+                   ? 0
+                   : -LUME_EIO;
+    }
     for (unsigned y = 0; y < request->height; ++y)
     {
         uintptr_t row = console.memory + (size_t)(request->y + y) * console.pitch +

@@ -72,7 +72,7 @@ $(OUT)/tests/hdmi-framebuffer$(HOSTEXE): tests/unit/hdmi_framebuffer_test.c $(HD
 .PHONY: check-hdmi-console
 check-hdmi-console: $(OUT)/tests/hdmi-console$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/hdmi-console$(HOSTEXE): tests/unit/hdmi_console_test.c drivers/display/bcm2712_hdmi/console.c drivers/display/bcm2712_hdmi/console.h src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c src/terminal/console_font.h
+$(OUT)/tests/hdmi-console$(HOSTEXE): tests/unit/hdmi_console_test.c drivers/display/bcm2712_hdmi/console.c drivers/display/bcm2712_hdmi/console.h drivers/display/framebuffer.h src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c src/terminal/console_font.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c -o "$@"
 

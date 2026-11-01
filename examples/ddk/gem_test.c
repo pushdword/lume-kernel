@@ -18,6 +18,7 @@ static unsigned phy_shadow_select;
 static unsigned checks, sync_calls, fail_sync, map_calls, fail_map;
 static unsigned tx_complete_after;
 static unsigned mdio_commands, fail_mdio_at, phy_vendor_accesses;
+static unsigned link_reads;
 static uint32_t milliseconds;
 
 uint32_t lume_clock_millis(void)
@@ -67,7 +68,10 @@ static void model_phy_write(unsigned reg, uint16_t value)
 static uint32_t lume_mmio_read32(uintptr_t address)
 {
     if (address == GEM_CFG_BASE + GEM_CFG_STATUS)
+    {
+        ++link_reads;
         return cfg_status;
+    }
     assert(address >= GEM_MAC_BASE && address < GEM_MAC_BASE + GEM_MMIO_BYTES);
     if (address == GEM_MAC_BASE + GEM_TX_FRAMES)
     {
@@ -281,11 +285,19 @@ static void exercise_netif(void)
     lume_netif_info(interface, &info);
     T(info.rx_packets == 1 && info.rx_errors == 1);
     cfg_status = 0;
+    unsigned previous_reads = link_reads;
+    for (unsigned i = 0; i < 10000; ++i)
+        T(gem_netif_link(&gem_network));
+    T(link_reads == previous_reads);
+    milliseconds += GEM_LINK_POLL_MS - 1;
+    T(gem_netif_link(&gem_network) && link_reads == previous_reads);
+    ++milliseconds;
     lume_netif_poll(interface);
     lume_netif_info(interface, &info);
     T(info.flags == LUME_IF_UP);
     T(!lume_netif_transmit(interface, frame, 60));
     cfg_status = GEM_CFG_STATUS_RGMII_LINK_STATUS;
+    milliseconds += GEM_LINK_POLL_MS;
     lume_netif_poll(interface);
 
     T(lume_netif_admin(interface, false) == 0);
@@ -541,6 +553,23 @@ int main(void)
     T((registers[GEM_NETWORK_CONFIG / 4] &
        (GEM_CONFIG_GIGABIT | GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX)) ==
       (GEM_CONFIG_SPEED_100 | GEM_CONFIG_FULL_DUPLEX));
+    struct gem_netif_context probe = {0};
+    milliseconds = UINT32_MAX - 100;
+    phy_accesses = mdio_commands;
+    T(gem_netif_link(&probe));
+    T(mdio_commands == phy_accesses + 2);
+    for (unsigned i = 0; i < 10000; ++i)
+        T(gem_netif_link(&probe));
+    T(mdio_commands == phy_accesses + 2);
+    phy_registers[1] = 0;
+    milliseconds += GEM_LINK_POLL_MS - 1;
+    T(gem_netif_link(&probe) && mdio_commands == phy_accesses + 2);
+    ++milliseconds;
+    T(!gem_netif_link(&probe) && mdio_commands == phy_accesses + 4);
+    probe.link_valid = false;
+    phy_registers[1] = 0x24;
+    T(gem_netif_link(&probe));
+    T(mdio_commands > phy_accesses + 4);
     T(lume_example_gem_eth_stop() == 0);
     /* Reapply LED modes after the PHY register contents change. */
     phy_shadows[0x0d] = 0x02c3;

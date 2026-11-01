@@ -268,6 +268,13 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 
 .PHONY: check-scheduler
 .PHONY: check-gem
+.PHONY: check-framebuffer-present
+check: check-framebuffer-present
+check-framebuffer-present: $(OUT)/tests/framebuffer-present$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/framebuffer-present$(HOSTEXE): tests/unit/framebuffer_present_test.c drivers/display/framebuffer.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check-gem: $(OUT)/tests/gem$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/gem$(HOSTEXE): HOSTCFLAGS += -UNDEBUG

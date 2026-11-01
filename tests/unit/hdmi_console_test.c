@@ -10,6 +10,8 @@ static unsigned flushes;
 static bool dma_failure;
 static unsigned char *memory;
 static size_t memory_bytes;
+static const void *last_flush;
+static size_t last_flush_bytes;
 
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
@@ -54,7 +56,40 @@ bool lume_dma_sync_for_device(const void *data, size_t bytes, enum lume_dma_dire
     assert((uintptr_t)data >= (uintptr_t)memory);
     assert((uintptr_t)data + bytes <= (uintptr_t)memory + memory_bytes);
     ++flushes;
+    last_flush = data;
+    last_flush_bytes = bytes;
     return !dma_failure;
+}
+
+static void present_rows(unsigned pitch)
+{
+    uint32_t pixels[160 * 4];
+    for (unsigned i = 0; i < sizeof(pixels) / sizeof(pixels[0]); ++i)
+        pixels[i] = i * UINT32_C(2654435761);
+    assert(!registered_graphics->claim(true));
+    struct lume_graphics_request update = {.pixels = (uintptr_t)pixels,
+                                           .x = 0,
+                                           .y = 7,
+                                           .width = 160,
+                                           .height = 4,
+                                           .pitch = 640,
+                                           .format = LUME_GRAPHICS_XRGB8888};
+    unsigned before = flushes;
+    assert(!registered_graphics->present(&update));
+    assert(flushes == before + (pitch == 640 ? 1 : 4));
+    if (pitch == 640)
+    {
+        assert(last_flush == memory + 7 * pitch && last_flush_bytes == 4 * pitch);
+        dma_failure = true;
+        assert(registered_graphics->present(&update) == -LUME_EIO);
+        assert(flushes == before + 2);
+        dma_failure = false;
+    }
+    before = flushes;
+    update.x = 1;
+    assert(registered_graphics->present(&update) == -LUME_EINVAL);
+    assert(flushes == before);
+    assert(!registered_graphics->claim(false));
 }
 
 static void padding(unsigned width, unsigned height, unsigned depth, unsigned pitch)
@@ -86,8 +121,12 @@ int main(void)
     assert(video(LUME_VIDEO_FONT_SELECT, 0, NULL) == -LUME_EBUSY);
     uint32_t pixels[] = {0xff0000, 0x00ff00, 0x0000ff};
     struct lume_graphics_request update = {.pixels = (uintptr_t)pixels,
-        .x = 5, .y = 5, .width = 3, .height = 1, .pitch = 12,
-        .format = LUME_GRAPHICS_XRGB8888};
+                                           .x = 5,
+                                           .y = 5,
+                                           .width = 3,
+                                           .height = 1,
+                                           .pitch = 12,
+                                           .format = LUME_GRAPHICS_XRGB8888};
     assert(!registered_graphics->present(&update));
     assert(((uint16_t *)(canvas + 5 * 336))[5] == 0x001f);
     assert(((uint16_t *)(canvas + 5 * 336))[6] == 0x07e0);
@@ -141,8 +180,12 @@ int main(void)
     assert(!video(LUME_VIDEO_UPLOAD, 0, custom));
     assert(video(LUME_VIDEO_FONT_COUNT, 0, NULL) == CONSOLE_FONT_COUNT + 1);
     assert(video(LUME_VIDEO_FONT_CURRENT, 0, NULL) == CONSOLE_FONT_COUNT);
+    present_rows(656);
     padding(160, 128, 32, 656);
     assert(!hdmi_console_detach() && !hdmi_console_detach());
+    assert(!hdmi_console_attach((uintptr_t)canvas, 160, 128, 32, 1, 640, sizeof(canvas)));
+    present_rows(640);
+    assert(!hdmi_console_detach());
     assert(hdmi_console_attach((uintptr_t)canvas, 160, 128, 24, 1, 656, sizeof(canvas)) ==
            -LUME_EINVAL);
     assert(hdmi_console_attach((uintptr_t)canvas, 160, 128, 32, 1, 639, sizeof(canvas)) ==

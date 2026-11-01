@@ -202,6 +202,49 @@ u8_t pbuf_free(struct pbuf *p)
     return 1;
 }
 
+static void chained_ring(void)
+{
+    notifications = 0;
+    unsigned char initial[8192], extra[1024];
+    for (unsigned i = 0; i < sizeof(initial); ++i)
+        initial[i] = (unsigned char)(i * 19u + 3u);
+    for (unsigned i = 0; i < sizeof(extra); ++i)
+        extra[i] = (unsigned char)(i * 7u + 41u);
+    struct lume_stream_request request = {.version = LUME_IO_VERSION, .port = 8095};
+    request.address[0] = 172;
+    request.address[1] = 30;
+    request.address[2] = 1;
+    request.address[3] = 163;
+    assert(!lume_stream_call(2, LUME_STREAM_CONNECT, &request));
+    struct pbuf tail = {.payload = initial + 5000, .len = 3192, .tot_len = 3192};
+    struct pbuf head = {.payload = initial, .len = 5000, .tot_len = 8192, .next = &tail};
+    struct pbuf empty = {.tot_len = 8192, .next = &head};
+    unsigned previous_freed = freed, previous_ack = acknowledged;
+    assert(pcb.recv(pcb.callback_arg, &pcb, &empty, ERR_OK) == ERR_OK);
+    assert(freed == previous_freed + 1 && acknowledged == previous_ack);
+    struct pbuf last = {.payload = extra + 333, .len = 691, .tot_len = 691};
+    struct pbuf append = {.payload = extra, .len = 333, .tot_len = 1024, .next = &last};
+    assert(pcb.recv(pcb.callback_arg, &pcb, &append, ERR_OK) == ERR_MEM);
+    assert(freed == previous_freed + 1 && acknowledged == previous_ack);
+    request.count = 1024;
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 1024);
+    assert(!memcmp(request.data, initial, 1024) && acknowledged == previous_ack + 1024);
+    assert(pcb.recv(pcb.callback_arg, &pcb, &append, ERR_OK) == ERR_OK);
+    assert(freed == previous_freed + 2);
+    request.count = sizeof(request.data);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 4096);
+    assert(!memcmp(request.data, initial + 1024, 4096));
+    request.count = sizeof(request.data);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 4096);
+    assert(!memcmp(request.data, initial + 5120, 3072));
+    assert(!memcmp(request.data + 3072, extra, 1024));
+    assert(acknowledged == previous_ack + sizeof(initial) + sizeof(extra));
+    assert(pcb.recv(pcb.callback_arg, &pcb, NULL, ERR_OK) == ERR_OK);
+    request.count = 1;
+    assert(!lume_stream_call(2, LUME_STREAM_RECEIVE, &request));
+    lume_stream_release(2);
+}
+
 int main(void)
 {
     netif_set_flags(&interface, NETIF_FLAG_LINK_UP);
@@ -352,6 +395,7 @@ int main(void)
     assert(lume_stream_call(0, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
     r.version = 0;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
+    chained_ring();
     puts(
         "PASS TCP ownership, backpressure, EOF, reset, async connect, half-close, listener, pure poll, ACK wake and bounded UDP queues");
 }

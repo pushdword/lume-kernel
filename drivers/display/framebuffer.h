@@ -6,6 +6,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+static inline uint16_t lume_framebuffer_rgb565(uint32_t color, unsigned order)
+{
+    if (order)
+        return ((color >> 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 3) & 0x1f);
+    return ((color << 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 19) & 0x1f);
+}
+
 static int lume_framebuffer_present(uintptr_t memory, unsigned width, unsigned height,
                                     unsigned pitch, unsigned depth, unsigned order,
                                     const struct lume_graphics_request *request)
@@ -21,17 +28,36 @@ static int lume_framebuffer_present(uintptr_t memory, unsigned width, unsigned h
     {
         const uint32_t *row = (const void *)(source + (uint64_t)y * request->pitch);
         uintptr_t target = memory + (size_t)(request->y + y) * pitch;
-        for (unsigned x = 0; x < request->width; ++x)
+        if (depth == 16)
         {
-            uint32_t color = row[x];
-            if (!order)
-                color = (color & 0xff00) | ((color & 255) << 16) | ((color >> 16) & 255);
-            if (depth == 16)
-                ((volatile uint16_t *)target)[request->x + x] =
-                    ((color >> 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 3) & 0x1f);
-            else
-                ((volatile uint32_t *)target)[request->x + x] = color | UINT32_C(0xff000000);
+            volatile uint16_t *out = (volatile uint16_t *)target + request->x;
+            unsigned x = 0;
+            if ((uintptr_t)out & 3)
+            {
+                out[x] = lume_framebuffer_rgb565(row[x], order);
+                ++x;
+            }
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            for (; request->width - x >= 2; x += 2)
+            {
+                uint32_t pair = lume_framebuffer_rgb565(row[x], order) |
+                                (uint32_t)lume_framebuffer_rgb565(row[x + 1], order) << 16;
+                *(volatile uint32_t *)(out + x) = pair;
+            }
+#endif
+            for (; x < request->width; ++x)
+                out[x] = lume_framebuffer_rgb565(row[x], order);
         }
+        else if (order)
+            for (unsigned x = 0; x < request->width; ++x)
+                ((volatile uint32_t *)target)[request->x + x] = row[x] | UINT32_C(0xff000000);
+        else
+            for (unsigned x = 0; x < request->width; ++x)
+            {
+                uint32_t color = row[x];
+                color = (color & 0xff00) | ((color & 255) << 16) | ((color >> 16) & 255);
+                ((volatile uint32_t *)target)[request->x + x] = color | UINT32_C(0xff000000);
+            }
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return 0;

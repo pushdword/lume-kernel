@@ -6,11 +6,16 @@
 #include <lume/device.h>
 #include <lume/netif.h>
 
+extern uint32_t lume_clock_millis(void);
+#define GEM_LINK_POLL_MS 250u
+
 struct gem_netif_context
 {
     struct lume_netif *interface;
     unsigned char mac[6];
     bool attached, tx_pending;
+    bool link_valid, link_up;
+    uint32_t link_sampled;
 };
 
 static struct gem_netif_context gem_network;
@@ -31,8 +36,16 @@ static void gem_netif_poll(void *opaque)
 
 static bool gem_netif_link(void *opaque)
 {
-    (void)opaque;
-    return lume_example_gem_link();
+    struct gem_netif_context *context = opaque;
+    uint32_t now = lume_clock_millis();
+    /* Sample PHY management independently of the packet polling rate. */
+    if (!context->link_valid || (uint32_t)(now - context->link_sampled) >= GEM_LINK_POLL_MS)
+    {
+        context->link_up = lume_example_gem_link();
+        context->link_sampled = now;
+        context->link_valid = true;
+    }
+    return context->link_up;
 }
 
 static int gem_netif_receive(void *opaque, void *data, size_t capacity)
@@ -67,6 +80,7 @@ static bool gem_netif_same_mac(const struct gem_netif_context *context,
 static bool gem_netif_admin(void *opaque, bool up)
 {
     struct gem_netif_context *context = opaque;
+    context->link_valid = false;
     if (up)
     {
         if (!context->attached)

@@ -89,11 +89,15 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
     if (error != ERR_OK || p->tot_len > sizeof(s->data) - s->count)
         return ERR_MEM;
     for (struct pbuf *q = p; q; q = q->next)
-        for (unsigned i = 0; i < q->len; ++i)
-        {
-            s->data[(s->first + s->count) % sizeof(s->data)] = ((unsigned char *)q->payload)[i];
-            ++s->count;
-        }
+    {
+        if (!q->len)
+            continue;
+        unsigned end = (s->first + s->count) % sizeof(s->data);
+        unsigned first = q->len < sizeof(s->data) - end ? q->len : sizeof(s->data) - end;
+        memcpy(s->data + end, q->payload, first);
+        memcpy(s->data, (const unsigned char *)q->payload + first, q->len - first);
+        s->count += q->len;
+    }
     pbuf_free(p);
     notify(s);
     /* Advertise space only after userspace consumes these bytes. */
@@ -374,8 +378,9 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         if (!s->count)
             return s->failed ? -LUME_EIO : s->eof ? 0 : -LUME_EAGAIN;
         unsigned n = r->count < s->count ? r->count : s->count;
-        for (unsigned i = 0; i < n; ++i)
-            r->data[i] = s->data[(s->first + i) % sizeof(s->data)];
+        unsigned first = n < sizeof(s->data) - s->first ? n : sizeof(s->data) - s->first;
+        memcpy(r->data, s->data + s->first, first);
+        memcpy(r->data + first, s->data, n - first);
         s->first = (s->first + n) % sizeof(s->data);
         s->count -= n;
         if (s->pcb)
