@@ -23,8 +23,8 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
     r->version = LUME_NET_CONTROL_VERSION;
     r->ifindex = index;
     int result = 0;
-    if (op > LUME_NET_WIFI_CONNECT_BEGIN || version != LUME_NET_CONTROL_VERSION || reserved || count ||
-        lost || (op != LUME_NET_EVENTS && cursor) || (op == LUME_NET_ENUM && index) ||
+    if (op > LUME_NET_STATS || version != LUME_NET_CONTROL_VERSION || reserved || count || lost ||
+        (op != LUME_NET_EVENTS && cursor) || (op == LUME_NET_ENUM && index) ||
         (op != LUME_NET_ENUM && op != LUME_NET_EVENTS && !index))
         result = -LUME_EINVAL;
     if (!result && index && !lume_netif_find(index))
@@ -48,6 +48,9 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         break;
     case LUME_NET_GET:
         result = lume_net_snapshot(index, &r->data.interfaces[0]);
+        break;
+    case LUME_NET_STATS:
+        lume_netif_statistics(lume_netif_find(index), &r->data.statistics);
         break;
     case LUME_NET_ADMIN:
         if (admin > 1)

@@ -280,6 +280,36 @@ int main(void)
     lume_netif_info(a, &info);
     CHECK(info.rx_packets == 1 && info.rx_errors == 2 && info.tx_packets == 1 &&
           info.tx_errors == 4);
+    lume_netif_account(a, LUME_NET_TX_DEPTH, 8);
+    lume_netif_account(a, LUME_NET_TX_DEPTH, 2);
+    lume_netif_account(a, LUME_NET_TX_BUSY, 0);
+    lume_netif_account(a, LUME_NET_TX_COMPLETE, 7);
+    lume_netif_account(a, LUME_NET_TX_COMPLETE, 3);
+    init(1);
+    CHECK(lume_net_control(LUME_NET_STATS, &request) == 0);
+    struct lume_net_statistics *statistics = &request.data.statistics;
+    CHECK(statistics->version == LUME_NET_STATS_VERSION &&
+          statistics->bytes == sizeof(*statistics));
+    CHECK(statistics->rx_bytes == 42 && statistics->tx_bytes == 14);
+    CHECK(statistics->tx_depth == 2 && statistics->tx_high_water == 8 && statistics->tx_busy == 1);
+    CHECK(statistics->tx_completed == 2 && statistics->tx_completion_ms == 10 &&
+          statistics->tx_max_completion_ms == 7);
+    lume_netif_account(a, LUME_NET_TX_RESTART, 3);
+    lume_netif_account(a, LUME_NET_WIFI_CREDIT, 4);
+    lume_netif_account(a, LUME_NET_WIFI_RX_DEPTH, 6);
+    lume_netif_account(a, LUME_NET_WIFI_RX_DEPTH, 1);
+    lume_netif_account(a, LUME_NET_WIFI_CREDIT_STALL, 0);
+    lume_netif_account(a, LUME_NET_WIFI_RX_DROP, 0);
+    lume_netif_account(a, LUME_NET_WIFI_PACKETS, 0);
+    lume_netif_account(a, LUME_NET_WIFI_BUS_ERROR, 0);
+    lume_netif_account(a, LUME_NET_WIFI_POLL_MS, 2);
+    lume_netif_account(a, LUME_NET_WIFI_SEND_MS, 3);
+    lume_netif_statistics(a, statistics);
+    CHECK(statistics->tx_restarts == 3 && statistics->wifi_credit_available == 4);
+    CHECK(statistics->wifi_rx_high_water == 6 && statistics->wifi_credit_stalls == 1);
+    CHECK(statistics->wifi_rx_drops == 1 && statistics->wifi_packets == 1);
+    CHECK(statistics->wifi_bus_errors == 1 && statistics->wifi_poll_ms == 2 &&
+          statistics->wifi_send_ms == 3);
     CHECK(lume_netif_admin(b, true) == 0);
     struct lume_wifi_bss_info aps[32];
     for (int mode = 0; mode <= 6; ++mode)

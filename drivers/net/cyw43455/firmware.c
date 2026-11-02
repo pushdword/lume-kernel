@@ -12,6 +12,13 @@
 #define RAM_BASE 0x198000u
 static const struct lume_sdio_bus *bus;
 static uint32_t registered_interface;
+
+static void network_account(unsigned event, uint64_t value)
+{
+    if (registered_interface)
+        lume_netif_account(lume_netif_find(registered_interface), event, value);
+}
+
 int lume_pi5_wifi_unregister(void);
 static struct lume_wifi_cores cores;
 static unsigned char transfer[512], verify[512], nvram[4096], raw_nvram[4096];
@@ -275,6 +282,10 @@ static int packet(void)
     rx_sequence = h.sequence;
     tx_credit = h.credit;
     flow_mask = h.flow;
+    unsigned credits = (unsigned char)(tx_credit - tx_sequence);
+    network_account(LUME_NET_WIFI_CREDIT,
+                    !flow_mask && !hardware_flow && credits <= 64 ? credits : 0);
+    network_account(LUME_NET_WIFI_PACKETS, 0);
     if (h.channel != 0)
         dispatch(&h);
     return (int)h.length;
@@ -675,6 +686,7 @@ static void dispatch(const struct lume_wifi_frame *h)
             if (n > 512 || auth_count == 4)
             {
                 ++receive_drops;
+                network_account(LUME_NET_WIFI_RX_DROP, 0);
                 return;
             }
             unsigned slot = (auth_head + auth_count) % 4;
@@ -687,6 +699,7 @@ static void dispatch(const struct lume_wifi_frame *h)
         if (!operational || n < 14 || n > 1514 || receive_count == 8)
         {
             ++receive_drops;
+            network_account(LUME_NET_WIFI_RX_DROP, 0);
             return;
         }
         unsigned slot = (receive_head + receive_count) % 8;
@@ -694,6 +707,7 @@ static void dispatch(const struct lume_wifi_frame *h)
             receive_queue[slot][i] = p[i];
         receive_size[slot] = (uint16_t)n;
         ++receive_count;
+        network_account(LUME_NET_WIFI_RX_DEPTH, receive_count);
         return;
     }
     struct lume_wifi_event e;
@@ -945,11 +959,13 @@ void lume_wifi_poll(void)
 {
     if (!operational)
         return;
+    uint32_t began = lume_clock_millis();
     for (unsigned n = 0; n < 4; ++n)
     {
         int r = packet();
         if (r < 0)
         {
+            network_account(LUME_NET_WIFI_BUS_ERROR, 0);
             operational = carrier = false;
             lume_puts("WIFI TRANSPORT FAILED\n");
             break;
@@ -966,6 +982,7 @@ void lume_wifi_poll(void)
     }
     else if (joining && (uint32_t)(lume_clock_millis() - join_started) >= 30000)
         lume_wifi_leave();
+    network_account(LUME_NET_WIFI_POLL_MS, (uint32_t)(lume_clock_millis() - began));
 }
 
 int lume_wifi_receive(void *out, size_t cap)
@@ -985,12 +1002,26 @@ int lume_wifi_receive(void *out, size_t cap)
 
 bool lume_wifi_send(const void *data, size_t bytes)
 {
-    if (!operational || !lume_wifi_link() || packet() < 0 ||
-        !lume_wifi_tx_allowed(tx_sequence, tx_credit, flow_mask, hardware_flow))
+    if (!operational || !lume_wifi_link())
         return false;
+    if (packet() < 0)
+    {
+        network_account(LUME_NET_WIFI_BUS_ERROR, 0);
+        return false;
+    }
+    if (!lume_wifi_tx_allowed(tx_sequence, tx_credit, flow_mask, hardware_flow))
+    {
+        network_account(LUME_NET_WIFI_CREDIT_STALL, 0);
+        return false;
+    }
+    uint32_t began = lume_clock_millis();
     size_t count = lume_wifi_data_frame(tx, sizeof(tx), tx_sequence, data, bytes);
     if (!count || !fifo(true, tx, count))
+    {
+        network_account(LUME_NET_WIFI_BUS_ERROR, 0);
         return false;
+    }
+    network_account(LUME_NET_WIFI_SEND_MS, (uint32_t)(lume_clock_millis() - began));
     ++tx_sequence;
     data_in_flight = true;
     data_sent_at = lume_clock_millis();

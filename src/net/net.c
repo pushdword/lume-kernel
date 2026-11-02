@@ -4,6 +4,8 @@
 #include "lume/early.h"
 #include "lume/net.h"
 #include "lume/activity.h"
+#include "lume/work.h"
+#include "lume/worker.h"
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"
@@ -167,11 +169,27 @@ void lume_net_release(uint32_t index)
 
 static uint64_t last_poll;
 static bool poll_valid;
+static bool repoll, tx_waiting;
+static uint64_t traffic_until;
+static void network_service(void *);
+static struct lume_work service_work = {.run = network_service};
 
 void lume_net_poll_background(void)
 {
-    if (!poll_valid || lume_clock_monotonic() - last_poll >= 10)
-        lume_net_poll();
+    if (!lume_netif_count())
+        return;
+    uint64_t now = lume_clock_monotonic();
+    uint64_t interval = tx_waiting || lume_stream_needs_poll() || now < traffic_until ? 1 : 10;
+    if (!poll_valid || repoll || now - last_poll >= interval)
+        (void)lume_work_submit(&service_work);
+}
+
+static void network_service(void *context)
+{
+    (void)context;
+    lume_net_poll();
+    if (repoll)
+        (void)lume_work_submit(&service_work);
 }
 
 void lume_net_poll(void)
@@ -179,6 +197,7 @@ void lume_net_poll(void)
     if ((!started && !lume_net_start()) || polling)
         return;
     polling = true;
+    repoll = tx_waiting = false;
     last_poll = lume_clock_monotonic();
     poll_valid = true;
     unsigned activity = lume_activity_enter(LUME_ACTIVITY_NETWORK);
@@ -197,7 +216,8 @@ void lume_net_poll(void)
             netif_set_link_up(&a->ip);
         if (!link && netif_is_link_up(&a->ip))
             lume_net_release(info.ifindex);
-        for (unsigned k = 0; k < 8; ++k)
+        unsigned received = 0;
+        for (; received < 8; ++received)
         {
             int bytes = lume_netif_receive(a->device, ethernet, sizeof(ethernet));
             if (bytes <= 0)
@@ -213,7 +233,19 @@ void lume_net_poll(void)
                 pbuf_free(p);
                 lume_netif_rx_error(a->device);
             }
+            lume_worker_checkpoint((unsigned)bytes);
         }
+        if (received == 8)
+        {
+            repoll = true;
+            lume_netif_account(a->device, LUME_NET_RX_BUDGET, 0);
+        }
+        if (received)
+            traffic_until = lume_clock_monotonic() + 20;
+        lume_netif_poll(a->device);
+        struct lume_net_statistics statistics;
+        lume_netif_statistics(a->device, &statistics);
+        tx_waiting |= statistics.tx_depth != 0;
     }
     if (!netif_default || !netif_is_link_up(netif_default))
         for (unsigned i = 0; i < adapter_count; ++i)

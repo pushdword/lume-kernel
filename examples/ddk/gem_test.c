@@ -253,25 +253,42 @@ static void exercise_netif(void)
     T(lume_netif_transmit(interface, frame, 60) && dma_submitted);
     frame[0] ^= 0xff;
     T(tx_frame[0] != frame[0]);
+    for (unsigned i = 0; i < GEM_TX_QUEUE; ++i)
+    {
+        frame[0] = (unsigned char)(i + 1);
+        T(lume_netif_transmit(interface, frame, 60));
+        frame[0] = 0xee;
+    }
+    T(gem_network.tx_count == GEM_TX_QUEUE && gem_network.tx_pending);
     T(!lume_netif_transmit(interface, frame, 60));
     lume_netif_info(interface, &info);
-    T(info.tx_packets == 1 && info.tx_errors == 1);
-    tx_complete_after = 4;
-    T(lume_netif_transmit(interface, frame, 60));
-    T(!tx_complete_after && gem_network.tx_pending);
-    lume_netif_info(interface, &info);
-    T(info.tx_packets == 2 && info.tx_errors == 1);
-    tx.descriptor.control |= GEM_TX_USED;
-    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
-    lume_netif_poll(interface);
-    T(!gem_network.tx_pending);
+    T(info.tx_packets == GEM_TX_QUEUE + 1 && info.tx_errors == 1);
+    struct lume_net_statistics statistics = {0};
+    lume_netif_statistics(interface, &statistics);
+    T(statistics.tx_depth == GEM_TX_QUEUE + 1 && statistics.tx_high_water == GEM_TX_QUEUE + 1);
+    T(statistics.tx_busy == 1);
+    for (unsigned i = 0; i <= GEM_TX_QUEUE; ++i)
+    {
+        if (i)
+            T(tx_frame[0] == i);
+        tx.descriptor.control |= GEM_TX_USED;
+        registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
+        ++milliseconds;
+        lume_netif_poll(interface);
+    }
+    T(!gem_network.tx_pending && !gem_network.tx_count);
+    lume_netif_statistics(interface, &statistics);
+    T(statistics.tx_completed == GEM_TX_QUEUE + 1 && !statistics.tx_depth);
+    T(statistics.tx_completion_ms == GEM_TX_QUEUE + 1 && statistics.tx_max_completion_ms == 1);
     T(lume_netif_transmit(interface, frame, 14));
     T((tx.descriptor.control & GEM_DESCRIPTOR_LENGTH) == 60);
     tx.descriptor.control |= GEM_TX_USED;
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN;
     lume_netif_poll(interface);
     lume_netif_info(interface, &info);
-    T(info.tx_packets == 3 && info.tx_errors == 2);
+    T(info.tx_packets == GEM_TX_QUEUE + 2 && info.tx_errors == 2);
+    lume_netif_statistics(interface, &statistics);
+    T(statistics.tx_dma_errors == 1 && !statistics.tx_timeouts);
     lume_netif_poll(interface);
     lume_netif_tx_error(0);
     lume_netif_info(interface, &info);
@@ -289,7 +306,7 @@ static void exercise_netif(void)
     for (unsigned i = 0; i < 10000; ++i)
         T(gem_netif_link(&gem_network));
     T(link_reads == previous_reads);
-    milliseconds += GEM_LINK_POLL_MS - 1;
+    milliseconds = gem_network.link_sampled + GEM_LINK_POLL_MS - 1;
     T(gem_netif_link(&gem_network) && link_reads == previous_reads);
     ++milliseconds;
     lume_netif_poll(interface);
@@ -318,9 +335,13 @@ static void exercise_netif(void)
     T(lume_netif_transmit(interface, frame, 60));
     lume_netif_info(interface, &info);
     uint64_t errors = info.tx_errors;
+    for (unsigned i = 0; i < 3; ++i)
+        T(lume_netif_transmit(interface, frame, 60));
     T(lume_netif_admin(interface, false) == 0);
     lume_netif_info(interface, &info);
-    T(info.tx_errors == errors + 1 && !gem_network.tx_pending);
+    T(info.tx_errors == errors + 4 && !gem_network.tx_pending && !gem_network.tx_count);
+    lume_netif_statistics(interface, &statistics);
+    T(statistics.tx_cancelled == 4 && !statistics.tx_depth);
     const unsigned char changed_mac[6] = {0x52, 0x54, 0, 0x12, 0x34, 0x58};
     T(lume_example_gem_configure(changed_mac, false) == 0);
     T(lume_netif_admin(interface, true) == -LUME_EIO);
@@ -526,6 +547,25 @@ int main(void)
     tx.descriptors[0].control |= GEM_TX_USED;
     registers[GEM_TX_FRAMES / 4] = 1;
     T(lume_example_gem_tx_complete() == 0);
+    T(lume_example_gem_transmit(frame, 60) == 0);
+    registers[GEM_TX_STATUS / 4] = 0;
+    unsigned restarts = lume_example_gem_tx_restarts();
+    milliseconds += 9;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(lume_example_gem_tx_restarts() == restarts);
+    ++milliseconds;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(lume_example_gem_tx_restarts() == restarts + 1);
+    uint32_t owned_descriptor = tx.descriptors[tx_index].control;
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_ACTIVE;
+    milliseconds += 10;
+    T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
+    T(lume_example_gem_tx_restarts() == restarts + 1);
+    T(tx.descriptors[tx_index].control == owned_descriptor);
+    registers[GEM_TX_STATUS / 4] = 0;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    T(lume_example_gem_tx_complete() == 0);
+    T(!tx_pending && tx_observed == tx_expected);
     milliseconds = UINT32_MAX - 499;
     T(lume_example_gem_transmit(frame, 60) == 0);
     registers[GEM_TX_STATUS / 4] = 0;

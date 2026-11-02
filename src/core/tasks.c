@@ -10,6 +10,7 @@
 #include "scheduler_policy.h"
 #include "lume/service.h"
 #include "lume/net.h"
+#include "lume/storage.h"
 #include "lume/boot_storage.h"
 #include "lume/heap.h"
 #include "lume/user_stack.h"
@@ -473,7 +474,9 @@ static void release_program(unsigned task)
     lume_stream_release(task + 1);
     lume_boot_release(task + 1);
     lume_heap_release(task + 1);
-    lume_files_release(&tasks[task].files);
+    if (!kernel_files_closed[task])
+        lume_files_release(&tasks[task].files);
+    kernel_files_closed[task] = false;
     lume_elf_release(&images[task]);
     if (tasks[task].data && !lume_page_free(tasks[task].data))
         lume_fail("program data release");
@@ -584,6 +587,11 @@ static struct lume_context *finish_program(unsigned status)
         states[task] = 4;
         wake_at[task] = UINT64_MAX;
         lume_smp_wake();
+        return wait_ready_task();
+    }
+    if (!kernel_close_ready(task))
+    {
+        sched_charge(&policy, lume_cpu_index(), now());
         return wait_ready_task();
     }
     sched_charge(&policy, lume_cpu_index(), now());

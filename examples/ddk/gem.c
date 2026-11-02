@@ -162,6 +162,8 @@ static unsigned tx_index, tx_count;
 static uint64_t tx_expected, tx_observed;
 static uint32_t tx_started;
 static bool tx_recovering;
+static unsigned tx_failure;
+static uint32_t tx_last_kick, tx_restarts;
 
 /* Read one 32-bit MAC register. The caller supplies an offset in bytes rather than a full
  * address.
@@ -769,8 +771,11 @@ int lume_example_gem_tx_complete(void)
      * its ownership flag.
      */
     if (!running || !sync_descriptor(&tx, true))
+    {
+        tx_failure = GEM_TX_FAILURE_DMA;
         /* Report that the device is unavailable or its descriptor cannot be synchronized. */
         return -LUME_EIO;
+    }
     if (physical_rp1)
         tx_observed += read_mac_reg(GEM_TX_FRAMES);
     if (physical_rp1 && tx_pending)
@@ -779,7 +784,12 @@ int lume_example_gem_tx_complete(void)
         bool owned = (tx.descriptors[tx_index].control & GEM_TX_USED) != 0;
         if (tx_recovering || (status & GEM_TX_STATUS_ERRORS) ||
             (!owned && (uint32_t)(lume_clock_millis() - tx_started) >= 1000))
+        {
+            if (!tx_recovering)
+                tx_failure =
+                    status & GEM_TX_STATUS_ERRORS ? GEM_TX_FAILURE_DMA : GEM_TX_FAILURE_TIMEOUT;
             return recover_transmit();
+        }
     }
     /* A clear USED bit means DMA still owns the descriptor. The CPU must not overwrite its frame
      * buffer yet.
@@ -787,8 +797,7 @@ int lume_example_gem_tx_complete(void)
     if (!(tx.descriptors[tx_index].control & GEM_TX_USED))
     {
         uint32_t status = physical_rp1 ? read_mac_reg(GEM_TX_STATUS) : 0;
-        if (physical_rp1 && tx_pending && (status & GEM_TX_STATUS_USED_BIT_READ) &&
-            !(status & (GEM_TX_STATUS_ACTIVE | GEM_TX_STATUS_ERRORS)))
+        if (physical_rp1 && tx_pending && !(status & (GEM_TX_STATUS_ACTIVE | GEM_TX_STATUS_ERRORS)))
         {
             /* One frame is outstanding. The counter proves egress before CPU reuse. */
             if (tx_observed == tx_expected)
@@ -799,9 +808,15 @@ int lume_example_gem_tx_complete(void)
             }
             else
             {
-                /* Resume an idle queue that stopped at a CPU-owned entry. */
-                write_mac_reg(GEM_TX_STATUS, GEM_TX_STATUS_USED_BIT_READ);
-                write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
+                /* RP1 can miss a start request. Retry an idle, uncompleted frame at 10 ms intervals. */
+                uint32_t now = lume_clock_millis();
+                if ((status & GEM_TX_STATUS_USED_BIT_READ) || (uint32_t)(now - tx_last_kick) >= 10)
+                {
+                    write_mac_reg(GEM_TX_STATUS, GEM_TX_STATUS_USED_BIT_READ);
+                    write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
+                    tx_last_kick = now;
+                    ++tx_restarts;
+                }
                 return -LUME_EAGAIN;
             }
         }
@@ -831,7 +846,22 @@ int lume_example_gem_tx_complete(void)
     /* Return an error when any selected TX error bit is set. Normal completion and reaching a
      * CPU-owned ring end are accepted.
      */
-    return (status & GEM_TX_STATUS_ERRORS) ? -LUME_EIO : 0;
+    if (status & GEM_TX_STATUS_ERRORS)
+    {
+        tx_failure = GEM_TX_FAILURE_DMA;
+        return -LUME_EIO;
+    }
+    return 0;
+}
+
+unsigned lume_example_gem_tx_failure(void)
+{
+    return tx_failure;
+}
+
+uint32_t lume_example_gem_tx_restarts(void)
+{
+    return tx_restarts;
 }
 
 /* Submit an entire Ethernet frame. data points to caller bytes and bytes is their count. Copying
@@ -884,9 +914,11 @@ int lume_example_gem_transmit(const void *data, size_t bytes)
         return -LUME_EIO;
     /* Remember that a completion must be collected before the next reuse of this TX slot. */
     tx_pending = true;
+    tx_failure = 0;
     if (physical_rp1)
     {
         tx_started = lume_clock_millis();
+        tx_last_kick = tx_started;
         ++tx_expected;
     }
     /* Add the one-shot transmit-start request to the persistent enable bits and notify the

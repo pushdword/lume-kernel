@@ -80,6 +80,35 @@ int main(void)
                                9, 0, 1,  0, 7, 5, 0x81, 3,    1,    0, 12, 9, 4, 0,
                                1, 1, 9,  0, 2, 0, 7,    5,    0x81, 3, 1,  0, 12};
     T(lume_usb_configuration(rpi_hub, sizeof(rpi_hub), &i) && i.hub && !i.keyboard);
+    uint8_t composite[] = {9, 2, 41, 0, 2, 1, 0,    0x80, 50,   9, 4,  0, 0, 1,
+                           3, 1, 1,  0, 7, 5, 0x83, 3,    8,    0, 10, 9, 4, 1,
+                           0, 1, 3,  1, 2, 0, 7,    5,    0x81, 3, 8,  0, 1};
+    struct lume_usb_configuration inputs;
+    T(lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
+    T(inputs.inputs == 2 && inputs.value == 1 && !inputs.hub);
+    T(inputs.input[0].keyboard && inputs.input[0].interface == 0 &&
+      inputs.input[0].endpoint == 0x83);
+    T(inputs.input[1].mouse && inputs.input[1].interface == 1 && inputs.input[1].endpoint == 0x81 &&
+      inputs.input[1].packet == 8);
+    composite[36] = 0x83;
+    T(!lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
+    composite[36] = 0x81;
+    composite[27] = 0;
+    T(!lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
+    composite[27] = 1;
+    composite[28] = 1;
+    T(lume_usb_configuration_inputs(composite, sizeof(composite), &inputs) && inputs.inputs == 1);
+    composite[28] = 0;
+    composite[34] = 8;
+    T(!lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
+    uint8_t many[9 + 16 * (LUME_USB_INPUTS + 1)] = {9, 2, sizeof(many), 0, LUME_USB_INPUTS + 1,
+                                                    1, 0, 0x80,         50};
+    for (unsigned n = 0; n <= LUME_USB_INPUTS; ++n)
+    {
+        const uint8_t part[16] = {9, 4, n, 0, 1, 3, 1, 2, 0, 7, 5, 0x81 + n, 3, 8, 0, 1};
+        memcpy(many + 9 + 16 * n, part, sizeof(part));
+    }
+    T(!lume_usb_configuration_inputs(many, sizeof(many), &inputs));
     struct lume_xhci_trb trbs[256] = {0};
     struct lume_xhci_ring ring = {trbs, UINT64_C(0x1100020000), 0, 1};
     for (unsigned n = 0; n < 1020; ++n)

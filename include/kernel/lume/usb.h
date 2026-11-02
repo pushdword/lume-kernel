@@ -11,6 +11,17 @@ struct lume_usb_interface
     bool keyboard, hub, mouse;
 };
 
+#define LUME_USB_INPUTS 4u
+
+struct lume_usb_configuration
+{
+    uint8_t value;
+    bool hub;
+    unsigned inputs;
+    struct lume_usb_interface input[LUME_USB_INPUTS];
+};
+
+bool lume_usb_configuration_inputs(const uint8_t *, size_t, struct lume_usb_configuration *);
 bool lume_usb_configuration(const uint8_t *, size_t, struct lume_usb_interface *);
 bool lume_usb_start(uint64_t frequency);
 void lume_usb_poll(void);

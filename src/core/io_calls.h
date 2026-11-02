@@ -68,6 +68,8 @@ static void kernel_step_admit(bool admit)
 {
     if (!public_mode)
         return;
+    lume_net_poll_background();
+    lume_storage_poll_background();
     unsigned previous = current_task;
     if (!lume_worker_busy() && kernel_owner == LUME_TASK_LIMIT && admit &&
         !io_queue_granted(&kernel_queue, lume_clock_monotonic()))
@@ -174,6 +176,34 @@ static bool kernel_cleanup_ready(unsigned task)
     kernel_wait[task] = true;
     states[task] = 4;
     return false;
+}
+
+static bool kernel_files_closed[LUME_TASK_LIMIT];
+
+static void kernel_close_files(void *context)
+{
+    unsigned task = (unsigned)(uintptr_t)context;
+    kernel_console_scope = false;
+    lume_files_release(&tasks[task].files);
+    kernel_console_scope = false;
+    kernel_files_closed[task] = true;
+    kernel_result = 0;
+}
+
+/* Final descriptor closes can wait for storage completion before the task is released. */
+static bool kernel_close_ready(unsigned task)
+{
+    if (kernel_files_closed[task])
+        return true;
+    kernel_owner = task;
+    kernel_launch = false;
+    kernel_wait[task] = true;
+    kernel_deferred_turn = true;
+    states[task] = 4;
+    if (!lume_worker_submit(kernel_close_files, (void *)(uintptr_t)task))
+        lume_fail("process file close submission");
+    kernel_step_admit(false);
+    return kernel_files_closed[task];
 }
 
 static bool kernel_thread_exit_ready(unsigned task)

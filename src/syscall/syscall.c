@@ -395,7 +395,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
              a == LUME_NET_WIFI_CONNECT_BEGIN) &&
             !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
             return -LUME_EPERM;
-        if (a > LUME_NET_WIFI_CONNECT_BEGIN || n != sizeof(struct lume_net_control))
+        if (a > LUME_NET_STATS || n != sizeof(struct lume_net_control))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -452,7 +452,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EFAULT;
         struct lume_fd_request request = *(const struct lume_fd_request *)(uintptr_t)b;
         if (a == LUME_FD_PATH && (request.count > LUME_PATH_MAX ||
-            !lume_user_buffer(request.buffer, request.count, true)))
+                                  !lume_user_buffer(request.buffer, request.count, true)))
             return -LUME_EFAULT;
         if (a == LUME_FD_POLL && request.count > LUME_FD_LIMIT)
             return -LUME_EINVAL;
@@ -477,7 +477,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         if (request.count > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
         if (request.family == 1 && (a == LUME_SOCKET_BIND || a == LUME_SOCKET_CONNECT ||
-                                   a == LUME_SOCKET_LOCAL || a == LUME_SOCKET_PEER))
+                                    a == LUME_SOCKET_LOCAL || a == LUME_SOCKET_PEER))
         {
             if (request.count > LUME_PATH_MAX)
                 return -LUME_EINVAL;

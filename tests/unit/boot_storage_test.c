@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "storage_work_mock.h"
 static FILE *volumes[2];
 static unsigned char mbr[512];
 static bool allowed[2];

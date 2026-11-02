@@ -664,6 +664,16 @@ int lume_example_gem_transmit(const void *, size_t);
  * is no pending operation, and negative EAGAIN while DMA still owns it.
  */
 int lume_example_gem_tx_complete(void);
+
+enum
+{
+    GEM_TX_FAILURE_DMA = 1,
+    GEM_TX_FAILURE_TIMEOUT = 2
+};
+
+/* Report the cause of the last failed completion until another frame is submitted. */
+unsigned lume_example_gem_tx_failure(void);
+uint32_t lume_example_gem_tx_restarts(void);
 /* RX copies and consumes a frame, then rearms DMA. Zero means no frame.
  * E2BIG drops the frame when the caller's buffer is too short. */
 /* Copy one completed RX frame into the caller buffer. Return its byte length, zero when no frame

@@ -6,6 +6,7 @@
 #include "lume/abi.h"
 #include "lume/boot_storage.h"
 #include "lume/worker.h"
+#include "lume/work.h"
 #include "ff.h"
 #include "diskio.h"
 #define STORAGE_HANDLES 256u
@@ -14,6 +15,10 @@ static struct storage_file
 {
     FIL file;
     unsigned references;
+    uint64_t dirty_at;
+    size_t dirty_bytes;
+    int write_error;
+    bool dirty;
 } storage_files[STORAGE_HANDLES];
 
 static struct storage_handle
@@ -31,6 +36,18 @@ static FATFS boot_filesystem;
 static bool boot_mounted;
 static void *read_cache;
 static char read_path[128];
+static uint64_t next_flush_at = UINT64_MAX;
+static unsigned flush_cursor;
+static void flush_one(void *);
+static struct lume_work flush_work = {.run = flush_one};
+#define STORAGE_FLUSH_MS 1000u
+#define STORAGE_FLUSH_BYTES (64u * 1024u)
+
+void lume_storage_poll_background(void)
+{
+    if (mounted && lume_clock_monotonic() >= next_flush_at)
+        (void)lume_work_submit(&flush_work);
+}
 
 static int close_read_cache(void)
 {
@@ -144,6 +161,66 @@ static int error(FRESULT r)
     }
 }
 
+static void flush_deadline(void)
+{
+    next_flush_at = UINT64_MAX;
+    for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
+    {
+        struct storage_file *file = storage_files + i;
+        if (file->references && file->dirty && !file->write_error &&
+            file->dirty_at + STORAGE_FLUSH_MS < next_flush_at)
+            next_flush_at = file->dirty_at + STORAGE_FLUSH_MS;
+    }
+}
+
+static int sync_file(struct storage_file *file)
+{
+    int result = error(f_sync(&file->file));
+    if (result && !file->write_error)
+        file->write_error = result;
+    if (!result)
+    {
+        file->dirty = false;
+        file->dirty_bytes = 0;
+    }
+    flush_deadline();
+    return file->write_error ? file->write_error : result;
+}
+
+static void dirty_file(struct storage_file *file, size_t bytes)
+{
+    if (!file->dirty)
+    {
+        file->dirty = true;
+        file->dirty_at = lume_clock_monotonic();
+    }
+    file->dirty_bytes += bytes;
+    if (file->dirty_at + STORAGE_FLUSH_MS < next_flush_at)
+        next_flush_at = file->dirty_at + STORAGE_FLUSH_MS;
+}
+
+/* FatFs retains one shared partial-sector and metadata window.
+ * Complete sectors still reach the device during f_write. Deferred work flushes one file. */
+static void flush_one(void *context)
+{
+    (void)context;
+    uint64_t now = lume_clock_monotonic();
+    for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
+    {
+        unsigned slot = (flush_cursor + i) % STORAGE_HANDLES;
+        struct storage_file *file = storage_files + slot;
+        if (file->references && file->dirty && !file->write_error &&
+            now - file->dirty_at >= STORAGE_FLUSH_MS)
+        {
+            (void)sync_file(file);
+            flush_cursor = (slot + 1) % STORAGE_HANDLES;
+            break;
+        }
+    }
+    flush_deadline();
+    lume_storage_poll_background();
+}
+
 static const char *name(const char *path)
 {
     if (path[0] != '/' || path[1] != 'd' || path[2] != 'a' || path[3] != 't' || path[4] != 'a' ||
@@ -222,7 +299,7 @@ static int open_handle(const char *path, unsigned flags, void **handle)
             (void)f_close(&candidate);
             return -LUME_EMFILE;
         }
-        file->file = candidate;
+        *file = (struct storage_file){.file = candidate};
     }
     ++file->references;
     *description = (struct storage_handle){file, flags};
@@ -238,8 +315,10 @@ static int close_handle(void *handle)
     struct storage_file *file = description->file;
     *description = (struct storage_handle){0};
     if (--file->references)
-        return 0;
-    return error(f_close(&file->file));
+        return file->write_error;
+    int result = error(f_close(&file->file));
+    flush_deadline();
+    return file->write_error ? file->write_error : result;
 }
 
 static int read_handle(void *handle, uint64_t offset, void *data, size_t bytes)
@@ -266,6 +345,11 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
         return -LUME_EBADF;
     if (offset > UINT32_MAX || bytes > UINT32_MAX - offset || bytes > INT32_MAX)
         return -LUME_EINVAL;
+    if (description->file->write_error)
+        return description->file->write_error;
+    if (!bytes)
+        return 0;
+    dirty_file(description->file, bytes);
     FIL *file = &description->file->file;
     FRESULT result;
     if (offset > f_size(file))
@@ -290,8 +374,16 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
     UINT count = 0;
     if (result == FR_OK)
         result = f_write(file, data, (UINT)bytes, &count);
-    if (result == FR_OK)
-        result = f_sync(file);
+    if (result == FR_OK &&
+        (description->file->dirty_bytes >= STORAGE_FLUSH_BYTES || count < bytes ||
+         lume_clock_monotonic() - description->file->dirty_at >= STORAGE_FLUSH_MS))
+    {
+        int synced = sync_file(description->file);
+        if (synced)
+            return synced;
+    }
+    if (result != FR_OK && !description->file->write_error)
+        description->file->write_error = error(result);
     return result == FR_OK ? (int)count : error(result);
 }
 
@@ -300,6 +392,8 @@ static int resize_handle(void *handle, uint64_t bytes)
     struct storage_handle *description = find_handle(handle);
     if (!description || !description->flags)
         return -LUME_EBADF;
+    if (description->file->write_error)
+        return description->file->write_error;
     FIL *file = &description->file->file;
     if (bytes > UINT32_MAX || bytes > f_size(file))
         return -LUME_EINVAL;
@@ -307,14 +401,14 @@ static int resize_handle(void *handle, uint64_t bytes)
     if (result == FR_OK)
         result = f_truncate(file);
     if (result == FR_OK)
-        result = f_sync(file);
+        return sync_file(description->file);
     return error(result);
 }
 
 static int sync_handle(void *handle)
 {
     struct storage_handle *description = find_handle(handle);
-    return description ? error(f_sync(&description->file->file)) : -LUME_EBADF;
+    return description ? sync_file(description->file) : -LUME_EBADF;
 }
 
 static int invalidate_read_cache(const char *path)
@@ -549,6 +643,7 @@ const struct lume_storage_ops *lume_storage_start(void)
     if (!lume_sd_allow_volume(volume.first, volume.count))
         return 0;
     mounted = true;
+    flush_deadline();
     lume_value("SD_LUME_FIRST_SECTOR", volume.first);
     lume_value("SD_LUME_SECTORS", volume.count);
     static const struct lume_storage_ops ops = {.walk = walk,

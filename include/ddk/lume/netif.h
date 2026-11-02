@@ -46,6 +46,9 @@ bool lume_netif_transmit(struct lume_netif *, const void *, size_t);
 /* Report errors discovered outside a transmit or receive dispatch. */
 void lume_netif_tx_error(struct lume_netif *);
 void lume_netif_rx_error(struct lume_netif *);
+/* Accounting never invokes callbacks. Failed accepted frames also increment tx_errors. */
+void lume_netif_account(struct lume_netif *, unsigned event, uint64_t value);
+void lume_netif_statistics(const struct lume_netif *, struct lume_net_statistics *);
 void lume_net_event_emit(uint32_t, uint32_t, uint32_t, uint32_t, uint64_t);
 int lume_net_events(uint32_t, uint64_t, struct lume_net_event *, unsigned, uint64_t *, uint32_t *);
 #endif

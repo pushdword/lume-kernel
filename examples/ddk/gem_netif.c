@@ -5,9 +5,11 @@
 #include "gem.h"
 #include <lume/device.h>
 #include <lume/netif.h>
+#include <string.h>
 
 extern uint32_t lume_clock_millis(void);
 #define GEM_LINK_POLL_MS 250u
+#define GEM_TX_QUEUE 16u
 
 struct gem_netif_context
 {
@@ -16,22 +18,71 @@ struct gem_netif_context
     bool attached, tx_pending;
     bool link_valid, link_up;
     uint32_t link_sampled;
+    uint32_t tx_started;
+    uint32_t tx_restarts;
+    unsigned tx_first, tx_count;
+
+    struct
+    {
+        size_t bytes;
+        unsigned char data[GEM_FRAME_MAX_BYTES];
+    } tx_queue[GEM_TX_QUEUE];
 };
 
 static struct gem_netif_context gem_network;
 
-/* Collect each accepted TX completion once, including failures discovered after submission. */
+static void gem_netif_depth(struct gem_netif_context *context)
+{
+    lume_netif_account(context->interface, LUME_NET_TX_DEPTH,
+                       context->tx_count + (unsigned)context->tx_pending);
+}
+
+/* Collect at most one completion and submit at most one queued frame per poll. */
 static void gem_netif_poll(void *opaque)
 {
     struct gem_netif_context *context = opaque;
-    if (!context->tx_pending)
-        return;
-    int result = lume_example_gem_tx_complete();
-    if (result == -LUME_EAGAIN)
-        return;
-    context->tx_pending = false;
-    if (result < 0)
-        lume_netif_tx_error(context->interface);
+    if (context->tx_pending)
+    {
+        lume_netif_account(context->interface, LUME_NET_TX_POLL, 0);
+        int result = lume_example_gem_tx_complete();
+        uint32_t restarts = lume_example_gem_tx_restarts();
+        lume_netif_account(context->interface, LUME_NET_TX_RESTART,
+                           (uint32_t)(restarts - context->tx_restarts));
+        context->tx_restarts = restarts;
+        if (result == -LUME_EAGAIN)
+            return;
+        context->tx_pending = false;
+        if (result < 0)
+            lume_netif_account(context->interface,
+                               lume_example_gem_tx_failure() == GEM_TX_FAILURE_TIMEOUT
+                                   ? LUME_NET_TX_TIMEOUT
+                                   : LUME_NET_TX_DMA_ERROR,
+                               0);
+        else
+            lume_netif_account(context->interface, LUME_NET_TX_COMPLETE,
+                               (uint32_t)(lume_clock_millis() - context->tx_started));
+    }
+    if (context->tx_count)
+    {
+        unsigned slot = context->tx_first;
+        int result =
+            lume_example_gem_transmit(context->tx_queue[slot].data, context->tx_queue[slot].bytes);
+        if (result == -LUME_EAGAIN)
+        {
+            lume_netif_account(context->interface, LUME_NET_TX_BUSY, 0);
+            return;
+        }
+        context->tx_first = (slot + 1) % GEM_TX_QUEUE;
+        --context->tx_count;
+        if (result < 0)
+            lume_netif_account(context->interface, LUME_NET_TX_SUBMIT_ERROR, 0);
+        else
+        {
+            context->tx_pending = true;
+            context->tx_started = lume_clock_millis();
+        }
+    }
+    gem_netif_depth(context);
 }
 
 static bool gem_netif_link(void *opaque)
@@ -58,12 +109,18 @@ static bool gem_netif_transmit(void *opaque, const void *data, size_t bytes)
 {
     struct gem_netif_context *context = opaque;
     gem_netif_poll(context);
-    /* Allow a preceding frame to finish before rejecting a serialized burst. */
-    for (unsigned i = 0; context->tx_pending && i < 10000; ++i)
-        gem_netif_poll(context);
-    if (context->tx_pending || lume_example_gem_transmit(data, bytes))
+    if (context->tx_count == GEM_TX_QUEUE)
+    {
+        lume_netif_account(context->interface, LUME_NET_TX_BUSY, 0);
         return false;
-    context->tx_pending = true;
+    }
+    unsigned slot = (context->tx_first + context->tx_count) % GEM_TX_QUEUE;
+    memcpy(context->tx_queue[slot].data, data, bytes);
+    context->tx_queue[slot].bytes = bytes;
+    ++context->tx_count;
+    gem_netif_depth(context);
+    if (!context->tx_pending)
+        gem_netif_poll(context);
     return true;
 }
 
@@ -104,10 +161,13 @@ static bool gem_netif_admin(void *opaque, bool up)
     gem_netif_poll(context);
     if (lume_example_gem_eth_stop())
         return false;
-    if (context->tx_pending)
+    if (context->tx_pending || context->tx_count)
     {
+        lume_netif_account(context->interface, LUME_NET_TX_CANCELLED,
+                           context->tx_count + (unsigned)context->tx_pending);
         context->tx_pending = false;
-        lume_netif_tx_error(context->interface);
+        context->tx_first = context->tx_count = 0;
+        gem_netif_depth(context);
     }
     return true;
 }
@@ -148,6 +208,7 @@ static int gem_netif_start(struct lume_device *device)
         context->interface = lume_netif_find((uint32_t)index);
     }
     context->attached = true;
+    context->tx_restarts = lume_example_gem_tx_restarts();
     return lume_netif_admin(context->interface, true);
 }
 

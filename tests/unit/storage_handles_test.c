@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include "storage_work_mock.h"
 
 #define DATA_SECTORS 69632u
 #define FAT_SECTORS 540u
@@ -202,7 +203,7 @@ static bool aliases(const struct lume_storage_ops *ops)
     T(ops->read_handle(reader, 0, out, sizeof(out)) == 0);
     T(ops->open("/data/EMPTY.BIN", LUME_O_RDWR, &writer) == 0 && writer != reader);
     T(ops->write_handle(writer, 0, pattern, sizeof(pattern)) == sizeof(pattern));
-    T(get32(disk[FIRST_DATA] + 28) == sizeof(pattern));
+    T(get32(disk[FIRST_DATA] + 28) == 0);
     T(ops->read_handle(reader, 0, out, sizeof(out)) == sizeof(out));
     T(!memcmp(pattern, out, sizeof(out)));
     T(ops->write_handle(reader, 0, pattern, 1) == -LUME_EBADF);
@@ -412,12 +413,45 @@ static bool failures(const struct lume_storage_ops *ops)
     fail_writes = true;
     T(ops->write_handle(handle, 0, data, 1) == -LUME_EIO);
     T(ops->sync_handle(handle) == -LUME_EIO);
+    T(ops->write_handle(handle, 0, data, 1) == -LUME_EIO);
     T(ops->close(handle) == -LUME_EIO);
     T(ops->close(handle) == -LUME_EBADF);
     fail_writes = false;
     T(ops->open("/data/empty.bin", LUME_O_RDONLY, &handle) == 0);
     T(ops->close(handle) == 0);
     T(failed_reads && failed_writes);
+    return true;
+}
+
+static bool writeback(const struct lume_storage_ops *ops)
+{
+    void *handle;
+    T(ops->create("/data/writeback.bin", false) == 0);
+    T(ops->open("/data/writeback.bin", LUME_O_RDWR, &handle) == 0);
+    T(ops->write_handle(handle, 0, "x", 1) == 1);
+    unsigned before = writes;
+    for (unsigned i = 1; i < 100; ++i)
+        T(ops->write_handle(handle, i, "x", 1) == 1);
+    T(writes == before);
+    storage_test_ms = 999;
+    lume_storage_poll_background();
+    T(!storage_test_work);
+    storage_test_ms = 1000;
+    lume_storage_poll_background();
+    T(storage_test_work);
+    storage_test_drain();
+    T(writes > before && !storage_test_work);
+    T(ops->close(handle) == 0);
+    T(ops->open("/data/writeback.bin", LUME_O_RDWR, &handle) == 0);
+    T(ops->write_handle(handle, 100, "y", 1) == 1);
+    storage_test_ms += 1000;
+    fail_writes = true;
+    lume_storage_poll_background();
+    storage_test_drain();
+    fail_writes = false;
+    T(ops->sync_handle(handle) == -LUME_EIO);
+    T(ops->write_handle(handle, 0, "z", 1) == -LUME_EIO);
+    T(ops->close(handle) == -LUME_EIO);
     return true;
 }
 
@@ -448,7 +482,7 @@ int main(void)
     const struct lume_storage_ops *ops = format(false);
     if (!ops || !ops->open || !ops->read_handle || !ops->write_handle || !ops->resize_handle ||
         !ops->close || !ops->sync_handle || !aliases(ops) || !limits(ops) || !interleaved(ops) ||
-        !checkpoints(ops) || !failures(ops) || !partial())
+        !checkpoints(ops) || !failures(ops) || !writeback(ops) || !partial())
         return 1;
     printf("PASS_STORAGE_HANDLES checks=%u reads=%u writes=%u\n", checks, reads, writes);
     return 0;

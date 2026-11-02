@@ -8,6 +8,7 @@
 #include "../../../drivers/usb/xhci/usb.c"
 #include "lume/hardware.h"
 #include "lume/graphics_device.h"
+
 bool lume_graphics_input_owned(void)
 {
     return false;
@@ -18,11 +19,18 @@ void lume_graphics_input(const struct lume_input_event *event)
     (void)event;
     abort();
 }
+
 static unsigned char *arena;
 static bool used[128], fail_command;
 static unsigned live, freed;
+static unsigned protocols;
 static uint64_t ticks;
 static struct host *emulated;
+
+bool lume_worker_busy(void)
+{
+    return false;
+}
 
 uint64_t lume_q35_counter_frequency(void)
 {
@@ -109,9 +117,17 @@ static void descriptor(struct host *h)
         }
         if (((request >> 8) & 255) == 6 && type == 2)
         {
-            const unsigned char bytes[25] = {9, 2, 25, 0, 1, 1, 0, 0x80, 0, 9, 4, 0, 0,
-                                             1, 3, 1,  1, 0, 7, 5, 0x81, 3, 8, 0, 10};
-            memcpy(d->buffer, bytes, 25);
+            const unsigned char bytes[] = {9, 2, 41, 0, 2, 1, 0,    0x80, 0,    9, 4,  0, 0, 1,
+                                           3, 1, 1,  0, 7, 5, 0x83, 3,    8,    0, 10, 9, 4, 1,
+                                           0, 1, 3,  1, 2, 0, 7,    5,    0x81, 3, 8,  0, 1};
+            memcpy(d->buffer, bytes, sizeof(bytes));
+        }
+        if ((request & 0xffff) == 0x0b21)
+        {
+            assert(!((request >> 16) & 0xffff));
+            unsigned interface = (unsigned)(request >> 32) & 0xffff;
+            assert(interface < 2);
+            protocols |= 1u << interface;
         }
     }
 }
@@ -140,6 +156,16 @@ bool lume_dma_sync_for_cpu(const void *p, size_t bytes, enum lume_dma_direction 
                         event.control |= slot << 24;
                         break;
                     }
+            if (!fail_command && (command_type == 11 || command_type == 12 || command_type == 13))
+            {
+                unsigned slot = event.control >> 24;
+                struct device *d = h->devices + slot;
+                uint32_t add = context(h, d, 0)[1];
+                for (unsigned n = 0; n < 32; ++n)
+                    if (add & (1u << n))
+                        memcpy((unsigned char *)d->output + n * h->context_bytes,
+                               context(h, d, n + 1), h->context_bytes);
+            }
         }
         else
         {
@@ -190,7 +216,10 @@ int main(void)
     h->dcbaa = page(h);
     assert(ring_init(h, &h->command));
     assert(enumerate(h, 1, 3, 0, 0, 0, 0, 0));
-    assert(keyboard_count == 1 && h->devices[1].inventory);
+    assert(keyboard_count == 1 && mouse_count == 1 && h->devices[1].inventory);
+    assert(protocols == 3 && h->devices[1].inputs == 2);
+    assert(h->devices[1].channels[0].endpoint == 7 && h->devices[1].channels[1].endpoint == 3);
+    assert(h->devices[1].output[0] >> 27 == 7);
     uint32_t first = h->devices[1].inventory;
     struct lume_hardware_info info;
     assert(!lume_hardware_get(first, &info) && info.parent == parent &&
@@ -200,7 +229,7 @@ int main(void)
     assert(!remove_root(h, 1) && live == before && freed == released && h->devices[1].disconnected);
     assert(!lume_hardware_get(first, &info));
     fail_command = false;
-    assert(remove_root(h, 1) && keyboard_count == 0 && live == 3);
+    assert(remove_root(h, 1) && keyboard_count == 0 && mouse_count == 0 && live == 3);
     assert(lume_hardware_get(first, &info) == -LUME_ENOENT);
     assert(enumerate(h, 1, 3, 0, 0, 0, 0, 0));
     uint32_t replacement = h->devices[1].inventory;
@@ -208,7 +237,7 @@ int main(void)
     before = live;
     assert(!lume_usb_stop_host(0) && live == before);
     *(uint32_t *)(uintptr_t)(h->op + 4) = 1;
-    assert(lume_usb_stop_host(0) && !live && !keyboard_count);
+    assert(lume_usb_stop_host(0) && !live && !keyboard_count && !mouse_count);
     assert(lume_hardware_get(replacement, &info) == -LUME_ENOENT);
     assert(!lume_hardware_remove(parent));
     assert(VirtualFree(registers, 0, MEM_RELEASE) && VirtualFree(arena, 0, MEM_RELEASE));

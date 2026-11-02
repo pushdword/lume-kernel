@@ -11,6 +11,7 @@
 #include "lume/vfs.h"
 #include "lume/sd.h"
 #include "sd_blocks_mock.h"
+#include "storage_work_mock.h"
 static int disk;
 static unsigned char mbr[512];
 static bool writable;

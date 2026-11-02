@@ -40,6 +40,16 @@ bool lume_stream_busy(void)
     return false;
 }
 
+bool lume_stream_needs_poll(void)
+{
+    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i)
+        if (streams[i].owner &&
+            (streams[i].count || streams[i].packets ||
+             (streams[i].pcb && (streams[i].pcb->unacked || streams[i].pcb->unsent))))
+            return true;
+    return false;
+}
+
 static struct stream *allocate(unsigned owner)
 {
     for (unsigned i = 0; i < 16; ++i)

@@ -77,7 +77,44 @@ enum lume_net_control_op
     /* BEGIN accepts work without waiting for a link or lease. Query WIFI_STATE and GET
      * for completion. Existing synchronous operations retain their contracts. */
     LUME_NET_DHCP_BEGIN = 10,
-    LUME_NET_WIFI_CONNECT_BEGIN = 11
+    LUME_NET_WIFI_CONNECT_BEGIN = 11,
+    LUME_NET_STATS = 12
+};
+
+#define LUME_NET_STATS_VERSION 1u
+
+enum lume_net_account_event
+{
+    LUME_NET_TX_DEPTH,
+    LUME_NET_TX_BUSY,
+    LUME_NET_TX_POLL,
+    LUME_NET_TX_COMPLETE,
+    LUME_NET_TX_DMA_ERROR,
+    LUME_NET_TX_TIMEOUT,
+    LUME_NET_TX_SUBMIT_ERROR,
+    LUME_NET_TX_CANCELLED,
+    LUME_NET_RX_BUDGET,
+    LUME_NET_TX_RESTART,
+    LUME_NET_WIFI_CREDIT,
+    LUME_NET_WIFI_CREDIT_STALL,
+    LUME_NET_WIFI_RX_DEPTH,
+    LUME_NET_WIFI_RX_DROP,
+    LUME_NET_WIFI_PACKETS,
+    LUME_NET_WIFI_BUS_ERROR,
+    LUME_NET_WIFI_POLL_MS,
+    LUME_NET_WIFI_SEND_MS
+};
+
+struct lume_net_statistics
+{
+    uint32_t version, bytes;
+    uint64_t polls, rx_bytes, tx_bytes, tx_busy, tx_polls, tx_completed;
+    uint64_t tx_dma_errors, tx_timeouts, tx_submit_errors, tx_cancelled;
+    uint64_t tx_depth, tx_high_water, tx_completion_ms, tx_max_completion_ms;
+    uint64_t rx_budget_exhausted;
+    uint64_t tx_restarts;
+    uint64_t wifi_credit_available, wifi_credit_stalls, wifi_rx_high_water, wifi_rx_drops;
+    uint64_t wifi_packets, wifi_bus_errors, wifi_poll_ms, wifi_send_ms;
 };
 
 struct lume_netif_info
@@ -143,6 +180,7 @@ struct lume_net_control
         struct lume_wifi_bss_info scan[LUME_NET_SCAN_MAX];
         struct lume_wifi_connect connect;
         struct lume_net_event events[LUME_NET_EVENTS_MAX];
+        struct lume_net_statistics statistics;
         uint32_t admin_up;
     } data;
 };
@@ -154,4 +192,5 @@ _Static_assert(sizeof(struct lume_wifi_state) == 64, "wireless state ABI");
 _Static_assert(sizeof(struct lume_wifi_connect) == 104, "wireless connect ABI");
 _Static_assert(sizeof(struct lume_net_event) == 64, "network event ABI");
 _Static_assert(sizeof(struct lume_net_control) == 2080, "network control ABI");
+_Static_assert(sizeof(struct lume_net_statistics) == 200, "network statistics ABI");
 #endif

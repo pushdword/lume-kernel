@@ -6,6 +6,7 @@
 struct lume_netif
 {
     struct lume_netif_info info;
+    struct lume_net_statistics statistics;
     struct lume_netif_ops ops;
     void *context;
     unsigned references;
@@ -199,6 +200,7 @@ void lume_netif_poll(struct lume_netif *p)
 {
     if (p)
     {
+        ++p->statistics.polls;
         unsigned activity = lume_activity_enter(
             p->info.kind == LUME_IF_WIFI ? LUME_ACTIVITY_WIFI : LUME_ACTIVITY_ETHERNET);
         if (p->info.flags & LUME_IF_UP)
@@ -226,7 +228,10 @@ int lume_netif_receive(struct lume_netif *p, void *out, size_t cap)
     if (n && !(p->info.flags & LUME_IF_LINK))
         return 0;
     if (n)
+    {
         ++p->info.rx_packets;
+        p->statistics.rx_bytes += (unsigned)n;
+    }
     return n;
 }
 
@@ -242,6 +247,7 @@ bool lume_netif_transmit(struct lume_netif *p, const void *data, size_t n)
         return false;
     }
     ++p->info.tx_packets;
+    p->statistics.tx_bytes += n;
     return true;
 }
 
@@ -255,4 +261,88 @@ void lume_netif_rx_error(struct lume_netif *p)
 {
     if (p)
         ++p->info.rx_errors;
+}
+
+void lume_netif_statistics(const struct lume_netif *p, struct lume_net_statistics *out)
+{
+    if (p && out)
+    {
+        *out = p->statistics;
+        out->version = LUME_NET_STATS_VERSION;
+        out->bytes = sizeof(*out);
+    }
+}
+
+void lume_netif_account(struct lume_netif *p, unsigned event, uint64_t value)
+{
+    if (!p)
+        return;
+    struct lume_net_statistics *s = &p->statistics;
+    switch (event)
+    {
+    case LUME_NET_TX_DEPTH:
+        s->tx_depth = value;
+        if (value > s->tx_high_water)
+            s->tx_high_water = value;
+        break;
+    case LUME_NET_TX_BUSY:
+        ++s->tx_busy;
+        break;
+    case LUME_NET_TX_POLL:
+        ++s->tx_polls;
+        break;
+    case LUME_NET_TX_COMPLETE:
+        ++s->tx_completed;
+        s->tx_completion_ms += value;
+        if (value > s->tx_max_completion_ms)
+            s->tx_max_completion_ms = value;
+        break;
+    case LUME_NET_TX_DMA_ERROR:
+        ++s->tx_dma_errors;
+        ++p->info.tx_errors;
+        break;
+    case LUME_NET_TX_TIMEOUT:
+        ++s->tx_timeouts;
+        ++p->info.tx_errors;
+        break;
+    case LUME_NET_TX_SUBMIT_ERROR:
+        ++s->tx_submit_errors;
+        ++p->info.tx_errors;
+        break;
+    case LUME_NET_TX_CANCELLED:
+        s->tx_cancelled += value;
+        p->info.tx_errors += value;
+        break;
+    case LUME_NET_RX_BUDGET:
+        ++s->rx_budget_exhausted;
+        break;
+    case LUME_NET_TX_RESTART:
+        s->tx_restarts += value;
+        break;
+    case LUME_NET_WIFI_CREDIT:
+        s->wifi_credit_available = value;
+        break;
+    case LUME_NET_WIFI_CREDIT_STALL:
+        ++s->wifi_credit_stalls;
+        break;
+    case LUME_NET_WIFI_RX_DEPTH:
+        if (value > s->wifi_rx_high_water)
+            s->wifi_rx_high_water = value;
+        break;
+    case LUME_NET_WIFI_RX_DROP:
+        ++s->wifi_rx_drops;
+        break;
+    case LUME_NET_WIFI_PACKETS:
+        ++s->wifi_packets;
+        break;
+    case LUME_NET_WIFI_BUS_ERROR:
+        ++s->wifi_bus_errors;
+        break;
+    case LUME_NET_WIFI_POLL_MS:
+        s->wifi_poll_ms += value;
+        break;
+    case LUME_NET_WIFI_SEND_MS:
+        s->wifi_send_ms += value;
+        break;
+    }
 }

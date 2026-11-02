@@ -28,18 +28,27 @@ bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32
 #define MAX_SLOTS 8u
 #define MAX_PAGES 192u
 
+struct input
+{
+    unsigned endpoint, packet;
+    unsigned char *report;
+    struct lume_xhci_ring ring;
+    uint64_t trb;
+    bool keyboard, mouse, pending;
+    struct lume_hid hid;
+};
+
 struct device
 {
     unsigned slot, speed, root, depth, route, tt_slot, tt_port, mtt;
     uint32_t inventory;
     unsigned hub_ports;
-    unsigned ep0_packet, irq_endpoint, irq_packet;
+    unsigned ep0_packet, inputs;
     uint32_t *input, *output;
-    unsigned char *buffer, *report;
-    struct lume_xhci_ring ep0, interrupt;
-    uint64_t irq_trb;
-    bool keyboard, mouse, hub, pending, disconnected;
-    struct lume_hid hid;
+    unsigned char *buffer;
+    struct lume_xhci_ring ep0;
+    bool hub, disconnected;
+    struct input channels[LUME_USB_INPUTS];
 };
 
 struct host
@@ -214,15 +223,15 @@ static uint64_t enqueue(struct lume_xhci_ring *r, uint64_t p, uint32_t status, u
     return address;
 }
 
-static void arm_input(struct host *h, struct device *d)
+static void arm_input(struct host *h, struct device *d, struct input *input)
 {
-    if (d->pending || d->disconnected)
+    if (input->pending || d->disconnected)
         return;
-    if (!lume_dma_sync_for_device(d->report, 64, LUME_DMA_FROM_DEVICE))
-        lume_fail("USB keyboard DMA buffer");
-    d->irq_trb = enqueue(&d->interrupt, dma(d->report), d->mouse ? 3 : 8, (1u << 10) | 32 | 4);
-    d->pending = true;
-    lume_mmio_write32(h->doorbells + d->slot * 4, d->irq_endpoint);
+    if (!lume_dma_sync_for_device(input->report, 64, LUME_DMA_FROM_DEVICE))
+        lume_fail("USB HID DMA buffer");
+    input->trb = enqueue(&input->ring, dma(input->report), input->packet, (1u << 10) | 32 | 4);
+    input->pending = true;
+    lume_mmio_write32(h->doorbells + d->slot * 4, input->endpoint);
 }
 
 static void events(struct host *h)
@@ -249,27 +258,36 @@ static void events(struct host *h)
             struct device *d = &h->devices[slot];
             if (ep == 1 && (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13)))
                 h->transfer_code = cc;
-            else if ((d->keyboard || d->mouse) && !d->disconnected && ep == d->irq_endpoint &&
-                     e.parameter == d->irq_trb)
+            else if (!d->disconnected)
             {
-                d->pending = false;
-                if ((cc == 1 || cc == 13) && (e.status & 0xffffff) == 0)
+                for (unsigned n = 0; n < d->inputs; ++n)
                 {
-                    cache(d->report, 64, true);
-                    if (d->mouse)
+                    struct input *input = d->channels + n;
+                    if (!input->pending || ep != input->endpoint || e.parameter != input->trb)
+                        continue;
+                    input->pending = false;
+                    unsigned remaining = e.status & 0xffffff;
+                    if ((cc == 1 || cc == 13) && remaining <= input->packet)
                     {
-                        ++d->hid.reports;
-                        lume_hid_mouse_report(d->report, 3, milliseconds(h));
+                        unsigned bytes = input->packet - remaining;
+                        cache(input->report, 64, true);
+                        if (input->mouse)
+                        {
+                            ++input->hid.reports;
+                            lume_hid_mouse_report(input->report, bytes, milliseconds(h));
+                        }
+                        else
+                            lume_hid_report(&input->hid, input->report, bytes, milliseconds(h));
                     }
                     else
-                        lume_hid_report(&d->hid, d->report, 8, milliseconds(h));
-                }
-                else
-                {
-                    ++h->errors;
-                    d->disconnected = true;
-                    d->hid.repeat_key = 0;
-                    lume_value("USB_KEYBOARD_COMPLETION_ERROR", cc);
+                    {
+                        ++h->errors;
+                        d->disconnected = true;
+                        input->hid.repeat_key = 0;
+                        lume_value("USB_HID_COMPLETION_ENDPOINT", ep);
+                        lume_value("USB_HID_COMPLETION_ERROR", cc);
+                    }
+                    break;
                 }
             }
         }
@@ -431,18 +449,23 @@ static bool update_ep0(struct host *h, struct device *d, unsigned packet)
 
 static bool input_device(struct host *h, struct device *d, const struct lume_usb_interface *i)
 {
+    if (d->inputs == LUME_USB_INPUTS)
+        return false;
     if (!control(h, d, 0x21, 11, 0, i->interface, 0))
         return false; /* SET_PROTOCOL(BOOT) */
-    d->irq_endpoint = (i->endpoint & 15) * 2 + 1;
-    d->irq_packet = i->packet;
-    if (!ring_init(h, &d->interrupt) || !(d->report = page(h)))
+    struct input *input = d->channels + d->inputs;
+    input->endpoint = (i->endpoint & 15) * 2 + 1;
+    input->packet = i->packet;
+    if (!ring_init(h, &input->ring) || !(input->report = page(h)))
         return false;
     cache(d->output, 4096, true);
     zero(d->input, 4096);
-    context(h, d, 0)[1] = 1 | (1u << d->irq_endpoint);
+    context(h, d, 0)[1] = 1 | (1u << input->endpoint);
     copy(context(h, d, 1), d->output, h->context_bytes);
     uint32_t *s = context(h, d, 1);
-    s[0] = (s[0] & 0x07ffffff) | (d->irq_endpoint << 27);
+    unsigned entries = s[0] >> 27;
+    if (entries < input->endpoint)
+        s[0] = (s[0] & 0x07ffffff) | (input->endpoint << 27);
     unsigned interval = i->interval;
     if (d->speed >= 3)
         interval = interval > 16 ? 15 : interval - 1;
@@ -453,32 +476,34 @@ static bool input_device(struct host *h, struct device *d, const struct lume_usb
             ++log;
         interval = log + 3;
     }
-    uint32_t *ep = context(h, d, d->irq_endpoint + 1);
+    uint32_t *ep = context(h, d, input->endpoint + 1);
     ep[0] = interval << 16;
     ep[1] = (i->packet << 16) | (7u << 3) | (3u << 1);
-    ep[2] = (uint32_t)d->interrupt.dma | 1;
-    ep[3] = (uint32_t)(d->interrupt.dma >> 32);
-    unsigned report_bytes = i->mouse ? 3 : 8;
-    ep[4] = report_bytes | (report_bytes << 16);
+    ep[2] = (uint32_t)input->ring.dma | 1;
+    ep[3] = (uint32_t)(input->ring.dma >> 32);
+    ep[4] = i->packet | ((unsigned)i->packet << 16);
     cache(d->input, 4096, false);
     if (!command(h, 12, dma(d->input), d->slot << 24, 0))
         return false;
-    d->keyboard = i->keyboard;
-    d->mouse = i->mouse;
-    if (d->keyboard)
+    input->keyboard = i->keyboard;
+    input->mouse = i->mouse;
+    ++d->inputs;
+    lume_value("USB_HID_INTERFACE", i->interface);
+    if (input->keyboard)
     {
         ++keyboard_count;
         lume_value("USB_KEYBOARD_SLOT", d->slot);
-        lume_value("USB_KEYBOARD_ENDPOINT", d->irq_endpoint);
+        lume_value("USB_KEYBOARD_ENDPOINT", input->endpoint);
         lume_puts("LUME USB HID KEYBOARD READY layout=PT\n");
     }
     else
     {
         ++mouse_count;
         lume_value("USB_MOUSE_SLOT", d->slot);
+        lume_value("USB_MOUSE_ENDPOINT", input->endpoint);
         lume_puts("LUME USB HID MOUSE READY\n");
     }
-    arm_input(h, d);
+    arm_input(h, d, input);
     return true;
 }
 
@@ -616,10 +641,11 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
     unsigned bytes = d->buffer[2] | ((unsigned)d->buffer[3] << 8);
     if (bytes < 9 || bytes > 512 || !control(h, d, 0x80, 6, 0x200, 0, (uint16_t)bytes))
         return false;
-    struct lume_usb_interface selected;
-    if (!lume_usb_configuration(d->buffer, bytes, &selected))
+    struct lume_usb_configuration selected;
+    if (!lume_usb_configuration_inputs(d->buffer, bytes, &selected))
         return false;
-    if (!selected.keyboard && !selected.mouse && !selected.hub && device_class != 9)
+    lume_value("USB_HID_INTERFACES", selected.inputs);
+    if (!selected.inputs && !selected.hub && device_class != 9)
     {
 #if defined(LUME_ARCH_AMD64)
         (void)lume_usb_inventory_state(d->inventory, LUME_HARDWARE_UNSUPPORTED, -LUME_ENOSYS);
@@ -627,11 +653,19 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
         lume_puts("USB DEVICE NO INPUT DRIVER\n");
         return true;
     }
-    if (!control(h, d, 0, 9, selected.configuration, 0, 0))
+    if (!control(h, d, 0, 9, selected.value, 0, 0))
         return false;
     delay(h, 10000);
-    bool ready =
-        selected.hub || device_class == 9 ? hub(h, d, protocol) : input_device(h, d, &selected);
+    bool ready = true;
+    if (selected.hub || device_class == 9)
+        ready = hub(h, d, protocol);
+    else
+        for (unsigned n = 0; n < selected.inputs; ++n)
+            if (!input_device(h, d, selected.input + n))
+            {
+                ready = false;
+                break;
+            }
 #if defined(LUME_ARCH_AMD64)
     (void)lume_usb_inventory_state(d->inventory, ready ? LUME_HARDWARE_READY : LUME_HARDWARE_FAILED,
                                    ready ? 0 : -LUME_EIO);
@@ -656,29 +690,32 @@ static bool remove_root(struct host *h, unsigned root)
 #endif
             h->dcbaa[slot] = 0;
             cache(h->dcbaa, 4096, false);
-            if (d->keyboard)
+            for (unsigned n = 0; n < LUME_USB_INPUTS; ++n)
             {
-                --keyboard_count;
+                struct input *input = d->channels + n;
                 const uint8_t released[8] = {0};
-                lume_hid_report(&d->hid, released, sizeof(released), milliseconds(h));
-            }
-            if (d->mouse)
-            {
-                --mouse_count;
-                const uint8_t released[3] = {0};
-                lume_hid_mouse_report(released, sizeof(released), milliseconds(h));
+                if (input->keyboard)
+                {
+                    --keyboard_count;
+                    lume_hid_report(&input->hid, released, sizeof(released), milliseconds(h));
+                }
+                if (input->mouse)
+                {
+                    --mouse_count;
+                    lume_hid_mouse_report(released, sizeof(released), milliseconds(h));
+                }
+                h->retired_reports += input->hid.reports;
+                h->retired_characters += input->hid.characters;
+                h->retired_dropped += input->hid.dropped;
+                release_page(h, input->report);
+                release_page(h, input->ring.trbs);
             }
             if (d->hub)
                 --hub_count;
-            h->retired_reports += d->hid.reports;
-            h->retired_characters += d->hid.characters;
-            h->retired_dropped += d->hid.dropped;
             release_page(h, d->input);
             release_page(h, d->output);
             release_page(h, d->buffer);
-            release_page(h, d->report);
             release_page(h, d->ep0.trbs);
-            release_page(h, d->interrupt.trbs);
             *d = (struct device){0};
         }
     h->root_ready &= ~(1u << (root - 1));
@@ -890,16 +927,22 @@ void lume_usb_poll(void)
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &h->devices[slot];
-            if ((!d->keyboard && !d->mouse) || d->disconnected)
+            if (!d->inputs || d->disconnected)
                 continue;
             if (!(lume_mmio_read32(h->op + 0x400 + (d->root - 1) * 16) & 1))
             {
                 d->disconnected = true;
-                d->hid.repeat_key = 0;
+                for (unsigned n = 0; n < d->inputs; ++n)
+                    d->channels[n].hid.repeat_key = 0;
                 continue;
             }
-            lume_hid_repeat(&d->hid, milliseconds(h));
-            arm_input(h, d);
+            for (unsigned n = 0; n < d->inputs; ++n)
+            {
+                struct input *input = d->channels + n;
+                if (input->keyboard)
+                    lume_hid_repeat(&input->hid, milliseconds(h));
+                arm_input(h, d, input);
+            }
         }
     }
 }
@@ -913,11 +956,15 @@ int lume_usb_getc(void)
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &hosts[i].devices[slot];
-            if (d->keyboard && !d->disconnected)
+            if (!d->disconnected)
             {
-                int c = lume_hid_getc(&d->hid);
-                if (c >= 0)
-                    return c;
+                for (unsigned n = 0; n < d->inputs; ++n)
+                    if (d->channels[n].keyboard)
+                    {
+                        int c = lume_hid_getc(&d->channels[n].hid);
+                        if (c >= 0)
+                            return c;
+                    }
             }
         }
     return -LUME_EAGAIN;
@@ -939,10 +986,14 @@ void lume_usb_stats(void)
         dropped += hosts[i].retired_dropped;
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
-            struct lume_hid *h = &hosts[i].devices[slot].hid;
-            reports += h->reports;
-            characters += h->characters;
-            dropped += h->dropped;
+            struct device *d = &hosts[i].devices[slot];
+            for (unsigned n = 0; n < d->inputs; ++n)
+            {
+                struct lume_hid *h = &d->channels[n].hid;
+                reports += h->reports;
+                characters += h->characters;
+                dropped += h->dropped;
+            }
         }
     }
     lume_value("USB_HID_REPORTS", reports);
@@ -990,10 +1041,13 @@ bool lume_usb_stop_host(unsigned index)
         return false;
     for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
     {
-        if (h->devices[slot].keyboard && keyboard_count)
-            --keyboard_count;
-        if (h->devices[slot].mouse && mouse_count)
-            --mouse_count;
+        for (unsigned n = 0; n < h->devices[slot].inputs; ++n)
+        {
+            if (h->devices[slot].channels[n].keyboard && keyboard_count)
+                --keyboard_count;
+            if (h->devices[slot].channels[n].mouse && mouse_count)
+                --mouse_count;
+        }
         if (h->devices[slot].hub && hub_count)
             --hub_count;
     }

@@ -173,6 +173,7 @@ UAPI_ABI := $(if $(filter aarch64 amd64 i686,$(ARCH)),include/abi/native,include
 TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Iinclude/kernel -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs poll heap user-stack mmu elf-load font memory
 TEST_NAMES += io-queue io-calls vfs-storage-handles ip4-route
+TEST_NAMES += net-service
 .PHONY: check-console-calls
 check: check-console-calls
 check-console-calls: $(OUT)/tests/console-calls$(HOSTEXE)
@@ -248,6 +249,7 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 	env "$(OUT)/tests/sdio$(HOSTEXE)"
 	env "$(OUT)/tests/wifi-net$(HOSTEXE)"
 	env "$(OUT)/tests/netif$(HOSTEXE)"
+	env "$(OUT)/tests/net-service$(HOSTEXE)"
 	env "$(OUT)/tests/wpa$(HOSTEXE)" tests/fixtures/wpa-handshake.bin
 	env "$(OUT)/tests/volume$(HOSTEXE)"
 	env "$(OUT)/tests/watchdog$(HOSTEXE)"
@@ -298,6 +300,9 @@ $(OUT)/tests/icmp$(HOSTEXE): tests/unit/icmp_test.c src/net/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
 $(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c
 HOST_LWIP_C := $(filter vendor/lwip/%,$(KERNEL_C_aarch64))
+$(OUT)/tests/net-service$(HOSTEXE): tests/unit/net_service_test.c src/net/net.c src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"
 $(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c include/kernel/lwipopts.h include/kernel/lume/lwip_hooks.h $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include tests/unit/ip4_route_test.c src/net/route.c $(HOST_LWIP_C) -o "$@"
@@ -323,7 +328,7 @@ $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
