@@ -139,6 +139,15 @@ void lume_mmu_release_user(unsigned task)
         shared[task] = 0;
         return;
     }
+    bool mapped = false;
+    for (unsigned i = 0; i < USER_BLOCKS; ++i)
+    {
+        unsigned slot = (unsigned)(LUME_USER_BASE / BLOCK) + i;
+        mapped |= task_root[task][slot] != 0;
+        task_root[task][slot] = 0;
+    }
+    if (mapped)
+        lume_arch_flush_user_tlb();
     for (unsigned i = 0; i < USER_BLOCKS; ++i)
     {
         if (task_pt[task][i] && !lume_page_free((uintptr_t)task_pt[task][i]))
@@ -175,16 +184,32 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
     return true;
 }
 
+bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
+{
+    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
+        return false;
+    uint32_t *entries[LUME_MMU_BATCH_PAGES];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        uint64_t va = addresses[i];
+        if (va < LUME_USER_BASE || va >= LUME_USER_LIMIT || (va & 4095))
+            return false;
+        entries[i] = entry(task, va, false);
+        if (!entries[i] || !(*entries[i] & PRESENT))
+            return false;
+    }
+    for (unsigned i = 0; i < count; ++i)
+        *entries[i] = 0;
+    if (count == 1)
+        __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)addresses[0]) : "memory");
+    else
+        lume_arch_flush_user_tlb();
+    return true;
+}
+
 void lume_mmu_unmap_user(unsigned task, uint64_t va)
 {
-    if (task >= LUME_TASK_LIMIT || va < LUME_USER_BASE || va >= LUME_USER_LIMIT || (va & 4095))
-        return;
-    uint32_t *p = entry(task, va, false);
-    if (p)
-    {
-        *p = 0;
-        __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)va) : "memory");
-    }
+    (void)lume_mmu_unmap_user_batch(task, &va, 1);
 }
 
 bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack)
@@ -244,6 +269,10 @@ void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
     (void)address;
     (void)bytes;
+}
+
+void lume_sync_code_clean_finish(void)
+{
 }
 
 void lume_sync_code_finish(void)

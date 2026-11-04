@@ -1,6 +1,7 @@
 #include "lume/usb.h"
 #include "lume/dma.h"
 #include "lume/graphics_device.h"
+#include "lume/work.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +93,34 @@ bool lume_worker_busy(void)
     return worker_busy;
 }
 
+bool lume_worker_pause(uint64_t deadline)
+{
+    (void)deadline;
+    return false;
+}
+
+bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
+{
+    (void)value;
+    (void)mask;
+    (void)deadline;
+    return false;
+}
+
+int lume_work_submit(struct lume_work *work)
+{
+    assert(work && work->run && work->domain == LUME_WORK_USB);
+    work->queued = true;
+    return 0;
+}
+
+bool lume_work_cancel(struct lume_work *work)
+{
+    bool queued = work->queued;
+    work->queued = false;
+    return queued;
+}
+
 uint64_t lume_page_alloc(uint64_t minimum)
 {
     (void)minimum;
@@ -138,6 +167,14 @@ _Noreturn void lume_fail(const char *reason)
 
 static struct lume_xhci_trb event_ring[256], keyboard_ring[256];
 static unsigned char keyboard_report[64];
+
+static void drain_topology(struct host *host)
+{
+    struct lume_work *work = &host->topology;
+    assert(work->queued);
+    work->queued = false;
+    work->run(work->context);
+}
 
 static void reset(void)
 {
@@ -208,11 +245,14 @@ static void reports_and_hotplug(void)
 
     worker_busy = false;
     assert(lume_usb_getc() == -LUME_EAGAIN);
+    assert(!host->next_scan && !second_port_reads && host->topology.queued);
+    drain_topology(host);
     assert(host->next_scan == 2000 && second_port_reads == 1);
     lume_usb_poll();
     assert(second_port_reads == 1);
     ticks = 2000000;
     lume_usb_poll();
+    drain_topology(host);
     assert(host->next_scan == 3000 && second_port_reads == 2);
     assert(!allocations && !diagnostics);
 

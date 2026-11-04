@@ -141,18 +141,72 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
 
 void lume_elf_release(struct lume_elf_image *image)
 {
-    for (unsigned i = 0; i < image->count; ++i)
+    for (unsigned first = 0; first < image->count;)
     {
-        lume_mmu_unmap_user(image->task, image->pages[i].address);
-        if (!lume_page_free(image->pages[i].physical))
-            lume_fail("ELF frame release");
-        if ((i & 15u) == 15u)
+        uint64_t addresses[LUME_MMU_BATCH_PAGES];
+        unsigned count = image->count - first;
+        if (count > LUME_MMU_BATCH_PAGES)
+            count = LUME_MMU_BATCH_PAGES;
+        for (unsigned i = 0; i < count; ++i)
+            addresses[i] = image->pages[first + i].address;
+        if (!lume_mmu_unmap_user_batch(image->task, addresses, count))
+            lume_fail("ELF mapping release");
+        for (unsigned i = 0; i < count; ++i)
+            if (!lume_page_free(image->pages[first + i].physical))
+                lume_fail("ELF frame release");
+        first += count;
+        if (count == LUME_MMU_BATCH_PAGES)
             lume_worker_checkpoint(65536);
     }
     for (unsigned i = 0; i < image->metadata_pages; ++i)
         if (!lume_page_free((uintptr_t)image->pages + (uint64_t)i * 4096))
             lume_fail("ELF metadata release");
     *image = (struct lume_elf_image){0};
+}
+
+struct elf_page_copy
+{
+    struct
+    {
+        unsigned char *target;
+        const unsigned char *source;
+        size_t bytes;
+        uint64_t executable;
+    } pages[LUME_MMU_BATCH_PAGES];
+
+    unsigned count;
+};
+
+/* Image builders retain lifecycle ownership until publication. Copy descriptors contain
+ * only pinned physical memory and cache ranges. */
+static void copy_elf_pages(void *context)
+{
+    const struct elf_page_copy *copy = context;
+    bool executable = false;
+    for (unsigned n = 0; n < copy->count; ++n)
+    {
+        for (size_t i = 0; i < copy->pages[n].bytes; ++i)
+            copy->pages[n].target[i] = copy->pages[n].source[i];
+        if (copy->pages[n].executable)
+        {
+            lume_sync_code_defer(copy->pages[n].executable, 4096);
+            executable = true;
+        }
+    }
+    if (executable)
+        lume_sync_code_clean_finish();
+}
+
+static void finish_elf_batch(struct elf_page_copy *copy)
+{
+    if (copy->count == LUME_MMU_BATCH_PAGES)
+    {
+        lume_worker_compute(copy_elf_pages, copy);
+        lume_worker_checkpoint(65536);
+    }
+    else if (copy->count)
+        copy_elf_pages(copy);
+    copy->count = 0;
 }
 
 bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
@@ -167,6 +221,7 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
         *image = (struct lume_elf_image){0};
         return false;
     }
+    struct elf_page_copy copy = {0};
     for (unsigned i = 0; i < source->count; ++i)
     {
         uint64_t address = source->pages[i].address, ignored;
@@ -184,17 +239,18 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
         }
         image->pages[image->count].address = address;
         image->pages[image->count++].physical = page;
-        for (unsigned j = 0; j < 4096; ++j)
-            ((unsigned char *)(uintptr_t)page)[j] =
-                ((const unsigned char *)(uintptr_t)source->pages[i].physical)[j];
-        if (execute)
-            lume_sync_code_defer(page, 4096);
-        if ((i & 15u) == 15u)
-            lume_worker_checkpoint(65536);
+        copy.pages[copy.count].target = (void *)(uintptr_t)page;
+        copy.pages[copy.count].source = (const void *)(uintptr_t)source->pages[i].physical;
+        copy.pages[copy.count].bytes = 4096;
+        copy.pages[copy.count++].executable = execute ? page : 0;
+        if (copy.count == LUME_MMU_BATCH_PAGES)
+            finish_elf_batch(&copy);
     }
+    finish_elf_batch(&copy);
     lume_sync_code_finish();
     return true;
 fail:
+    lume_sync_code_finish();
     lume_elf_release(image);
     return false;
 }
@@ -213,6 +269,7 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
         *image = (struct lume_elf_image){0};
         return false;
     }
+    struct elf_page_copy copy = {0};
     for (unsigned n = 0; n < plan.count; ++n)
     {
         struct lume_elf_segment *s = &plan.segments[n];
@@ -233,20 +290,22 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
             uint64_t copy_start = va > s->address ? va : s->address;
             uint64_t file_end = s->address + s->file_size;
             uint64_t copy_end = va + 4096 < file_end ? va + 4096 : file_end;
+            copy.pages[copy.count].target = (void *)(uintptr_t)page;
+            copy.pages[copy.count].source = 0;
+            copy.pages[copy.count].bytes = 0;
+            copy.pages[copy.count].executable = (s->flags & 1) ? page : 0;
             if (copy_start < copy_end)
             {
-                unsigned char *out = (void *)(uintptr_t)(page + copy_start - va);
-                const unsigned char *in =
+                copy.pages[copy.count].target = (void *)(uintptr_t)(page + copy_start - va);
+                copy.pages[copy.count].source =
                     (const unsigned char *)data + s->offset + copy_start - s->address;
-                for (uint64_t i = 0; i < copy_end - copy_start; ++i)
-                    out[i] = in[i];
+                copy.pages[copy.count].bytes = (size_t)(copy_end - copy_start);
             }
-            if (s->flags & 1)
-                lume_sync_code_defer(page, 4096);
-            if (!(image->count & 15u))
-                lume_worker_checkpoint(65536);
+            if (++copy.count == LUME_MMU_BATCH_PAGES)
+                finish_elf_batch(&copy);
         }
     }
+    finish_elf_batch(&copy);
     lume_sync_code_finish();
     image->entry = plan.entry;
     image->tls_address = plan.tls_address;
@@ -255,6 +314,7 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
     image->tls_align = plan.tls_align;
     return true;
 fail:
+    lume_sync_code_finish();
     lume_elf_release(image);
     return false;
 }

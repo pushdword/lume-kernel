@@ -1,4 +1,5 @@
 #include "lume/early.h"
+#include "lume/elf.h"
 #include "lume/heap.h"
 #include "lume/abi.h"
 #include <assert.h>
@@ -10,6 +11,11 @@ static uint64_t pinned_end;
 void lume_worker_checkpoint(unsigned bytes)
 {
     assert(bytes == 65536);
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
 }
 
 bool lume_gpu_heap_allowed(unsigned pid, uint64_t end)
@@ -61,6 +67,14 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
     unsigned page = (unsigned)((va - BASE) / 4096);
     assert(task < LUME_TASK_LIMIT && page < TEST_PAGES && mapped[task][page]);
     mapped[task][page] = 0;
+}
+
+bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
+{
+    assert(count && count <= LUME_MMU_BATCH_PAGES);
+    for (unsigned i = 0; i < count; ++i)
+        lume_mmu_unmap_user(task, addresses[i]);
+    return true;
 }
 
 bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool execute,

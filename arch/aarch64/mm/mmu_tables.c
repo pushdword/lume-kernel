@@ -177,6 +177,13 @@ void lume_mmu_release_user(unsigned task)
         shared_user[task] = 0;
         return;
     }
+    if (user_root[task][LUME_USER_BASE >> 30])
+    {
+        user_root[task][LUME_USER_BASE >> 30] = 0;
+#ifdef __aarch64__
+        __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+#endif
+    }
     for (unsigned block = 0; block < USER_BLOCKS; ++block)
     {
         uint64_t *p = user_tables[task][block];
@@ -247,20 +254,34 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
     return true;
 }
 
+bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
+{
+    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
+        return false;
+    uint64_t *entries[LUME_MMU_BATCH_PAGES];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        uint64_t va = addresses[i];
+        if (va < LUME_USER_BASE || va >= LUME_USER_LIMIT || (va & 4095))
+            return false;
+        entries[i] = user_entry(task, va, false);
+        if (!entries[i] || !(*entries[i] & 1))
+            return false;
+    }
+    for (unsigned i = 0; i < count; ++i)
+        *entries[i] = 0;
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst" ::: "memory");
+    for (unsigned i = 0; i < count; ++i)
+        __asm__ volatile("tlbi vaae1is, %0" ::"r"(addresses[i] >> 12) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+#endif
+    return true;
+}
+
 void lume_mmu_unmap_user(unsigned task, uint64_t va)
 {
-    if (task < LUME_TASK_LIMIT && va >= LUME_USER_BASE && va < LUME_USER_LIMIT && !(va & 4095))
-    {
-        uint64_t *entry = user_entry(task, va, false);
-        if (entry)
-        {
-            *entry = 0;
-#ifdef __aarch64__
-            __asm__ volatile("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" ::"r"(va >> 12)
-                             : "memory");
-#endif
-        }
-    }
+    (void)lume_mmu_unmap_user_batch(task, &va, 1);
 }
 
 bool lume_mmu_translate(uint64_t base, uint64_t va, bool write, bool user, bool execute,

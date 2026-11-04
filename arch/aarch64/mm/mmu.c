@@ -11,6 +11,11 @@ void lume_sync_code_defer(uint64_t address, size_t bytes)
         __asm__ volatile("dc cvau, %0" ::"r"(p) : "memory");
 }
 
+void lume_sync_code_clean_finish(void)
+{
+    __asm__ volatile("dsb ish" ::: "memory");
+}
+
 void lume_sync_code_finish(void)
 {
     __asm__ volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");

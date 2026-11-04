@@ -9,6 +9,7 @@
 #include "lume/wireless.h"
 #include "lume/wifi_protocol.h"
 #include "lume/wpa.h"
+#include "lume/worker.h"
 #define RAM_BASE 0x198000u
 static const struct lume_sdio_bus *bus;
 static uint32_t registered_interface;
@@ -47,6 +48,34 @@ static uint32_t data_sent_at;
 static unsigned requests, responses, events;
 static uint32_t stage, last_mailbox;
 static uint32_t join_started;
+static unsigned operation_depth;
+static bool reported_link;
+static unsigned char reported_peer[6];
+
+/* The transport buffers and SDPCM/BCDC sequence state remain owned across every wait. */
+static bool operation_begin(bool wait)
+{
+    while (!lume_wifi_claim())
+    {
+        if (!wait || !lume_worker_pause_ms(1))
+            return false;
+    }
+    ++operation_depth;
+    return true;
+}
+
+static void operation_end(void)
+{
+    if (!operation_depth)
+        lume_fail("Wi-Fi operation owner");
+    if (!--operation_depth)
+    {
+        reported_link = operational && carrier && ssid_ok && psk_ok;
+        for (unsigned i = 0; i < 6; ++i)
+            reported_peer[i] = reported_link ? supplicant.peer[i] : 0;
+    }
+    lume_wifi_release();
+}
 
 static uint32_t get32(const unsigned char *p)
 {
@@ -83,6 +112,29 @@ static void mark(unsigned n)
 {
     stage = n;
     lume_value("WIFI_FW_STAGE", stage);
+}
+
+static uint64_t deadline_after(unsigned us)
+{
+    return lume_counter_read() + lume_counter_frequency() * us / 1000000;
+}
+
+static bool before_deadline(uint64_t deadline)
+{
+    return (int64_t)(lume_counter_read() - deadline) < 0;
+}
+
+static void delay_until(unsigned us, uint64_t deadline)
+{
+    uint64_t now = lume_counter_read();
+    if ((int64_t)(now - deadline) >= 0)
+        return;
+    uint64_t frequency = lume_counter_frequency();
+    uint64_t remaining = (deadline - now) * 1000000 / frequency;
+    if (remaining < us)
+        us = (unsigned)remaining;
+    if (us)
+        bus->delay_us(us);
 }
 
 static bool wait_reg(uint32_t a, uint32_t mask, uint32_t expected)
@@ -151,6 +203,7 @@ static int open_asset(struct lume_files *files, const char *path, size_t bytes, 
             return -1;
         actual = lume_wifi_crc32(actual, transfer, count);
         done += count;
+        lume_worker_checkpoint((unsigned)count);
     }
     if (actual != crc || lume_vfs_seek(files, (uint64_t)fd, 0, LUME_SEEK_SET))
         return -1;
@@ -202,6 +255,7 @@ static bool upload(struct lume_files *f, int fd, size_t bytes, uint32_t *reset_v
         }
         crc = lume_wifi_crc32(crc, verify, count);
         offset += count;
+        lume_worker_checkpoint((unsigned)count);
     }
     lume_value("WIFI_FW_READBACK_CRC32", crc);
     return crc == LUME_WIFI_FIRMWARE_CRC32;
@@ -293,16 +347,19 @@ static int packet(void)
 
 static bool wait_transmit(void)
 {
-    for (unsigned n = 0; n < 2000; ++n)
+    uint64_t deadline = deadline_after(2000000);
+    for (unsigned n = 0; n < 2000 && before_deadline(deadline); ++n)
     {
         /* Refresh both hardware XOFF and the SDPCM window before every TX. */
         if (packet() < 0)
             return false;
+        if (!before_deadline(deadline))
+            break;
         if (lume_wifi_tx_allowed(tx_sequence, tx_credit, flow_mask, hardware_flow))
             return true;
         if (n % 100 == 99 && !write_reg(cores.sdio + 0x40, 8))
             return false;
-        bus->delay_us(1000);
+        delay_until(1000, deadline);
     }
     lume_value("WIFI_TX_STALL_FLOW", flow_mask);
     lume_value("WIFI_TX_STALL_HARDWARE", hardware_flow);
@@ -339,11 +396,14 @@ static int control(uint32_t op, bool set, const void *input, size_t bytes, void 
         return -1;
     ++tx_sequence;
     ++requests;
-    for (unsigned n = 0; n < 3000; ++n)
+    uint64_t deadline = deadline_after(3000000);
+    for (unsigned n = 0; n < 3000 && before_deadline(deadline); ++n)
     {
         int length = packet();
         if (length < 0)
             return -1;
+        if (!before_deadline(deadline))
+            break;
         if (length)
         {
             int32_t status;
@@ -372,7 +432,7 @@ static int control(uint32_t op, bool set, const void *input, size_t bytes, void 
             }
             ++events;
         }
-        bus->delay_us(1000);
+        delay_until(1000, deadline);
     }
     lume_value("WIFI_FW_TIMEOUT_COMMAND", op);
     return -1;
@@ -498,48 +558,57 @@ static bool run(struct lume_files *files)
         return false;
     bool ready = false;
     unsigned char csr;
-    for (unsigned n = 0; n < 2000; ++n)
+    uint64_t deadline = deadline_after(2000000);
+    for (unsigned n = 0; n < 2000 && before_deadline(deadline); ++n)
     {
         if (!read_byte(1, 0x1000e, &csr))
             return false;
+        if (!before_deadline(deadline))
+            break;
         if (csr & 0x80)
         {
             ready = true;
             break;
         }
-        bus->delay_us(1000);
+        delay_until(1000, deadline);
     }
     if (!ready || !write_byte(1, 0x1000e, (unsigned char)(csr | 2)) || !write_byte(0, 0x210, 0) ||
         !write_byte(0, 0x211, 2) || !write_reg(cores.sdio + 0x48, 4u << 16) ||
         !write_reg(cores.sdio + 0x24, 0xe0) || !write_byte(0, 2, 6))
         return false;
     ready = false;
-    for (unsigned n = 0; n < 2000; ++n)
+    deadline = deadline_after(2000000);
+    for (unsigned n = 0; n < 2000 && before_deadline(deadline); ++n)
     {
         unsigned char v;
         if (!read_byte(0, 3, &v))
             return false;
+        if (!before_deadline(deadline))
+            break;
         if ((v & 6) == 6)
         {
             ready = true;
             break;
         }
-        bus->delay_us(1000);
+        delay_until(1000, deadline);
     }
     if (!ready || !write_byte(0, 4, 7))
         return false;
     mark(6);
     ready = false;
-    for (unsigned n = 0; n < 3000; ++n)
+    deadline = deadline_after(3000000);
+    for (unsigned n = 0; n < 3000 && before_deadline(deadline); ++n)
     {
         if (packet() < 0)
             return false;
+        if (!before_deadline(deadline))
+            break;
         if (last_mailbox & 8)
         {
             ready = true;
             break;
         }
-        bus->delay_us(1000);
+        delay_until(1000, deadline);
     }
     lume_value("WIFI_FW_MAILBOX", last_mailbox);
     if (!ready || ((last_mailbox >> 16) & 255) != 4)
@@ -596,7 +665,7 @@ static bool run(struct lume_files *files)
     return true;
 }
 
-bool lume_wifi_firmware(void)
+static bool firmware_owned(void)
 {
     bus = lume_wifi_bus();
     if (!bus || !bus->write53)
@@ -797,7 +866,7 @@ static void dispatch(const struct lume_wifi_frame *h)
     }
 }
 
-bool lume_wifi_prepare(const unsigned char mac[6])
+static bool prepare_owned(const unsigned char mac[6])
 {
     if (!mac || (mac[0] & 1))
         return false;
@@ -955,7 +1024,7 @@ static void authenticate(void)
     }
 }
 
-void lume_wifi_poll(void)
+static void poll_owned(void)
 {
     if (!operational)
         return;
@@ -985,7 +1054,7 @@ void lume_wifi_poll(void)
     network_account(LUME_NET_WIFI_POLL_MS, (uint32_t)(lume_clock_millis() - began));
 }
 
-int lume_wifi_receive(void *out, size_t cap)
+static int receive_owned(void *out, size_t cap)
 {
     if (!receive_count)
         return 0;
@@ -1000,7 +1069,7 @@ int lume_wifi_receive(void *out, size_t cap)
     return (int)bytes;
 }
 
-bool lume_wifi_send(const void *data, size_t bytes)
+static bool send_owned(const void *data, size_t bytes)
 {
     if (!operational || !lume_wifi_link())
         return false;
@@ -1028,7 +1097,7 @@ bool lume_wifi_send(const void *data, size_t bytes)
     return true;
 }
 
-bool lume_wifi_link(void)
+static bool link_owned(void)
 {
     return operational && carrier && ssid_ok && psk_ok;
 }
@@ -1046,7 +1115,7 @@ static bool start_interface(void)
            lume_wifi_prepare(station_mac);
 }
 
-int lume_wifi_scan(struct lume_access_point *out, size_t capacity)
+static int scan_owned(struct lume_access_point *out, size_t capacity)
 {
     if (!start_interface() || scan_running)
         return -1;
@@ -1085,7 +1154,7 @@ int lume_wifi_scan(struct lume_access_point *out, size_t capacity)
     return (int)count;
 }
 
-void lume_wifi_leave(void)
+static void leave_owned(void)
 {
     /* The installed firmware does not reliably acknowledge DOWN/DISASSOC
      * after traffic. WL_ON provides a deterministic, bounded radio stop. */
@@ -1127,7 +1196,7 @@ static bool join_begin(const unsigned char *ssid, size_t sn, const unsigned char
     return ok;
 }
 
-bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
+static bool join_owned(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
 {
     bool ok = join_begin(ssid, sn, key, kn);
     uint32_t start = lume_clock_millis();
@@ -1173,6 +1242,8 @@ static bool cyw_transmit(void *ctx, const void *p, size_t n)
 static bool cyw_admin(void *ctx, bool up)
 {
     (void)ctx;
+    if (!operation_begin(true))
+        return false;
     if (!up)
     {
         lume_wifi_leave();
@@ -1182,6 +1253,7 @@ static bool cyw_admin(void *ctx, bool up)
             operational = false;
         }
     }
+    operation_end();
     return true;
 }
 
@@ -1224,23 +1296,38 @@ static bool cyw_connect_begin(void *ctx, const unsigned char *s, size_t sn, cons
                               size_t kn)
 {
     (void)ctx;
-    return join_begin(s, sn, k, kn);
+    if (!operation_begin(true))
+        return false;
+    bool result = join_begin(s, sn, k, kn);
+    operation_end();
+    return result;
 }
 
 static int cyw_connect_status(void *ctx)
 {
     (void)ctx;
-    return lume_wifi_link() ? 0 : operational && joining ? -LUME_EAGAIN : -LUME_EIO;
+    if (!operation_begin(false))
+        return -LUME_EAGAIN;
+    int result = link_owned() ? 0 : operational && joining ? -LUME_EAGAIN : -LUME_EIO;
+    operation_end();
+    return result;
 }
 
 static void cyw_peer(void *ctx, unsigned char out[6])
 {
     (void)ctx;
+    if (!operation_begin(false))
+    {
+        for (unsigned i = 0; i < 6; ++i)
+            out[i] = reported_peer[i];
+        return;
+    }
     for (unsigned i = 0; i < 6; ++i)
-        out[i] = lume_wifi_link() ? supplicant.peer[i] : 0;
+        out[i] = link_owned() ? supplicant.peer[i] : 0;
+    operation_end();
 }
 
-bool lume_pi5_wifi_register(const unsigned char mac[6])
+static bool register_owned(const unsigned char mac[6])
 {
     static const struct lume_netif_ops data = {cyw_poll, cyw_link, cyw_receive, cyw_transmit,
                                                cyw_admin};
@@ -1274,7 +1361,7 @@ bool lume_pi5_wifi_register(const unsigned char mac[6])
     return true;
 }
 
-int lume_pi5_wifi_unregister(void)
+static int unregister_owned(void)
 {
     if (!registered_interface)
         return 0;
@@ -1284,5 +1371,102 @@ int lume_pi5_wifi_unregister(void)
     result = lume_netif_unregister(registered_interface);
     if (!result)
         registered_interface = 0;
+    return result;
+}
+
+bool lume_wifi_firmware(void)
+{
+    if (!operation_begin(true))
+        return false;
+    bool result = firmware_owned();
+    operation_end();
+    return result;
+}
+
+bool lume_wifi_prepare(const unsigned char mac[6])
+{
+    if (!operation_begin(true))
+        return false;
+    bool result = prepare_owned(mac);
+    operation_end();
+    return result;
+}
+
+void lume_wifi_poll(void)
+{
+    if (!operation_begin(false))
+        return;
+    poll_owned();
+    operation_end();
+}
+
+int lume_wifi_receive(void *out, size_t capacity)
+{
+    if (!operation_begin(false))
+        return 0;
+    int result = receive_owned(out, capacity);
+    operation_end();
+    return result;
+}
+
+bool lume_wifi_send(const void *data, size_t bytes)
+{
+    if (!operation_begin(false))
+        return false;
+    bool result = send_owned(data, bytes);
+    operation_end();
+    return result;
+}
+
+bool lume_wifi_link(void)
+{
+    if (!operation_begin(false))
+        return reported_link;
+    bool result = link_owned();
+    operation_end();
+    return result;
+}
+
+int lume_wifi_scan(struct lume_access_point *out, size_t capacity)
+{
+    if (!operation_begin(true))
+        return -LUME_EBUSY;
+    int result = scan_owned(out, capacity);
+    operation_end();
+    return result;
+}
+
+void lume_wifi_leave(void)
+{
+    if (!operation_begin(true))
+        return;
+    leave_owned();
+    operation_end();
+}
+
+bool lume_wifi_join(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
+{
+    if (!operation_begin(true))
+        return false;
+    bool result = join_owned(ssid, sn, key, kn);
+    operation_end();
+    return result;
+}
+
+bool lume_pi5_wifi_register(const unsigned char mac[6])
+{
+    if (!operation_begin(true))
+        return false;
+    bool result = register_owned(mac);
+    operation_end();
+    return result;
+}
+
+int lume_pi5_wifi_unregister(void)
+{
+    if (!operation_begin(false))
+        return -LUME_EBUSY;
+    int result = unregister_owned();
+    operation_end();
     return result;
 }

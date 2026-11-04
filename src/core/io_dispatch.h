@@ -33,10 +33,16 @@ static bool kernel_resource_available(unsigned domain, unsigned task, bool mutat
            (task >= LUME_TASK_LIMIT || !kernel_process_conflict(task, mutation));
 }
 
+static bool kernel_regular_draining(void)
+{
+    return kernel_drain_until && lume_clock_monotonic() < kernel_drain_until;
+}
+
 static bool kernel_request_ready(unsigned domain, unsigned task, const struct lume_context *frame,
                                  bool admitted)
 {
     return kernel_resource_available(domain, task, kernel_call_mutates(frame)) &&
+           (admitted || domain == KERNEL_IO_EXCLUSIVE || !kernel_regular_draining()) &&
            (admitted || !kernel_domain_queue(domain)->count);
 }
 
@@ -74,7 +80,13 @@ static void kernel_work(void *context)
     unsigned domain = (unsigned)(uintptr_t)context;
     if (domain == LUME_WORK_NETWORK)
         stream_reap();
-    kernel_deferred += lume_work_drain_on(domain, 8);
+    for (unsigned n = 0; n < 8; ++n)
+    {
+        unsigned done = lume_work_drain_on(domain, 1);
+        kernel_deferred += done;
+        if (!done || kernel_control_queue.count)
+            break;
+    }
 }
 
 static bool kernel_background_pending(unsigned domain)
@@ -137,6 +149,8 @@ static void kernel_memory_waiters(void)
 
 static bool kernel_admit_queue(unsigned domain)
 {
+    if (domain != KERNEL_IO_EXCLUSIVE && kernel_regular_draining())
+        return false;
     struct io_queue *queue = kernel_domain_queue(domain);
     unsigned slot = domain == KERNEL_IO_EXCLUSIVE ? LUME_WORK_GENERAL : domain;
     if (lume_worker_busy_on(slot) || io_queue_granted(queue, lume_clock_monotonic()))
@@ -200,6 +214,7 @@ static bool kernel_admit_queue(unsigned domain)
 
 static bool kernel_commit_drain(void)
 {
+    bool pending = kernel_control_queue.count != 0;
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
     {
         struct kernel_io_lane *lane = kernel_lanes + i;
@@ -216,23 +231,28 @@ static bool kernel_commit_drain(void)
             kernel_drain_until = kernel_drain_retry = 0;
             return true;
         }
-        uint64_t at = lume_clock_monotonic();
-        if (kernel_drain_until && at < kernel_drain_until)
-            return true;
-        if (kernel_drain_until)
-        {
-            kernel_drain_until = 0;
-            kernel_drain_retry = at + 8;
-        }
-        if (at >= kernel_drain_retry)
-        {
-            /* Quiescence attempts bound admission delays while older device waits continue. */
-            kernel_drain_until = at + 2;
-            return true;
-        }
+        pending = true;
+        break;
+    }
+    if (!pending)
+    {
+        kernel_drain_until = kernel_drain_retry = 0;
         return false;
     }
-    kernel_drain_until = kernel_drain_retry = 0;
+    uint64_t at = lume_clock_monotonic();
+    if (kernel_drain_until && at < kernel_drain_until)
+        return true;
+    if (kernel_drain_until)
+    {
+        kernel_drain_until = 0;
+        kernel_drain_retry = at + 8;
+    }
+    if (at >= kernel_drain_retry)
+    {
+        /* Quiescence attempts bound admission delays while older device waits continue. */
+        kernel_drain_until = at + 2;
+        return true;
+    }
     return false;
 }
 
@@ -255,17 +275,18 @@ static void kernel_image_commit_end(void)
         kernel_lanes[slot].exclusive = kernel_lanes[slot].exclusive_pending = false;
 }
 
-static void kernel_step_admit(bool admit)
+/* A selected lane returns with the lock held before the submitter commits its return path. */
+static void kernel_step_selected(bool admit, unsigned selected_domain)
 {
     if (!public_mode)
         return;
     lume_net_poll_background();
     lume_storage_poll_background();
     bool draining = kernel_commit_drain();
+    if (admit && !lume_worker_busy() && !kernel_any_grant())
+        (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
     if (admit && !draining)
     {
-        if (!lume_worker_busy() && !kernel_any_grant())
-            (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
         for (unsigned n = 0; n < LUME_WORK_DOMAINS; ++n)
         {
             unsigned domain = (kernel_lane_cursor + n) % LUME_WORK_DOMAINS;
@@ -274,8 +295,9 @@ static void kernel_step_admit(bool admit)
             if (!available || lume_worker_busy_on(domain))
                 continue;
             bool background_ready =
-                domain != LUME_WORK_GENERAL ||
-                kernel_resource_available(KERNEL_IO_EXCLUSIVE, LUME_TASK_LIMIT, false);
+                !kernel_control_queue.count &&
+                (domain != LUME_WORK_GENERAL ||
+                 kernel_resource_available(KERNEL_IO_EXCLUSIVE, LUME_TASK_LIMIT, false));
             if (lane->deferred_turn && background_ready && kernel_background_pending(domain))
             {
                 lane->deferred_turn = false;
@@ -298,11 +320,12 @@ static void kernel_step_admit(bool admit)
             (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
     }
     unsigned previous = current_task;
-    unsigned cursor = kernel_lane_cursor;
+    unsigned cursor = selected_domain < LUME_WORK_DOMAINS ? selected_domain : kernel_lane_cursor;
+    unsigned turns = selected_domain < LUME_WORK_DOMAINS ? 1 : LUME_WORK_DOMAINS;
     uint64_t started = lume_counter_read();
     uint64_t frequency = lume_counter_frequency();
     uint64_t budget = frequency / 500 + (frequency % 500 != 0);
-    for (unsigned n = 0; n < LUME_WORK_DOMAINS; ++n)
+    for (unsigned n = 0; n < turns; ++n)
     {
         unsigned domain = (cursor + n) % LUME_WORK_DOMAINS;
         struct kernel_io_lane *lane = kernel_lanes + domain;
@@ -310,31 +333,52 @@ static void kernel_step_admit(bool admit)
             continue;
         unsigned owner = lane->owner;
         current_task = owner < LUME_TASK_LIMIT ? owner : previous;
-        bool change_root = owner != previous;
+        bool reclaim = lane->reclaim;
+        bool change_root = owner != previous || reclaim;
         if (change_root)
-            lume_mmu_switch(owner < LUME_TASK_LIMIT ? lume_mmu_task_root(owner) : lume_mmu_root());
+            lume_mmu_switch(owner < LUME_TASK_LIMIT && !reclaim ? lume_mmu_task_root(owner)
+                                                                : lume_mmu_root());
         uint64_t began = counter();
-        bool resumed = lume_worker_resume_on(domain);
-        if (resumed && domain != LUME_WORK_STORAGE)
+        local.worker_slot = domain;
+        local.worker_owner = owner;
+        local.worker_started = began;
+        local.worker_lock_before = lume_worker_lock_wait_on(domain);
+        local.worker_running = true;
+        /* A running callback may release the lock before this dispatcher regains control. */
+        if (domain != LUME_WORK_STORAGE)
             ++kernel_parallel_epoch;
+        bool resumed = lume_worker_resume_on(domain);
         uint64_t elapsed = counter() - began;
-        total_kernel_ticks += elapsed;
+        uint64_t waited = lume_worker_lock_wait_on(domain) - local.worker_lock_before;
+        local.worker_running = false;
+        local.lock += waited;
+        total_kernel_ticks += elapsed - waited;
         if (owner < LUME_TASK_LIMIT)
-            kernel_ticks[owner] += elapsed;
+        {
+            kernel_ticks[owner] += elapsed - waited;
+            lock_ticks[owner] += waited;
+        }
         if (account_inside)
             account_start += elapsed;
         current_task = previous;
         if (change_root)
-            lume_mmu_switch(previous < LUME_TASK_LIMIT ? lume_mmu_task_root(previous)
-                                                       : lume_mmu_root());
+            lume_mmu_switch(previous < LUME_TASK_LIMIT && !(reclaim && previous == owner)
+                                ? lume_mmu_task_root(previous)
+                                : lume_mmu_root());
         if (!lume_worker_busy_on(domain) && owner < LUME_TASK_LIMIT)
         {
             struct lume_context *frame = &tasks[owner].context;
             lane->owner = LUME_TASK_LIMIT;
             lane->exclusive = lane->mutation = lane->exclusive_pending = false;
+            lane->reclaim = false;
             kernel_wait[owner] = false;
-            if (lane->launch && lane->result >= 0 &&
-                LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
+            if (reclaim)
+            {
+                states[owner] = 1;
+                sched_wake(&policy, owner, unit, 0);
+            }
+            else if (lane->launch && lane->result >= 0 &&
+                     LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
                 states[owner] = 3;
             else if (!lane->launch && stream_waits[owner].active && stream_waits[owner].pending)
                 states[owner] = 4;
@@ -355,7 +399,14 @@ static void kernel_step_admit(bool admit)
                 break;
         }
     }
+    if (admit && !lume_worker_busy() && !kernel_any_grant())
+        (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
     kernel_memory_waiters();
+}
+
+static void kernel_step_admit(bool admit)
+{
+    kernel_step_selected(admit, LUME_WORK_DOMAINS);
 }
 
 static void kernel_step(void)
@@ -384,7 +435,7 @@ static bool kernel_files_closed[LUME_TASK_LIMIT];
 static void kernel_close_files(void *context)
 {
     unsigned task = (unsigned)(uintptr_t)context;
-    lume_files_release(&tasks[task].files);
+    detach_program(task);
     kernel_files_closed[task] = true;
     kernel_lanes[LUME_WORK_GENERAL].result = 0;
 }
@@ -400,9 +451,10 @@ static bool kernel_close_ready(unsigned task)
     lane->deferred_turn = true;
     kernel_wait[task] = true;
     states[task] = 4;
+    wake_at[task] = UINT64_MAX;
     if (!lume_worker_submit_on(LUME_WORK_GENERAL, kernel_close_files, (void *)(uintptr_t)task))
         lume_fail("process file close submission");
-    kernel_step_admit(false);
+    kernel_step_selected(false, LUME_WORK_GENERAL);
     return kernel_files_closed[task];
 }
 

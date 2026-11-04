@@ -13,7 +13,8 @@ enum
     WORK,
     NETWORK,
     INTERRUPT_DOMAIN,
-    DOMAIN_INTERRUPT
+    DOMAIN_INTERRUPT,
+    RUNNING_WORK
 };
 
 static struct registration
@@ -235,26 +236,33 @@ static void run_work(void *context)
 {
     struct registration *r = context;
     struct lume_work *work = r->object;
-    void *owner = r->owner;
-    /* A running callback keeps its reference while a resubmission gets a new slot. */
-    r->kind = 0;
+    /* A running callback retains its registration while a resubmission gets a new slot. */
+    r->kind = RUNNING_WORK;
     work->queued = false;
     void (*run)(void *) = work->run;
     void *argument = work->context;
     run(argument);
-    lume_module_unpin(owner);
+    release(r);
 }
 
 int lume_module_work_submit(struct lume_work *work)
 {
-    if (!work || !work->run)
+    if (!work || !work->run || work->domain >= LUME_WORK_DOMAINS)
         return -LUME_EINVAL;
     uint64_t flags = lume_irq_save();
+    struct registration *running = find(RUNNING_WORK, work);
+    struct registration *queued = find(WORK, work);
+    if ((running && running->work.domain != work->domain) ||
+        (work->queued && (!queued || queued->work.domain != work->domain)))
+    {
+        lume_irq_restore(flags);
+        return -LUME_EINVAL;
+    }
     struct registration *r;
     int result = work->queued ? 0 : reserve(WORK, work, (uintptr_t)work->run, &r);
     if (!result && !work->queued)
     {
-        r->work = (struct lume_work){.run = run_work, .context = r};
+        r->work = (struct lume_work){.run = run_work, .context = r, .domain = work->domain};
         result = lume_work_submit(&r->work);
         if (result)
             release(r);

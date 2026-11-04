@@ -4,11 +4,32 @@
 #include "lume/mmio.h"
 #include "lume/counter.h"
 #include "lume/sdio.h"
+#include "lume/cpu.h"
+#include "lume/worker.h"
+#include <limits.h>
 #define HOST LUME_BOARD_WIFI_SDHCI_BASE
 #define PINCTRL LUME_BOARD_BCM2712_PINCTRL_BASE
 #define GPIO LUME_BOARD_BCM2712_GPIO_BASE
 static uint64_t frequency, commands, errors;
 static bool active;
+static unsigned reservation_owner, reservation_depth;
+
+bool lume_wifi_claim(void)
+{
+    unsigned owner = lume_worker_current();
+    if ((reservation_depth && reservation_owner != owner) || reservation_depth == UINT_MAX)
+        return false;
+    reservation_owner = owner;
+    ++reservation_depth;
+    return true;
+}
+
+void lume_wifi_release(void)
+{
+    if (!reservation_depth || reservation_owner != lume_worker_current())
+        lume_fail("SDIO reservation owner");
+    --reservation_depth;
+}
 
 static uint32_t rd(unsigned r)
 {
@@ -22,17 +43,41 @@ static void wr(unsigned r, uint32_t v)
 
 static void delay(unsigned us)
 {
-    lume_counter_delay_us(frequency, us);
+    if (!us)
+        return;
+    uint64_t deadline = lume_counter_read() + frequency * us / 1000000;
+    if (us < 1000 || !reservation_depth || reservation_owner != lume_worker_current() ||
+        !lume_worker_pause(deadline))
+        lume_counter_delay_us(frequency, us);
+}
+
+static void wait_slice(uint64_t start, uint64_t deadline)
+{
+    uint64_t now = lume_counter_read();
+    if ((int64_t)(now - deadline) >= 0)
+        return;
+    if (now - start < frequency / 40000)
+    {
+        lume_cpu_relax_ordered();
+        return;
+    }
+    uint64_t next = now + frequency / 1000;
+    if ((int64_t)(next - deadline) > 0)
+        next = deadline;
+    if (!lume_worker_pause(next))
+        lume_cpu_relax_ordered();
 }
 
 static bool wait_register(unsigned r, uint32_t mask, uint32_t wanted, unsigned ms)
 {
     uint64_t start = lume_counter_read();
+    uint64_t deadline = start + frequency * ms / 1000;
     do
     {
         if ((rd(r) & mask) == wanted)
             return true;
-    } while (lume_counter_read() - start < frequency * ms / 1000);
+        wait_slice(start, deadline);
+    } while ((int64_t)(lume_counter_read() - deadline) < 0);
     ++errors;
     return false;
 }
@@ -40,7 +85,8 @@ static bool wait_register(unsigned r, uint32_t mask, uint32_t wanted, unsigned m
 static bool event(uint32_t mask, unsigned ms)
 {
     uint64_t start = lume_counter_read();
-    uint32_t status;
+    uint64_t deadline = start + frequency * ms / 1000;
+    uint32_t status = 0;
     do
     {
         status = rd(0x30);
@@ -51,14 +97,15 @@ static bool event(uint32_t mask, unsigned ms)
             wr(0x30, mask);
             return true;
         }
-    } while (lume_counter_read() - start < frequency * ms / 1000);
+        wait_slice(start, deadline);
+    } while ((int64_t)(lume_counter_read() - deadline) < 0);
     lume_value("WIFI_ERROR_INTERRUPT", status);
     lume_value("WIFI_ERROR_PRESENT", rd(0x24));
     ++errors;
     return false;
 }
 
-static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t *response)
+static bool command_owned(unsigned index, uint32_t argument, uint32_t flags, uint32_t *response)
 {
     uint32_t inhibit = 1u | ((flags & ((1u << 21) | (1u << 16))) ? 2u : 0u);
     if (!wait_register(0x24, inhibit, 0, 500))
@@ -75,6 +122,15 @@ static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t 
     if (response)
         *response = rd(0x10);
     return (flags & (3u << 16)) != (3u << 16) || event(2, 1000);
+}
+
+static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t *response)
+{
+    if (!lume_wifi_claim())
+        return false;
+    bool result = command_owned(index, argument, flags, response);
+    lume_wifi_release();
+    return result;
 }
 
 static bool transfer53(uint32_t argument, unsigned char *data, size_t bytes, bool write)
@@ -100,7 +156,7 @@ static bool transfer53(uint32_t argument, unsigned char *data, size_t bytes, boo
     uint32_t response;
     uint32_t flags =
         LUME_SDIO_RESPONSE | LUME_SDIO_CHECKS | (1u << 21) | (write ? 0 : 16) | (blocks ? 34 : 0);
-    if (!command(53, argument, flags, &response) || (response & 0xcf00))
+    if (!command_owned(53, argument, flags, &response) || (response & 0xcf00))
         return false;
     for (unsigned block = 0; block < count; ++block)
     {
@@ -129,12 +185,20 @@ static bool transfer53(uint32_t argument, unsigned char *data, size_t bytes, boo
 
 static bool read53(uint32_t arg, unsigned char *data, size_t bytes)
 {
-    return transfer53(arg, data, bytes, false);
+    if (!lume_wifi_claim())
+        return false;
+    bool result = transfer53(arg, data, bytes, false);
+    lume_wifi_release();
+    return result;
 }
 
 static bool write53(uint32_t arg, const unsigned char *data, size_t bytes)
 {
-    return transfer53(arg, (unsigned char *)data, bytes, true);
+    if (!lume_wifi_claim())
+        return false;
+    bool result = transfer53(arg, (unsigned char *)data, bytes, true);
+    lume_wifi_release();
+    return result;
 }
 static const struct lume_sdio_bus bus = {command, read53, delay, write53};
 
@@ -157,7 +221,7 @@ static bool clock_rate(unsigned divider)
     return true;
 }
 
-bool lume_wifi_transfer_clock(void)
+static bool transfer_clock_owned(void)
 {
     if (!active || !clock_rate(4))
         return false;
@@ -165,7 +229,7 @@ bool lume_wifi_transfer_clock(void)
     return true;
 }
 
-bool lume_wifi_probe(uint64_t hz, bool d0)
+static bool probe_owned(uint64_t hz, bool d0)
 {
     frequency = hz;
     commands = errors = 0;
@@ -226,7 +290,7 @@ bool lume_wifi_probe(uint64_t hz, bool d0)
     return ok;
 }
 
-void lume_wifi_stop(void)
+static void stop_owned(void)
 {
     if (!active)
         return;
@@ -239,4 +303,30 @@ void lume_wifi_stop(void)
     lume_value("WIFI_TOTAL_COMMANDS", commands);
     lume_value("WIFI_TOTAL_ERRORS", errors);
     lume_puts("LUME WIFI SDIO STOPPED\n");
+}
+
+bool lume_wifi_transfer_clock(void)
+{
+    if (!lume_wifi_claim())
+        return false;
+    bool result = transfer_clock_owned();
+    lume_wifi_release();
+    return result;
+}
+
+bool lume_wifi_probe(uint64_t hz, bool d0)
+{
+    if (!lume_wifi_claim())
+        return false;
+    bool result = probe_owned(hz, d0);
+    lume_wifi_release();
+    return result;
+}
+
+void lume_wifi_stop(void)
+{
+    if (!lume_wifi_claim())
+        return;
+    stop_owned();
+    lume_wifi_release();
 }

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "lume/early.h"
+#include "lume/worker.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -19,6 +20,16 @@ void lume_value(const char *name, uint64_t value)
 {
     (void)name;
     (void)value;
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    (void)bytes;
 }
 
 int main(void)

@@ -13,6 +13,11 @@ static size_t memory_bytes;
 static const void *last_flush;
 static size_t last_flush_bytes;
 
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
     if (kind == LUME_PLATFORM_GRAPHICS)

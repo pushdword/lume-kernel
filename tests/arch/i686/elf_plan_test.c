@@ -39,6 +39,14 @@ void lume_mmu_unmap_user(unsigned task, uint64_t address)
     abort();
 }
 
+bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
+{
+    (void)task;
+    (void)addresses;
+    (void)count;
+    abort();
+}
+
 uint64_t lume_mmu_task_root(unsigned task)
 {
     (void)task;
@@ -64,6 +72,11 @@ void lume_sync_code_defer(uint64_t address, size_t bytes)
     abort();
 }
 
+void lume_sync_code_clean_finish(void)
+{
+    abort();
+}
+
 void lume_sync_code_finish(void)
 {
     abort();
@@ -72,6 +85,13 @@ void lume_sync_code_finish(void)
 void lume_worker_checkpoint(unsigned bytes)
 {
     (void)bytes;
+    abort();
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    (void)run;
+    (void)context;
     abort();
 }
 

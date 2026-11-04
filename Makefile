@@ -569,7 +569,7 @@ check: check-io-domains
 .PHONY: check-usb-poll
 check-usb-poll: $(OUT)/tests/usb-poll$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/usb-poll$(HOSTEXE): tests/unit/usb_poll_test.c drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c
+$(OUT)/tests/usb-poll$(HOSTEXE): tests/unit/usb_poll_test.c drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c include/kernel/lume/worker.h include/ddk/lume/work.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c -o "$@"
 check: check-usb-poll

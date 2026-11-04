@@ -11,14 +11,27 @@ static void thread_drop(unsigned task)
     service_bus_release(task);
     unsigned owner = process_slot(task);
     uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
-    for (unsigned i = 0; i < thread_pages[task]; ++i)
+    for (unsigned first = 0; first < thread_pages[task];)
     {
-        lume_mmu_unmap_user(owner, base + (uint64_t)i * 4096);
-        if (tasks[task].stack[i] && !lume_page_free(tasks[task].stack[i]))
-            lume_fail("thread stack release");
-        tasks[task].stack[i] = 0;
+        uint64_t addresses[LUME_MMU_BATCH_PAGES];
+        unsigned count = thread_pages[task] - first, mapped = 0;
+        if (count > LUME_MMU_BATCH_PAGES)
+            count = LUME_MMU_BATCH_PAGES;
+        for (unsigned i = first; i < first + count; ++i)
+            if (tasks[task].stack[i])
+                addresses[mapped++] = base + (uint64_t)i * 4096;
+        if (mapped && !lume_mmu_unmap_user_batch(owner, addresses, mapped))
+            lume_fail("thread stack mapping release");
+        for (unsigned i = first; i < first + count; ++i)
+        {
+            if (tasks[task].stack[i] && !lume_page_free(tasks[task].stack[i]))
+                lume_fail("thread stack release");
+            tasks[task].stack[i] = 0;
+        }
+        first += count;
+        if (count == LUME_MMU_BATCH_PAGES)
+            lume_worker_checkpoint(65536);
     }
-    lume_arch_flush_user_tlb();
     thread_pages[task] = 0;
     lume_mmu_release_user(task);
     states[task] = 0;

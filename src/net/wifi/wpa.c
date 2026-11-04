@@ -2,6 +2,7 @@
  * encrypts 802.11 traffic. The supplicant derives and validates handshake keys using the
  * unmodified Mbed TLS AES and SHA1 implementations. */
 #include "lume/wpa.h"
+#include "lume/worker.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/sha1.h"
 #include <string.h>
@@ -69,28 +70,50 @@ void lume_wpa_hmac(const void *key, size_t kn, const void *data, size_t n, unsig
     lume_secret_clear(inner, sizeof(inner));
 }
 
+struct pmk_rounds
+{
+    unsigned char key[64], u[20], v[20];
+    size_t key_bytes;
+    unsigned count;
+};
+
+static void pmk_compute(void *context)
+{
+    struct pmk_rounds *rounds = context;
+    for (unsigned i = 0; i < rounds->count; ++i)
+    {
+        lume_wpa_hmac(rounds->key, rounds->key_bytes, rounds->u, 20, rounds->u);
+        for (unsigned j = 0; j < 20; ++j)
+            rounds->v[j] ^= rounds->u[j];
+    }
+}
+
 bool lume_wpa_pmk(const void *key, size_t kn, const void *ssid, size_t sn, unsigned char out[32])
 {
     if (!key || kn < 8 || kn > 63 || !ssid || !sn || sn > 32 || !out)
         return false;
-    unsigned char salt[36] = {0}, u[20], v[20];
+    struct pmk_rounds rounds = {.key_bytes = kn};
+    unsigned char salt[36] = {0}, result[32];
+    memcpy(rounds.key, key, kn);
     memcpy(salt, ssid, sn);
     for (unsigned block = 1; block <= 2; ++block)
     {
         salt[sn + 3] = (unsigned char)block;
-        lume_wpa_hmac(key, kn, salt, sn + 4, u);
-        memcpy(v, u, 20);
-        for (unsigned i = 1; i < 4096; ++i)
+        lume_wpa_hmac(rounds.key, rounds.key_bytes, salt, sn + 4, rounds.u);
+        memcpy(rounds.v, rounds.u, 20);
+        for (unsigned i = 1; i < 4096;)
         {
-            lume_wpa_hmac(key, kn, u, 20, u);
-            for (unsigned j = 0; j < 20; ++j)
-                v[j] ^= u[j];
+            rounds.count = 4096 - i < 64 ? 4096 - i : 64;
+            lume_worker_compute(pmk_compute, &rounds);
+            lume_worker_checkpoint(0);
+            i += rounds.count;
         }
-        memcpy(out + (block - 1) * 20, v, block == 1 ? 20 : 12);
+        memcpy(result + (block - 1) * 20, rounds.v, block == 1 ? 20 : 12);
     }
+    memcpy(out, result, sizeof(result));
     lume_secret_clear(salt, sizeof(salt));
-    lume_secret_clear(u, sizeof(u));
-    lume_secret_clear(v, sizeof(v));
+    lume_secret_clear(result, sizeof(result));
+    lume_secret_clear(&rounds, sizeof(rounds));
     return true;
 }
 

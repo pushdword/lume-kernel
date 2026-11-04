@@ -1,4 +1,5 @@
 #include "lume/early.h"
+#include "lume/worker.h"
 #if defined(LUME_ARCH_I686)
 #define PHYSICAL_LIMIT UINT64_C(0x80000000)
 #define IMAGE_BLOCK UINT64_C(0x400000)
@@ -67,6 +68,19 @@ uint64_t lume_pages_total(void)
     return total_count;
 }
 
+struct page_zero
+{
+    volatile uint64_t *data;
+    size_t bytes;
+};
+
+static void zero_pages(void *context)
+{
+    const struct page_zero *request = context;
+    for (size_t i = 0; i < request->bytes / sizeof(*request->data); ++i)
+        request->data[i] = 0;
+}
+
 uint64_t lume_pages_alloc_span(unsigned count)
 {
     if (!count || count > 32768 || free_count < count)
@@ -82,9 +96,23 @@ uint64_t lume_pages_alloc_span(unsigned count)
         for (uint64_t q = first; q <= p; ++q)
             used[q / 64] |= UINT64_C(1) << (q & 63);
         free_count -= count;
-        volatile uint64_t *data = (void *)(uintptr_t)(first * 4096);
-        for (size_t i = 0; i < (size_t)count * 512; ++i)
-            data[i] = 0;
+        /* Reserved pages remain unpublished until their complete span is initialized. */
+        size_t bytes = (size_t)count * 4096;
+        for (size_t offset = 0; offset < bytes;)
+        {
+            size_t length =
+                bytes - offset < LUME_WORKER_SLICE_BYTES ? bytes - offset : LUME_WORKER_SLICE_BYTES;
+            struct page_zero request = {
+                .data = (void *)(uintptr_t)(first * 4096 + offset),
+                .bytes = length,
+            };
+            if (length == LUME_WORKER_SLICE_BYTES)
+                lume_worker_compute(zero_pages, &request);
+            else
+                zero_pages(&request);
+            lume_worker_checkpoint((unsigned)length);
+            offset += length;
+        }
         return first * 4096;
     }
     return 0;

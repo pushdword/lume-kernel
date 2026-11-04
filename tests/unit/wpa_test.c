@@ -1,8 +1,20 @@
 #include "lume/wpa.h"
+#include "lume/worker.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 static unsigned checks, entropy_calls;
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    (void)bytes;
+}
+
 #define CHECK(x)                                                                                   \
     do                                                                                             \
     {                                                                                              \

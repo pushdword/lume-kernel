@@ -3,6 +3,7 @@
 #include "lume/early.h"
 #include "lume/mmio.h"
 #include "lume/wpa.h"
+#include "lume/worker.h"
 #define RNG LUME_BOARD_RNG200_BASE
 
 static uint32_t rd(unsigned off)
@@ -37,7 +38,10 @@ bool lume_entropy(void *out, size_t bytes)
             return false;
         }
         if (rd(0x0c) <= 16 || !(rd(0x24) & 255))
+        {
+            (void)lume_worker_pause_ms(1);
             continue;
+        }
         uint32_t word = rd(0x20);
         for (unsigned i = 0; i < 4 && used < bytes; ++i)
             p[used++] = (unsigned char)(word >> (i * 8));

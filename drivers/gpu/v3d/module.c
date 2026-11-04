@@ -126,12 +126,59 @@ static bool map(void *context, uint64_t physical, size_t bytes, uint64_t *bus)
     return lume_dma_map(&binding->dma, physical, bytes, bus);
 }
 
+struct cache_sync
+{
+    const void *pixels;
+    size_t bytes, pitch;
+    unsigned rows;
+    enum lume_dma_direction direction;
+    bool cpu, result;
+};
+
+static void sync_compute(void *context)
+{
+    struct cache_sync *request = context;
+    request->result =
+        request->cpu
+            ? lume_dma_sync_rect_for_cpu(request->pixels, request->bytes, request->pitch,
+                                         request->rows, request->direction)
+            : lume_dma_sync_rect_for_device(request->pixels, request->bytes, request->pitch,
+                                            request->rows, request->direction);
+}
+
 static bool sync(void *context, const void *pixels, size_t bytes, size_t pitch, unsigned rows,
                  enum lume_dma_direction direction, bool cpu)
 {
     (void)context;
-    return cpu ? lume_dma_sync_rect_for_cpu(pixels, bytes, pitch, rows, direction)
-               : lume_dma_sync_rect_for_device(pixels, bytes, pitch, rows, direction);
+    size_t span;
+    if (!pixels || direction < LUME_DMA_TO_DEVICE || direction > LUME_DMA_BIDIRECTIONAL ||
+        !lume_dma_rect_bytes(bytes, pitch, rows, &span) || span > UINTPTR_MAX - (uintptr_t)pixels)
+        return false;
+    unsigned batch = bytes < LUME_WORKER_SLICE_BYTES ? LUME_WORKER_SLICE_BYTES / bytes : 1;
+    for (unsigned row = 0; row < rows;)
+    {
+        unsigned count = rows - row < batch ? rows - row : batch;
+        for (size_t offset = 0; offset < bytes;)
+        {
+            size_t length =
+                bytes - offset < LUME_WORKER_SLICE_BYTES ? bytes - offset : LUME_WORKER_SLICE_BYTES;
+            struct cache_sync request = {
+                .pixels = (const void *)((uintptr_t)pixels + (size_t)row * pitch + offset),
+                .bytes = length,
+                .pitch = pitch,
+                .rows = count,
+                .direction = direction,
+                .cpu = cpu,
+            };
+            lume_worker_compute(sync_compute, &request);
+            if (!request.result)
+                return false;
+            lume_worker_checkpoint((unsigned)(length * count));
+            offset += length;
+        }
+        row += count;
+    }
+    return true;
 }
 
 static bool wait(void *context, volatile uint32_t *event, uint32_t mask, uint64_t deadline)

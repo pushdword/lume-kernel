@@ -31,6 +31,15 @@ static unsigned current_task, kernel_deferred, policy, unit = 1;
 static unsigned states[LUME_TASK_LIMIT], executed[LUME_TASK_LIMIT], wake_count[LUME_TASK_LIMIT];
 static unsigned process_owner[LUME_TASK_LIMIT];
 static uint64_t total_kernel_ticks, kernel_ticks[LUME_TASK_LIMIT], account_start;
+static uint64_t lock_ticks[LUME_TASK_LIMIT];
+
+static struct
+{
+    unsigned worker_slot, worker_owner;
+    uint64_t worker_started, worker_lock_before, lock;
+    bool worker_running;
+} local;
+
 static uint64_t wake_at[LUME_TASK_LIMIT], clock_ms, root;
 static bool kernel_wait[LUME_TASK_LIMIT], process_exiting[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
@@ -63,6 +72,11 @@ void lume_files_release(struct lume_files *files)
     assert(files == &tasks[current_task].files && root == current_task + 1);
     assert(!kernel_console_scope);
     ++files_released[current_task];
+}
+
+static void detach_program(unsigned task)
+{
+    lume_files_release(&tasks[task].files);
 }
 
 static struct
@@ -234,6 +248,12 @@ bool lume_worker_busy_on(unsigned slot)
     return slot < LUME_WORK_DOMAINS && worker_functions[slot] != NULL;
 }
 
+uint64_t lume_worker_lock_wait_on(unsigned slot)
+{
+    (void)slot;
+    return 0;
+}
+
 bool lume_worker_resume_on(unsigned slot)
 {
     ++resumes;
@@ -269,9 +289,10 @@ unsigned lume_work_drain(unsigned budget)
 
 unsigned lume_work_drain_on(unsigned slot, unsigned budget)
 {
-    assert(budget == 8);
+    assert(budget == 1);
+    bool pending = work_pending[slot];
     work_pending[slot] = false;
-    return 1;
+    return pending ? 1 : 0;
 }
 
 static void sched_wake(unsigned *scheduler, unsigned task, unsigned tick, unsigned extra)
@@ -377,6 +398,8 @@ void *lume_kernel_allocate(size_t bytes)
 
 static void reset(void)
 {
+    memset(&local, 0, sizeof(local));
+    memset(lock_ticks, 0, sizeof(lock_ticks));
     memset(kernel_files_closed, 0, sizeof(kernel_files_closed));
     memset(files_released, 0, sizeof(files_released));
     memset(tasks, 0, sizeof(tasks));

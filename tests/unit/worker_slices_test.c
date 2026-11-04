@@ -114,6 +114,11 @@ static uint64_t lume_counter_frequency(void)
 
 #define LUME_EARLY_H
 
+static uint64_t lume_pages_alloc_span(unsigned count)
+{
+    return (uintptr_t)calloc(count, 4096);
+}
+
 static _Noreturn void lume_fail(const char *message)
 {
     if (failure_expected)
@@ -145,6 +150,25 @@ static void lume_value(const char *name, uint64_t value)
 }
 
 #define LUME_SMP_H
+#define LUME_CPU_LIMIT 4u
+
+static void lume_smp_lock(void)
+{
+    T(!lock_owned);
+    lock_owned = true;
+    ++lock_turn;
+}
+
+static void lume_smp_unlock(void)
+{
+    T(lock_owned);
+    lock_owned = false;
+}
+
+static uint64_t lume_smp_wait_total(void)
+{
+    return 0;
+}
 
 static bool lume_smp_contended(void)
 {
@@ -517,6 +541,8 @@ static void guard_failure(void)
     failure_expected = false;
     T(!strcmp(failure_message, "kernel worker stack overflow"));
     T(phase == 1 && lume_worker_busy());
+    /* The host fatal handler discarded the resume frame that held this claim. */
+    workers[0].running = false;
     __worker_stack[0] = __worker_stack[1];
     T(lume_worker_resume() && phase == 2 && !lume_worker_busy());
     stats(1, 2, 0, 0, 1);

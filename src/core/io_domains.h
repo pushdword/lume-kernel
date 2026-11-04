@@ -3,18 +3,29 @@
 #include "lume/work.h"
 #include "lume/worker.h"
 
+_Static_assert(LUME_WORKER_LIMIT == LUME_WORK_DOMAINS, "one worker per resource domain");
+
 struct kernel_io_lane
 {
     struct io_queue queue;
     unsigned owner;
     int64_t result;
-    bool launch, deferred_turn, exclusive, mutation, exclusive_pending;
+    bool launch, deferred_turn, exclusive, mutation, exclusive_pending, reclaim;
 };
 
 static struct kernel_io_lane kernel_lanes[LUME_WORK_DOMAINS];
 static struct io_queue kernel_control_queue;
 static unsigned kernel_lane_cursor;
 static uint64_t kernel_parallel_epoch, kernel_drain_until, kernel_drain_retry;
+
+enum kernel_memory_phase
+{
+    KERNEL_MEMORY_LIVE,
+    KERNEL_MEMORY_RECLAIMING,
+    KERNEL_MEMORY_RELEASED
+};
+
+static enum kernel_memory_phase kernel_memory_release[LUME_TASK_LIMIT];
 
 static bool kernel_task_active(unsigned task)
 {

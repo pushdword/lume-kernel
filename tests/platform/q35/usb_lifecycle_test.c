@@ -32,6 +32,33 @@ bool lume_worker_busy(void)
     return false;
 }
 
+bool lume_worker_pause(uint64_t deadline)
+{
+    (void)deadline;
+    return false;
+}
+
+bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
+{
+    (void)value;
+    (void)mask;
+    (void)deadline;
+    return false;
+}
+
+int lume_work_submit(struct lume_work *work)
+{
+    work->queued = true;
+    return 0;
+}
+
+bool lume_work_cancel(struct lume_work *work)
+{
+    bool queued = work->queued;
+    work->queued = false;
+    return queued;
+}
+
 uint64_t lume_q35_counter_frequency(void)
 {
     return 1000000;
@@ -211,6 +238,7 @@ int main(void)
     h->ports = 1;
     h->context_bytes = 32;
     h->valid = h->running = true;
+    h->operation = HOST_START;
     h->event_cycle = 1;
     h->events = page(h);
     h->dcbaa = page(h);
@@ -235,6 +263,7 @@ int main(void)
     uint32_t replacement = h->devices[1].inventory;
     assert(replacement && replacement != first);
     before = live;
+    h->operation = HOST_IDLE;
     assert(!lume_usb_stop_host(0) && live == before);
     *(uint32_t *)(uintptr_t)(h->op + 4) = 1;
     assert(lume_usb_stop_host(0) && !live && !keyboard_count && !mouse_count);

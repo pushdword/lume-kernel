@@ -12,6 +12,7 @@
 #include "lume/abi.h"
 #include "lume/dma.h"
 #include "lume/worker.h"
+#include "lume/work.h"
 #if defined(LUME_ARCH_AMD64)
 #include "lume/usb_inventory.h"
 #include "lume/hardware_abi.h"
@@ -27,6 +28,20 @@ bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32
 #define RP1 LUME_BOARD_RP1_BASE
 #define MAX_SLOTS 8u
 #define MAX_PAGES 192u
+
+enum host_operation
+{
+    HOST_IDLE,
+    HOST_START,
+    HOST_SCAN,
+    HOST_STOP,
+};
+
+enum completion
+{
+    COMMAND_READY = 1,
+    TRANSFER_READY = 2,
+};
 
 struct input
 {
@@ -60,14 +75,19 @@ struct host
     struct lume_xhci_ring command;
     struct device devices[MAX_SLOTS + 1];
     uint64_t waiting_command, waiting_transfer;
-    unsigned command_code, command_slot, transfer_code;
+    unsigned command_code, command_slot, transfer_code, transfer_slot;
+    volatile uint32_t completion;
     bool running, valid;
     unsigned errors, completions;
     uint32_t root_ready, next_scan;
     unsigned retired_reports, retired_characters, retired_dropped;
-    bool scanning;
+    bool scanning, event_polling;
+    /* The host operation owns command, EP0 and DMA storage across worker waits. */
+    enum host_operation operation;
+    struct lume_work topology;
 };
 static struct host hosts[2];
+static void topology_work(void *);
 static unsigned keyboard_count, mouse_count, hub_count;
 #ifdef LUME_PLATFORM_LKM
 static unsigned configured_hosts;
@@ -77,7 +97,7 @@ static unsigned configured_hosts = 3;
 
 bool lume_usb_configure_host(unsigned index, bool enabled)
 {
-    if (index >= 2 || hosts[index].valid)
+    if (index >= 2 || hosts[index].valid || hosts[index].operation != HOST_IDLE)
         return false;
     if (enabled)
         configured_hosts |= 1u << index;
@@ -88,9 +108,9 @@ bool lume_usb_configure_host(unsigned index, bool enabled)
 #if defined(LUME_ARCH_AMD64)
 bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent)
 {
-    if (index >= 2 || hosts[index].valid || !parent || (base & 4095) || size < 0x4000 ||
-        base < UINT64_C(0xc0000000) || base >= UINT64_C(0x100000000) ||
-        size > UINT64_C(0x100000000) - base)
+    if (index >= 2 || hosts[index].valid || hosts[index].operation != HOST_IDLE || !parent ||
+        (base & 4095) || size < 0x4000 || base < UINT64_C(0xc0000000) ||
+        base >= UINT64_C(0x100000000) || size > UINT64_C(0x100000000) - base)
         return false;
     pci_hosts[index].base = base;
     pci_hosts[index].size = size;
@@ -113,7 +133,30 @@ static uint32_t milliseconds(struct host *h)
 static void delay(struct host *h, unsigned us)
 {
     uint64_t start = lume_counter_read();
-    while (lume_counter_read() - start < h->frequency * us / 1000000)
+    uint64_t ticks = h->frequency * us / 1000000;
+    if (lume_worker_pause(start + ticks))
+        return;
+    while (lume_counter_read() - start < ticks)
+    {
+        lume_uart_poll_input();
+        lume_cpu_relax();
+    }
+}
+
+static void wait_progress(struct host *h, uint32_t mask, uint64_t deadline)
+{
+    uint64_t now = lume_counter_read();
+    if ((int64_t)(now - deadline) >= 0)
+        return;
+    uint64_t next = now + h->frequency / 1000 + (h->frequency % 1000 != 0);
+    if ((int64_t)(next - deadline) > 0)
+        next = deadline;
+    if (lume_worker_wait_bits(&h->completion, mask, next))
+        return;
+    uint64_t until = now + h->frequency / 20000 + (h->frequency % 20000 != 0);
+    if ((int64_t)(until - deadline) > 0)
+        until = deadline;
+    while ((int64_t)(lume_counter_read() - until) < 0)
     {
         lume_uart_poll_input();
         lume_cpu_relax();
@@ -122,13 +165,13 @@ static void delay(struct host *h, unsigned us)
 
 static bool wait_register(struct host *h, uint64_t a, uint32_t mask, uint32_t value, unsigned ms)
 {
-    uint64_t start = lume_counter_read();
+    uint64_t deadline = lume_counter_read() + h->frequency * ms / 1000;
     do
     {
         if ((lume_mmio_read32(a) & mask) == value)
             return true;
-        delay(h, 50);
-    } while (lume_counter_read() - start < h->frequency * ms / 1000);
+        wait_progress(h, 0, deadline);
+    } while ((int64_t)(lume_counter_read() - deadline) < 0);
     return false;
 }
 
@@ -236,6 +279,9 @@ static void arm_input(struct host *h, struct device *d, struct input *input)
 
 static void events(struct host *h)
 {
+    if (h->event_polling || !h->events)
+        return;
+    h->event_polling = true;
     unsigned used = 0;
     while (used++ < 256)
     {
@@ -248,16 +294,21 @@ static void events(struct host *h)
         unsigned type = (e.control >> 10) & 63, cc = e.status >> 24, slot = e.control >> 24,
                  ep = (e.control >> 16) & 31;
         ++h->completions;
-        if (type == 33 && e.parameter == h->waiting_command)
+        if (type == 33 && h->waiting_command && e.parameter == h->waiting_command)
         {
             h->command_code = cc;
             h->command_slot = slot;
+            h->completion |= COMMAND_READY;
         }
         else if (type == 32 && slot && slot <= MAX_SLOTS)
         {
             struct device *d = &h->devices[slot];
-            if (ep == 1 && (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13)))
+            if (ep == 1 && h->waiting_transfer && slot == h->transfer_slot &&
+                (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13)))
+            {
                 h->transfer_code = cc;
+                h->completion |= TRANSFER_READY;
+            }
             else if (!d->disconnected)
             {
                 for (unsigned n = 0; n < d->inputs; ++n)
@@ -304,22 +355,26 @@ static void events(struct host *h)
     }
     write64(h->rt + 0x38, dma(&h->events[h->event_head]) | 8);
     lume_mmio_write32(h->rt + 0x20, 1); /* IP W1C, IE stays clear: no RP1 interrupts. */
+    h->event_polling = false;
 }
 
 static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned control,
                     unsigned *slot)
 {
+    if (h->operation == HOST_IDLE || h->waiting_command || h->waiting_transfer)
+        return false;
     h->command_code = 0;
+    h->completion &= ~COMMAND_READY;
     h->waiting_command = enqueue(&h->command, parameter, 0, (type << 10) | control);
     lume_mmio_write32(h->doorbells, 0);
-    uint64_t start = lume_counter_read();
+    uint64_t deadline = lume_counter_read() + h->frequency;
     do
     {
         events(h);
         if (h->command_code)
             break;
-        delay(h, 50);
-    } while (lume_counter_read() - start < h->frequency);
+        wait_progress(h, COMMAND_READY, deadline);
+    } while ((int64_t)(lume_counter_read() - deadline) < 0);
     h->waiting_command = 0;
     if (h->command_code != 1)
     {
@@ -336,12 +391,14 @@ static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned 
 static bool control(struct host *h, struct device *d, uint8_t request_type, uint8_t request,
                     uint16_t value, uint16_t index, uint16_t bytes)
 {
-    if (bytes > 512)
+    if (bytes > 512 || h->operation == HOST_IDLE || h->waiting_command || h->waiting_transfer)
         return false;
     bool input = (request_type & 0x80) != 0;
     uint64_t setup = request_type | ((uint64_t)request << 8) | ((uint64_t)value << 16) |
                      ((uint64_t)index << 32) | ((uint64_t)bytes << 48);
     h->transfer_code = 0;
+    h->transfer_slot = d->slot;
+    h->completion &= ~TRANSFER_READY;
     if (bytes)
     {
         cache(d->buffer, 512, false);
@@ -353,15 +410,16 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
     h->waiting_transfer =
         enqueue(&d->ep0, 0, 0, (4u << 10) | 32 | ((!bytes || !input) ? 1u << 16 : 0));
     lume_mmio_write32(h->doorbells + d->slot * 4, 1);
-    uint64_t start = lume_counter_read();
+    uint64_t deadline = lume_counter_read() + h->frequency / 2;
     do
     {
         events(h);
         if (h->transfer_code)
             break;
-        delay(h, 50);
-    } while (lume_counter_read() - start < h->frequency / 2);
+        wait_progress(h, TRANSFER_READY, deadline);
+    } while ((int64_t)(lume_counter_read() - deadline) < 0);
     h->waiting_transfer = 0;
+    h->transfer_slot = 0;
     if (h->transfer_code != 1)
     {
         ++h->errors;
@@ -725,7 +783,8 @@ static bool remove_root(struct host *h, unsigned root)
 static void scan_roots(struct host *h, bool initial)
 {
     uint32_t now = milliseconds(h);
-    if (h->scanning || (!initial && (int32_t)(now - h->next_scan) < 0))
+    if ((h->operation != HOST_START && h->operation != HOST_SCAN) || h->scanning ||
+        (!initial && (int32_t)(now - h->next_scan) < 0))
         return;
     h->scanning = true;
     h->next_scan = now + 1000;
@@ -790,9 +849,31 @@ static void scan_roots(struct host *h, bool initial)
     h->scanning = false;
 }
 
+static void topology_work(void *context)
+{
+    struct host *h = context;
+    if (!h->running || h->operation != HOST_IDLE)
+        return;
+    h->operation = HOST_SCAN;
+    scan_roots(h, false);
+    h->operation = HOST_IDLE;
+}
+
+static void queue_topology(struct host *h)
+{
+    if (h->operation != HOST_IDLE || h->topology.queued ||
+        (int32_t)(milliseconds(h) - h->next_scan) < 0)
+        return;
+    h->topology.run = topology_work;
+    h->topology.context = h;
+    h->topology.domain = LUME_WORK_USB;
+    (void)lume_work_submit(&h->topology);
+}
+
 static bool host_start(struct host *h, unsigned index, uint64_t frequency)
 {
     *h = (struct host){0};
+    h->operation = HOST_START;
     h->index = index;
     h->frequency = frequency;
 #if !defined(LUME_ARCH_AMD64)
@@ -890,7 +971,8 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
 
 bool lume_usb_start_host(unsigned index, uint64_t frequency)
 {
-    if (index >= 2 || !(configured_hosts & (1u << index)) || !frequency)
+    if (index >= 2 || !(configured_hosts & (1u << index)) || !frequency ||
+        hosts[index].operation != HOST_IDLE)
         return false;
     if (hosts[index].valid)
         return hosts[index].running;
@@ -898,7 +980,9 @@ bool lume_usb_start_host(unsigned index, uint64_t frequency)
     if (!lume_pi5_dma_start())
         return false;
 #endif
-    return host_start(&hosts[index], index, frequency);
+    bool started = host_start(&hosts[index], index, frequency);
+    hosts[index].operation = HOST_IDLE;
+    return started;
 }
 
 bool lume_usb_start(uint64_t frequency)
@@ -919,11 +1003,10 @@ void lume_usb_poll(void)
     for (unsigned i = 0; i < 2; ++i)
     {
         struct host *h = &hosts[i];
-        if (!h->running)
+        if (!h->running || h->operation == HOST_STOP)
             continue;
         events(h);
-        if (!lume_worker_busy())
-            scan_roots(h, false);
+        queue_topology(h);
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &h->devices[slot];
@@ -953,6 +1036,9 @@ int lume_usb_getc(void)
     lume_usb_poll();
 #endif
     for (unsigned i = 0; i < 2; ++i)
+    {
+        if (!hosts[i].running)
+            continue;
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &hosts[i].devices[slot];
@@ -967,6 +1053,7 @@ int lume_usb_getc(void)
                     }
             }
         }
+    }
     return -LUME_EAGAIN;
 }
 
@@ -1007,14 +1094,22 @@ bool lume_usb_stop_host(unsigned index)
     if (index >= 2)
         return false;
     struct host *h = &hosts[index];
+    if (h->operation != HOST_IDLE)
+        return false;
     if (!h->valid)
         return true;
+    if (h->topology.queued && !lume_work_cancel(&h->topology))
+        return false;
+    h->operation = HOST_STOP;
+    h->running = false;
     lume_mmio_write32(h->op, 0);
     bool stopped = wait_register(h, h->op + 4, 1, 1, 500);
     lume_value(index ? "USB1_DMA_STOPPED" : "USB0_DMA_STOPPED", stopped);
     if (!stopped)
+    {
+        h->operation = HOST_IDLE;
         return false;
-    h->running = false;
+    }
 #if defined(LUME_ARCH_AMD64)
     for (unsigned depth = 5; depth-- > 0;)
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
@@ -1023,7 +1118,10 @@ bool lume_usb_stop_host(unsigned index)
             if (d->inventory && d->depth == depth)
             {
                 if (lume_usb_inventory_remove(d->inventory))
+                {
+                    h->operation = HOST_IDLE;
                     return false;
+                }
                 d->inventory = 0;
             }
         }
@@ -1038,7 +1136,10 @@ bool lume_usb_stop_host(unsigned index)
                 ok = false;
         }
     if (!ok)
+    {
+        h->operation = HOST_IDLE;
         return false;
+    }
     for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
     {
         for (unsigned n = 0; n < h->devices[slot].inputs; ++n)

@@ -21,12 +21,32 @@ void lume_heap_swap(unsigned a, unsigned b)
     ends[b] = value;
 }
 
+struct heap_page_copy
+{
+    struct
+    {
+        uint64_t source, target;
+    } pages[LUME_MMU_BATCH_PAGES];
+
+    unsigned count;
+};
+
+static void copy_heap_pages(void *context)
+{
+    const struct heap_page_copy *copy = context;
+    for (unsigned n = 0; n < copy->count; ++n)
+        for (unsigned i = 0; i < 4096; ++i)
+            ((unsigned char *)(uintptr_t)copy->pages[n].target)[i] =
+                ((const unsigned char *)(uintptr_t)copy->pages[n].source)[i];
+}
+
 bool lume_heap_clone(unsigned source, unsigned target)
 {
     if (source >= LUME_TASK_LIMIT || target >= LUME_TASK_LIMIT || source == target || ends[target])
         return false;
     uint64_t end = ends[source] ? ends[source] : HEAP_BASE;
     unsigned pages = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+    struct heap_page_copy copy = {0};
     for (unsigned i = 0; i < pages; ++i)
     {
         uint64_t address = HEAP_BASE + (uint64_t)i * 4096, physical;
@@ -40,12 +60,18 @@ bool lume_heap_clone(unsigned source, unsigned target)
             (void)lume_page_free(page);
             goto fail;
         }
-        for (unsigned j = 0; j < 4096; ++j)
-            ((unsigned char *)(uintptr_t)page)[j] = ((const unsigned char *)(uintptr_t)physical)[j];
+        copy.pages[copy.count].source = physical;
+        copy.pages[copy.count++].target = page;
         ends[target] = address + 4096;
-        if ((i & 15u) == 15u)
+        if (copy.count == LUME_MMU_BATCH_PAGES)
+        {
+            lume_worker_compute(copy_heap_pages, &copy);
             lume_worker_checkpoint(65536);
+            copy.count = 0;
+        }
     }
+    if (copy.count)
+        copy_heap_pages(&copy);
     ends[target] = end;
     return true;
 fail:
@@ -53,14 +79,29 @@ fail:
     return false;
 }
 
-static void release_page(unsigned task, unsigned index)
+static void release_pages(unsigned task, unsigned first, unsigned count)
 {
-    uint64_t va = HEAP_BASE + (uint64_t)index * 4096, physical;
-    if (!lume_mmu_translate(lume_mmu_task_root(task), va, true, true, false, &physical))
-        lume_fail("heap mapping release");
-    lume_mmu_unmap_user(task, va);
-    if (!lume_page_free(physical))
-        lume_fail("heap page release");
+    while (count)
+    {
+        uint64_t addresses[LUME_MMU_BATCH_PAGES], physical[LUME_MMU_BATCH_PAGES];
+        unsigned batch = count < LUME_MMU_BATCH_PAGES ? count : LUME_MMU_BATCH_PAGES;
+        for (unsigned i = 0; i < batch; ++i)
+        {
+            addresses[i] = HEAP_BASE + (uint64_t)(first + i) * 4096;
+            if (!lume_mmu_translate(lume_mmu_task_root(task), addresses[i], true, true, false,
+                                    physical + i))
+                lume_fail("heap mapping release");
+        }
+        if (!lume_mmu_unmap_user_batch(task, addresses, batch))
+            lume_fail("heap mapping release");
+        for (unsigned i = 0; i < batch; ++i)
+            if (!lume_page_free(physical[i]))
+                lume_fail("heap page release");
+        first += batch;
+        count -= batch;
+        if (batch == LUME_MMU_BATCH_PAGES)
+            lume_worker_checkpoint(65536);
+    }
 }
 
 int64_t lume_heap_brk(unsigned pid, uint64_t end)
@@ -90,23 +131,15 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
         {
             if (p)
                 (void)lume_page_free(p);
-            while (added > before)
-            {
-                --added;
-                release_page(task, added);
-            }
+            release_pages(task, before, added - before);
             lume_mmu_switch(lume_mmu_task_root(task));
             return -LUME_ENOMEM;
         }
         if ((added & 15u) == 15u)
             lume_worker_checkpoint(65536);
     }
-    for (unsigned i = after; i < before; ++i)
-    {
-        release_page(task, i);
-        if ((i & 15u) == 15u)
-            lume_worker_checkpoint(65536);
-    }
+    if (after < before)
+        release_pages(task, after, before - after);
     ends[task] = end;
     lume_mmu_switch(lume_mmu_task_root(task));
     return (int64_t)end;
@@ -119,12 +152,7 @@ void lume_heap_release(unsigned pid)
     unsigned task = pid - 1;
     uint64_t end = ends[task] ? ends[task] : HEAP_BASE;
     unsigned count = (unsigned)((end - HEAP_BASE + 4095) / 4096);
-    for (unsigned i = 0; i < count; ++i)
-    {
-        release_page(task, i);
-        if ((i & 15u) == 15u)
-            lume_worker_checkpoint(65536);
-    }
+    release_pages(task, 0, count);
     ends[task] = 0;
 }
 

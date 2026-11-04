@@ -2,6 +2,7 @@
 #include "lume/platform_driver.h"
 #include "lume/abi.h"
 #include "lume/dma.h"
+#include "lume/worker.h"
 #include "terminal.h"
 #include "console_font.h"
 #include <string.h>
@@ -262,20 +263,64 @@ static int graphics_claim(bool acquire)
     return 0;
 }
 
+struct framebuffer_update
+{
+    uintptr_t memory;
+    unsigned width, height, pitch, depth, order;
+    struct lume_graphics_request request;
+    int result;
+};
+
+static void present_compute(void *context)
+{
+    struct framebuffer_update *update = context;
+    const struct lume_graphics_request *request = &update->request;
+    update->result = lume_framebuffer_present(update->memory, update->width, update->height,
+                                              update->pitch, update->depth, update->order, request);
+    if (update->result)
+        return;
+    uintptr_t first =
+        update->memory + (size_t)request->y * update->pitch + request->x * (update->depth / 8);
+    if (!lume_dma_sync_rect_for_device((const void *)first, request->width * (update->depth / 8),
+                                       update->pitch, request->height, LUME_DMA_TO_DEVICE))
+        update->result = -LUME_EIO;
+}
+
 static int graphics_present(const struct lume_graphics_request *request)
 {
     if (!console.enabled || !console.graphics_owned)
         return -LUME_EBADF;
-    int result = lume_framebuffer_present(console.memory, console.width, console.height,
-                                          console.pitch, console.depth, console.order, request);
-    if (result)
-        return result;
-    uintptr_t first =
-        console.memory + (size_t)request->y * console.pitch + request->x * (console.depth / 8);
-    return lume_dma_sync_rect_for_device((const void *)first, request->width * (console.depth / 8),
-                                         console.pitch, request->height, LUME_DMA_TO_DEVICE)
-               ? 0
-               : -LUME_EIO;
+    struct framebuffer_update update = {
+        .memory = console.memory,
+        .width = console.width,
+        .height = console.height,
+        .pitch = console.pitch,
+        .depth = console.depth,
+        .order = console.order,
+        .request = *request,
+    };
+    const struct lume_graphics_request full = *request;
+    if (!update.memory || (update.depth != 16 && update.depth != 32) || update.order > 1 ||
+        full.format != LUME_GRAPHICS_XRGB8888 || !full.width || !full.height ||
+        full.x > update.width || full.y > update.height || full.width > update.width - full.x ||
+        full.height > update.height - full.y || (uint64_t)full.width * 4 > full.pitch ||
+        (uint64_t)update.width * (update.depth / 8) > update.pitch)
+        return -LUME_EINVAL;
+    unsigned batch = LUME_WORKER_SLICE_BYTES / ((uint64_t)full.width * 4);
+    if (!batch)
+        batch = 1;
+    for (unsigned row = 0; row < full.height;)
+    {
+        update.request = full;
+        update.request.y += row;
+        update.request.pixels += (uint64_t)row * full.pitch;
+        update.request.height = full.height - row < batch ? full.height - row : batch;
+        lume_worker_compute(present_compute, &update);
+        if (update.result)
+            return update.result;
+        row += update.request.height;
+    }
+    return 0;
 }
 
 static const struct lume_platform_graphics_ops graphics_operations = {

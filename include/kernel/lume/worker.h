@@ -7,7 +7,7 @@
 /* Workers preserve synchronous call stacks across device waits. Entry, resume, waits and
  * checkpoints require masked IRQs and the scheduler lock. Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
-#define LUME_WORKER_LIMIT 4u
+#define LUME_WORKER_LIMIT 5u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);
@@ -18,6 +18,11 @@ bool lume_worker_submit_on(unsigned slot, void (*run)(void *), void *context);
 bool lume_worker_busy_on(unsigned slot);
 bool lume_worker_resume_on(unsigned slot);
 unsigned lume_worker_current(void);
+uint64_t lume_worker_lock_wait_on(unsigned slot);
+/* Compute callbacks use pinned RAM and cache operations with IRQs masked. The worker keeps
+ * subsystem ownership while releasing the scheduler lock. Callbacks must not allocate,
+ * access device registers, invoke kernel services or suspend. Calls outside a worker run inline. */
+void lume_worker_compute(void (*run)(void *), void *context);
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline);
 bool lume_worker_pause(uint64_t deadline);
 bool lume_worker_pause_ms(unsigned milliseconds);

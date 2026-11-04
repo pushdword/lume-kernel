@@ -10,6 +10,7 @@ enum lume_work_domain
     LUME_WORK_STORAGE,
     LUME_WORK_NETWORK,
     LUME_WORK_DISPLAY,
+    LUME_WORK_USB,
     LUME_WORK_DOMAINS
 };
 

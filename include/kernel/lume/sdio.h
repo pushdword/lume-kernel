@@ -31,6 +31,11 @@ bool lume_sdio_backplane_read(const struct lume_sdio_bus *, uint32_t, uint32_t *
 bool lume_sdio_backplane_write(const struct lume_sdio_bus *, uint32_t, uint32_t);
 bool lume_sdio_memory(const struct lume_sdio_bus *, bool, uint32_t, void *, size_t);
 const struct lume_sdio_bus *lume_wifi_bus(void);
+/* Reservations require the scheduler lock and remain owned across worker suspension.
+ * Nested calls from the owning worker share the reservation. Other workers are rejected
+ * without waiting. */
+bool lume_wifi_claim(void);
+void lume_wifi_release(void);
 bool lume_wifi_transfer_clock(void);
 bool lume_wifi_probe(uint64_t counter_hz, bool bcm2712d0);
 void lume_wifi_stop(void);

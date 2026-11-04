@@ -87,6 +87,14 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
     abort();
 }
 
+bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
+{
+    assert(count && count <= LUME_MMU_BATCH_PAGES);
+    for (unsigned i = 0; i < count; ++i)
+        lume_mmu_unmap_user(task, addresses[i]);
+    return true;
+}
+
 uint64_t lume_mmu_task_root(unsigned task)
 {
     assert(task == 3 || task == 4);
@@ -114,6 +122,10 @@ void lume_sync_code_defer(uint64_t address, size_t bytes)
     ++syncs;
 }
 
+void lume_sync_code_clean_finish(void)
+{
+}
+
 void lume_sync_code_finish(void)
 {
     ++completions;
@@ -123,6 +135,11 @@ void lume_worker_checkpoint(unsigned bytes)
 {
     assert(bytes == 65536);
     ++checkpoints;
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
 }
 
 _Noreturn void lume_fail(const char *message)
