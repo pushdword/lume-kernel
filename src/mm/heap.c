@@ -4,6 +4,7 @@
 #include "lume/heap.h"
 #include "lume/mmu.h"
 #include "lume/gpu_device.h"
+#include "lume/worker.h"
 #define HEAP_BASE LUME_HEAP_BASE
 static uint64_t ends[LUME_TASK_LIMIT];
 
@@ -42,6 +43,8 @@ bool lume_heap_clone(unsigned source, unsigned target)
         for (unsigned j = 0; j < 4096; ++j)
             ((unsigned char *)(uintptr_t)page)[j] = ((const unsigned char *)(uintptr_t)physical)[j];
         ends[target] = address + 4096;
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
     }
     ends[target] = end;
     return true;
@@ -95,10 +98,14 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
             lume_mmu_switch(lume_mmu_task_root(task));
             return -LUME_ENOMEM;
         }
+        if ((added & 15u) == 15u)
+            lume_worker_checkpoint(65536);
     }
     for (unsigned i = after; i < before; ++i)
     {
         release_page(task, i);
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
     }
     ends[task] = end;
     lume_mmu_switch(lume_mmu_task_root(task));
@@ -113,7 +120,11 @@ void lume_heap_release(unsigned pid)
     uint64_t end = ends[task] ? ends[task] : HEAP_BASE;
     unsigned count = (unsigned)((end - HEAP_BASE + 4095) / 4096);
     for (unsigned i = 0; i < count; ++i)
+    {
         release_page(task, i);
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
+    }
     ends[task] = 0;
 }
 

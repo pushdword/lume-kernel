@@ -1,32 +1,54 @@
 #include "lume/work.h"
 #include "lume/irq.h"
 #include "lume/abi.h"
-static struct lume_work *queue[LUME_WORK_LIMIT];
-static unsigned head, count;
-static bool draining;
+
+static struct
+{
+    struct lume_work *entries[LUME_WORK_LIMIT];
+    unsigned head, count;
+    bool draining;
+    struct lume_work *running;
+} queues[LUME_WORK_DOMAINS];
 
 bool lume_work_pending(void)
 {
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        if (lume_work_pending_on(i))
+            return true;
+    return false;
+}
+
+bool lume_work_pending_on(unsigned domain)
+{
+    if (domain >= LUME_WORK_DOMAINS)
+        return false;
     uint64_t flags = lume_irq_save();
-    bool result = count != 0;
+    bool result = queues[domain].count != 0;
     lume_irq_restore(flags);
     return result;
 }
 
 int lume_work_submit(struct lume_work *work)
 {
-    if (!work || !work->run)
+    if (!work || !work->run || work->domain >= LUME_WORK_DOMAINS)
         return -LUME_EINVAL;
     uint64_t flags = lume_irq_save();
     int result = 0;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        if (queues[i].running == work && i != work->domain)
+        {
+            lume_irq_restore(flags);
+            return -LUME_EINVAL;
+        }
     if (!work->queued)
     {
-        if (count == LUME_WORK_LIMIT)
+        unsigned domain = work->domain;
+        if (queues[domain].count == LUME_WORK_LIMIT)
             result = -LUME_ENOSPC;
         else
         {
-            queue[(head + count) % LUME_WORK_LIMIT] = work;
-            ++count;
+            unsigned slot = (queues[domain].head + queues[domain].count++) % LUME_WORK_LIMIT;
+            queues[domain].entries[slot] = work;
             work->queued = true;
         }
     }
@@ -38,43 +60,61 @@ bool lume_work_cancel(struct lume_work *work)
 {
     uint64_t flags = lume_irq_save();
     bool found = false;
-    for (unsigned i = 0; i < count; ++i)
-        if (queue[(head + i) % LUME_WORK_LIMIT] == work)
-        {
-            for (unsigned j = i + 1; j < count; ++j)
-                queue[(head + j - 1) % LUME_WORK_LIMIT] = queue[(head + j) % LUME_WORK_LIMIT];
-            queue[(head + --count) % LUME_WORK_LIMIT] = 0;
-            work->queued = false;
-            found = true;
-            break;
-        }
+    if (work)
+        for (unsigned domain = 0; domain < LUME_WORK_DOMAINS; ++domain)
+            if (queues[domain].running == work)
+            {
+                lume_irq_restore(flags);
+                return false;
+            }
+    for (unsigned domain = 0; domain < LUME_WORK_DOMAINS; ++domain)
+        for (unsigned i = 0; i < queues[domain].count; ++i)
+            if (queues[domain].entries[(queues[domain].head + i) % LUME_WORK_LIMIT] == work)
+            {
+                for (unsigned j = i + 1; j < queues[domain].count; ++j)
+                    queues[domain].entries[(queues[domain].head + j - 1) % LUME_WORK_LIMIT] =
+                        queues[domain].entries[(queues[domain].head + j) % LUME_WORK_LIMIT];
+                queues[domain]
+                    .entries[(queues[domain].head + --queues[domain].count) % LUME_WORK_LIMIT] = 0;
+                work->queued = false;
+                found = true;
+                break;
+            }
     lume_irq_restore(flags);
     return found;
 }
 
 unsigned lume_work_drain(unsigned budget)
 {
-    if (draining)
+    return lume_work_drain_on(LUME_WORK_GENERAL, budget);
+}
+
+unsigned lume_work_drain_on(unsigned domain, unsigned budget)
+{
+    if (domain >= LUME_WORK_DOMAINS || queues[domain].draining)
         return 0;
-    draining = true;
+    queues[domain].draining = true;
     unsigned done = 0;
     while (done < budget)
     {
         uint64_t flags = lume_irq_save();
-        struct lume_work *work = count ? queue[head] : 0;
+        struct lume_work *work =
+            queues[domain].count ? queues[domain].entries[queues[domain].head] : 0;
         if (work)
         {
-            queue[head] = 0;
-            head = (head + 1) % LUME_WORK_LIMIT;
-            --count;
+            queues[domain].entries[queues[domain].head] = 0;
+            queues[domain].head = (queues[domain].head + 1) % LUME_WORK_LIMIT;
+            --queues[domain].count;
             work->queued = false;
         }
         lume_irq_restore(flags);
         if (!work)
             break;
+        queues[domain].running = work;
         work->run(work->context);
+        queues[domain].running = 0;
         ++done;
     }
-    draining = false;
+    queues[domain].draining = false;
     return done;
 }

@@ -34,6 +34,15 @@ struct lume_file_ops
 
 static bool capable = true, claimed, valid_buffer = true;
 static unsigned presents;
+static unsigned presented_rows, checkpoints, checkpoint_bytes;
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(bytes && bytes <= 65536);
+    ++checkpoints;
+    checkpoint_bytes += bytes;
+}
+
 static int attach_error;
 
 void lume_gpu_release(unsigned owner)
@@ -81,7 +90,9 @@ int lume_platform_graphics_claim(bool acquire)
 
 int lume_platform_graphics_present(const struct lume_graphics_request *r)
 {
-    (void)r;
+    assert(r->width == 1024 && r->height <= 16 && r->y == presented_rows);
+    assert(r->pixels == 4096 + (uint64_t)presented_rows * 4096);
+    presented_rows += r->height;
     ++presents;
     return 0;
 }
@@ -143,7 +154,8 @@ int main(void)
     assert(lume_graphics_call(&files, 1, LUME_GRAPHICS_PRESENT, &r) == -LUME_EFAULT);
     valid_buffer = true;
     assert(!lume_graphics_call(&files, 1, LUME_GRAPHICS_PRESENT, &r));
-    assert(presents == 1);
+    assert(presents == 48 && presented_rows == 768 && checkpoints == 48);
+    assert(checkpoint_bytes == 1024 * 768 * 4);
     struct lume_input_event event = {.type = LUME_INPUT_KEY, .code = 4, .x = 1};
     for (unsigned i = 0; i < EVENTS + 1; ++i)
         lume_graphics_input(&event);

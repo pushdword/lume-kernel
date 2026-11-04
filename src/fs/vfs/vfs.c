@@ -131,6 +131,7 @@ static struct open_file
     int node, pipe;
     unsigned references, status;
     uint32_t flags;
+    bool closing;
     uint64_t offset;
     const struct lume_file_ops *external;
     void *context;
@@ -522,7 +523,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
 static int new_object(int node, int pipe, uint32_t flags)
 {
     for (unsigned i = 0; i < OPEN_FILES; ++i)
-        if (!open_files[i].references)
+        if (!open_files[i].references && !open_files[i].closing)
         {
             open_files[i] =
                 (struct open_file){.node = node, .pipe = pipe, .references = 1, .flags = flags};
@@ -613,6 +614,17 @@ bool lume_vfs_storage_io(struct lume_files *files, uint64_t fd)
     return file && file->references && !file->external && file->pipe < 0 &&
            nodes[file->node].kind == LUME_NODE_FILE && nodes[file->node].persistent &&
            !nodes[file->node].block;
+}
+
+bool lume_vfs_exec_callbacks(const struct lume_files *files)
+{
+    for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+    {
+        int object = files->fd[i].object;
+        if (object >= 0 && (files->fd[i].flags & LUME_FD_CLOEXEC) && open_files[object].external)
+            return true;
+    }
+    return false;
 }
 
 int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, void *context,
@@ -758,8 +770,11 @@ int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
     if (!d)
         return -LUME_EBADF;
     int result = 0;
+    bind_descriptor(f, (unsigned)fd, -1, 0);
     if (!--d->references)
     {
+        /* A suspended close callback retains its object until device cleanup returns. */
+        d->closing = true;
         if (d->external)
             d->external->close(d->context);
         else if (d->pipe >= 0)
@@ -785,8 +800,8 @@ int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
             --nodes[d->node].references;
             release_ram(&nodes[d->node]);
         }
+        d->closing = false;
     }
-    bind_descriptor(f, (unsigned)fd, -1, 0);
     return result;
 }
 

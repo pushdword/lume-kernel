@@ -7,6 +7,11 @@
 
 static uint64_t pinned_end;
 
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(bytes == 65536);
+}
+
 bool lume_gpu_heap_allowed(unsigned pid, uint64_t end)
 {
     return pid != 1 || end >= pinned_end;

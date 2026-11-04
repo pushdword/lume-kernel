@@ -43,6 +43,7 @@ bool lume_vfs_node_buffer(void *, size_t);
 void lume_files_init(struct lume_files *);
 void lume_files_clone(struct lume_files *, const struct lume_files *);
 void lume_files_inherit(struct lume_files *, const struct lume_files *);
+bool lume_vfs_exec_callbacks(const struct lume_files *);
 void lume_files_release(struct lume_files *);
 int64_t lume_vfs_open(struct lume_files *, const char *, uint64_t flags);
 void lume_vfs_terminal_open(int (*)(struct lume_files *, const char *, uint64_t));

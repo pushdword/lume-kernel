@@ -132,6 +132,11 @@ static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
 static const struct lume_file_ops tcp_ops = {LUME_NODE_SOCKET, tcp_close,  tcp_read, tcp_write,
                                              tcp_poll,         tcp_source, false};
 
+bool lume_socket_network_io(struct lume_files *files, unsigned fd)
+{
+    return lume_vfs_external(files, fd, &tcp_ops) != NULL;
+}
+
 static void discard_rights(struct local_ring *ring, uint64_t end)
 {
     while (ring->rights_count && ring->rights[ring->rights_first].offset < end)

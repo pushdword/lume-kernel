@@ -1,4 +1,5 @@
 #include "lume/graphics_device.h"
+#include "lume/worker.h"
 #include "lume/platform_driver.h"
 #include "lume/external_file.h"
 #include "lume/early.h"
@@ -160,5 +161,20 @@ int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action
     uint64_t bytes = (uint64_t)(r->height - 1) * r->pitch + (uint64_t)r->width * 4;
     if (!lume_user_buffer(r->pixels, bytes, false))
         return -LUME_EFAULT;
-    return lume_platform_graphics_present(r);
+    unsigned rows = 65536u / (r->width * 4u);
+    if (!rows)
+        rows = 1;
+    for (unsigned row = 0; row < r->height;)
+    {
+        struct lume_graphics_request part = *r;
+        part.y += row;
+        part.pixels += (uint64_t)row * r->pitch;
+        part.height = r->height - row < rows ? r->height - row : rows;
+        result = lume_platform_graphics_present(&part);
+        if (result)
+            return result;
+        row += part.height;
+        lume_worker_checkpoint(part.width * part.height * 4u);
+    }
+    return 0;
 }

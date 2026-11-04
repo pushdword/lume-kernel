@@ -226,6 +226,44 @@ static void model_compare(bool masked)
     T(!lume_work_pending());
 }
 
+static void pinned_callback(void *context)
+{
+    struct lume_work *work = context;
+    work->domain = LUME_WORK_NETWORK;
+    T(lume_work_submit(work) == -LUME_EINVAL);
+    work->domain = LUME_WORK_GENERAL;
+    T(!lume_work_submit(work));
+    T(!lume_work_cancel(work));
+}
+
+static void independent_domains(void)
+{
+    struct test_work pool[POOL_SIZE];
+    irq_masked = expected_masked = false;
+    initialize(pool);
+    for (unsigned i = 0; i < LUME_WORK_LIMIT; ++i)
+        T(!lume_work_submit(&pool[i].work));
+    pool[LUME_WORK_LIMIT].work.domain = LUME_WORK_NETWORK;
+    T(!lume_work_submit(&pool[LUME_WORK_LIMIT].work));
+    T(lume_work_pending_on(LUME_WORK_GENERAL) && lume_work_pending_on(LUME_WORK_NETWORK));
+    T(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
+    T(event_count == 1 && events[0] == LUME_WORK_LIMIT);
+    T(!lume_work_pending_on(LUME_WORK_NETWORK) && lume_work_pending_on(LUME_WORK_GENERAL));
+    T(lume_work_drain(LUME_WORK_LIMIT) == LUME_WORK_LIMIT);
+    T(event_count == LUME_WORK_LIMIT + 1);
+    for (unsigned i = 0; i < LUME_WORK_LIMIT; ++i)
+        T(events[i + 1] == i);
+    pool[0].work.domain = LUME_WORK_DOMAINS;
+    T(lume_work_submit(&pool[0].work) == -LUME_EINVAL);
+    T(!lume_work_pending_on(LUME_WORK_DOMAINS));
+    T(!lume_work_drain_on(LUME_WORK_DOMAINS, 1));
+    struct lume_work pinned = {.run = pinned_callback};
+    pinned.context = &pinned;
+    T(!lume_work_submit(&pinned));
+    T(lume_work_drain(1) == 1 && pinned.queued);
+    T(lume_work_cancel(&pinned) && !lume_work_pending());
+}
+
 int main(void)
 {
     queue_order(false);
@@ -234,6 +272,7 @@ int main(void)
     callback_changes(true);
     model_compare(false);
     model_compare(true);
+    independent_domains();
     T(saves == restores && !irq_depth);
     printf("WORK_QUEUE_PASS %u checks\n", checks);
     return 0;

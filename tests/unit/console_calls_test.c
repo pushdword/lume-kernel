@@ -51,9 +51,9 @@ static unsigned process_slot(unsigned task)
     return process_owner[task];
 }
 
-static bool lume_worker_busy(void)
+static bool kernel_inline_available(void)
 {
-    return busy;
+    return !busy || kernel_console_scope;
 }
 
 bool lume_console_ready(void)
@@ -82,12 +82,6 @@ bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
 {
     assert(files == &tasks[process_slot(current_task)].files);
     return fd == 4;
-}
-
-bool lume_vfs_storage_io(struct lume_files *files, uint64_t fd)
-{
-    assert(files == &tasks[process_slot(kernel_owner)].files);
-    return fd == 3;
 }
 
 static bool lume_user_buffer(uint64_t address, uint64_t bytes, bool writing)
@@ -129,45 +123,6 @@ static struct lume_context frame(unsigned number, uint64_t a, uint64_t b, uint64
     result.x[1] = b;
     result.x[2] = c;
     return result;
-}
-
-static void classification(void)
-{
-    kernel_owner = 0;
-    current_task = 1;
-    for (unsigned n = 0; n < LUME_TASK_LIMIT; ++n)
-        process_owner[n] = n;
-    unsigned allowed[] = {LUME_SYS_OPEN,   LUME_SYS_FILE_MODE, LUME_SYS_GETDENTS, LUME_SYS_CHDIR,
-                          LUME_SYS_GETCWD, LUME_SYS_SEEK,      LUME_SYS_STAT,     LUME_SYS_MKDIR,
-                          LUME_SYS_UNLINK, LUME_SYS_RMDIR};
-    for (unsigned n = 0; n < sizeof(allowed) / sizeof(*allowed); ++n)
-    {
-        tasks[0].context = frame(allowed[n], 0, 0, 0);
-        assert(kernel_console_storage(0));
-    }
-    unsigned restricted[] = {LUME_SYS_READ, LUME_SYS_WRITE, LUME_SYS_CLOSE};
-    for (unsigned n = 0; n < sizeof(restricted) / sizeof(*restricted); ++n)
-    {
-        tasks[0].context = frame(restricted[n], 3, 0, 0);
-        assert(kernel_console_storage(0));
-        tasks[0].context.x[0] = 1;
-        assert(!kernel_console_storage(0));
-    }
-    tasks[0].context = frame(LUME_SYS_FS, LUME_FS_SYNC, 3, 0);
-    assert(kernel_console_storage(0));
-    tasks[0].context.x[1] = 4;
-    assert(!kernel_console_storage(0));
-    tasks[0].context.x[0] = LUME_FS_TRUNCATE;
-    assert(!kernel_console_storage(0));
-    unsigned denied_calls[] = {LUME_SYS_MODULE, LUME_SYS_HARDWARE, LUME_SYS_NET,
-                               LUME_SYS_NETCTL, LUME_SYS_STREAM,   LUME_SYS_BOOT,
-                               LUME_SYS_EXEC,   LUME_SYS_FORK,     LUME_SYS_TERMINAL};
-    for (unsigned n = 0; n < sizeof(denied_calls) / sizeof(*denied_calls); ++n)
-    {
-        tasks[0].context = frame(denied_calls[n], 3, 0, 0);
-        assert(!kernel_console_storage(0));
-    }
-    assert(!kernel_console_storage(LUME_TASK_LIMIT));
 }
 
 static void pipe_and_descriptor_classification(void)
@@ -214,14 +169,6 @@ static void pipe_and_descriptor_classification(void)
     call = frame(LUME_SYS_WRITE, LUME_FD_INFO, 0, 0);
     assert(!kernel_fd_query_call(&call));
     kernel_console_scope = false;
-    call = frame(LUME_SYS_GRAPHICS, LUME_GRAPHICS_PRESENT, 0, 0);
-    assert(!kernel_graphics_call(&call));
-    kernel_console_scope = true;
-    assert(kernel_graphics_call(&call));
-    call.x[0] = LUME_GRAPHICS_ACQUIRE;
-    assert(!kernel_graphics_call(&call));
-    call.x[0] = LUME_GRAPHICS_QUERY;
-    assert(!kernel_graphics_call(&call));
     kernel_console_scope = false;
     busy = false;
     call = frame(LUME_SYS_READ, 4, 0, 0);
@@ -276,7 +223,6 @@ static void readiness_and_io(void)
 
 int main(void)
 {
-    classification();
     pipe_and_descriptor_classification();
     readiness_and_io();
     puts(

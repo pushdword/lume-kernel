@@ -172,7 +172,7 @@ static bool poll_valid;
 static bool repoll, tx_waiting;
 static uint64_t traffic_until;
 static void network_service(void *);
-static struct lume_work service_work = {.run = network_service};
+static struct lume_work service_work = {.run = network_service, .domain = LUME_WORK_NETWORK};
 
 void lume_net_poll_background(void)
 {
@@ -313,6 +313,7 @@ static void wait_ms(unsigned ms)
             lume_net_poll();
             last = now;
         }
+        (void)lume_worker_pause_ms(1);
     }
 }
 

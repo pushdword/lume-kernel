@@ -1,4 +1,5 @@
 #include "lume/vfs.h"
+#include "lume/external_file.h"
 #include "lume/wait.h"
 #include "lume/file_mode.h"
 #include <assert.h>
@@ -36,6 +37,41 @@ void lume_console_write(const char *data, size_t bytes)
     memcpy(console_data, data, bytes);
     console_bytes = bytes;
     ++console_calls;
+}
+
+static struct close_probe
+{
+    struct lume_files *owner, *other;
+    int fd, object, opened;
+    unsigned calls;
+} close_probe;
+
+static void close_during_allocation(void *context)
+{
+    struct close_probe *probe = context;
+    char byte;
+    T(probe->owner->fd[probe->fd].object < 0);
+    T(lume_vfs_read(probe->owner, probe->fd, &byte, 1) == -LUME_EBADF);
+    probe->opened = (int)lume_vfs_open(probe->other, "/dev/null", LUME_O_WRONLY);
+    T(probe->opened >= 0);
+    T(probe->other->fd[probe->opened].object != probe->object);
+    ++probe->calls;
+}
+
+static void closing_object_lifetime(void)
+{
+    struct lume_files owner, other;
+    lume_files_init(&owner);
+    lume_files_init(&other);
+    static const struct lume_file_ops ops = {.close = close_during_allocation};
+    close_probe = (struct close_probe){.owner = &owner, .other = &other};
+    close_probe.fd = lume_vfs_attach(&owner, &ops, &close_probe, 0);
+    T(close_probe.fd >= 0);
+    close_probe.object = owner.fd[close_probe.fd].object;
+    T(lume_vfs_close(&owner, close_probe.fd) == 0 && close_probe.calls == 1);
+    T(lume_vfs_write(&other, close_probe.opened, "x", 1) == 1);
+    lume_files_release(&owner);
+    lume_files_release(&other);
 }
 
 static void replace_files(void)
@@ -410,6 +446,7 @@ int main(void)
         T(lume_vfs_write(&f, request.other, b, 0) == 0);
         T(lume_vfs_close(&f, request.other) == 0);
     }
+    closing_object_lifetime();
     replace_files();
     jail_directory();
     recycled_nodes();

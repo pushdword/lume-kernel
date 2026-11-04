@@ -65,7 +65,7 @@ static struct lume_context *thread_finish(uint64_t result)
         if (thread_slots[i].thread && process_slot(i) == owner && states[i] && states[i] != 5)
             remaining = true;
     if (!remaining && states[owner] != 2 && (main_thread_done[owner] || process_exiting[owner]) &&
-        !(kernel_owner == owner && lume_worker_busy()))
+        !kernel_task_active(owner))
     {
         states[owner] = 1;
         sched_wake(&policy, owner, unit, 0);
@@ -81,7 +81,7 @@ static struct lume_context *process_terminate(unsigned status)
     process_status[owner] = status;
     process_exiting[owner] = true;
     thread_waiting[owner] = futex_address[owner] = 0;
-    if (states[owner] != 2 && !(kernel_owner == owner && lume_worker_busy()))
+    if (states[owner] != 2 && !kernel_task_active(owner))
     {
         states[owner] = 1;
         sched_wake(&policy, owner, unit, 0);

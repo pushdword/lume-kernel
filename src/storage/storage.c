@@ -41,7 +41,7 @@ static char read_path[128];
 static uint64_t next_flush_at = UINT64_MAX;
 static unsigned flush_cursor;
 static void flush_one(void *);
-static struct lume_work flush_work = {.run = flush_one};
+static struct lume_work flush_work = {.run = flush_one, .domain = LUME_WORK_STORAGE};
 #define STORAGE_FLUSH_MS 1000u
 #define STORAGE_FLUSH_BYTES (64u * 1024u)
 

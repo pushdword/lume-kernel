@@ -4,17 +4,23 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The single worker preserves synchronous kernel call stacks across device waits.
- * Entry, resume, waits and checkpoints require masked IRQs. Callers serialize shared subsystems
- * until the submitted function returns. Wait storage must outlive the function. */
+/* Workers preserve synchronous call stacks across device waits. Entry, resume, waits and
+ * checkpoints require masked IRQs and the scheduler lock. Resource queues own subsystem
+ * admission until the submitted function returns. Wait storage must outlive the function. */
+#define LUME_WORKER_LIMIT 4u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);
 bool lume_worker_submit(void (*run)(void *), void *context);
 bool lume_worker_busy(void);
 bool lume_worker_resume(void);
+bool lume_worker_submit_on(unsigned slot, void (*run)(void *), void *context);
+bool lume_worker_busy_on(unsigned slot);
+bool lume_worker_resume_on(unsigned slot);
+unsigned lume_worker_current(void);
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline);
 bool lume_worker_pause(uint64_t deadline);
+bool lume_worker_pause_ms(unsigned milliseconds);
 /* Checkpoints charge processed bytes and yield after 64 KiB or 2 ms of running time.
  * A CPU waiting for the kernel lock also causes a yield at the next checkpoint.
  * A contended yield resumes after another lock acquisition or on another CPU.

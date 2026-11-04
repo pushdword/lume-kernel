@@ -69,7 +69,7 @@ static void release_fiber(struct lume_fiber *fiber)
 
 static void lume_fiber_init(struct lume_fiber *fiber, uintptr_t top, void (*target)(void))
 {
-    T(top == (uintptr_t)__worker_top);
+    T(top != 0);
     release_fiber(fiber);
 #ifdef _WIN32
     fiber->target = target;
@@ -137,6 +137,9 @@ static void lume_value(const char *name, uint64_t value)
         observed_timeouts = value;
     else if (!strcmp(name, "KERNEL_WORKER_YIELDS"))
         observed_yields = value;
+    else if (!strcmp(name, "KERNEL_WORKER_PEAK") || !strcmp(name, "KERNEL_WORKER_OVERLAPS") ||
+             !strcmp(name, "KERNEL_WORKER_MAX_SLICE_TICKS"))
+        (void)value;
     else
         T(false);
 }
@@ -554,6 +557,58 @@ static void profiling_across_suspension(void)
     T(out.rows[0][LUME_ACTIVITY_WORKER].ticks == 9);
 }
 
+struct independent_case
+{
+    volatile uint32_t event;
+    unsigned stage;
+    uint64_t marker;
+};
+
+static void independent_job(void *context)
+{
+    struct independent_case *test = context;
+    volatile uint64_t preserved[64];
+    for (unsigned i = 0; i < 64; ++i)
+        preserved[i] = test->marker ^ i;
+    test->stage = 1;
+    T(lume_worker_wait_bits(&test->event, 1, ticks + 1000000));
+    T(test->event == 1);
+    test->stage = 2;
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    for (unsigned i = 0; i < 64; ++i)
+        T(preserved[i] == (test->marker ^ i));
+    test->stage = 3;
+}
+
+static void independent_waits(void)
+{
+    struct independent_case cases[3] = {
+        {.marker = 0x11223344}, {.marker = 0xaabbccdd}, {.marker = 0x44556677}};
+    lume_worker_start();
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        T(lume_worker_submit_on(i + 1, independent_job, cases + i));
+        T(lume_worker_resume_on(i + 1) && cases[i].stage == 1);
+    }
+    T(peak == 3 && overlaps == 2);
+    T(!lume_worker_submit_on(1, independent_job, cases));
+    T(!lume_worker_submit_on(LUME_WORKER_LIMIT, independent_job, cases));
+    T(!lume_worker_resume() && !lume_worker_busy_on(0));
+    T(!lume_worker_resume_on(1) && !lume_worker_resume_on(2) && !lume_worker_resume_on(3));
+    const unsigned order[] = {1, 2, 0};
+    for (unsigned n = 0; n < 3; ++n)
+    {
+        unsigned i = order[n];
+        cases[i].event = 1;
+        T(lume_worker_resume_on(i + 1) && cases[i].stage == 2);
+        T(lume_worker_resume_on(i + 1) && cases[i].stage == 3);
+        T(!lume_worker_busy_on(i + 1));
+        for (unsigned j = n + 1; j < 3; ++j)
+            T(cases[order[j]].stage == 1);
+    }
+    T(!lume_worker_busy() && jobs == 3);
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -586,7 +641,9 @@ int main(void)
     T(counter_reads == reads_before && contention_reads == contention_before &&
       !lume_worker_busy());
     profiling_across_suspension();
-    release_fiber(&worker);
+    independent_waits();
+    for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
+        release_fiber(&workers[i].fiber);
 #ifdef _WIN32
     T(ConvertFiberToThread());
 #endif

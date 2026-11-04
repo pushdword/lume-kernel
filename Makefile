@@ -323,7 +323,7 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -547,6 +547,14 @@ $(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/w
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/core/work.c -o "$@"
 check: check-worker-slices
+
+.PHONY: check-io-domains
+check-io-domains: $(OUT)/tests/io-classify$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_classify.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+check: check-io-domains
 
 .PHONY: check-usb-poll
 check-usb-poll: $(OUT)/tests/usb-poll$(HOSTEXE)

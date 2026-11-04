@@ -20,6 +20,12 @@ uint32_t lume_clock_millis(void)
     return (uint32_t)milliseconds;
 }
 
+bool lume_worker_pause_ms(unsigned duration)
+{
+    milliseconds += duration;
+    return true;
+}
+
 uint64_t lume_irq_save(void)
 {
     return 0;
@@ -155,25 +161,28 @@ int main(void)
     for (unsigned i = 0; i < 5; ++i)
         lume_net_poll_background();
     assert(!received_frames && lume_work_pending());
-    assert(lume_work_drain(1) == 1 && received_frames == 8 && lume_work_pending());
-    assert(lume_work_drain(1) == 1 && received_frames == 16 && lume_work_pending());
-    assert(lume_work_drain(1) == 1 && received_frames == 20 && !lume_work_pending());
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1 && received_frames == 8 &&
+           lume_work_pending());
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1 && received_frames == 16 &&
+           lume_work_pending());
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1 && received_frames == 20 &&
+           !lume_work_pending());
     struct lume_net_statistics statistics;
     lume_netif_statistics(interface, &statistics);
     assert(statistics.rx_budget_exhausted == 2 && checkpoints == 20);
     milliseconds = 100;
     lume_net_poll_background();
-    assert(lume_work_drain(1) == 1);
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
     milliseconds = 101;
     lume_net_poll_background();
     assert(!lume_work_pending());
     milliseconds = 110;
     lume_net_poll_background();
-    assert(lume_work_drain(1) == 1);
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
     active_stream = true;
     milliseconds = 111;
     lume_net_poll_background();
-    assert(lume_work_drain(1) == 1);
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
     active_stream = false;
     struct lume_work occupied[LUME_WORK_LIMIT];
     for (unsigned i = 0; i < LUME_WORK_LIMIT; ++i)
@@ -183,9 +192,10 @@ int main(void)
     }
     milliseconds = 121;
     lume_net_poll_background();
-    assert(lume_work_drain(LUME_WORK_LIMIT) == LUME_WORK_LIMIT);
-    lume_net_poll_background();
-    assert(lume_work_drain(1) == 1 && !lume_work_pending());
+    assert(lume_work_pending_on(LUME_WORK_GENERAL) && lume_work_pending_on(LUME_WORK_NETWORK));
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
+    assert(lume_work_pending_on(LUME_WORK_GENERAL) && !lume_work_pending_on(LUME_WORK_NETWORK));
+    assert(lume_work_drain(LUME_WORK_LIMIT) == LUME_WORK_LIMIT && !lume_work_pending());
     puts("PASS network deferred service, RX budget, rearming, serialization and queue pressure");
     return 0;
 }

@@ -1,6 +1,8 @@
 #include "lume/abi.h"
 #include "lume/vfs.h"
 #include "lume/wait.h"
+#include "lume/worker.h"
+#include "lume/work.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,28 +24,36 @@ static struct
     struct lume_context context;
     struct lume_files files;
 } tasks[LUME_TASK_LIMIT];
-static struct io_queue kernel_queue;
-static unsigned current_task, kernel_owner, kernel_deferred, policy, unit = 1;
+
+static unsigned current_task, kernel_deferred, policy, unit = 1;
 static unsigned states[LUME_TASK_LIMIT], executed[LUME_TASK_LIMIT], wake_count[LUME_TASK_LIMIT];
 static unsigned process_owner[LUME_TASK_LIMIT];
 static uint64_t total_kernel_ticks, kernel_ticks[LUME_TASK_LIMIT], account_start;
 static uint64_t wake_at[LUME_TASK_LIMIT], clock_ms, root;
-static int64_t kernel_result;
 static bool kernel_wait[LUME_TASK_LIMIT], process_exiting[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue;
-static bool public_mode = true, account_inside, kernel_launch, kernel_deferred_turn;
-static bool suspended_once, block_pipe, pending_work, nonblock_pipe, filesystem_scope;
+static bool public_mode = true, account_inside;
+static bool worker_suspended[LUME_WORK_DOMAINS], work_pending[LUME_WORK_DOMAINS];
+static bool worker_blocked[LUME_WORK_DOMAINS];
+static bool block_pipe, nonblock_pipe, filesystem_scope;
 static bool expect_writing, override_result;
 static int64_t inline_result;
 static unsigned pipe_process, charges, selections, progress, submissions, resumes;
 static struct lume_context *inline_frame, selected_frame;
 static bool kernel_console_scope;
 static bool memory_descriptor;
-static void (*worker_function)(void *);
-static void *worker_argument;
+static void (*worker_functions[LUME_WORK_DOMAINS])(void *);
+static void *worker_arguments[LUME_WORK_DOMAINS];
+static unsigned task_domain[LUME_TASK_LIMIT];
+static bool task_mutation[LUME_TASK_LIMIT];
+#define worker_function worker_functions[0]
+#define worker_argument worker_arguments[0]
+#define suspended_once worker_suspended[0]
+#define pending_work work_pending[0]
 static unsigned files_released[LUME_TASK_LIMIT];
+static unsigned counter_step = 1, worker_cost_ms;
 
 void lume_files_release(struct lume_files *files)
 {
@@ -74,9 +84,41 @@ static uint64_t lume_clock_monotonic(void)
     return clock_ms;
 }
 
+#include "io_domains.h"
+#define kernel_queue kernel_lanes[0].queue
+#define kernel_owner kernel_lanes[0].owner
+#define kernel_launch kernel_lanes[0].launch
+#define kernel_deferred_turn kernel_lanes[0].deferred_turn
+#define KERNEL_IO_EXCLUSIVE LUME_WORK_DOMAINS
+
+static unsigned kernel_call_domain(unsigned task, const struct lume_context *frame)
+{
+    (void)frame;
+    return process_exiting[process_slot(task)] ? KERNEL_IO_EXCLUSIVE : task_domain[task];
+}
+
+static bool kernel_call_mutates(const struct lume_context *frame)
+{
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        if (frame == &tasks[i].context)
+            return task_mutation[i];
+    return false;
+}
+
 static uint64_t counter(void)
 {
-    return ++clock_ms;
+    clock_ms += counter_step;
+    return clock_ms;
+}
+
+static uint64_t lume_counter_read(void)
+{
+    return clock_ms * 1000;
+}
+
+static uint64_t lume_counter_frequency(void)
+{
+    return 1000000;
 }
 
 static uint64_t lume_mmu_task_root(unsigned task)
@@ -94,44 +136,75 @@ static void lume_mmu_switch(uint64_t value)
     root = value;
 }
 
-static bool lume_worker_busy(void)
+bool lume_worker_busy(void)
 {
-    return worker_function != NULL;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        if (worker_functions[i])
+            return true;
+    return false;
 }
 
-static bool lume_worker_submit(void (*function)(void *), void *argument)
+bool lume_worker_submit(void (*function)(void *), void *argument)
 {
-    assert(!worker_function);
+    return lume_worker_submit_on(0, function, argument);
+}
+
+bool lume_worker_submit_on(unsigned slot, void (*function)(void *), void *argument)
+{
+    assert(slot < LUME_WORK_DOMAINS && !worker_functions[slot]);
     ++submissions;
-    worker_function = function;
-    worker_argument = argument;
+    worker_functions[slot] = function;
+    worker_arguments[slot] = argument;
     return true;
 }
 
-static bool lume_worker_resume(void)
+bool lume_worker_resume(void)
+{
+    return lume_worker_resume_on(0);
+}
+
+bool lume_worker_busy_on(unsigned slot)
+{
+    return slot < LUME_WORK_DOMAINS && worker_functions[slot] != NULL;
+}
+
+bool lume_worker_resume_on(unsigned slot)
 {
     ++resumes;
-    if (suspended_once)
+    if (worker_blocked[slot])
+        return false;
+    if (worker_suspended[slot])
     {
-        suspended_once = false;
+        worker_suspended[slot] = false;
         kernel_console_scope = filesystem_scope;
         return false;
     }
-    void (*function)(void *) = worker_function;
-    function(worker_argument);
-    worker_function = NULL;
+    void (*function)(void *) = worker_functions[slot];
+    function(worker_arguments[slot]);
+    worker_functions[slot] = NULL;
+    clock_ms += worker_cost_ms;
     return true;
 }
 
-static bool lume_work_pending(void)
+bool lume_work_pending(void)
 {
     return pending_work;
 }
 
-static unsigned lume_work_drain(unsigned budget)
+bool lume_work_pending_on(unsigned slot)
+{
+    return work_pending[slot];
+}
+
+unsigned lume_work_drain(unsigned budget)
+{
+    return lume_work_drain_on(0, budget);
+}
+
+unsigned lume_work_drain_on(unsigned slot, unsigned budget)
 {
     assert(budget == 8);
-    pending_work = false;
+    work_pending[slot] = false;
     return 1;
 }
 
@@ -242,7 +315,21 @@ static void reset(void)
     memset(pipe_queues, 0, sizeof(pipe_queues));
     memset(wake_at, 0, sizeof(wake_at));
     memset(context_replaced, 0, sizeof(context_replaced));
-    kernel_queue = (struct io_queue){0};
+    memset(kernel_lanes, 0, sizeof(kernel_lanes));
+    memset(worker_functions, 0, sizeof(worker_functions));
+    memset(worker_arguments, 0, sizeof(worker_arguments));
+    memset(worker_suspended, 0, sizeof(worker_suspended));
+    memset(work_pending, 0, sizeof(work_pending));
+    memset(worker_blocked, 0, sizeof(worker_blocked));
+    memset(task_domain, 0, sizeof(task_domain));
+    memset(task_mutation, 0, sizeof(task_mutation));
+    kernel_control_queue = (struct io_queue){0};
+    kernel_lane_cursor = 0;
+    kernel_parallel_epoch = kernel_drain_until = kernel_drain_retry = 0;
+    counter_step = 1;
+    worker_cost_ms = 0;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        kernel_lanes[i].owner = LUME_TASK_LIMIT;
     pipe_queue = (struct lume_wait_queue){0};
     worker_function = NULL;
     block_pipe = suspended_once = pending_work = kernel_deferred_turn = false;
@@ -307,8 +394,9 @@ static void cancellation_and_exit(void)
     wake_at[1] = UINT64_MAX;
     kernel_step();
     assert(!executed[0] && !executed[1] && states[1] == 1 && !kernel_wait[1]);
-    assert(kernel_queue.granted && kernel_queue.grant.task == 1 && wake_count[1] == 1);
-    assert(io_queue_claim(&kernel_queue, 1, clock_ms));
+    assert(kernel_control_queue.granted && kernel_control_queue.grant.task == 1 &&
+           wake_count[1] == 1);
+    assert(io_queue_claim(&kernel_control_queue, 1, clock_ms));
     kernel_step_admit(false);
     assert(!lume_worker_busy());
     kernel_cancel(1);
@@ -530,8 +618,150 @@ static void queued_memory_io(void)
     }
 }
 
+static void enqueue_domain(unsigned task, unsigned domain)
+{
+    task_domain[task] = domain;
+    tasks[task].context = (struct lume_context){.x = {3}, .pc = 100};
+    tasks[task].context.x[8] = LUME_SYS_READ;
+    assert(kernel_enqueue(task, domain, false));
+    kernel_wait[task] = true;
+    states[task] = 4;
+}
+
+static void bounded_resource_turn(void)
+{
+    reset();
+    counter_step = 0;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        enqueue_domain(i, i);
+    kernel_step();
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        assert(executed[i] == 1);
+    assert(!lume_worker_busy() && resumes == LUME_WORK_DOMAINS);
+
+    reset();
+    counter_step = 0;
+    worker_cost_ms = 1;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        enqueue_domain(i, i);
+    kernel_step();
+    assert(executed[0] == 1 && executed[1] == 1 && !executed[2] && !executed[3]);
+    assert(kernel_lane_cursor == 2 && resumes == 2);
+    kernel_step();
+    assert(executed[2] == 1 && executed[3] == 1 && !lume_worker_busy());
+}
+
+static void independent_resources(void)
+{
+    reset();
+    worker_blocked[LUME_WORK_STORAGE] = true;
+    enqueue_domain(0, LUME_WORK_STORAGE);
+    enqueue_domain(1, LUME_WORK_NETWORK);
+    enqueue_domain(2, LUME_WORK_DISPLAY);
+    enqueue_domain(3, LUME_WORK_GENERAL);
+    for (unsigned i = 0; i < 4; ++i)
+        kernel_step();
+    assert(!executed[0] && kernel_task_active(0) && kernel_wait[0]);
+    assert(executed[1] == 1 && executed[2] == 1 && executed[3] == 1);
+    assert(root == 4 && current_task == 3);
+    worker_blocked[LUME_WORK_STORAGE] = false;
+    kernel_step();
+    assert(executed[0] == 1 && !kernel_wait[0] && !lume_worker_busy());
+
+    reset();
+    worker_blocked[LUME_WORK_STORAGE] = true;
+    enqueue_domain(0, LUME_WORK_STORAGE);
+    enqueue_domain(1, LUME_WORK_STORAGE);
+    enqueue_domain(2, LUME_WORK_NETWORK);
+    for (unsigned i = 0; i < 3; ++i)
+        kernel_step();
+    assert(!executed[0] && !executed[1] && executed[2] == 1);
+    worker_blocked[LUME_WORK_STORAGE] = false;
+    kernel_step();
+    assert(executed[0] == 1 && !executed[1]);
+    kernel_step();
+    assert(executed[1] == 1 && !lume_worker_busy());
+}
+
+static void descriptor_conflicts(void)
+{
+    reset();
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_owner[1] = 0;
+    enqueue_domain(1, LUME_WORK_STORAGE);
+    task_mutation[1] = true;
+    enqueue_domain(2, LUME_WORK_STORAGE);
+    kernel_step();
+    assert(!executed[0] && !executed[1] && executed[2] == 1);
+    assert(kernel_lanes[LUME_WORK_STORAGE]
+               .queue.entries[kernel_lanes[LUME_WORK_STORAGE].queue.head]
+               .task == 1);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    kernel_step();
+    assert(executed[0] == 1 && executed[1] == 1 && !lume_worker_busy());
+
+    reset();
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_owner[1] = 0;
+    enqueue_domain(1, LUME_WORK_STORAGE);
+    kernel_step();
+    assert(executed[1] == 1 && !executed[0]);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+}
+
+static void exclusive_wait_keeps_progress(void)
+{
+    reset();
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_exiting[1] = true;
+    assert(!kernel_cleanup_ready(1));
+    enqueue_domain(2, LUME_WORK_DISPLAY);
+    enqueue_domain(3, LUME_WORK_GENERAL);
+    kernel_step();
+    kernel_step();
+    assert(executed[2] == 1 && executed[3] == 1 && !executed[0]);
+    assert(states[1] == 4 && kernel_control_queue.queued[1]);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    kernel_step();
+    assert(states[1] == 1 && kernel_cleanup_ready(1) && !lume_worker_busy());
+
+    reset();
+    clock_ms = 100;
+    worker_blocked[LUME_WORK_NETWORK] = worker_blocked[LUME_WORK_STORAGE] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    enqueue_domain(1, LUME_WORK_STORAGE);
+    kernel_step();
+    kernel_lanes[LUME_WORK_STORAGE].exclusive_pending = true;
+    enqueue_domain(2, LUME_WORK_DISPLAY);
+    kernel_step();
+    assert(!executed[2] && !kernel_exclusive_active());
+    clock_ms = 110;
+    kernel_step();
+    assert(executed[2] == 1 && !kernel_exclusive_active());
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    kernel_step();
+    assert(kernel_exclusive_active());
+    worker_blocked[LUME_WORK_STORAGE] = false;
+    kernel_step();
+    assert(!kernel_exclusive_active() && !lume_worker_busy());
+}
+
 int main(void)
 {
+    bounded_resource_turn();
+    independent_resources();
+    descriptor_conflicts();
+    exclusive_wait_keeps_progress();
     ownership();
     cancellation_and_exit();
     pipe_and_fairness();

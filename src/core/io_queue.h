@@ -72,6 +72,23 @@ static inline bool io_queue_pop(struct io_queue *queue, struct io_ticket *ticket
     return false;
 }
 
+static inline bool io_queue_take(struct io_queue *queue, unsigned index, struct io_ticket *ticket)
+{
+    if (index >= queue->count)
+        return false;
+    struct io_ticket entry = queue->entries[(queue->head + index) % LUME_TASK_LIMIT];
+    for (unsigned i = index + 1; i < queue->count; ++i)
+        queue->entries[(queue->head + i - 1) % LUME_TASK_LIMIT] =
+            queue->entries[(queue->head + i) % LUME_TASK_LIMIT];
+    --queue->count;
+    if (entry.task >= LUME_TASK_LIMIT || !queue->queued[entry.task] ||
+        entry.generation != queue->generation[entry.task])
+        return false;
+    queue->queued[entry.task] = false;
+    *ticket = entry;
+    return true;
+}
+
 static inline bool io_queue_granted(struct io_queue *queue, uint64_t at)
 {
     if (queue->granted && (queue->grant.generation != queue->generation[queue->grant.task] ||
