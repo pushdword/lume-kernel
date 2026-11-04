@@ -120,7 +120,7 @@ int lume_task_drop_capabilities(unsigned pid, uint64_t mask)
     if (!pid || pid > LUME_TASK_LIMIT ||
         (mask & ~(uint64_t)(LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_SERVICE |
                             LUME_CAP_DRIVER_ADMIN | LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SUPERVISOR |
-                            LUME_CAP_SERVICE_CONTROL)))
+                            LUME_CAP_SERVICE_CONTROL | LUME_CAP_CLOCK_ADMIN)))
         return -LUME_EINVAL;
     capabilities[pid - 1] &= ~mask;
     return 0;
@@ -370,14 +370,14 @@ static bool child_running;
 
 static int pick_task(void)
 {
-    unsigned excluded = lume_cpu_index() ? (1u | 1u << 2) : 0;
+    uint64_t excluded = lume_cpu_index() ? (1u | 1u << 2) : 0;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (process_stopped[thread_slots[i].process] && !process_exiting[thread_slots[i].process])
-            excluded |= 1u << i;
+            excluded |= UINT64_C(1) << i;
     if (public_mode && io_queue_granted(&kernel_queue, lume_clock_monotonic()))
     {
         unsigned task = kernel_queue.grant.task;
-        if (states[task] == 1 && !(excluded & (1u << task)))
+        if (states[task] == 1 && !(excluded & (UINT64_C(1) << task)))
             return (int)task;
     }
     return sched_pick(&policy, lume_cpu_index(), states, excluded, unit);
@@ -950,6 +950,7 @@ static int start_program(struct lume_context *frame)
     struct lume_spawn_action actions[LUME_SPAWN_ACTION_MAX];
     char action_paths[LUME_SPAWN_ACTION_MAX][LUME_PATH_MAX];
     unsigned action_count = 0;
+    struct lume_spawn_options_request options = {0};
     if (actions_call)
     {
         if (!lume_user_buffer(LUME_CONTEXT_REG(frame, 0), sizeof(struct lume_spawn_actions_request),
@@ -957,8 +958,22 @@ static int start_program(struct lume_context *frame)
             return -LUME_EFAULT;
         struct lume_spawn_actions_request extended =
             *(const struct lume_spawn_actions_request *)(uintptr_t)LUME_CONTEXT_REG(frame, 0);
-        if (extended.version != LUME_SPAWN_VERSION || extended.count > LUME_SPAWN_ACTION_MAX)
+        if ((extended.version != LUME_SPAWN_VERSION &&
+             extended.version != LUME_SPAWN_OPTIONS_VERSION) ||
+            extended.count > LUME_SPAWN_ACTION_MAX)
             return -LUME_EINVAL;
+        if (extended.version == LUME_SPAWN_OPTIONS_VERSION)
+        {
+            if (LUME_CONTEXT_REG(frame, 1) != sizeof(options) ||
+                !lume_user_buffer(LUME_CONTEXT_REG(frame, 0), sizeof(options), false))
+                return -LUME_EFAULT;
+            options =
+                *(const struct lume_spawn_options_request *)(uintptr_t)LUME_CONTEXT_REG(frame, 0);
+            if (options.reserved ||
+                (options.flags & ~(LUME_SPAWN_SIGDEFAULT | LUME_SPAWN_SIGMASK | LUME_SPAWN_SETSID |
+                                   LUME_SPAWN_CLOEXEC_DEFAULT)))
+                return -LUME_EINVAL;
+        }
         action_count = extended.count;
         if (action_count &&
             !lume_user_buffer(extended.actions, sizeof(actions[0]) * action_count, false))
@@ -967,12 +982,16 @@ static int start_program(struct lume_context *frame)
         {
             actions[i] = ((const struct lume_spawn_action *)(uintptr_t)extended.actions)[i];
             struct lume_spawn_action *a = &actions[i];
-            if (a->operation < LUME_SPAWN_CLOSE || a->operation > LUME_SPAWN_OPEN ||
-                a->fd >= LUME_FD_MAX || a->target >= LUME_FD_MAX ||
-                (a->operation != LUME_SPAWN_OPEN && (a->path || a->flags)) ||
-                (a->operation != LUME_SPAWN_DUP2 && a->target))
+            unsigned maximum =
+                extended.version == LUME_SPAWN_VERSION ? LUME_SPAWN_OPEN : LUME_SPAWN_CHDIR;
+            bool directory = a->operation == LUME_SPAWN_CHDIR;
+            if (a->operation < LUME_SPAWN_CLOSE || a->operation > maximum || a->fd >= LUME_FD_MAX ||
+                a->target >= LUME_FD_MAX ||
+                (a->operation != LUME_SPAWN_OPEN && !directory && (a->path || a->flags)) ||
+                (a->operation != LUME_SPAWN_DUP2 && a->target) ||
+                (directory && (a->fd || a->flags)))
                 return -LUME_EINVAL;
-            if (a->operation == LUME_SPAWN_OPEN)
+            if (a->operation == LUME_SPAWN_OPEN || directory)
             {
                 unsigned used;
                 int result = user_string(a->path, action_paths[i], sizeof(action_paths[i]), &used);
@@ -1031,15 +1050,67 @@ static int start_program(struct lume_context *frame)
     }
     const void *data;
     size_t bytes;
-    error = lume_vfs_program(&tasks[owner].files, path, &data, &bytes);
+    if (asynchronous && !inherit)
+    {
+        lume_files_init(&tasks[child].files);
+        memcpy(tasks[child].files.cwd, tasks[owner].files.cwd, sizeof(tasks[child].files.cwd));
+    }
+    else if (inherit && !actions_call)
+        lume_files_inherit(&tasks[child].files, &tasks[owner].files);
+    else
+        lume_files_clone(&tasks[child].files, &tasks[owner].files);
+    tasks[child].files.identity = tasks[owner].files.identity;
+    if (options.flags & LUME_SPAWN_CLOEXEC_DEFAULT)
+        for (unsigned i = 3; i < LUME_FD_MAX; ++i)
+            if (tasks[child].files.fd[i].object >= 0)
+                tasks[child].files.fd[i].flags |= LUME_FD_CLOEXEC;
+    for (unsigned i = 0; i < action_count; ++i)
+    {
+        struct lume_spawn_action *a = &actions[i];
+        struct lume_files *files = &tasks[child].files;
+        int64_t result;
+        if (a->operation == LUME_SPAWN_CHDIR)
+            result = lume_vfs_chdir(files, action_paths[i]);
+        else if (a->operation == LUME_SPAWN_CLOSE)
+            result = lume_vfs_close(files, a->fd);
+        else if (a->operation == LUME_SPAWN_DUP2)
+        {
+            result = lume_vfs_dup2(files, a->fd, a->target);
+            if (result >= 0)
+                files->fd[a->target].flags &= ~LUME_FD_CLOEXEC;
+        }
+        else
+        {
+            (void)lume_vfs_close(files, a->fd);
+            result = lume_vfs_open(files, action_paths[i], a->flags);
+            if (result >= 0 && result != a->fd)
+            {
+                int opened = (int)result;
+                result = lume_vfs_dup2(files, (unsigned)opened, a->fd);
+                (void)lume_vfs_close(files, (unsigned)opened);
+            }
+        }
+        if (result < 0)
+        {
+            lume_files_release(files);
+            return result;
+        }
+    }
+    error = lume_vfs_program(&tasks[child].files, path, &data, &bytes);
     if (error)
+    {
+        lume_files_release(&tasks[child].files);
         return error;
+    }
     struct lume_elf_plan plan;
     if (!lume_elf_plan(data, bytes, &plan))
+    {
+        lume_files_release(&tasks[child].files);
         return -LUME_ENOEXEC;
+    }
     uint64_t program_before = lume_pages_free();
     int load_error = -LUME_ENOMEM;
-    bool files_ready = false;
+    bool files_ready = true;
     tasks[child].context = (struct lume_context){0};
     tasks[child].data = 0;
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
@@ -1064,50 +1135,6 @@ static int start_program(struct lume_context *frame)
     LUME_CONTEXT_PC(c) = images[child].entry;
     LUME_CONTEXT_STATUS(c) = LUME_CONTEXT_USER_STATUS;
     LUME_CONTEXT_TLS(c) = child + 1;
-    if (asynchronous && !inherit)
-    {
-        lume_files_init(&tasks[child].files);
-        for (unsigned i = 0; i < sizeof(tasks[child].files.cwd); ++i)
-            tasks[child].files.cwd[i] = tasks[owner].files.cwd[i];
-    }
-    else if (actions_call)
-        lume_files_clone(&tasks[child].files, &tasks[owner].files);
-    else if (inherit)
-        lume_files_inherit(&tasks[child].files, &tasks[owner].files);
-    else
-        lume_files_clone(&tasks[child].files, &tasks[owner].files);
-    tasks[child].files.identity = tasks[owner].files.identity;
-    files_ready = true;
-    for (unsigned i = 0; i < action_count; ++i)
-    {
-        struct lume_spawn_action *a = &actions[i];
-        struct lume_files *files = &tasks[child].files;
-        int64_t result;
-        if (a->operation == LUME_SPAWN_CLOSE)
-            result = lume_vfs_close(files, a->fd);
-        else if (a->operation == LUME_SPAWN_DUP2)
-        {
-            result = lume_vfs_dup2(files, a->fd, a->target);
-            if (result >= 0)
-                files->fd[a->target].flags &= ~LUME_FD_CLOEXEC;
-        }
-        else
-        {
-            (void)lume_vfs_close(files, a->fd);
-            result = lume_vfs_open(files, action_paths[i], a->flags);
-            if (result >= 0 && result != a->fd)
-            {
-                int opened = (int)result;
-                result = lume_vfs_dup2(files, (unsigned)opened, a->fd);
-                (void)lume_vfs_close(files, (unsigned)opened);
-            }
-        }
-        if (result < 0)
-        {
-            load_error = (int)result;
-            goto fail;
-        }
-    }
     if (actions_call)
         for (unsigned i = 0; i < LUME_FD_MAX; ++i)
             if (tasks[child].files.fd[i].flags & LUME_FD_CLOEXEC)
@@ -1120,6 +1147,8 @@ static int start_program(struct lume_context *frame)
             goto fail;
         }
         lume_mmu_switch(lume_mmu_root());
+        extern void lume_gpu_release(unsigned);
+        lume_gpu_release(owner + 1);
         lume_heap_swap(owner, child);
         struct lume_elf_image image = images[owner];
         images[owner] = images[child];
@@ -1165,6 +1194,14 @@ static int start_program(struct lume_context *frame)
     tasks[child].calls = tasks[child].exits = tasks[child].faults = tasks[child].preemptions = 0;
     parents[child] = owner;
     signal_inherit(child, owner, true);
+    if (options.flags & LUME_SPAWN_SIGDEFAULT)
+        for (unsigned i = 1; i < LUME_SIGNAL_COUNT; ++i)
+            if (options.signal_default & (UINT32_C(1) << i))
+                signals[child].action[i] = (struct signal_action){0};
+    if (options.flags & LUME_SPAWN_SIGMASK)
+        signals[child].mask = options.signal_mask & ~SIGNAL_UNMASKABLE;
+    if (options.flags & LUME_SPAWN_SETSID)
+        signals[child].session = signals[child].group = child + 1;
     user_ticks[child] = kernel_ticks[child] = 0;
     lock_ticks[child] = 0;
     dispatches[child] = 0;
@@ -1378,6 +1415,12 @@ struct lume_context *lume_tasks_device_irq(struct lume_context *frame)
     return task_interrupt(frame, false);
 }
 
+static bool kernel_render_available(void)
+{
+    return !lume_worker_busy() && !kernel_queue.count &&
+           !io_queue_granted(&kernel_queue, lume_clock_monotonic());
+}
+
 #include "query_calls.h"
 
 struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, uint64_t far)
@@ -1408,9 +1451,12 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     {
         bool admitted = io_queue_claim(&kernel_queue, task, lume_clock_monotonic());
         kernel_step_admit(!admitted);
+        if (svc && !process_exiting[process] && kernel_gpu_backpressure(frame))
+            return frame;
         console_call = svc && kernel_console_call(frame);
         pipe_call = svc && kernel_pipe_call(frame);
         independent = independent || console_call || pipe_call ||
+                      (svc && kernel_graphics_call(frame)) ||
                       (svc && kernel_fd_query_call(frame)) ||
                       (svc && kernel_console_available() &&
                        LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SIGNAL &&
@@ -1457,6 +1503,20 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         lume_value("PROGRAM_FAULT_ESR", esr);
         lume_value("PROGRAM_FAULT_ADDRESS", far);
         lume_value("PROGRAM_FAULT_PC", LUME_CONTEXT_PC(frame));
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+        lume_value("PROGRAM_FAULT_LINK", LUME_CONTEXT_REG(frame, 30));
+        lume_value("PROGRAM_FAULT_ARG0", LUME_CONTEXT_REG(frame, 0));
+        uint64_t pointer = LUME_CONTEXT_REG(frame, 29);
+        for (unsigned depth = 0;
+             depth < 16 && !(pointer & 15) && lume_user_buffer(pointer, 16, false); ++depth)
+        {
+            const uint64_t *record = (const uint64_t *)(uintptr_t)pointer;
+            lume_value("PROGRAM_FAULT_FRAME", record[1]);
+            if (record[0] <= pointer)
+                break;
+            pointer = record[0];
+        }
+#endif
         exit_signals[task] = 11;
         return finish_program(139);
     }
@@ -1497,6 +1557,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return result;
     }
     if (pipe_call)
+        return kernel_pipe_result(frame);
+    if (public_mode && svc && kernel_graphics_call(frame))
         return kernel_pipe_result(frame);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FD &&
         (LUME_CONTEXT_REG(frame, 0) == LUME_FD_POLL || LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT))
@@ -1890,7 +1952,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     tasks[0].context = (struct lume_context){0};
     thread_new(thread_slots, 0, 0, false);
     capabilities[0] = LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_DRIVER_ADMIN |
-                      LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SERVICE_CONTROL;
+                      LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SERVICE_CONTROL | LUME_CAP_CLOCK_ADMIN;
     tasks[0].calls = tasks[0].exits = tasks[0].faults = tasks[0].preemptions = 0;
     tasks[0].data = lume_page_alloc(0);
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)

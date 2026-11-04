@@ -31,6 +31,11 @@ static unsigned wait_calls, busy_responses, failed_block, error_command;
 static uint32_t deferred, card_error, response_error;
 static bool writing, defer_events, missing_complete, auto_error, reset_stuck, missing_ready;
 static bool reenter, card_busy, abort_inhibit;
+static unsigned char scr_data[8], switch_data[64];
+static const unsigned char *control_data;
+static unsigned control_bytes, control_words, width_commands, switch_commands, card_width;
+static bool application_command, refuse_high_speed;
+static uint32_t width_error;
 
 #define CHECK(condition)                                                                           \
     do                                                                                             \
@@ -92,6 +97,16 @@ static uint32_t model_read(uintptr_t address)
     unsigned reg = register_index(address);
     if (reg != 0x20 / 4)
         return registers[reg];
+    if (control_bytes)
+    {
+        CHECK(control_words * 4 < control_bytes);
+        const unsigned char *p = control_data + control_words * 4;
+        uint32_t value =
+            (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+        if (++control_words * 4 == control_bytes)
+            queue_events(2);
+        return value;
+    }
     CHECK(!writing && words < total_blocks * 128);
     unsigned char *p = card[first_sector + words / 128] + (words % 128) * 4;
     uint32_t value =
@@ -120,6 +135,8 @@ static void model_write(uintptr_t address, uint32_t value)
         }
         return;
     }
+    if (reg == 0x2c / 4 && (value & 1))
+        registers[reg] |= 2;
     if (reg == 0x20 / 4)
     {
         CHECK(writing && words < total_blocks * 128);
@@ -133,6 +150,49 @@ static void model_write(uintptr_t address, uint32_t value)
     if (reg != 12 / 4)
         return;
     unsigned index = value >> 24;
+    if (index == 55)
+    {
+        CHECK(registers[8 / 4] == rca);
+        application_command = true;
+        registers[0x10 / 4] = 32;
+        queue_events(1);
+        return;
+    }
+    if (index == 51 || index == 6)
+    {
+        if (index == 6 && application_command)
+        {
+            CHECK(registers[8 / 4] == 2 && !(value & (1u << 21)));
+            ++width_commands;
+            registers[0x10 / 4] = width_error;
+            if (!width_error)
+                card_width = 4;
+            application_command = false;
+            queue_events(1);
+            return;
+        }
+        CHECK((value & 0x003f003fu) == (RESPONSE | CHECKS | (1u << 21) | 16u));
+        CHECK(((registers[0x28 / 4] & 2) ? 4u : 1u) == card_width);
+        control_bytes = index == 51 ? 8 : 64;
+        CHECK(registers[4 / 4] == ((1u << 16) | control_bytes));
+        control_data = index == 51 ? scr_data : switch_data;
+        control_words = 0;
+        if (index == 51)
+            CHECK(application_command && !registers[8 / 4]);
+        else
+        {
+            CHECK(!application_command);
+            uint32_t argument = registers[8 / 4];
+            CHECK(argument == 0x00fffff1 || argument == 0x80fffff1);
+            if (argument & 0x80000000u)
+                switch_data[16] = refuse_high_speed ? 0 : 1;
+            ++switch_commands;
+        }
+        application_command = false;
+        registers[0x10 / 4] = response_error;
+        queue_events(index == error_command ? (1u << 16) | 0x8000u : 33u);
+        return;
+    }
     if (index == 12)
     {
         CHECK((value & (3u << 22)) == (3u << 22));
@@ -308,6 +368,17 @@ static void setup(bool use_interrupts)
     deferred = card_error = response_error = 0;
     writing = missing_complete = auto_error = reset_stuck = missing_ready = false;
     reenter = card_busy = abort_inhibit = false;
+    memset(scr_data, 0, sizeof(scr_data));
+    memset(switch_data, 0, sizeof(switch_data));
+    scr_data[0] = 2;
+    scr_data[1] = 5;
+    switch_data[13] = 2;
+    control_data = NULL;
+    control_bytes = control_words = width_commands = switch_commands = width_error = 0;
+    card_width = 1;
+    application_command = refuse_high_speed = false;
+    bus_width = 4;
+    maximum_hz = 50000000;
     interrupt_mode = defer_events = use_interrupts;
     pending = 0;
     registers[0x38 / 4] = use_interrupts ? UINT32_MAX : 0;
@@ -451,6 +522,67 @@ static void command_counts(void)
            single_commands, data_commands + status_commands, auto_stops);
 }
 
+static void bus_modes(void)
+{
+    for (unsigned scenario = 0; scenario < 8; ++scenario)
+    {
+        setup(false);
+        if (scenario == 1)
+            scr_data[1] = 1;
+        else if (scenario == 2)
+            switch_data[13] = 0;
+        else if (scenario == 3)
+            refuse_high_speed = true;
+        else if (scenario == 4)
+            maximum_hz = 25000000;
+        else if (scenario == 5)
+            bus_width = 1;
+        else if (scenario == 6)
+            scr_data[0] = 0;
+        else if (scenario == 7)
+            maximum_hz = 20000000;
+        CHECK(select_bus(1u << 21, 1u << 22));
+        bool wide = scenario != 1 && scenario != 5;
+        bool fast = scenario == 0 || scenario == 1 || scenario == 5;
+        CHECK(width_commands == wide && card_width == (wide ? 4u : 1u));
+        CHECK((registers[0x28 / 4] & 6) == ((wide ? 2u : 0u) | (fast ? 4u : 0u)));
+        CHECK(((registers[0x2c / 4] >> 8) & 255) == (fast ? 2u : scenario == 7 ? 5u : 4u));
+        CHECK(switch_commands == (scenario >= 4 && scenario != 5 ? 0u : scenario == 2 ? 1u : 2u));
+        CHECK(!errors);
+    }
+    setup(false);
+    CHECK(select_bus(0, 1u << 22) && !switch_commands);
+    setup(false);
+    CHECK(select_bus(1u << 21, 0) && !switch_commands);
+    setup(false);
+    width_error = 1u << 22;
+    CHECK(!select_bus(1u << 21, 1u << 22));
+    CHECK(!(registers[0x28 / 4] & 6) && !switch_commands && errors == 1);
+    setup(false);
+    error_command = 51;
+    CHECK(!select_bus(1u << 21, 1u << 22));
+    CHECK(!width_commands && !(registers[0x28 / 4] & 6) && errors == 1);
+    setup(false);
+    response_error = 1u << 22;
+    CHECK(!select_bus(1u << 21, 1u << 22) && !width_commands && errors == 1);
+    setup(false);
+    error_command = 6;
+    CHECK(!select_bus(1u << 21, 1u << 22));
+    CHECK(width_commands == 1 && !(registers[0x28 / 4] & 4) && errors == 1);
+    setup(false);
+    device.state = LUME_DEVICE_OFF;
+    CHECK(!lume_sd_configure_bus(8, 50000000));
+    CHECK(!lume_sd_configure_bus(4, 100000));
+    CHECK(lume_sd_configure_bus(4, 200000000));
+    CHECK(bus_width == 4 && maximum_hz == 50000000);
+    device.state = LUME_DEVICE_READY;
+    CHECK(!lume_sd_configure_bus(1, 25000000));
+    setup(true);
+    defer_events = false;
+    unsigned char data[512];
+    CHECK(lume_sd_read(0, data) && !wait_calls && !errors && irq_flags == 0x80);
+}
+
 int main(void)
 {
     success(false);
@@ -461,6 +593,7 @@ int main(void)
     failures(false, true);
     failures(true, true);
     command_counts();
+    bus_modes();
     printf("PASS SDHCI PIO groups: cases=%u checks=%u\n", cases, checks);
     return 0;
 }

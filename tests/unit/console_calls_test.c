@@ -78,7 +78,7 @@ bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
     return (fd < 3 && !terminal_descriptor) || fd == 9;
 }
 
-bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
+bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
 {
     assert(files == &tasks[process_slot(current_task)].files);
     return fd == 4;
@@ -213,6 +213,15 @@ static void pipe_and_descriptor_classification(void)
     assert(!kernel_fd_query_call(&call));
     call = frame(LUME_SYS_WRITE, LUME_FD_INFO, 0, 0);
     assert(!kernel_fd_query_call(&call));
+    kernel_console_scope = false;
+    call = frame(LUME_SYS_GRAPHICS, LUME_GRAPHICS_PRESENT, 0, 0);
+    assert(!kernel_graphics_call(&call));
+    kernel_console_scope = true;
+    assert(kernel_graphics_call(&call));
+    call.x[0] = LUME_GRAPHICS_ACQUIRE;
+    assert(!kernel_graphics_call(&call));
+    call.x[0] = LUME_GRAPHICS_QUERY;
+    assert(!kernel_graphics_call(&call));
     kernel_console_scope = false;
     busy = false;
     call = frame(LUME_SYS_READ, 4, 0, 0);

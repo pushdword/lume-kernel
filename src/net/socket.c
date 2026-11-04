@@ -6,8 +6,13 @@
 #include "lume/poll.h"
 #include <string.h>
 
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#define SOCKETS 64u
+#define PAIRS 32u
+#else
 #define SOCKETS 16u
 #define PAIRS 8u
+#endif
 #define RIGHTS 8u
 
 extern int lume_stream_nowait(unsigned, unsigned, struct lume_stream_request *);
@@ -55,7 +60,7 @@ struct local_pair;
 struct local_end
 {
     struct local_pair *pair;
-    unsigned side;
+    unsigned side, uid, gid;
     struct lume_poll_source source;
 };
 
@@ -124,8 +129,8 @@ static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
     return stream(file, LUME_STREAM_SEND, &request);
 }
 
-static const struct lume_file_ops tcp_ops = {LUME_NODE_SOCKET, tcp_close, tcp_read,
-                                             tcp_write,        tcp_poll,  tcp_source};
+static const struct lume_file_ops tcp_ops = {LUME_NODE_SOCKET, tcp_close,  tcp_read, tcp_write,
+                                             tcp_poll,         tcp_source, false};
 
 static void discard_rights(struct local_ring *ring, uint64_t end)
 {
@@ -220,8 +225,8 @@ static unsigned local_poll(void *context)
                                                                     : 0);
 }
 
-static const struct lume_file_ops local_ops = {LUME_NODE_SOCKET, local_close, local_read,
-                                               local_write,      local_poll,  local_source};
+static const struct lume_file_ops local_ops = {
+    LUME_NODE_SOCKET, local_close, local_read, local_write, local_poll, local_source, true};
 
 #include "unix_socket.h"
 
@@ -243,7 +248,7 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
                          struct lume_socket_request *r)
 {
     if (r->version != LUME_SOCKET_VERSION || r->bytes != sizeof(*r) || r->reserved ||
-        r->reserved2 || operation > LUME_SOCKET_PENDING ||
+        r->reserved2 || operation > LUME_SOCKET_CREDENTIALS ||
         r->flags & ~(LUME_FD_CLOEXEC | LUME_FD_NONBLOCK))
         return -LUME_EINVAL;
     if (operation == LUME_SOCKET_CREATE)
@@ -281,8 +286,10 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             struct local_pair *pair = &local_pairs[i];
             if (pair->open[0] || pair->open[1])
                 continue;
-            pair->end[0] = (struct local_end){.pair = pair, .side = 0};
-            pair->end[1] = (struct local_end){.pair = pair, .side = 1};
+            pair->end[0] = (struct local_end){
+                .pair = pair, .side = 0, .uid = files->identity.euid, .gid = files->identity.egid};
+            pair->end[1] = (struct local_end){
+                .pair = pair, .side = 1, .uid = files->identity.euid, .gid = files->identity.egid};
             lume_poll_source_reset(&pair->end[0].source);
             lume_poll_source_reset(&pair->end[1].source);
             pair->open[0] = pair->open[1] = true;
@@ -314,14 +321,34 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             return 0;
         }
         if (operation != LUME_SOCKET_SEND_FD && operation != LUME_SOCKET_RECEIVE_FD &&
-            operation != LUME_SOCKET_SHUTDOWN)
+            operation != LUME_SOCKET_SHUTDOWN && operation != LUME_SOCKET_CREDENTIALS)
             return named_operation(files, named, operation, r);
         end = named->end;
+        if (!end && operation == LUME_SOCKET_CREDENTIALS)
+            return -LUME_EINVAL;
     }
     if (end)
     {
         struct local_pair *pair = end->pair;
         struct local_ring *ring = &pair->ring[end->side ^ 1];
+        if (operation == LUME_SOCKET_CREDENTIALS)
+        {
+            if (!r->buffer || r->count != sizeof(struct lume_socket_credentials))
+                return -LUME_EINVAL;
+            const struct local_end *peer = &pair->end[end->side ^ 1];
+            struct lume_socket_credentials credentials = {.version = LUME_SOCKET_VERSION,
+                                                          .bytes = sizeof(credentials),
+                                                          .uid = peer->uid,
+                                                          .gid = peer->gid};
+            memcpy((void *)(uintptr_t)r->buffer, &credentials, sizeof(credentials));
+            return 0;
+        }
+        if (operation == LUME_SOCKET_LOCAL || operation == LUME_SOCKET_PEER)
+        {
+            r->family = 1;
+            r->count = 0;
+            return 0;
+        }
         if (operation == LUME_SOCKET_PENDING)
         {
             r->count = pair->ring[end->side].count;

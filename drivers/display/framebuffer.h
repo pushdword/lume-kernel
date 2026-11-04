@@ -13,6 +13,24 @@ static inline uint16_t lume_framebuffer_rgb565(uint32_t color, unsigned order)
     return ((color << 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 19) & 0x1f);
 }
 
+static inline uint32_t lume_framebuffer_rgb565_pair(uint32_t first, uint32_t second, unsigned order)
+{
+#if UINTPTR_MAX > UINT32_MAX
+    uint64_t colors = first | (uint64_t)second << 32;
+    uint64_t packed = ((colors >> 5) & UINT64_C(0x000007e0000007e0));
+    if (order)
+        packed |= ((colors >> 8) & UINT64_C(0x0000f8000000f800)) |
+                  ((colors >> 3) & UINT64_C(0x0000001f0000001f));
+    else
+        packed |= ((colors << 8) & UINT64_C(0x0000f8000000f800)) |
+                  ((colors >> 19) & UINT64_C(0x0000001f0000001f));
+    return (uint32_t)packed | (uint32_t)(packed >> 16);
+#else
+    return lume_framebuffer_rgb565(first, order) | (uint32_t)lume_framebuffer_rgb565(second, order)
+                                                       << 16;
+#endif
+}
+
 static int lume_framebuffer_present(uintptr_t memory, unsigned width, unsigned height,
                                     unsigned pitch, unsigned depth, unsigned order,
                                     const struct lume_graphics_request *request)
@@ -40,8 +58,7 @@ static int lume_framebuffer_present(uintptr_t memory, unsigned width, unsigned h
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
             for (; request->width - x >= 2; x += 2)
             {
-                uint32_t pair = lume_framebuffer_rgb565(row[x], order) |
-                                (uint32_t)lume_framebuffer_rgb565(row[x + 1], order) << 16;
+                uint32_t pair = lume_framebuffer_rgb565_pair(row[x], row[x + 1], order);
                 *(volatile uint32_t *)(out + x) = pair;
             }
 #endif

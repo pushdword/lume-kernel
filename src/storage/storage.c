@@ -31,6 +31,8 @@ static int close_handle(void *);
 static struct lume_volume volume;
 static FATFS filesystem;
 static bool mounted;
+static bool data_faulted;
+static bool replacing, replacement_io_failed;
 static struct lume_volume boot_volume;
 static FATFS boot_filesystem;
 static bool boot_mounted;
@@ -45,7 +47,7 @@ static struct lume_work flush_work = {.run = flush_one};
 
 void lume_storage_poll_background(void)
 {
-    if (mounted && lume_clock_monotonic() >= next_flush_at)
+    if (mounted && !data_faulted && lume_clock_monotonic() >= next_flush_at)
         (void)lume_work_submit(&flush_work);
 }
 
@@ -67,7 +69,9 @@ static const struct lume_volume *drive_volume(BYTE drive)
 DSTATUS disk_initialize(BYTE drive)
 {
     const struct lume_volume *v = drive_volume(drive);
-    return !v || !v->count ? STA_NOINIT : 0;
+    return !v || !v->count || (!drive && (data_faulted || (replacing && replacement_io_failed)))
+               ? STA_NOINIT
+               : 0;
 }
 
 DSTATUS disk_status(BYTE drive)
@@ -77,6 +81,8 @@ DSTATUS disk_status(BYTE drive)
 
 DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
 {
+    if (!drive && (data_faulted || (replacing && replacement_io_failed)))
+        return RES_NOTRDY;
     const struct lume_volume *v = drive_volume(drive);
     if (!v || !count || sector >= v->count || count > v->count - sector)
         return RES_PARERR;
@@ -86,7 +92,11 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
         bool result = lume_sd_read_blocks(v->first + sector + i, group, out + (size_t)i * 512);
         lume_worker_checkpoint(group * 512);
         if (!result)
+        {
+            if (!drive && replacing)
+                replacement_io_failed = true;
             return RES_ERROR;
+        }
         i += group;
     }
     return RES_OK;
@@ -94,6 +104,8 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
 
 DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
 {
+    if (!drive && (data_faulted || (replacing && replacement_io_failed)))
+        return RES_NOTRDY;
     const struct lume_volume *v = drive_volume(drive);
     if (!v || !(drive == 0 ? mounted : boot_mounted) || !count || sector >= v->count ||
         count > v->count - sector)
@@ -104,7 +116,11 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
         bool result = lume_sd_write_blocks(v->first + sector + i, group, data + (size_t)i * 512);
         lume_worker_checkpoint(group * 512);
         if (!result)
+        {
+            if (!drive && replacing)
+                replacement_io_failed = true;
             return RES_ERROR;
+        }
         i += group;
     }
     return RES_OK;
@@ -112,6 +128,8 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
 
 DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
 {
+    if (!drive && (data_faulted || (replacing && replacement_io_failed)))
+        return RES_NOTRDY;
     const struct lume_volume *v = drive_volume(drive);
     if (!v || !v->count)
         return RES_PARERR;
@@ -204,6 +222,8 @@ static void dirty_file(struct storage_file *file, size_t bytes)
 static void flush_one(void *context)
 {
     (void)context;
+    if (data_faulted)
+        return;
     uint64_t now = lume_clock_monotonic();
     for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
     {
@@ -551,6 +571,44 @@ static int rename_file(const char *from, const char *to)
     return busy ? busy : error(f_rename(a, b));
 }
 
+static int replace_file(const char *from, const char *to, unsigned *state)
+{
+    if (!state)
+        return -LUME_EINVAL;
+    *state = LUME_STORAGE_REPLACE_UNCHANGED;
+    if (data_faulted)
+        return -LUME_EIO;
+    int cached = close_read_cache();
+    if (cached)
+        return cached;
+    const char *a = name(from), *b = name(to);
+    if (!a || !b)
+        return -LUME_EINVAL;
+    int busy = busy_file(a);
+    if (!busy)
+        busy = busy_file(b);
+    if (busy)
+        return busy;
+    BYTE progress;
+    replacing = true;
+    replacement_io_failed = false;
+    FRESULT result = f_replace(a, b, &progress);
+    replacing = false;
+    if (replacement_io_failed)
+        result = FR_DISK_ERR;
+    _Static_assert(FF_REPLACE_UNCHANGED == LUME_STORAGE_REPLACE_UNCHANGED &&
+                       FF_REPLACE_UNCERTAIN == LUME_STORAGE_REPLACE_UNCERTAIN &&
+                       FF_REPLACE_COMMITTED == LUME_STORAGE_REPLACE_COMMITTED,
+                   "replacement state contract");
+    *state = progress;
+    if (result != FR_OK && progress != FF_REPLACE_UNCHANGED)
+    {
+        data_faulted = true;
+        lume_puts("FAT32 metadata replacement failed. Restart before accessing /data.\n");
+    }
+    return error(result);
+}
+
 static bool walk_directory(char path[128], unsigned length, unsigned depth,
                            lume_storage_visit visit, void *context)
 {
@@ -583,7 +641,7 @@ static bool walk_directory(char path[128], unsigned length, unsigned depth,
         for (unsigned i = 0; entry.fname[i]; ++i)
         {
             unsigned char c = (unsigned char)entry.fname[i];
-            if (n >= 126 || c < 32 || c >= 127)
+            if (n >= 126 || c < 32 || c == 127)
             {
                 ok = false;
                 break;
@@ -617,6 +675,8 @@ static bool walk(lume_storage_visit visit, void *context)
 
 const struct lume_storage_ops *lume_storage_start(void)
 {
+    if (data_faulted)
+        return 0;
     for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
         if (storage_handles[i].file && read_cache != storage_handles + i)
             return 0;
@@ -659,7 +719,8 @@ const struct lume_storage_ops *lume_storage_start(void)
                                                 .write_handle = write_handle,
                                                 .resize_handle = resize_handle,
                                                 .close = close_handle,
-                                                .sync_handle = sync_handle};
+                                                .sync_handle = sync_handle,
+                                                .replace = replace_file};
     return &ops;
 }
 

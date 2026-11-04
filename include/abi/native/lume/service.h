@@ -23,7 +23,8 @@ enum
     NETD_CONNECT,
     NETD_PAUSE,
     NETD_RECONNECT,
-    NETD_RELOAD
+    NETD_RELOAD,
+    NETD_IMPORT_FILE
 };
 
 enum

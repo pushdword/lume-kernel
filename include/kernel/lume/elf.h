@@ -39,4 +39,6 @@ void lume_elf_release(struct lume_elf_image *);
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 void lume_mmu_unmap_user(unsigned task, uint64_t va);
 void lume_sync_code(uint64_t address, size_t bytes);
+void lume_sync_code_defer(uint64_t address, size_t bytes);
+void lume_sync_code_finish(void);
 #endif

@@ -103,6 +103,12 @@ int main(void)
     CHECK(lume_mmu_device_mapping(UINT64_C(0x107d510600)));
     CHECK(lume_mmu_device_mapping(UINT64_C(0x107c701400)));
     CHECK(lume_mmu_device_mapping(UINT64_C(0x107c013880)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x1002000000)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x1002008000)));
+    CHECK(lume_mmu_device_mapping(UINT64_C(0x1002030800)));
+    CHECK(lume_mmu_translate(root, UINT64_C(0x1002030800), true, false, false, &pa));
+    CHECK(pa == UINT64_C(0x1002030800));
+    CHECK(!lume_mmu_translate(root, UINT64_C(0x1002000000), false, true, false, &pa));
     CHECK(!lume_mmu_translate(root, UINT64_C(0x107c013880), false, true, false, &pa));
     CHECK(!lume_mmu_translate(root, UINT64_C(0x107c013880), false, false, true, &pa));
     CHECK(lume_mmu_video_mapping(0x3fc00000, 0x200000));
@@ -217,6 +223,17 @@ int main(void)
     ++layout.secondary_guard;
     CHECK(!lume_mmu_tables(&fdt, &layout));
     layout.secondary_guard = 0x4f0000;
+    CHECK(!lume_mmu_tables(&fdt, &layout));
+    layout.end = 0x800000;
+    layout.secondary_guard = 0x780000;
+    CHECK(lume_mmu_tables(&fdt, &layout));
+    root = lume_mmu_root();
+    CHECK(lume_mmu_translate(root, 0x600000, true, false, false, &pa) && pa == 0x600000);
+    CHECK(lume_mmu_translate(root, 0x7fffff, true, false, false, &pa) && pa == 0x7fffff);
+    CHECK(!lume_mmu_translate(root, 0x600000, false, false, true, &pa));
+    CHECK(!lume_mmu_translate(root, 0x600000, false, true, false, &pa));
+    CHECK(!lume_mmu_translate(root, layout.secondary_guard, true, false, false, &pa));
+    layout.end += 4096;
     CHECK(!lume_mmu_tables(&fdt, &layout));
     printf("PASS_MMU_TABLES checks=%u\n", checks);
 }

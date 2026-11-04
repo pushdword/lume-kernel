@@ -2,14 +2,24 @@
 #include "lume/smp.h"
 #define ADDRESS UINT64_C(0x0000fffffffff000)
 
-void lume_sync_code(uint64_t address, size_t bytes)
+void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
     uint64_t ctr;
     __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
     uint64_t line = UINT64_C(4) << ((ctr >> 16) & 15);
     for (uint64_t p = address & ~(line - 1); p < address + bytes; p += line)
         __asm__ volatile("dc cvau, %0" ::"r"(p) : "memory");
+}
+
+void lume_sync_code_finish(void)
+{
     __asm__ volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");
+}
+
+void lume_sync_code(uint64_t address, size_t bytes)
+{
+    lume_sync_code_defer(address, bytes);
+    lume_sync_code_finish();
 }
 
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
@@ -44,9 +54,9 @@ bool lume_mmu_start(const struct lume_fdt *fdt)
 {
     extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[],
         __stack_guard[], __worker_guard[], __secondary_stacks[];
-    struct lume_layout layout = {(uintptr_t)__image_start,  (uintptr_t)__text_end,
-                                 (uintptr_t)__readonly_end, (uintptr_t)__image_end,
-                                 (uintptr_t)__stack_guard,  (uintptr_t)__worker_guard,
+    struct lume_layout layout = {(uintptr_t)__image_start,     (uintptr_t)__text_end,
+                                 (uintptr_t)__readonly_end,    (uintptr_t)__image_end,
+                                 (uintptr_t)__stack_guard,     (uintptr_t)__worker_guard,
                                  (uintptr_t)__secondary_stacks};
     if (!lume_mmu_tables(fdt, &layout))
         return false;

@@ -40,6 +40,7 @@ static int64_t inline_result;
 static unsigned pipe_process, charges, selections, progress, submissions, resumes;
 static struct lume_context *inline_frame, selected_frame;
 static bool kernel_console_scope;
+static bool memory_descriptor;
 static void (*worker_function)(void *);
 static void *worker_argument;
 static unsigned files_released[LUME_TASK_LIMIT];
@@ -61,6 +62,11 @@ static bool kernel_console_storage(unsigned task)
 {
     assert(task < LUME_TASK_LIMIT);
     return filesystem_scope;
+}
+
+bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
+{
+    return memory_descriptor && files == &tasks[1].files && fd == 3;
 }
 
 static uint64_t lume_clock_monotonic(void)
@@ -242,6 +248,7 @@ static void reset(void)
     block_pipe = suspended_once = pending_work = kernel_deferred_turn = false;
     nonblock_pipe = filesystem_scope = expect_writing = override_result = false;
     kernel_console_scope = kernel_launch = account_inside = false;
+    memory_descriptor = false;
     inline_frame = NULL;
     pipe_process = charges = selections = progress = submissions = resumes = 0;
     current_task = 3;
@@ -505,6 +512,24 @@ static void final_close_wait(void)
     assert(kernel_close_ready(1) && files_released[1] == 1);
 }
 
+static void queued_memory_io(void)
+{
+    for (unsigned replay = 0; replay < 2; ++replay)
+    {
+        reset();
+        enqueue(0, false);
+        enqueue(1, replay != 0);
+        enqueue(2, false);
+        filesystem_scope = suspended_once = memory_descriptor = true;
+        kernel_step();
+        assert(lume_worker_busy() && kernel_owner == 0 && !executed[0]);
+        assert(states[1] == 1 && !kernel_wait[1] && !kernel_queue.queued[1]);
+        assert(tasks[1].context.pc == (replay ? 100u : 96u));
+        assert(states[2] == 4 && kernel_wait[2] && kernel_queue.queued[2]);
+        assert(kernel_queue.count == 1 && !executed[1] && !executed[2]);
+    }
+}
+
 int main(void)
 {
     ownership();
@@ -513,6 +538,7 @@ int main(void)
     inline_pipe_completion();
     inline_pipe_wait_and_replay();
     final_close_wait();
+    queued_memory_io();
     assert(network_checks && network_checks == storage_checks);
     puts(
         "PASS_IO_CALLS owner root, completion, cancellation, exit, inline pipe replay and bounded fairness");

@@ -1,6 +1,7 @@
 #include "lume/poll.h"
 #include "lume/socket_file.h"
 #include "lume/io.h"
+#include "lume/wait.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -113,13 +114,171 @@ static struct lume_fd_request pipe_create(struct lume_files *files)
     return pipe;
 }
 
+static void high_waiters_test(void)
+{
+    struct lume_wait_queue queue = {0};
+    T(lume_wait_subscribe(&queue, 0) && lume_wait_subscribe(&queue, 32));
+    T(lume_wait_subscribe(&queue, 63) && !lume_wait_subscribe(&queue, 64));
+    lume_wait_wake(&queue);
+    lume_wait_cancel(&queue, 32);
+    T(lume_wait_take(&queue, 63) && lume_wait_take(&queue, 0));
+    T(!lume_wait_take(&queue, 32) && !lume_wait_take(&queue, 64));
+    T(!queue.ready && !queue.waiting);
+    struct lume_files files;
+    lume_files_init(&files);
+    struct lume_fd_request pipe = pipe_create(&files);
+    struct lume_poll_watch first = watch(&files, pipe.fd, LUME_POLLIN, 31);
+    struct lume_poll_watch last = watch(&files, pipe.fd, LUME_POLLIN, 63);
+    T(lume_vfs_write(&files, pipe.other, "x", 1) == 1);
+    T(lume_vfs_poll_take(63) && lume_vfs_poll_take(31));
+    T(!lume_vfs_poll_take(0) && !lume_vfs_poll_take(32));
+    T(lume_vfs_poll_check(&files, &first) == 1 && lume_vfs_poll_check(&files, &last) == 1);
+    lume_vfs_poll_cancel(31);
+    lume_vfs_poll_cancel(63);
+    lume_files_release(&files);
+}
+
 static struct lume_socket_request pair_create(struct lume_files *files)
 {
     struct lume_socket_request pair = {
         .version = LUME_SOCKET_VERSION, .bytes = sizeof(pair), .family = 1, .type = 1};
     T(!lume_socket_call(files, LUME_SOCKET_PAIR, &pair));
     T(!lume_vfs_pipe_io(files, pair.fd));
+    T(lume_vfs_memory_io(files, pair.fd));
+    T(lume_vfs_memory_io(files, pair.other));
+    for (unsigned side = 0; side < 2; ++side)
+        for (unsigned query = 0; query < 2; ++query)
+        {
+            char name[108];
+            memset(name, 0x5a, sizeof(name));
+            struct lume_socket_request address = {.version = LUME_SOCKET_VERSION,
+                                                  .bytes = sizeof(address),
+                                                  .fd = side ? pair.other : pair.fd,
+                                                  .family = 1,
+                                                  .buffer = (uintptr_t)name,
+                                                  .count = sizeof(name)};
+            T(!lume_socket_call(files, query ? LUME_SOCKET_PEER : LUME_SOCKET_LOCAL, &address));
+            T(address.family == 1 && address.count == 0 && name[0] == 0x5a);
+        }
     return pair;
+}
+
+static void peer_credentials(struct lume_files *files, int fd, unsigned uid, unsigned gid)
+{
+    struct lume_socket_credentials credentials = {0};
+    struct lume_socket_request request = {.version = LUME_SOCKET_VERSION,
+                                          .bytes = sizeof(request),
+                                          .fd = fd,
+                                          .buffer = (uintptr_t)&credentials,
+                                          .count = sizeof(credentials)};
+    T(!lume_socket_call(files, LUME_SOCKET_CREDENTIALS, &request));
+    T(credentials.version == LUME_SOCKET_VERSION && credentials.bytes == sizeof(credentials));
+    T(credentials.uid == uid && credentials.gid == gid);
+    --request.count;
+    T(lume_socket_call(files, LUME_SOCKET_CREDENTIALS, &request) == -LUME_EINVAL);
+    ++request.count;
+    request.buffer = 0;
+    T(lume_socket_call(files, LUME_SOCKET_CREDENTIALS, &request) == -LUME_EINVAL);
+}
+
+static void credentials_test(void)
+{
+    struct lume_files server, client, inherited;
+    lume_files_init(&server);
+    lume_files_init(&client);
+    server.identity.euid = 501;
+    server.identity.egid = 77;
+    struct lume_socket_request pair = pair_create(&server);
+    server.identity.euid = 502;
+    server.identity.egid = 78;
+    peer_credentials(&server, pair.fd, 501, 77);
+    peer_credentials(&server, pair.other, 501, 77);
+    lume_files_clone(&inherited, &server);
+    peer_credentials(&inherited, pair.fd, 501, 77);
+    lume_files_release(&inherited);
+    T(!lume_vfs_close(&server, pair.other));
+    peer_credentials(&server, pair.fd, 501, 77);
+    T(!lume_vfs_close(&server, pair.fd));
+
+    struct lume_socket_request listener = {
+        .version = LUME_SOCKET_VERSION, .bytes = sizeof(listener), .family = 1, .type = 1};
+    T(!lume_socket_call(&server, LUME_SOCKET_CREATE, &listener));
+    T(lume_vfs_memory_io(&server, listener.fd));
+    char path[] = "/tmp/credentials";
+    listener.buffer = (uintptr_t)path;
+    listener.count = sizeof(path);
+    T(!lume_socket_call(&server, LUME_SOCKET_BIND, &listener));
+    listener.count = 1;
+    T(!lume_socket_call(&server, LUME_SOCKET_LISTEN, &listener));
+    server.identity.euid = 503;
+    server.identity.egid = 79;
+    T(!lume_socket_call(&server, LUME_SOCKET_LISTEN, &listener));
+    client.identity.euid = 1002;
+    client.identity.egid = 81;
+    struct lume_socket_request connection = {
+        .version = LUME_SOCKET_VERSION, .bytes = sizeof(connection), .family = 1, .type = 1};
+    T(!lume_socket_call(&client, LUME_SOCKET_CREATE, &connection));
+    struct lume_socket_credentials output;
+    struct lume_socket_request query = {.version = LUME_SOCKET_VERSION,
+                                        .bytes = sizeof(query),
+                                        .fd = connection.fd,
+                                        .buffer = (uintptr_t)&output,
+                                        .count = sizeof(output)};
+    T(lume_socket_call(&client, LUME_SOCKET_CREDENTIALS, &query) == -LUME_EINVAL);
+    connection.buffer = (uintptr_t)path;
+    connection.count = sizeof(path);
+    T(!lume_socket_call(&client, LUME_SOCKET_CONNECT, &connection));
+    client.identity.euid = client.identity.egid = 0;
+    peer_credentials(&client, connection.fd, 502, 78);
+    T(!lume_socket_call(&server, LUME_SOCKET_ACCEPT, &listener));
+    peer_credentials(&server, listener.other, 1002, 81);
+    T(!lume_vfs_close(&client, connection.fd));
+    peer_credentials(&server, listener.other, 1002, 81);
+    lume_files_release(&client);
+    lume_files_release(&server);
+}
+
+static void pipe_pool_test(void)
+{
+    struct lume_files owners[8];
+    int pairs[96][2];
+    unsigned capacity = 0;
+    for (unsigned pass = 0; pass < 2; ++pass)
+    {
+        for (unsigned i = 0; i < 8; ++i)
+            lume_files_init(owners + i);
+        unsigned created = 0;
+        for (; created < 96; ++created)
+        {
+            struct lume_fd_request request = {.version = LUME_FD_VERSION, .bytes = sizeof(request)};
+            int result = lume_vfs_fd_call(owners + created / 12, LUME_FD_PIPE, &request);
+            if (result)
+            {
+                T(result == -LUME_ENOMEM);
+                break;
+            }
+            pairs[created][0] = request.fd;
+            pairs[created][1] = request.other;
+        }
+        T(created > 8 && created < 96);
+        if (pass)
+            T(created == capacity);
+        capacity = created;
+        for (unsigned i = 0; i < created; ++i)
+        {
+            unsigned char value = i;
+            T(lume_vfs_write(owners + i / 12, pairs[i][1], &value, 1) == 1);
+        }
+        for (unsigned i = 0; i < created; ++i)
+        {
+            unsigned char value = 255;
+            T(lume_vfs_read(owners + i / 12, pairs[i][0], &value, 1) == 1 && value == i);
+            T(!lume_vfs_close(owners + i / 12, pairs[i][1]));
+            T(lume_vfs_read(owners + i / 12, pairs[i][0], &value, 1) == 0);
+        }
+        for (unsigned i = 0; i < 8; ++i)
+            lume_files_release(owners + i);
+    }
 }
 
 int main(void)
@@ -209,7 +368,7 @@ int main(void)
         repeated.records[i] = (struct lume_pollfd){b.fd, LUME_POLLIN, 0};
     lume_vfs_poll_prepare(&files, &repeated);
     T(lume_vfs_poll_subscribe(&files, &repeated, 31));
-    T(!lume_vfs_poll_subscribe(&files, &repeated, 32));
+    T(!lume_vfs_poll_subscribe(&files, &repeated, LUME_POLL_TASK_LIMIT));
     T(lume_vfs_write(&files, b.other, "b", 1) == 1);
     T(lume_vfs_poll_take(8) && lume_vfs_poll_take(31));
     T(lume_vfs_poll_check(&files, &repeated) == LUME_FD_LIMIT);
@@ -332,8 +491,8 @@ int main(void)
         lume_vfs_poll_cancel(i);
     lume_files_release(&files);
     lume_files_init(&files);
-    struct lume_socket_request listener = {.version = LUME_SOCKET_VERSION,
-                                            .bytes = sizeof(listener), .family = 1, .type = 1};
+    struct lume_socket_request listener = {
+        .version = LUME_SOCKET_VERSION, .bytes = sizeof(listener), .family = 1, .type = 1};
     T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &listener));
     char socket_name[] = "/tmp/.X11-unix/X0";
     listener.buffer = (uintptr_t)socket_name;
@@ -344,8 +503,8 @@ int main(void)
     struct lume_poll_watch pending = watch(&files, listener.fd, LUME_POLLIN, 10);
     for (unsigned connection = 0; connection < 3; ++connection)
     {
-        struct lume_socket_request client = {.version = LUME_SOCKET_VERSION,
-                                              .bytes = sizeof(client), .family = 1, .type = 1};
+        struct lume_socket_request client = {
+            .version = LUME_SOCKET_VERSION, .bytes = sizeof(client), .family = 1, .type = 1};
         T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &client));
         client.buffer = (uintptr_t)socket_name;
         client.count = sizeof(socket_name);
@@ -365,8 +524,8 @@ int main(void)
     struct lume_socket_request queued[2];
     for (unsigned i = 0; i < 2; ++i)
     {
-        queued[i] = (struct lume_socket_request){.version = LUME_SOCKET_VERSION,
-            .bytes = sizeof(queued[i]), .family = 1, .type = 1};
+        queued[i] = (struct lume_socket_request){
+            .version = LUME_SOCKET_VERSION, .bytes = sizeof(queued[i]), .family = 1, .type = 1};
         T(!lume_socket_call(&files, LUME_SOCKET_CREATE, queued + i));
         queued[i].buffer = (uintptr_t)socket_name;
         queued[i].count = sizeof(socket_name);
@@ -386,8 +545,8 @@ int main(void)
     T(!lume_vfs_close(&files, queued[1].fd));
     lume_vfs_poll_cancel(11);
     T(!lume_vfs_close(&files, listener.fd));
-    listener = (struct lume_socket_request){.version = LUME_SOCKET_VERSION,
-                                            .bytes = sizeof(listener), .family = 1, .type = 1};
+    listener = (struct lume_socket_request){
+        .version = LUME_SOCKET_VERSION, .bytes = sizeof(listener), .family = 1, .type = 1};
     T(!lume_socket_call(&files, LUME_SOCKET_CREATE, &listener));
     listener.buffer = (uintptr_t)socket_name;
     listener.count = sizeof(socket_name);
@@ -396,6 +555,9 @@ int main(void)
     lume_files_release(&files);
     for (unsigned i = 0; i < LUME_POLL_TASK_LIMIT; ++i)
         T(!lume_vfs_poll_take(i));
+    credentials_test();
+    pipe_pool_test();
+    high_waiters_test();
     printf(
         "PASS_POLL checks=%u object isolation, aliases, fork, generations, teardown and cancel\n",
         checks);

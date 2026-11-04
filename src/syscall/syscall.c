@@ -19,7 +19,11 @@
 #include "lume/graphics_device.h"
 #include "lume/tty_device.h"
 #include "lume/platform_driver.h"
+#include "lume/realtime.h"
+#include "lume/gpu_device.h"
 #include <string.h>
+
+static struct lume_realtime realtime;
 
 extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
 
@@ -267,6 +271,17 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         *(struct lume_graphics_request *)(uintptr_t)b = request;
         return result;
     }
+    case LUME_SYS_GPU:
+    {
+        if (a > LUME_GPU_COPY || n != sizeof(struct lume_gpu_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
+        struct lume_gpu_request request = *(const struct lume_gpu_request *)(uintptr_t)b;
+        int result = lume_gpu_call(files, pid, (unsigned)a, &request);
+        *(struct lume_gpu_request *)(uintptr_t)b = request;
+        return result;
+    }
     case LUME_SYS_TTY:
     {
         if (a > LUME_TTY_OPEN || n != sizeof(struct lume_tty_request))
@@ -347,13 +362,16 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return lume_vfs_sync(files, b);
         if (a == LUME_FS_TRUNCATE)
             return lume_vfs_truncate(files, b);
-        if (a == LUME_FS_RENAME)
+        if (a == LUME_FS_RENAME || a == LUME_FS_REPLACE)
         {
             char to[LUME_PATH_MAX];
             r = string(b, p);
             if (!r)
                 r = string(n, to);
-            return r ? r : lume_vfs_rename(files, p, to);
+            if (r)
+                return r;
+            return a == LUME_FS_REPLACE ? lume_vfs_replace(files, p, to)
+                                        : lume_vfs_rename(files, p, to);
         }
         if (a != LUME_FS_STAT_PATH && a != LUME_FS_STAT_FD && a != LUME_FS_STAT_INODE)
             return -LUME_EINVAL;
@@ -372,6 +390,22 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         extern uint64_t lume_clock_monotonic(void);
         return (int64_t)lume_clock_monotonic();
+    }
+    case LUME_SYS_REALTIME:
+    {
+        if (a > LUME_REALTIME_SET || n != sizeof(struct lume_realtime_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, a == LUME_REALTIME_GET))
+            return -LUME_EFAULT;
+        struct lume_realtime_request request;
+        memcpy(&request, (const void *)(uintptr_t)b, sizeof(request));
+        extern uint64_t lume_clock_monotonic(void);
+        int result = lume_realtime_control(&realtime, (unsigned)a, &request, lume_clock_monotonic(),
+                                           !files->identity.euid &&
+                                               lume_task_capable(pid, LUME_CAP_CLOCK_ADMIN));
+        if (!result && a == LUME_REALTIME_GET)
+            memcpy((void *)(uintptr_t)b, &request, sizeof(request));
+        return result;
     }
     case LUME_SYS_SERVICE:
     {
@@ -469,7 +503,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_SOCKET:
     {
-        if (a > LUME_SOCKET_PENDING || n != sizeof(struct lume_socket_request))
+        if (a > LUME_SOCKET_CREDENTIALS || n != sizeof(struct lume_socket_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -489,6 +523,13 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             return -LUME_EFAULT;
         if (a == LUME_SOCKET_RECEIVE_FD && !lume_user_buffer(request.buffer, request.count, true))
             return -LUME_EFAULT;
+        if (a == LUME_SOCKET_CREDENTIALS)
+        {
+            if (request.count != sizeof(struct lume_socket_credentials))
+                return -LUME_EINVAL;
+            if (!lume_user_buffer(request.buffer, request.count, true))
+                return -LUME_EFAULT;
+        }
         int64_t result = lume_socket_call(files, (unsigned)a, &request);
         *(struct lume_socket_request *)(uintptr_t)b = request;
         return result;

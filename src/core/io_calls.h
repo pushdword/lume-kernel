@@ -40,7 +40,7 @@ static void kernel_call(void *context)
     (void)context;
     unsigned task = kernel_owner;
     unsigned process = process_slot(task);
-    kernel_console_scope = !kernel_launch && kernel_console_storage(task);
+    kernel_console_scope = kernel_launch || kernel_console_storage(task);
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
     kernel_result = LUME_CONTEXT_REG(&tasks[task].context, 8) == LUME_SYS_FORK
                         ? fork_program(&tasks[task].context)
@@ -62,6 +62,41 @@ static void kernel_cancel(unsigned task)
     io_queue_cancel(&kernel_queue, task);
     if (kernel_owner != task)
         kernel_wait[task] = false;
+}
+
+static void kernel_memory_waiters(void)
+{
+    if (!kernel_console_scope)
+        return;
+    for (unsigned i = 0; i < kernel_queue.count;)
+    {
+        struct io_ticket ticket = kernel_queue.entries[(kernel_queue.head + i) % LUME_TASK_LIMIT];
+        unsigned task = ticket.task;
+        if (task >= LUME_TASK_LIMIT || !kernel_queue.queued[task] ||
+            ticket.generation != kernel_queue.generation[task])
+        {
+            ++i;
+            continue;
+        }
+        struct lume_context *frame = &tasks[task].context;
+        uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+        bool memory_io =
+            (number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
+            lume_vfs_memory_io(&tasks[process_slot(task)].files, LUME_CONTEXT_REG(frame, 0));
+        if (!kernel_wait[task] || states[task] != 4 || process_exiting[process_slot(task)] ||
+            !memory_io)
+        {
+            ++i;
+            continue;
+        }
+        io_queue_cancel(&kernel_queue, task);
+        if (!ticket.replay)
+            LUME_CONTEXT_PC(frame) -= LUME_SYSCALL_INSTRUCTION_BYTES;
+        kernel_wait[task] = false;
+        states[task] = 1;
+        sched_wake(&policy, task, unit, 0);
+        lume_smp_wake();
+    }
 }
 
 static void kernel_step_admit(bool admit)
@@ -133,7 +168,10 @@ static void kernel_step_admit(bool admit)
                                                        : lume_mmu_root());
     }
     if (lume_worker_busy())
+    {
+        kernel_memory_waiters();
         return;
+    }
     if (kernel_owner < LUME_TASK_LIMIT)
     {
         unsigned task = kernel_owner;

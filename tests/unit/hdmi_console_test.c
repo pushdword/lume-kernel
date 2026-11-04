@@ -61,6 +61,14 @@ bool lume_dma_sync_for_device(const void *data, size_t bytes, enum lume_dma_dire
     return !dma_failure;
 }
 
+bool lume_dma_sync_rect_for_device(const void *data, size_t row_bytes, size_t pitch, unsigned rows,
+                                   enum lume_dma_direction direction)
+{
+    size_t bytes;
+    assert(lume_dma_rect_bytes(row_bytes, pitch, rows, &bytes));
+    return lume_dma_sync_for_device(data, bytes, direction);
+}
+
 static void present_rows(unsigned pitch)
 {
     uint32_t pixels[160 * 4];
@@ -76,7 +84,7 @@ static void present_rows(unsigned pitch)
                                            .format = LUME_GRAPHICS_XRGB8888};
     unsigned before = flushes;
     assert(!registered_graphics->present(&update));
-    assert(flushes == before + (pitch == 640 ? 1 : 4));
+    assert(flushes == before + 1);
     if (pitch == 640)
     {
         assert(last_flush == memory + 7 * pitch && last_flush_bytes == 4 * pitch);

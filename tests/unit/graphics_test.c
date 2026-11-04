@@ -29,11 +29,17 @@ struct lume_file_ops
     int64_t (*write)(void *, const void *, uint64_t);
     unsigned (*poll)(void *);
     struct lume_poll_source *(*source)(void *);
+    bool memory_io;
 };
 
 static bool capable = true, claimed, valid_buffer = true;
 static unsigned presents;
 static int attach_error;
+
+void lume_gpu_release(unsigned owner)
+{
+    (void)owner;
+}
 
 bool lume_task_capable(unsigned owner, uint64_t capabilities)
 {

@@ -258,8 +258,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
         lume_fail("program image staging allocation");
     lume_vfs_program_buffer(initial_program, 1024 * 1024);
     lume_vfs_program_allocator(allocate_program);
-    uint64_t node_memory = lume_pages_alloc_span(512);
-    if (!node_memory || !lume_vfs_node_buffer((void *)(uintptr_t)node_memory, 2 * 1024 * 1024))
+    uint64_t node_memory = lume_pages_alloc_span(1024);
+    if (!node_memory || !lume_vfs_node_buffer((void *)(uintptr_t)node_memory, 4 * 1024 * 1024))
         lume_fail("filesystem node allocation");
     extern unsigned char lume_shell_elf_begin[], lume_shell_elf_end[];
     lume_vfs_init(lume_shell_elf_begin, (size_t)(lume_shell_elf_end - lume_shell_elf_begin));

@@ -5,6 +5,13 @@
 #include <stdint.h>
 typedef bool (*lume_storage_visit)(const char *, bool, uint64_t, void *);
 
+enum
+{
+    LUME_STORAGE_REPLACE_UNCHANGED,
+    LUME_STORAGE_REPLACE_UNCERTAIN,
+    LUME_STORAGE_REPLACE_COMMITTED
+};
+
 struct lume_storage_ops
 {
     bool (*walk)(lume_storage_visit, void *);
@@ -23,6 +30,9 @@ struct lume_storage_ops
     int (*resize_handle)(void *, uint64_t);
     int (*close)(void *);
     int (*sync_handle)(void *);
+    /* Replacement accepts closed regular files. The state records namespace changes
+     * even when reclaiming the previous contents reports an error. */
+    int (*replace)(const char *, const char *, unsigned *state);
 };
 
 struct lume_volume

@@ -59,6 +59,6 @@ SECTIONS
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }
 ASSERT((_start == 0x200000), "Pi5 image entry must be 0x200000")
-ASSERT((__image_end <= 0x600000), "Early image and stacks exceed the reserved 4 MiB")
+ASSERT((__image_end <= 0x800000), "Early image and stacks exceed the reserved 6 MiB")
 ASSERT(((__bss_end - __bss_start) % 16 == 0), "BSS alignment")
 ASSERT((__user_code_end - __user_code_start <= 4096), "Early EL0 code must fit one page")

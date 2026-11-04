@@ -4,6 +4,7 @@
 #include <stdint.h>
 struct lume_context;
 int64_t lume_heap_brk(unsigned, uint64_t);
+bool lume_heap_contains(unsigned, uint64_t, uint64_t);
 void lume_heap_release(unsigned);
 bool lume_heap_clone(unsigned, unsigned);
 void lume_heap_swap(unsigned, unsigned);

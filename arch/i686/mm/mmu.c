@@ -240,11 +240,21 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
     return true;
 }
 
-void lume_sync_code(uint64_t address, size_t bytes)
+void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
     (void)address;
     (void)bytes;
+}
+
+void lume_sync_code_finish(void)
+{
     __asm__ volatile("lock\naddl $0, (%%esp)" : : : "memory", "cc");
+}
+
+void lume_sync_code(uint64_t address, size_t bytes)
+{
+    lume_sync_code_defer(address, bytes);
+    lume_sync_code_finish();
 }
 
 bool lume_mmu_device_mapping(uint64_t address)

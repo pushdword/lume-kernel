@@ -28,6 +28,8 @@ static uint64_t boot_first, boot_count;
 static uint32_t rca;
 static uint64_t reads, writes, errors, rejected;
 static bool ready, transferring;
+static unsigned bus_width = 1;
+static uint32_t maximum_hz = 50000000;
 
 static uint32_t rd(unsigned reg)
 {
@@ -60,6 +62,15 @@ bool lume_sd_configure(uint64_t base, uint64_t size, uint32_t irq)
     return true;
 }
 
+bool lume_sd_configure_bus(unsigned width, uint32_t hz)
+{
+    if (device.state != LUME_DEVICE_OFF || (width != 1 && width != 4) || hz < 400000)
+        return false;
+    bus_width = width;
+    maximum_hz = hz > 50000000 ? 50000000 : hz;
+    return true;
+}
+
 static void delay(unsigned us)
 {
     if (!lume_worker_pause(lume_counter_read() + frequency * us / 1000000))
@@ -85,6 +96,15 @@ static bool event(uint32_t mask, unsigned ms)
     uint32_t status = 0;
     do
     {
+        if (interrupt_mode)
+        {
+            uint32_t asserted = rd(0x30);
+            if (asserted)
+            {
+                pending |= asserted;
+                wr(0x30, asserted);
+            }
+        }
         status = interrupt_mode ? pending : rd(0x30);
         if (status & 0xffff8000u)
             break;
@@ -96,6 +116,12 @@ static bool event(uint32_t mask, unsigned ms)
                 wr(0x30, mask);
             lume_irq_restore(flags);
             return true;
+        }
+        /* Short PIO gaps avoid a scheduler round trip. Longer waits release the worker. */
+        if (lume_counter_read() - start < frequency / 40000)
+        {
+            lume_cpu_relax_ordered();
+            continue;
         }
         if (interrupt_mode)
         {
@@ -173,6 +199,78 @@ static bool clock_rate(unsigned divider)
     return true;
 }
 
+static bool read_register_data(unsigned index, uint32_t argument, bool application,
+                               unsigned char *data, unsigned bytes)
+{
+    uint32_t response;
+    wr(4, (1u << 16) | bytes);
+    uint32_t flags = RESPONSE | CHECKS | (1u << 21) | 16u;
+    bool success = application ? app(index, argument, flags, &response)
+                               : command(index, argument, flags, &response);
+    if (!success)
+        return false;
+    if (response & 0xfdffe008u)
+    {
+        lume_value("SD_CARD_ERROR", response);
+        ++errors;
+        ready = false;
+        return false;
+    }
+    if (!event(32, 1000))
+        return false;
+    for (unsigned i = 0; i < bytes; i += 4)
+    {
+        uint32_t value = rd(0x20);
+        for (unsigned j = 0; j < 4; ++j)
+            data[i + j] = (unsigned char)(value >> (8 * j));
+    }
+    return event(2, 1000);
+}
+
+static bool select_bus(uint32_t capabilities, uint32_t csd2)
+{
+    unsigned char scr[8], status[64];
+    uint32_t response;
+    uint32_t hz = maximum_hz < 25000000 ? maximum_hz : 25000000;
+    unsigned divider = (100000000u + hz - 1) / hz;
+    if (!clock_rate(divider) || !read_register_data(51, 0, true, scr, sizeof(scr)))
+        return false;
+    unsigned width = 1;
+    if (bus_width == 4 && (scr[1] & 4))
+    {
+        if (!app(6, 2, RESPONSE | CHECKS, &response))
+            return false;
+        if (response & 0xfdffe008u)
+        {
+            ++errors;
+            return false;
+        }
+        wr(0x28, rd(0x28) | 2u);
+        width = 4;
+    }
+    if (maximum_hz > 25000000 && (capabilities & (1u << 21)) && (csd2 & (1u << 22)) &&
+        (scr[0] & 15))
+    {
+        if (!read_register_data(6, 0x00fffff1, false, status, sizeof(status)))
+            return false;
+        if (status[13] & 2)
+        {
+            if (!read_register_data(6, 0x80fffff1, false, status, sizeof(status)))
+                return false;
+            if ((status[16] & 15) == 1)
+            {
+                wr(0x28, rd(0x28) | 4u);
+                divider = (100000000u + maximum_hz - 1) / maximum_hz;
+                if (!clock_rate(divider))
+                    return false;
+            }
+        }
+    }
+    lume_value("SD_BUS_WIDTH", width);
+    lume_value("SD_BUS_HZ", 100000000u / divider);
+    return true;
+}
+
 static bool initialize(uint64_t hz)
 {
     ready = transferring = false;
@@ -240,9 +338,8 @@ static bool initialize(uint64_t hz)
     capacity = ((uint64_t)size + 1) * 1024;
     if (!command(7, rca, (3u << 16) | CHECKS, &response) || (response & 0xfdffe008u))
         return false;
-    if (!clock_rate(4))
-        return false; /* 25 MHz standard speed, no CMD6 high-speed switch */
-    lume_value("SD_BUS_HZ", 25000000);
+    if (!select_bus(capabilities, csd2))
+        return false;
     ready = true;
     lume_value("SD_SECTORS", capacity);
     lume_puts("LUME NATIVE SD PIO READY\n");

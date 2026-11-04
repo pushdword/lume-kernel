@@ -1,6 +1,7 @@
 #include "lume/module_arch.h"
 #include "lume/elf.h"
 #include "lume/mmu.h"
+#include "lume/worker.h"
 
 static uint16_t le16(const unsigned char *p)
 {
@@ -145,6 +146,8 @@ void lume_elf_release(struct lume_elf_image *image)
         lume_mmu_unmap_user(image->task, image->pages[i].address);
         if (!lume_page_free(image->pages[i].physical))
             lume_fail("ELF frame release");
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
     }
     for (unsigned i = 0; i < image->metadata_pages; ++i)
         if (!lume_page_free((uintptr_t)image->pages + (uint64_t)i * 4096))
@@ -185,8 +188,11 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
             ((unsigned char *)(uintptr_t)page)[j] =
                 ((const unsigned char *)(uintptr_t)source->pages[i].physical)[j];
         if (execute)
-            lume_sync_code(page, 4096);
+            lume_sync_code_defer(page, 4096);
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
     }
+    lume_sync_code_finish();
     return true;
 fail:
     lume_elf_release(image);
@@ -236,9 +242,12 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
                     out[i] = in[i];
             }
             if (s->flags & 1)
-                lume_sync_code(page, 4096);
+                lume_sync_code_defer(page, 4096);
+            if (!(image->count & 15u))
+                lume_worker_checkpoint(65536);
         }
     }
+    lume_sync_code_finish();
     image->entry = plan.entry;
     image->tls_address = plan.tls_address;
     image->tls_file = plan.tls_file;

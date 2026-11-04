@@ -5,6 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static uint64_t pinned_end;
+
+bool lume_gpu_heap_allowed(unsigned pid, uint64_t end)
+{
+    return pid != 1 || end >= pinned_end;
+}
+
 #define BASE LUME_HEAP_BASE
 #define TEST_PAGES 2048u
 static uint64_t mapped[LUME_TASK_LIMIT][TEST_PAGES];
@@ -103,6 +110,14 @@ int main(void)
     assert(lume_heap_brk(1, BASE + 31) == BASE + 31 && allocated == 1);
     assert(lume_heap_brk(1, 0) == BASE + 31);
     assert(lume_heap_brk(1, BASE + 4096) == BASE + 4096 && allocated == 1);
+    assert(lume_heap_contains(1, BASE, 4096));
+    assert(!lume_heap_contains(0, BASE, 1));
+    assert(!lume_heap_contains(1, BASE - 1, 1));
+    assert(!lume_heap_contains(1, BASE, 4097));
+    assert(!lume_heap_contains(1, BASE, 0));
+    pinned_end = BASE + 4096;
+    assert(lume_heap_brk(1, BASE) == -LUME_EBUSY && allocated == 1);
+    pinned_end = 0;
     assert(switched == original_switches && map_calls == original_maps);
     assert(lume_heap_brk(2, BASE + 8193) == BASE + 8193 && allocated == 4);
     assert(mapped[0][0] && mapped[1][0] && mapped[0][0] != mapped[1][0]);

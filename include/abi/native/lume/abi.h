@@ -74,6 +74,8 @@ enum lume_syscall
     LUME_SYS_VIDEO = 51,
     LUME_SYS_GRAPHICS = 52,
     LUME_SYS_TTY = 53,
+    LUME_SYS_REALTIME = 54,
+    LUME_SYS_GPU = 55,
 };
 
 enum

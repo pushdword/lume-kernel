@@ -38,6 +38,36 @@ void lume_console_write(const char *data, size_t bytes)
     ++console_calls;
 }
 
+static void replace_files(void)
+{
+    struct lume_files files;
+    lume_files_init(&files);
+    const char *source = "/tmp/replace-new", *target = "/tmp/replace-old";
+    int fd = (int)lume_vfs_open(&files, source, LUME_O_CREAT | LUME_O_RDWR);
+    T(fd >= 0 && lume_vfs_write(&files, fd, "new", 3) == 3);
+    T(lume_vfs_close(&files, fd) == 0);
+    fd = (int)lume_vfs_open(&files, target, LUME_O_CREAT | LUME_O_RDWR);
+    T(fd >= 0 && lume_vfs_write(&files, fd, "previous", 8) == 8);
+    T(lume_vfs_replace(&files, source, target) == -LUME_EBUSY);
+    T(lume_vfs_close(&files, fd) == 0);
+    struct lume_stat original, replaced, result;
+    T(lume_vfs_stat_path(&files, source, &original) == 0100644);
+    T(lume_vfs_stat_path(&files, target, &replaced) == 0100644);
+    T(lume_vfs_rename(&files, source, target) == -LUME_EEXIST);
+    T(lume_vfs_replace(&files, source, "/tmp") == -LUME_EISDIR);
+    T(lume_vfs_replace(&files, source, source) == 0);
+    T(lume_vfs_replace(&files, source, target) == 0);
+    T(lume_vfs_stat_path(&files, source, &result) == -LUME_ENOENT);
+    T(lume_vfs_stat_inode(replaced.inode, &result) == -LUME_ENOENT);
+    T(lume_vfs_stat_path(&files, target, &result) == 0100644 && result.size == 3 &&
+      result.inode == original.inode);
+    fd = (int)lume_vfs_open(&files, target, LUME_O_RDONLY);
+    char data[16];
+    T(fd >= 0 && lume_vfs_read(&files, fd, data, sizeof(data)) == 3 && !memcmp(data, "new", 3));
+    T(lume_vfs_close(&files, fd) == 0 && lume_vfs_remove(&files, target, false) == 0);
+    lume_files_release(&files);
+}
+
 static void jail_directory(void)
 {
     struct lume_files files, inherited;
@@ -111,6 +141,80 @@ static void jail_directory(void)
     T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EPERM);
     files.identity.euid = 0;
     T(lume_vfs_remove(&files, "/tmp/jail-directory", true) == 0);
+    lume_files_release(&files);
+}
+
+static bool imported_names(lume_storage_visit visit, void *context)
+{
+    char path[64] = "/data/";
+    memset(path + 6, 'a', 47);
+    path[53] = 0;
+    if (!visit(path, false, 0, context))
+        return false;
+    memset(path + 6, 'b', 48);
+    path[54] = 0;
+    return visit(path, false, 0, context) && visit("/data/last", false, 0, context);
+}
+
+static void imported_directory_bounds(void)
+{
+    const struct lume_storage_ops operations = {.walk = imported_names};
+    lume_vfs_init(NULL, 0);
+    T(lume_vfs_mount_storage(&operations));
+    struct lume_files files;
+    lume_files_init(&files);
+    int fd = (int)lume_vfs_open(&files, "/data", LUME_O_RDONLY);
+    T(fd >= 3);
+
+    struct
+    {
+        unsigned char before[16];
+        struct lume_dirent entries[2];
+        unsigned char after[16];
+    } buffer;
+
+    memset(&buffer, 0x5a, sizeof(buffer));
+    T(lume_vfs_getdents(&files, fd, buffer.entries, sizeof(buffer.entries)) ==
+      sizeof(struct lume_dirent));
+    T(strlen(buffer.entries[0].name) == 47 && buffer.entries[0].name[0] == 'a');
+    T(lume_vfs_getdents(&files, fd, buffer.entries + 1, sizeof(buffer.entries[1])) ==
+      -LUME_ENAMETOOLONG);
+    T(lume_vfs_getdents(&files, fd, buffer.entries + 1, sizeof(buffer.entries[1])) ==
+      -LUME_ENAMETOOLONG);
+    for (unsigned i = 0; i < sizeof(buffer.before); ++i)
+        T(buffer.before[i] == 0x5a && buffer.after[i] == 0x5a);
+    for (unsigned i = 0; i < sizeof(buffer.entries[1]); ++i)
+        T(((unsigned char *)&buffer.entries[1])[i] == 0x5a);
+    T(lume_vfs_seek(&files, fd, 1, LUME_SEEK_CUR) >= 0);
+    T(lume_vfs_getdents(&files, fd, buffer.entries, sizeof(buffer.entries)) ==
+      sizeof(struct lume_dirent));
+    T(!strcmp(buffer.entries[0].name, "last"));
+    T(lume_vfs_getdents(&files, fd, buffer.entries, sizeof(buffer.entries)) == 0);
+    T(lume_vfs_close(&files, fd) == 0);
+    lume_files_release(&files);
+}
+
+static void recycled_nodes(void)
+{
+    struct lume_files files;
+    lume_files_init(&files);
+    int held = (int)lume_vfs_open(&files, "/tmp/reuse-held", LUME_O_CREAT | LUME_O_RDWR);
+    T(held >= 0 && lume_vfs_write(&files, held, "held", 4) == 4);
+    T(lume_vfs_remove(&files, "/tmp/reuse-held", false) == 0);
+    for (unsigned i = 0; i < 4096; ++i)
+    {
+        int fd = (int)lume_vfs_open(&files, "/tmp/reuse-file", LUME_O_CREAT | LUME_O_RDWR);
+        T(fd >= 0 && lume_vfs_write(&files, fd, "new", 3) == 3);
+        T(lume_vfs_close(&files, fd) == 0);
+        T(lume_vfs_remove(&files, "/tmp/reuse-file", false) == 0);
+        T(lume_vfs_mkdir(&files, "/tmp/reuse-dir") == 0);
+        T(lume_vfs_remove(&files, "/tmp/reuse-dir", true) == 0);
+    }
+    char contents[4];
+    T(lume_vfs_seek(&files, held, 0, 0) == 0);
+    T(lume_vfs_read(&files, held, contents, sizeof(contents)) == sizeof(contents));
+    T(!memcmp(contents, "held", sizeof(contents)));
+    T(lume_vfs_close(&files, held) == 0);
     lume_files_release(&files);
 }
 
@@ -306,7 +410,9 @@ int main(void)
         T(lume_vfs_write(&f, request.other, b, 0) == 0);
         T(lume_vfs_close(&f, request.other) == 0);
     }
+    replace_files();
     jail_directory();
+    recycled_nodes();
     /* Exhaust finite RAM nodes, independently of open descriptor limits. */
     int result = 0;
     for (unsigned i = 0; i < 200; ++i)
@@ -319,6 +425,7 @@ int main(void)
         T(lume_vfs_close(&f, result) == 0);
     }
     T(result == -LUME_ENOSPC);
+    imported_directory_bounds();
     printf("VFS RAM paths/fds/permissions/seek/directories/limits: %u checks PASS\n", checks);
     return 0;
 }

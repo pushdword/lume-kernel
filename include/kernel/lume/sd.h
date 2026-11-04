@@ -5,6 +5,7 @@
 #define LUME_SD_MAX_SECTORS 32u
 bool lume_sd_start(uint64_t counter_frequency);
 bool lume_sd_configure(uint64_t base, uint64_t size, uint32_t irq);
+bool lume_sd_configure_bus(unsigned width, uint32_t maximum_hz);
 bool lume_sd_stop(void);
 bool lume_sd_read(uint64_t sector, void *data);
 bool lume_sd_write(uint64_t sector, const void *data);

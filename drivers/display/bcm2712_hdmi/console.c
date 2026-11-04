@@ -270,23 +270,12 @@ static int graphics_present(const struct lume_graphics_request *request)
                                           console.pitch, console.depth, console.order, request);
     if (result)
         return result;
-    if (request->width * (console.depth / 8) == console.pitch)
-    {
-        uintptr_t first = console.memory + (size_t)request->y * console.pitch;
-        return lume_dma_sync_for_device((const void *)first,
-                                        (size_t)request->height * console.pitch, LUME_DMA_TO_DEVICE)
-                   ? 0
-                   : -LUME_EIO;
-    }
-    for (unsigned y = 0; y < request->height; ++y)
-    {
-        uintptr_t row = console.memory + (size_t)(request->y + y) * console.pitch +
-                        request->x * (console.depth / 8);
-        if (!lume_dma_sync_for_device((const void *)row, request->width * (console.depth / 8),
-                                      LUME_DMA_TO_DEVICE))
-            return -LUME_EIO;
-    }
-    return 0;
+    uintptr_t first =
+        console.memory + (size_t)request->y * console.pitch + request->x * (console.depth / 8);
+    return lume_dma_sync_rect_for_device((const void *)first, request->width * (console.depth / 8),
+                                         console.pitch, request->height, LUME_DMA_TO_DEVICE)
+               ? 0
+               : -LUME_EIO;
 }
 
 static const struct lume_platform_graphics_ops graphics_operations = {

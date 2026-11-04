@@ -6368,6 +6368,101 @@ FRESULT f_rename(const TCHAR *path_old, /* Pointer to the object name to be rena
     LEAVE_FF(fs, res);
 }
 
+/* Replace an existing closed regular file without unlinking its name first.
+ * An I/O error after mutation requires the caller to stop volume access.
+ * FAT does not provide a journal for recovery after power loss. */
+FRESULT f_replace(const TCHAR *path_old, const TCHAR *path_new, BYTE *state)
+{
+    FRESULT res;
+    FATFS *fs;
+    DIR source, target;
+    BYTE entry[SZDIRE];
+    DWORD incoming, previous;
+    const TCHAR *old_relative = path_old, *new_relative = path_new;
+    int old_drive, new_drive;
+    DEF_NAMEBUFF
+
+    if (!state)
+        return FR_INVALID_PARAMETER;
+    *state = FF_REPLACE_UNCHANGED;
+    old_drive = get_ldnumber(&old_relative);
+    new_drive = get_ldnumber(&new_relative);
+    if (old_drive < 0 || old_drive != new_drive)
+        return FR_INVALID_PARAMETER;
+    res = mount_volume(&path_old, &fs, FA_WRITE);
+    if (res == FR_OK)
+    {
+        source.obj.fs = fs;
+        target.obj.fs = fs;
+        INIT_NAMEBUFF(fs);
+#if FF_FS_EXFAT
+        if (fs->fs_type == FS_EXFAT)
+            res = FR_INVALID_PARAMETER;
+        else
+#endif
+            res = follow_path(&source, path_old);
+        if (res == FR_OK && (source.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+            res = FR_INVALID_NAME;
+        if (res == FR_OK && (source.dir[DIR_Attr] & (AM_DIR | AM_RDO)))
+            res = FR_DENIED;
+#if FF_FS_LOCK
+        if (res == FR_OK)
+            res = chk_share(&source, 2);
+#endif
+        if (res == FR_OK)
+        {
+            memcpy(entry, source.dir, SZDIRE);
+            incoming = ld_clust(fs, entry);
+            res = follow_path(&target, new_relative);
+            if (res == FR_OK && (target.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+                res = FR_INVALID_NAME;
+            if (res == FR_OK && (target.dir[DIR_Attr] & (AM_DIR | AM_RDO)))
+                res = FR_DENIED;
+#if FF_FS_LOCK
+            if (res == FR_OK)
+                res = chk_share(&target, 2);
+#endif
+            if (res == FR_OK && source.obj.sclust == target.obj.sclust &&
+                source.dptr == target.dptr)
+            {
+                *state = FF_REPLACE_COMMITTED;
+            }
+            else if (res == FR_OK)
+            {
+                previous = ld_clust(fs, target.dir);
+                if ((incoming && (incoming < 2 || incoming >= fs->n_fatent)) ||
+                    (previous && (previous < 2 || previous >= fs->n_fatent)) ||
+                    (incoming && incoming == previous) ||
+                    (!incoming && ld_32(entry + DIR_FileSize)) ||
+                    (!previous && ld_32(target.dir + DIR_FileSize)))
+                    res = FR_INT_ERR;
+                if (res == FR_OK)
+                {
+                    *state = FF_REPLACE_UNCERTAIN;
+                    memcpy(target.dir + 13, entry + 13, SZDIRE - 13);
+                    target.dir[DIR_Attr] = entry[DIR_Attr] | AM_ARC;
+                    fs->wflag = 1;
+                    res = sync_fs(fs);
+                    if (res == FR_OK)
+                        res = dir_remove(&source);
+                    if (res == FR_OK)
+                        res = sync_fs(fs);
+                    if (res == FR_OK)
+                    {
+                        *state = FF_REPLACE_COMMITTED;
+                        if (previous)
+                            res = remove_chain(&target.obj, previous, 0);
+                        if (res == FR_OK)
+                            res = sync_fs(fs);
+                    }
+                }
+            }
+        }
+        FREE_NAMEBUFF();
+    }
+    LEAVE_FF(fs, res);
+}
+
 #endif /* !FF_FS_READONLY */
 #endif /* FF_FS_MINIMIZE == 0 */
 #endif /* FF_FS_MINIMIZE <= 1 */

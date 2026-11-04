@@ -6,7 +6,7 @@ static struct named_socket
     char path[LUME_PATH_MAX], peer[LUME_PATH_MAX];
     struct lume_poll_source source;
     struct local_end *end;
-    unsigned first, count, backlog;
+    unsigned first, count, backlog, uid, gid;
     struct local_end *pending[LOCAL_BACKLOG];
 } named_sockets[SOCKETS];
 
@@ -103,8 +103,8 @@ static struct lume_poll_source *named_source(void *context)
     return socket->end ? local_source(socket->end) : &socket->source;
 }
 
-static const struct lume_file_ops named_ops = {LUME_NODE_SOCKET, named_close, named_read,
-                                               named_write,      named_poll,  named_source};
+static const struct lume_file_ops named_ops = {
+    LUME_NODE_SOCKET, named_close, named_read, named_write, named_poll, named_source, true};
 
 static int named_operation(struct lume_files *files, struct named_socket *socket,
                            unsigned operation, struct lume_socket_request *r)
@@ -143,6 +143,10 @@ static int named_operation(struct lume_files *files, struct named_socket *socket
         struct local_pair *pair = pair_allocate();
         if (!pair)
             return -LUME_ENOMEM;
+        pair->end[0].uid = files->identity.euid;
+        pair->end[0].gid = files->identity.egid;
+        pair->end[1].uid = listener->uid;
+        pair->end[1].gid = listener->gid;
         socket->end = &pair->end[0];
         socket->waiting = false;
         memcpy(socket->peer, listener->path, sizeof(socket->peer));
@@ -156,6 +160,11 @@ static int named_operation(struct lume_files *files, struct named_socket *socket
     {
         if (!socket->path[0] || socket->end)
             return -LUME_EINVAL;
+        if (!socket->listening)
+        {
+            socket->uid = files->identity.euid;
+            socket->gid = files->identity.egid;
+        }
         socket->listening = true;
         socket->backlog = !r->count || r->count > LOCAL_BACKLOG ? LOCAL_BACKLOG : r->count;
         named_notify_connectors(socket->path);

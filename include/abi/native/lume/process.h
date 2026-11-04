@@ -11,7 +11,8 @@ enum
     LUME_CAP_DRIVER_ADMIN = 8u,
     LUME_CAP_HW_DIAGNOSTIC = 16u,
     LUME_CAP_SUPERVISOR = 32u,
-    LUME_CAP_SERVICE_CONTROL = 64u
+    LUME_CAP_SERVICE_CONTROL = 64u,
+    LUME_CAP_CLOCK_ADMIN = 128u
 };
 
 enum
@@ -83,6 +84,8 @@ enum
     LUME_FS_STAT_FD,
     LUME_FS_COMPAT_OPEN,
     LUME_FS_COMPAT_REMOVE,
-    LUME_FS_STAT_INODE
+    LUME_FS_STAT_INODE,
+    /* Replace closed regular files. RENAME retains its no-replacement contract. */
+    LUME_FS_REPLACE
 };
 #endif

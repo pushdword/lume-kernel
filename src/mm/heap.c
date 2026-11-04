@@ -3,8 +3,15 @@
 #include "lume/abi.h"
 #include "lume/heap.h"
 #include "lume/mmu.h"
+#include "lume/gpu_device.h"
 #define HEAP_BASE LUME_HEAP_BASE
 static uint64_t ends[LUME_TASK_LIMIT];
+
+bool lume_heap_contains(unsigned pid, uint64_t address, uint64_t bytes)
+{
+    return pid && pid <= LUME_TASK_LIMIT && bytes && address >= HEAP_BASE &&
+           address <= ends[pid - 1] && bytes <= ends[pid - 1] - address;
+}
 
 void lume_heap_swap(unsigned a, unsigned b)
 {
@@ -63,6 +70,8 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
         return (int64_t)old;
     if (end < HEAP_BASE || end > LUME_HEAP_LIMIT)
         return -LUME_ENOMEM;
+    if (!lume_gpu_heap_allowed(pid, end))
+        return -LUME_EBUSY;
     unsigned before = (unsigned)((old - HEAP_BASE + 4095) / 4096);
     unsigned after = (unsigned)((end - HEAP_BASE + 4095) / 4096);
     if (before == after)

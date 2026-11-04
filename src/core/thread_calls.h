@@ -214,7 +214,7 @@ static struct lume_context *thread_call(struct lume_context *frame)
             thread_id(thread_slots, target) == r.tid)
         {
             struct thread_state *t = &thread_slots[target];
-            result = target == task                                        ? -35
+            result = target == task && op == LUME_THREAD_JOIN              ? -35
                      : t->detached || (t->joiner && t->joiner != task + 1) ? -LUME_EINVAL
                                                                            : 0;
             if (!result && op == LUME_THREAD_DETACH)

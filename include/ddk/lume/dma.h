@@ -22,6 +22,21 @@ bool lume_dma_cache_span(uintptr_t, size_t, size_t line, uintptr_t *first, uintp
  * access those lines between sync_for_device and completion followed by sync_for_cpu. */
 bool lume_dma_sync_for_device(const void *, size_t, enum lume_dma_direction);
 bool lume_dma_sync_for_cpu(const void *, size_t, enum lume_dma_direction);
+
+static inline bool lume_dma_rect_bytes(size_t row_bytes, size_t pitch, unsigned rows, size_t *bytes)
+{
+    if (!bytes || !rows || !row_bytes || row_bytes > pitch ||
+        rows - 1 > (SIZE_MAX - row_bytes) / pitch)
+        return false;
+    *bytes = (size_t)(rows - 1) * pitch + row_bytes;
+    return true;
+}
+
+/* Rectangular transfers complete all row cache operations with one final barrier. */
+bool lume_dma_sync_rect_for_device(const void *, size_t row_bytes, size_t pitch, unsigned rows,
+                                   enum lume_dma_direction);
+bool lume_dma_sync_rect_for_cpu(const void *, size_t row_bytes, size_t pitch, unsigned rows,
+                                enum lume_dma_direction);
 extern const struct lume_dma_domain lume_rp1_dma_domain;
 bool lume_pi5_dma_start(void);
 #endif

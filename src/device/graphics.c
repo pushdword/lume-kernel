@@ -3,6 +3,7 @@
 #include "lume/external_file.h"
 #include "lume/early.h"
 #include "lume/process.h"
+#include "lume/gpu_device.h"
 #include <string.h>
 
 #define SESSIONS 4u
@@ -43,6 +44,7 @@ void lume_graphics_input(const struct lume_input_event *event)
 
 void lume_graphics_release(unsigned owner)
 {
+    lume_gpu_release(owner);
     if (!active || active->owner != owner)
         return;
     struct session *session = active;
@@ -97,8 +99,8 @@ static unsigned input_poll(void *context)
     return session != active ? LUME_POLLIN | LUME_POLLHUP : session->count ? LUME_POLLIN : 0;
 }
 
-static const struct lume_file_ops input_ops = {LUME_NODE_CHAR, input_close, input_read,
-                                               input_write,    input_poll,  input_source};
+static const struct lume_file_ops input_ops = {
+    LUME_NODE_CHAR, input_close, input_read, input_write, input_poll, input_source, true};
 
 int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action,
                        struct lume_graphics_request *r)

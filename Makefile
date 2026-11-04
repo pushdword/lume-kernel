@@ -220,6 +220,13 @@ $(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/st
 check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
 	env "$<"
 check: check-storage-handles
+.PHONY: check-storage-replace
+$(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
+check-storage-replace: $(OUT)/tests/storage-replace$(HOSTEXE)
+	env "$<"
+check: check-storage-replace
 .PHONY: check-sdhci
 $(OUT)/tests/sdhci$(HOSTEXE): tests/unit/sdhci_test.c drivers/storage/sdhci/sd.c include/kernel/lume/sd.h src/storage/block.c src/storage/volume.c
 	mkdir -p "$(@D)"
@@ -350,6 +357,11 @@ $(OUT)/tests/mmu$(HOSTEXE): tests/arch/aarch64/mmu_test.c arch/aarch64/mm/mmu_ta
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 $(OUT)/tests/elf-load$(HOSTEXE): tests/unit/elf_load_test.c src/exec/elf.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+$(OUT)/tests/gpu$(HOSTEXE): tests/unit/gpu_test.c src/device/gpu.c
+
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 
@@ -599,3 +611,11 @@ $(OUT)/tests/uart-rx$(HOSTEXE): tests/unit/uart_rx_test.c platform/raspberrypi5/
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-uart-rx
+
+.PHONY: check-realtime
+check-realtime: $(OUT)/tests/realtime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/realtime$(HOSTEXE): tests/unit/realtime_test.c src/core/realtime.c include/kernel/lume/realtime.h include/abi/native/lume/realtime_abi.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+check: check-realtime

@@ -109,15 +109,16 @@ static void sched_wake(struct sched_policy *s, unsigned slot, uint32_t unit, uns
 }
 
 static int sched_pick(const struct sched_policy *s, unsigned core, const unsigned *state,
-                      unsigned excluded, uint32_t unit)
+                      uint64_t excluded, uint32_t unit)
 {
-    unsigned mask = excluded, skip = s->cpu[core].yielded;
+    uint64_t mask = excluded;
+    unsigned skip = s->cpu[core].yielded;
     if (skip < SCHED_TASKS)
     {
         for (unsigned i = 0; i < SCHED_TASKS; i++)
-            if (i != skip && state[i] == 1u && !(mask & (1u << i)))
+            if (i != skip && state[i] == 1u && !(mask & (UINT64_C(1) << i)))
             {
-                mask |= 1u << skip;
+                mask |= UINT64_C(1) << skip;
                 break;
             }
     }
@@ -125,7 +126,7 @@ static int sched_pick(const struct sched_policy *s, unsigned core, const unsigne
     for (unsigned n = 1; n <= SCHED_TASKS; n++)
     {
         unsigned i = (s->cursor[core] + n) % SCHED_TASKS;
-        if (state[i] != 1u || (mask & (1u << i)))
+        if (state[i] != 1u || (mask & (UINT64_C(1) << i)))
             continue;
         if (best < 0 || !LUME_SCHED_FAIR || s->task[i].service < s->task[best].service)
         {
@@ -141,7 +142,7 @@ static int sched_pick(const struct sched_policy *s, unsigned core, const unsigne
         for (unsigned n = 1; n <= SCHED_TASKS; n++)
         {
             unsigned i = (s->cursor[core] + n) % SCHED_TASKS;
-            if (state[i] == 1u && !(mask & (1u << i)) && s->task[i].last_core == core &&
+            if (state[i] == 1u && !(mask & (UINT64_C(1) << i)) && s->task[i].last_core == core &&
                 s->task[i].service <= ceiling)
             {
                 best = (int)i;

@@ -1,6 +1,7 @@
 #define LUME_CONSOLE_CALL_BYTES 64u
 #include "lume/process.h"
 #include "lume/console_output.h"
+#include "lume/graphics.h"
 
 /* Filesystem calls do not enter the console, USB enumeration or display lifecycle. */
 static bool kernel_console_storage(unsigned task)
@@ -46,7 +47,14 @@ static bool kernel_pipe_call(struct lume_context *frame)
         return false;
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     return (number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
-           lume_vfs_pipe_io(&tasks[process_slot(current_task)].files, LUME_CONTEXT_REG(frame, 0));
+           lume_vfs_memory_io(&tasks[process_slot(current_task)].files, LUME_CONTEXT_REG(frame, 0));
+}
+
+static bool kernel_graphics_call(struct lume_context *frame)
+{
+    return kernel_console_available() &&
+           LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_GRAPHICS &&
+           LUME_CONTEXT_REG(frame, 0) == LUME_GRAPHICS_PRESENT;
 }
 
 static bool kernel_fd_query_call(struct lume_context *frame)

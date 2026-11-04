@@ -53,6 +53,13 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *frame, u
     return -LUME_EINVAL;
 }
 
+static bool render_available = true;
+
+static bool kernel_render_available(void)
+{
+    return render_available;
+}
+
 #include "query_calls.h"
 
 int main(void)
@@ -94,15 +101,29 @@ int main(void)
         frame.x[arg] |= UINT64_C(1) << 32;
         assert(!kernel_query_call(&frame, 1));
     }
-    assert(local.calls == 17 && entered == 17 && progress == 17 && !shell_calls);
+    struct lume_context terminal = {.x = {LUME_TTY_GET, UINT64_MAX, 96}};
+    terminal.x[8] = expected_number = LUME_SYS_TTY;
+    memcpy(expected_arguments, terminal.x, sizeof(expected_arguments));
+    assert(kernel_query_call(&terminal, 1) && (int64_t)terminal.x[0] == -LUME_EINVAL);
+    assert(local.calls == 18 && entered == 18 && progress == 18 && !shell_calls);
     current_task = 0;
     expected_number = LUME_SYS_GETPID;
     memset(expected_arguments, 0, sizeof(expected_arguments));
     struct lume_context frame = {0};
     frame.x[8] = LUME_SYS_GETPID;
     assert(kernel_query_call(&frame, 1));
-    assert(tasks[0].calls == 1 && local.calls == 18 && entered == 18 && progress == 18);
+    assert(tasks[0].calls == 1 && local.calls == 19 && entered == 19 && progress == 19);
     assert(shell_calls == (UINT64_C(1) << LUME_SYS_GETPID));
+    struct lume_context copy = {.x = {LUME_GPU_COPY, UINT64_MAX, 64}};
+    copy.x[8] = LUME_SYS_GPU;
+    struct lume_context original = copy;
+    assert(!kernel_gpu_backpressure(&copy) && !memcmp(&copy, &original, sizeof(copy)));
+    render_available = false;
+    assert(kernel_gpu_backpressure(&copy) && (int64_t)copy.x[0] == -LUME_EAGAIN);
+    assert(copy.x[1] == UINT64_MAX && copy.x[2] == 64 && invoked == 18);
+    copy.x[0] = LUME_GPU_BIND;
+    original = copy;
+    assert(!kernel_gpu_backpressure(&copy) && !memcmp(&copy, &original, sizeof(copy)));
     puts("QUERY_CALLS_PASS scalar-arguments thread-generation rejected-operations accounting");
     return 0;
 }

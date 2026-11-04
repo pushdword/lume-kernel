@@ -83,6 +83,14 @@ static int dma_domain(uint32_t id, struct lume_dma_domain *domain)
     int result = lume_hardware_get(id, &info);
     if (result)
         return result;
+    for (unsigned i = 0; i < info.identity_count; ++i)
+        if (info.origin == LUME_HARDWARE_DT && info.identities[i].kind == LUME_HARDWARE_ID_DT &&
+            !strcmp(info.identities[i].value, "brcm,2712-v3d"))
+        {
+            /* V3D accesses system RAM directly through its 36-bit AXI address space. */
+            *domain = (struct lume_dma_domain){0, 0, UINT64_C(1) << 36, (UINT64_C(1) << 36) - 1};
+            return 0;
+        }
     /* This platform binding uses the RP1 inbound PCIe window. */
     for (unsigned i = 0; i < info.identity_count; ++i)
         if (info.origin == LUME_HARDWARE_DT && info.identities[i].kind == LUME_HARDWARE_ID_DT &&

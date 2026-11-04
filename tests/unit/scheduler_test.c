@@ -67,6 +67,13 @@ static void fair_service(uint32_t unit)
 
 int main(void)
 {
+    struct sched_policy policy;
+    unsigned states[SCHED_TASKS] = {0};
+    sched_init(&policy, 0);
+    states[SCHED_TASKS - 1] = 1;
+    sched_new(&policy, SCHED_TASKS - 1, SCHED_TASKS);
+    assert(sched_pick(&policy, 0, states, 0, 1000) == SCHED_TASKS - 1);
+    assert(sched_pick(&policy, 0, states, UINT64_C(1) << (SCHED_TASKS - 1), 1000) == -1);
     fair_service(1000);
     fair_service(62500);
     printf("PASS_SCHEDULER cpus=%u quantum_ms=%u tick_ms=%u fairness/wake/reuse/counter-wrap\n",

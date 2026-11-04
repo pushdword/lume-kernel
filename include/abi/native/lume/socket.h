@@ -17,7 +17,13 @@ enum
     LUME_SOCKET_SEND_FD,
     LUME_SOCKET_RECEIVE_FD,
     LUME_SOCKET_OPTION,
-    LUME_SOCKET_PENDING
+    LUME_SOCKET_PENDING,
+    LUME_SOCKET_CREDENTIALS
+};
+
+struct lume_socket_credentials
+{
+    uint32_t version, bytes, uid, gid;
 };
 
 struct lume_socket_request
@@ -32,4 +38,5 @@ struct lume_socket_request
 };
 
 _Static_assert(sizeof(struct lume_socket_request) == 56, "socket request ABI");
+_Static_assert(sizeof(struct lume_socket_credentials) == 16, "socket credentials ABI");
 #endif

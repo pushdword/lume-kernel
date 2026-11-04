@@ -51,6 +51,15 @@ static int probe(struct lume_hardware *hardware, void *context)
     resource = lume_hardware_resource(hardware, 0);
     if (!irq || !lume_sd_configure(resource->base, resource->size, irq))
         return -LUME_EINVAL;
+    struct lume_property property;
+    unsigned width = 1;
+    uint32_t maximum_hz = 50000000;
+    if (!lume_hardware_property(hardware, "bus-width", LUME_PROPERTY_U32, 0, &property))
+        width = (unsigned)property.values[0];
+    if (!lume_hardware_property(hardware, "max-frequency", LUME_PROPERTY_U32, 0, &property))
+        maximum_hz = (uint32_t)property.values[0];
+    if (!lume_sd_configure_bus(width, maximum_hz))
+        return -LUME_EINVAL;
     return 0;
 }
 

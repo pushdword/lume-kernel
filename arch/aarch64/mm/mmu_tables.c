@@ -13,7 +13,7 @@
 #define PXN (UINT64_C(1) << 53)
 #define UXN (UINT64_C(1) << 54)
 #define NORMAL (AF | INNER | (UINT64_C(1) << 2))
-static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[2][512];
+static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[3][512];
 static _Alignas(4096) uint64_t soc_l2[512], rp1_l2[512], pcie_l2[512];
 static _Alignas(4096) uint64_t module_l3[2][512];
 static uint64_t module_first, module_base, module_end;
@@ -36,7 +36,7 @@ static void zero(uint64_t *p, unsigned count)
 
 bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layout)
 {
-    if (!fdt->ram_count || layout->start != 0x200000 || layout->end > 0x600000 ||
+    if (!fdt->ram_count || layout->start != 0x200000 || layout->end > 0x800000 ||
         layout->text_end < layout->start || layout->readonly_end < layout->text_end ||
         layout->end < layout->readonly_end || layout->guard < layout->readonly_end ||
         layout->guard >= layout->end ||
@@ -52,7 +52,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
         return false;
     zero(root, 512);
     zero(&ram_l2[0][0], 8 * 512);
-    zero(&image_l3[0][0], 1024);
+    zero(&image_l3[0][0], 3 * 512);
     zero(soc_l2, 512);
     zero(rp1_l2, 512);
     zero(pcie_l2, 512);
@@ -79,9 +79,8 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
         }
     }
     root[0] = table(ram_l2[0]);
-    ram_l2[0][1] = table(image_l3[0]);
-    if (layout->end > 0x400000)
-        ram_l2[0][2] = table(image_l3[1]);
+    for (unsigned block = 1; (uint64_t)block * BLOCK < layout->end; ++block)
+        ram_l2[0][block] = table(image_l3[block - 1]);
     for (uint64_t p = layout->start; p < layout->end; p += PAGE)
     {
         if (p == layout->guard || p == layout->worker_guard ||
@@ -103,6 +102,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     pcie_l2[0] = UINT64_C(0x1000000000) | AF | PXN | UXN | 1;
     pcie_l2[7] = UINT64_C(0x1000e00000) | AF | PXN | UXN | 1; /* BCM2712 SDHCI */
     pcie_l2[8] = UINT64_C(0x1001000000) | AF | PXN | UXN | 1; /* Separate Wi-Fi SDIO host */
+    pcie_l2[16] = UINT64_C(0x1002000000) | AF | PXN | UXN | 1; /* V3D hub, core and SMS */
     root[UINT64_C(0x107fff9000) >> 30] = table(soc_l2);
     soc_l2[(UINT64_C(0x107c013880) >> 21) & 511] = UINT64_C(0x107c000000) | AF | PXN | UXN | 1;
     soc_l2[(UINT64_C(0x107fff9000) >> 21) & 511] = UINT64_C(0x107fe00000) | AF | PXN | UXN | 1;
@@ -256,7 +256,8 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
         {
             *entry = 0;
 #ifdef __aarch64__
-            __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+            __asm__ volatile("dsb ishst; tlbi vaae1is, %0; dsb ish; isb" ::"r"(va >> 12)
+                             : "memory");
 #endif
         }
     }

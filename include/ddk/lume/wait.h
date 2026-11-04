@@ -7,15 +7,15 @@
  * condition while IRQs are masked, then yields to the scheduler. Wake does not run tasks. */
 struct lume_wait_queue
 {
-    uint32_t waiting, ready;
+    uint64_t waiting, ready;
 };
 
 static inline bool lume_wait_subscribe(struct lume_wait_queue *q, unsigned task)
 {
-    if (!q || task >= 32)
+    if (!q || task >= 64)
         return false;
-    q->waiting |= UINT32_C(1) << task;
-    q->ready &= ~(UINT32_C(1) << task);
+    q->waiting |= UINT64_C(1) << task;
+    q->ready &= ~(UINT64_C(1) << task);
     return true;
 }
 
@@ -26,16 +26,16 @@ static inline void lume_wait_wake(struct lume_wait_queue *q)
 
 static inline void lume_wait_cancel(struct lume_wait_queue *q, unsigned task)
 {
-    if (q && task < 32)
+    if (q && task < 64)
     {
-        q->waiting &= ~(UINT32_C(1) << task);
-        q->ready &= ~(UINT32_C(1) << task);
+        q->waiting &= ~(UINT64_C(1) << task);
+        q->ready &= ~(UINT64_C(1) << task);
     }
 }
 
 static inline bool lume_wait_take(struct lume_wait_queue *q, unsigned task)
 {
-    bool ready = q && task < 32 && (q->ready & (UINT32_C(1) << task));
+    bool ready = q && task < 64 && (q->ready & (UINT64_C(1) << task));
     if (ready)
         lume_wait_cancel(q, task);
     return ready;

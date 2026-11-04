@@ -18,6 +18,10 @@ PLATFORM_MODULES += $(OUT)/modules/bcm2712-hdmi.lkm
 L2_MODULE_SOURCE := drivers/irq/brcm_l2/module.c
 PLATFORM_MODULE_SOURCES += $(L2_MODULE_SOURCE)
 PLATFORM_MODULES += $(OUT)/modules/brcm-l2.lkm
+V3D_MODULE_SOURCE := drivers/gpu/v3d/module.c drivers/gpu/v3d/v3d.c
+PLATFORM_MODULE_SOURCES += $(V3D_MODULE_SOURCE)
+PLATFORM_MODULES += $(OUT)/modules/bcm2712-v3d.lkm
+$(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(V3D_MODULE_SOURCE))): CPPFLAGS += -Idrivers/gpu/v3d
 PLATFORM_MODULE_OBJECTS := $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(PLATFORM_MODULE_SOURCES)))
 .PHONY: platform-modules
 all: platform-modules
@@ -38,6 +42,10 @@ $(OUT)/modules/bcm2712-hdmi.lkm: $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(HD
 	$(LD) -r --build-id=none $^ -o "$@"
 
 $(OUT)/modules/brcm-l2.lkm: $(OUT)/lkm/obj/$(L2_MODULE_SOURCE).o
+	mkdir -p "$(@D)"
+	$(LD) -r --build-id=none $^ -o "$@"
+
+$(OUT)/modules/bcm2712-v3d.lkm: $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(V3D_MODULE_SOURCE)))
 	mkdir -p "$(@D)"
 	$(LD) -r --build-id=none $^ -o "$@"
 

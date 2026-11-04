@@ -18,6 +18,9 @@
 static unsigned char disk[DATA_SECTORS][512], mbr[512];
 static unsigned reads, writes, checks, failed_reads, failed_writes;
 static bool writable, fail_reads, fail_writes;
+static unsigned write_attempts, fail_write_at;
+static unsigned read_attempts, fail_read_at;
+static bool fail_after_write;
 static bool track_transfers;
 static unsigned checkpoint_calls, checkpoint_bytes, pending_transfers;
 static unsigned last_checkpoint, one_byte_checkpoints, directory_checkpoints;
@@ -72,7 +75,7 @@ bool lume_sd_read(uint64_t sector, void *data)
 {
     transfer_started();
     ++reads;
-    if (fail_reads)
+    if (fail_reads || ++read_attempts == fail_read_at)
     {
         ++failed_reads;
         return false;
@@ -91,7 +94,8 @@ bool lume_sd_read(uint64_t sector, void *data)
 bool lume_sd_write(uint64_t sector, const void *data)
 {
     transfer_started();
-    if (fail_writes)
+    bool injected = ++write_attempts == fail_write_at;
+    if (fail_writes || (injected && !fail_after_write))
     {
         ++failed_writes;
         return false;
@@ -100,6 +104,11 @@ bool lume_sd_write(uint64_t sector, const void *data)
         return false;
     ++writes;
     memcpy(disk[sector - LUME_CARD_DATA_FIRST], data, 512);
+    if (injected)
+    {
+        ++failed_writes;
+        return false;
+    }
     return true;
 }
 
@@ -455,6 +464,40 @@ static bool writeback(const struct lume_storage_ops *ops)
     return true;
 }
 
+static bool unicode_visit(const char *path, bool directory, uint64_t bytes, void *opaque)
+{
+    unsigned *found = opaque;
+    if (!strcmp(path, "/data/informação"))
+    {
+        T(directory && !(*found & 1));
+        *found |= 1;
+    }
+    else if (!strcmp(path, "/data/informação/ação-€-Á.txt"))
+    {
+        T(!directory && bytes == 12 && !(*found & 2));
+        *found |= 2;
+    }
+    return true;
+}
+
+static bool unicode_remount(const struct lume_storage_ops *ops)
+{
+    const char *path = "/data/Informação/ação-€-Á.txt";
+    T(ops->create("/data/Informação", true) == 0);
+    T(ops->create(path, false) == 0);
+    void *handle;
+    T(ops->open(path, LUME_O_RDWR, &handle) == 0);
+    T(ops->write_handle(handle, 0, "UTF8 content", 12) == 12);
+    T(ops->sync_handle(handle) == 0 && ops->close(handle) == 0);
+    T(lume_storage_start() == ops);
+    unsigned found = 0;
+    T(ops->walk(unicode_visit, &found) && found == 3);
+    char data[16];
+    T(ops->read(path, 0, data, sizeof(data)) == 12);
+    T(!memcmp(data, "UTF8 content", 12));
+    return true;
+}
+
 static bool partial(void)
 {
     const struct lume_storage_ops *ops = format(true);
@@ -482,7 +525,8 @@ int main(void)
     const struct lume_storage_ops *ops = format(false);
     if (!ops || !ops->open || !ops->read_handle || !ops->write_handle || !ops->resize_handle ||
         !ops->close || !ops->sync_handle || !aliases(ops) || !limits(ops) || !interleaved(ops) ||
-        !checkpoints(ops) || !failures(ops) || !writeback(ops) || !partial())
+        !checkpoints(ops) || !unicode_remount(ops) || !failures(ops) || !writeback(ops) ||
+        !partial())
         return 1;
     printf("PASS_STORAGE_HANDLES checks=%u reads=%u writes=%u\n", checks, reads, writes);
     return 0;

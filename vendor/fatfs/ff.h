@@ -332,6 +332,11 @@ typedef char TCHAR;
     FRESULT f_unlink(const TCHAR *path);       /* Delete an existing file or directory */
     FRESULT f_rename(const TCHAR *path_old,
                      const TCHAR *path_new);                  /* Rename/Move a file or directory */
+    /* Closed regular-file replacement for serialized filesystem callers. */
+    FRESULT f_replace(const TCHAR *path_old, const TCHAR *path_new, BYTE *state);
+#define FF_REPLACE_UNCHANGED 0
+#define FF_REPLACE_UNCERTAIN 1
+#define FF_REPLACE_COMMITTED 2
     FRESULT f_stat(const TCHAR *path, FILINFO *fno);          /* Get file status */
     FRESULT f_chmod(const TCHAR *path, BYTE attr, BYTE mask); /* Change attribute of a file/dir */
     FRESULT f_utime(const TCHAR *path, const FILINFO *fno);   /* Change timestamp of a file/dir */

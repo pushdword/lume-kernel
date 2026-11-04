@@ -57,9 +57,20 @@ bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool 
     abort();
 }
 
-void lume_sync_code(uint64_t address, size_t bytes)
+void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
     (void)address;
+    (void)bytes;
+    abort();
+}
+
+void lume_sync_code_finish(void)
+{
+    abort();
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
     (void)bytes;
     abort();
 }

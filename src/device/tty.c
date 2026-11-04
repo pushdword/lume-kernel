@@ -262,8 +262,8 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
     return done ? (int64_t)done : -LUME_EAGAIN;
 }
 
-static const struct lume_file_ops tty_ops = {LUME_NODE_CHAR, tty_close, tty_read,
-                                             tty_write,      tty_poll,  tty_source};
+static const struct lume_file_ops tty_ops = {LUME_NODE_CHAR, tty_close,  tty_read, tty_write,
+                                             tty_poll,       tty_source, true};
 
 static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
 {

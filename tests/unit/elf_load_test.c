@@ -8,7 +8,7 @@
 static _Alignas(4096) unsigned char memory[FRAMES][4096];
 static bool used[FRAMES];
 static uint64_t virtuals[FRAMES], physicals[FRAMES];
-static unsigned allocated, mappings, syncs, tasks[FRAMES];
+static unsigned allocated, mappings, syncs, completions, checkpoints, tasks[FRAMES];
 static bool writable[FRAMES], executable[FRAMES];
 static int allocation_budget = -1, map_budget = -1;
 
@@ -108,10 +108,21 @@ bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool 
     return false;
 }
 
-void lume_sync_code(uint64_t address, size_t bytes)
+void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
     assert(address && bytes == 4096);
     ++syncs;
+}
+
+void lume_sync_code_finish(void)
+{
+    ++completions;
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(bytes == 65536);
+    ++checkpoints;
 }
 
 _Noreturn void lume_fail(const char *message)
@@ -145,13 +156,14 @@ int main(void)
         put(h + 8, 8, i ? 4096 : 0);
         put(h + 16, 8, LUME_ELF_BASE + (uint64_t)i * 0x200000);
         put(h + 32, 8, 4096);
-        put(h + 40, 8, i ? 5 * 1024 * 1024 : 4096);
+        put(h + 40, 8, i ? 5 * 1024 * 1024 : 512 * 1024);
         put(h + 48, 8, 4096);
     }
     memset(elf + 4096, 0x5a, 4096);
     struct lume_elf_image image;
     assert(lume_elf_load(3, elf, sizeof(elf), &image));
-    assert(image.count == 1281 && image.metadata_pages == 6 && mappings == 1281 && syncs == 1);
+    assert(image.count == 1408 && image.metadata_pages == 6 && mappings == 1408 && syncs == 128);
+    assert(completions == 1 && checkpoints == image.count / 16);
     for (unsigned i = 0; i < mappings; ++i)
     {
         unsigned char *p = (void *)(uintptr_t)physicals[i];
@@ -176,6 +188,7 @@ int main(void)
         assert(!allocated && !mappings && !image.pages);
     }
     map_budget = -1;
+    put(elf + 64 + 40, 8, 4096);
     put(elf + 64 + 56 + 40, 8, 4096);
     assert(lume_elf_load(3, elf, sizeof(elf), &image));
     assert(image.count == 2 && allocated == 3 && mappings == 2);

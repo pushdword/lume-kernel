@@ -5,14 +5,14 @@
 #include <fd.h>
 
 struct lume_files;
-#define LUME_POLL_TASK_LIMIT 32u
+#define LUME_POLL_TASK_LIMIT 64u
 
 /* Source mutation is serialized by the caller. Sources remain allocated until all
  * subscriptions to their previous generation have been cancelled. */
 struct lume_poll_source
 {
     uint64_t generation;
-    uint32_t waiting;
+    uint64_t waiting;
 };
 
 void lume_poll_source_reset(struct lume_poll_source *);

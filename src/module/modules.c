@@ -25,6 +25,7 @@
 #include "lume/wpa.h"
 #include "lume/console_output.h"
 #include "lume/block.h"
+#include "lume/gpu_device.h"
 #include <string.h>
 #if defined(LUME_ARCH_AMD64)
 #include "lume/q35.h"
@@ -57,6 +58,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_hardware_dma)
     EXPORT(lume_dma_map)
     EXPORT(lume_dma_sync_for_device)
+    EXPORT(lume_dma_sync_rect_for_device)
+    EXPORT(lume_dma_sync_rect_for_cpu)
     EXPORT(lume_dma_sync_for_cpu)
 #define SERVICE(service, function)                                                                 \
     if (!strcmp(name, #function))                                                                  \
@@ -96,6 +99,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_display_write)
     EXPORT(lume_graphics_input)
     EXPORT(lume_graphics_input_owned)
+    EXPORT(lume_gpu_register)
+    EXPORT(lume_gpu_unregister)
     EXPORT(lume_entropy)
     EXPORT(lume_fail)
     EXPORT(lume_files_init)
