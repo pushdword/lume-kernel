@@ -4,11 +4,24 @@
 #include "lume/graphics.h"
 #include "lume/gpu.h"
 #include "lume/credential.h"
+#include "lume/thread.h"
+#include "lume/signal.h"
 
 #define KERNEL_IO_EXCLUSIVE LUME_WORK_DOMAINS
 
+static bool kernel_local_control_call(const struct lume_context *frame)
+{
+    uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+    uint64_t action = LUME_CONTEXT_REG(frame, 0);
+    return (number == LUME_SYS_THREAD &&
+            (action == LUME_THREAD_WAIT || action == LUME_THREAD_WAKE)) ||
+           (number == LUME_SYS_SIGNAL && action == LUME_SIGNAL_MASK);
+}
+
 static bool kernel_call_mutates(const struct lume_context *frame)
 {
+    if (kernel_local_control_call(frame))
+        return false;
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     switch (number)
     {
@@ -47,6 +60,8 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     uint64_t action = LUME_CONTEXT_REG(frame, 0);
     if (process_exiting[process])
         return KERNEL_IO_EXCLUSIVE;
+    if (kernel_local_control_call(frame))
+        return LUME_WORK_GENERAL;
     switch (number)
     {
     case LUME_SYS_READ:
@@ -81,8 +96,10 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_STREAM:
         return LUME_WORK_NETWORK;
     case LUME_SYS_SOCKET:
-        if (action == LUME_SOCKET_SEND_FD || action == LUME_SOCKET_RECEIVE_FD ||
-            action == LUME_SOCKET_SHUTDOWN)
+        /* Descriptor messages move references and bounded data in local memory queues. */
+        if (action == LUME_SOCKET_SEND_FD || action == LUME_SOCKET_RECEIVE_FD)
+            return LUME_WORK_GENERAL;
+        if (action == LUME_SOCKET_SHUTDOWN)
             return KERNEL_IO_EXCLUSIVE;
         return LUME_WORK_NETWORK;
     case LUME_SYS_GRAPHICS:

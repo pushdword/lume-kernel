@@ -1456,6 +1456,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_PROBE ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_CPU ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SLEEP ||
+                kernel_local_control_call(frame) ||
                 (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FD &&
                  (LUME_CONTEXT_REG(frame, 0) == LUME_FD_POLL ||
                   LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT)) ||

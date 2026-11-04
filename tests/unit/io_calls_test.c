@@ -1,5 +1,6 @@
 #include "lume/abi.h"
 #include "lume/vfs.h"
+#include "lume/socket.h"
 #include "lume/wait.h"
 #include "lume/worker.h"
 #include "lume/work.h"
@@ -683,6 +684,30 @@ static void independent_resources(void)
     assert(executed[1] == 1 && !lume_worker_busy());
 }
 
+static void local_messages_during_loading(void)
+{
+    for (unsigned shared = 0; shared < 2; ++shared)
+    {
+        reset();
+        worker_blocked[LUME_WORK_STORAGE] = true;
+        enqueue_domain(0, LUME_WORK_STORAGE);
+        task_mutation[0] = true;
+        kernel_step();
+        if (shared)
+            process_owner[1] = 0;
+        enqueue_domain(1, LUME_WORK_GENERAL);
+        tasks[1].context.x[8] = LUME_SYS_SOCKET;
+        tasks[1].context.x[0] = LUME_SOCKET_RECEIVE_FD;
+        task_mutation[1] = true;
+        kernel_step();
+        assert(executed[1] == !shared && !executed[0]);
+        worker_blocked[LUME_WORK_STORAGE] = false;
+        kernel_step();
+        kernel_step();
+        assert(executed[0] == 1 && executed[1] == 1 && !lume_worker_busy());
+    }
+}
+
 static void descriptor_conflicts(void)
 {
     reset();
@@ -760,6 +785,7 @@ int main(void)
 {
     bounded_resource_turn();
     independent_resources();
+    local_messages_during_loading();
     descriptor_conflicts();
     exclusive_wait_keeps_progress();
     ownership();
