@@ -16,7 +16,7 @@ struct kernel_io_lane
 static struct kernel_io_lane kernel_lanes[LUME_WORK_DOMAINS];
 static struct io_queue kernel_control_queue;
 static unsigned kernel_lane_cursor;
-static uint64_t kernel_parallel_epoch, kernel_drain_until, kernel_drain_retry;
+static uint64_t kernel_parallel_epoch;
 
 enum kernel_memory_phase
 {

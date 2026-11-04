@@ -448,6 +448,7 @@ static bool kernel_enqueue(unsigned, unsigned, bool);
 static void kernel_cancel(unsigned);
 static void detach_program(unsigned);
 #include "stream_calls.h"
+#include "netctl_calls.h"
 #include "io_calls.h"
 
 static void detach_program(unsigned task)
@@ -820,6 +821,8 @@ static void wake_tasks(void)
             if (kernel_wait[i] || thread_waiting[i])
                 continue;
             if (stream_wake(i, at))
+                continue;
+            if (netctl_wake(i, at))
                 continue;
             if (service_wait_wake(i, at))
                 continue;
@@ -2000,7 +2003,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     size_t bytes;
     if (!lume_vfs_image("/bin/sh", &elf, &bytes))
         return false;
-    if (!stream_waits_start())
+    if (!stream_waits_start() || !netctl_waits_start())
         return false;
     public_mode = true;
     for (unsigned i = 0; i < LUME_CPU_LIMIT; ++i)
@@ -2011,7 +2014,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         kernel_lanes[i] = (struct kernel_io_lane){.owner = LUME_TASK_LIMIT};
     kernel_control_queue = (struct io_queue){0};
     kernel_lane_cursor = 0;
-    kernel_parallel_epoch = kernel_drain_until = kernel_drain_retry = 0;
+    kernel_parallel_epoch = 0;
     lume_console_output_start();
     kernel_deferred = 0;
     elf_mode = true;

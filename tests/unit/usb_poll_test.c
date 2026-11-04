@@ -32,6 +32,19 @@ static uint64_t ticks = 1000000;
 static uint32_t registers[512], runtime[32], doorbells[16];
 static unsigned second_port_reads, event_reads, allocations, diagnostics;
 
+enum wait_model
+{
+    WAIT_NONE,
+    WAIT_REGISTER,
+    WAIT_COMMAND,
+    WAIT_TRANSFER,
+};
+static enum wait_model wait_model;
+static uint64_t ready_at, wait_deadline;
+static unsigned waits, completion_code;
+static bool injected;
+static void inject_completion(void);
+
 static uint64_t lume_counter_read(void)
 {
     return ticks;
@@ -103,8 +116,13 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
 {
     (void)value;
     (void)mask;
-    (void)deadline;
-    return false;
+    if (wait_model == WAIT_NONE)
+        return false;
+    assert(deadline > ticks && deadline - ticks <= 1000 && deadline <= wait_deadline);
+    ticks = deadline;
+    ++waits;
+    inject_completion();
+    return true;
 }
 
 int lume_work_submit(struct lume_work *work)
@@ -166,7 +184,32 @@ _Noreturn void lume_fail(const char *reason)
 #include "../../drivers/usb/xhci/usb.c"
 
 static struct lume_xhci_trb event_ring[256], keyboard_ring[256];
+static struct lume_xhci_trb command_ring[256], control_ring[256];
 static unsigned char keyboard_report[64];
+
+static void inject_completion(void)
+{
+    struct host *host = hosts;
+    assert(host->operation == HOST_SCAN && !host->event_polling);
+    assert(!lume_usb_start_host(0, host->frequency));
+    if (injected || ticks < ready_at)
+        return;
+    injected = true;
+    if (wait_model == WAIT_REGISTER)
+    {
+        registers[0] = 2;
+        return;
+    }
+    assert(host->waiting_command || host->waiting_transfer);
+    assert(!command(host, 9, 0, 0, NULL));
+    assert(!control(host, &host->devices[1], 0, 0, 0, 0, 0));
+    if (wait_model == WAIT_COMMAND)
+        event_ring[0] = (struct lume_xhci_trb){host->waiting_command, completion_code << 24,
+                                               (1u << 24) | (33u << 10) | 1};
+    else
+        event_ring[0] = (struct lume_xhci_trb){host->waiting_transfer, completion_code << 24,
+                                               (1u << 24) | (1u << 16) | (32u << 10) | 1};
+}
 
 static void drain_topology(struct host *host)
 {
@@ -187,6 +230,9 @@ static void reset(void)
     memset(keyboard_report, 0, sizeof(keyboard_report));
     second_port_reads = event_reads = allocations = diagnostics = 0;
     ticks = 1000000;
+    wait_model = WAIT_NONE;
+    waits = 0;
+    injected = false;
     worker_busy = true;
     hosts[0] = (struct host){.op = (uintptr_t)registers,
                              .rt = (uintptr_t)runtime,
@@ -336,11 +382,57 @@ static void composite_reports(void)
     graphics = false;
 }
 
+static void wait_case(enum wait_model model, int ready_offset, unsigned code, bool success)
+{
+    reset();
+    memset(command_ring, 0, sizeof(command_ring));
+    memset(control_ring, 0, sizeof(control_ring));
+    struct host *host = hosts;
+    host->operation = HOST_SCAN;
+    host->command = (struct lume_xhci_ring){command_ring, (uintptr_t)command_ring, 0, 1};
+    host->devices[1].slot = 1;
+    host->devices[1].ep0 = (struct lume_xhci_ring){control_ring, (uintptr_t)control_ring, 0, 1};
+    wait_model = model;
+    completion_code = code;
+    wait_deadline = ticks + (model == WAIT_COMMAND ? 1000000 : 500000);
+    ready_at = (uint64_t)((int64_t)wait_deadline + ready_offset);
+    if (model == WAIT_REGISTER)
+        assert(wait_register(host, (uintptr_t)registers, 2, 2, 500) == success);
+    else if (model == WAIT_COMMAND)
+    {
+        unsigned slot = 0;
+        assert(command(host, 9, 0, 0, &slot) == success);
+        assert(slot == (success ? 1u : 0u) && !host->waiting_command);
+        assert(host->errors == (success ? 0u : 1u));
+    }
+    else
+    {
+        assert(control(host, &host->devices[1], 0, 0, 0, 0, 0) == success);
+        assert(!host->waiting_transfer && !host->transfer_slot);
+        assert(host->errors == (success ? 0u : 1u));
+    }
+    assert(waits && ticks == wait_deadline && host->operation == HOST_SCAN);
+    assert(injected == (ready_offset <= 0));
+}
+
+static void final_wait_observation(void)
+{
+    for (enum wait_model model = WAIT_REGISTER; model <= WAIT_TRANSFER; ++model)
+    {
+        wait_case(model, -100, 1, true);
+        wait_case(model, 0, 1, true);
+        wait_case(model, 1, 1, false);
+        if (model != WAIT_REGISTER)
+            wait_case(model, -100, 5, false);
+    }
+}
+
 int main(void)
 {
     reports_and_hotplug();
     bounded_events();
     composite_reports();
-    puts("PASS_USB_POLL bounded reports, composite endpoints, short packets and deferred hotplug");
+    final_wait_observation();
+    puts("PASS_USB_POLL bounded HID, deferred hotplug, final completion and absolute deadlines");
     return 0;
 }

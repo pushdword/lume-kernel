@@ -5,12 +5,15 @@
 #include "lume/storage.h"
 #include "lume/sd.h"
 #include "lume/worker.h"
+#include "lume/abi.h"
 #define DATA 0x1f0
 #define CONTROL 0x3f6
 static uint64_t capacity, allowed_first, allowed_count;
 static uint64_t reads, writes, failures;
 static bool failed;
 static bool flush_supported;
+/* Controller ownership covers PIO, worker suspension and the final cache flush. */
+static bool operating;
 
 static void delay(void)
 {
@@ -21,6 +24,9 @@ static void delay(void)
 static bool wait_status(bool data)
 {
     uint64_t start = lume_counter_read_relaxed();
+    uint64_t frequency = lume_counter_frequency();
+    uint64_t timeout = frequency ? frequency * 2 : 2000000;
+    uint64_t deadline = start + timeout;
     for (unsigned i = 0; i < 10000000; ++i)
     {
         uint8_t status = lume_in8(CONTROL);
@@ -33,8 +39,17 @@ static bool wait_status(bool data)
             if (data ? (status & 8) != 0 : (status & 8) == 0)
                 return true;
         }
-        if (lume_counter_read_relaxed() - start >= 2000000)
+        uint64_t now = lume_counter_read_relaxed();
+        if ((int64_t)(now - deadline) >= 0)
             break;
+        if (frequency && now - start >= frequency / 40000)
+        {
+            uint64_t next = now + frequency / 1000 + (frequency % 1000 != 0);
+            if ((int64_t)(next - deadline) > 0)
+                next = deadline;
+            if (lume_worker_pause(next))
+                continue;
+        }
         lume_cpu_relax();
     }
     failed = true;
@@ -59,7 +74,7 @@ static bool select_sectors(uint64_t sector, unsigned count, uint8_t command)
     return wait_status(true);
 }
 
-static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
+static bool read_blocks_owned(uint64_t sector, unsigned count, void *buffer)
 {
     if (!buffer || !select_sectors(sector, count, 0x20))
         return false;
@@ -82,7 +97,7 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
     return true;
 }
 
-static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
+static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buffer)
 {
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || !allowed_count ||
         sector < allowed_first || sector - allowed_first >= allowed_count ||
@@ -110,6 +125,26 @@ static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
     return true;
 }
 
+static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
+{
+    if (operating)
+        return false;
+    operating = true;
+    bool result = read_blocks_owned(sector, count, buffer);
+    operating = false;
+    return result;
+}
+
+static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
+{
+    if (operating)
+        return false;
+    operating = true;
+    bool result = write_blocks_owned(sector, count, buffer);
+    operating = false;
+    return result;
+}
+
 static bool read_sector(uint64_t sector, void *buffer)
 {
     return read_blocks(sector, 1, buffer);
@@ -123,7 +158,7 @@ static bool write_sector(uint64_t sector, const void *buffer)
 static bool start(uint64_t frequency)
 {
     (void)frequency;
-    return capacity && !failed;
+    return capacity && !failed && !operating;
 }
 
 static bool configure(uint64_t base, uint64_t size, uint32_t irq)
@@ -136,7 +171,12 @@ static bool configure(uint64_t base, uint64_t size, uint32_t irq)
 
 static bool stop(void)
 {
-    return !failed && wait_status(false);
+    if (operating)
+        return false;
+    operating = true;
+    bool result = !failed && wait_status(false);
+    operating = false;
+    return result;
 }
 
 static uint64_t sectors(void)
@@ -146,8 +186,8 @@ static uint64_t sectors(void)
 
 static bool allow(uint64_t first, uint64_t count)
 {
-    if (failed || allowed_count || first != LUME_PC_DATA_FIRST || first >= capacity || !count ||
-        count != capacity - first)
+    if (operating || failed || allowed_count || first != LUME_PC_DATA_FIRST || first >= capacity ||
+        !count || count != capacity - first)
         return false;
     allowed_first = first;
     allowed_count = count;
@@ -169,7 +209,7 @@ static void stats(void)
     lume_value("ATA_PIO_FAILURES", failures);
 }
 
-int lume_pc_ide_register(void)
+static int register_owned(void)
 {
     lume_out8(CONTROL, 2);
     lume_out8(DATA + 6, 0xa0);
@@ -200,5 +240,15 @@ int lume_pc_ide_register(void)
     int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
         stats();
+    return result;
+}
+
+int lume_pc_ide_register(void)
+{
+    if (operating)
+        return -LUME_EBUSY;
+    operating = true;
+    int result = register_owned();
+    operating = false;
     return result;
 }

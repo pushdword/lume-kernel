@@ -72,12 +72,14 @@ static bool wait_register(unsigned r, uint32_t mask, uint32_t wanted, unsigned m
 {
     uint64_t start = lume_counter_read();
     uint64_t deadline = start + frequency * ms / 1000;
-    do
+    for (;;)
     {
         if ((rd(r) & mask) == wanted)
             return true;
+        if ((int64_t)(lume_counter_read() - deadline) >= 0)
+            break;
         wait_slice(start, deadline);
-    } while ((int64_t)(lume_counter_read() - deadline) < 0);
+    }
     ++errors;
     return false;
 }
@@ -87,7 +89,7 @@ static bool event(uint32_t mask, unsigned ms)
     uint64_t start = lume_counter_read();
     uint64_t deadline = start + frequency * ms / 1000;
     uint32_t status = 0;
-    do
+    for (;;)
     {
         status = rd(0x30);
         if (status & 0xffff8000u)
@@ -97,8 +99,10 @@ static bool event(uint32_t mask, unsigned ms)
             wr(0x30, mask);
             return true;
         }
+        if ((int64_t)(lume_counter_read() - deadline) >= 0)
+            break;
         wait_slice(start, deadline);
-    } while ((int64_t)(lume_counter_read() - deadline) < 0);
+    }
     lume_value("WIFI_ERROR_INTERRUPT", status);
     lume_value("WIFI_ERROR_PRESENT", rd(0x24));
     ++errors;

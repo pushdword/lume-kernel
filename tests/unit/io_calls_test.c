@@ -5,11 +5,13 @@
 #include "lume/worker.h"
 #include "lume/work.h"
 #include "lume/net.h"
+#include "lume/net_commands.h"
+#include "lume/process.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define LUME_TASK_LIMIT 4u
+#define LUME_TASK_LIMIT LUME_WORK_DOMAINS
 #define LUME_CONTEXT_SYSCALL_REGISTER 8u
 #define LUME_SYSCALL_INSTRUCTION_BYTES 4u
 #define LUME_CONTEXT_REG(c, n) ((c)->x[n])
@@ -48,6 +50,8 @@ static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue;
 static bool public_mode = true, account_inside;
 static bool worker_suspended[LUME_WORK_DOMAINS], work_pending[LUME_WORK_DOMAINS];
 static bool worker_blocked[LUME_WORK_DOMAINS];
+static bool work_requeue[LUME_WORK_DOMAINS];
+static unsigned work_drained[LUME_WORK_DOMAINS];
 static bool block_pipe, nonblock_pipe, filesystem_scope;
 static bool expect_writing, override_result;
 static int64_t inline_result;
@@ -87,6 +91,12 @@ static struct
 static unsigned stream_attempts, stream_connects, stream_closes;
 static bool stream_ready, stream_event, stream_fault, stop_during_attempt;
 static uint32_t pending_signal;
+static unsigned netctl_attempts, netctl_starts, netctl_cancels;
+static bool netctl_ready, netctl_fault, netctl_return_fault, netctl_capable = true;
+static bool signal_during_scan;
+static int cancel_scan_result;
+static uint32_t compat_index = 7;
+static unsigned compat_formats, compat_interfaces;
 
 static bool task_signal_pending(unsigned owner)
 {
@@ -96,6 +106,9 @@ static bool task_signal_pending(unsigned owner)
 
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool writing)
 {
+    if (bytes == sizeof(struct lume_net_control) || bytes == sizeof(struct lume_net_request) ||
+        bytes == sizeof(((struct lume_net_request *)0)->output))
+        return pointer && (!writing || !netctl_fault);
     assert(pointer && bytes == sizeof(struct lume_stream_request));
     return !writing || !stream_fault;
 }
@@ -146,6 +159,62 @@ int lume_stream_nowait(unsigned owner, unsigned operation, struct lume_stream_re
 static unsigned process_slot(unsigned task)
 {
     return process_owner[task];
+}
+
+bool lume_task_capable(unsigned pid, uint64_t capability)
+{
+    assert(pid == process_slot(current_task) + 1 && capability == LUME_CAP_NET_ADMIN);
+    return netctl_capable;
+}
+
+int64_t lume_net_control_progress(unsigned owner, unsigned operation,
+                                  struct lume_net_control *request, bool started, bool *pending)
+{
+    assert(worker_functions[LUME_WORK_NETWORK] && owner == current_task + 1);
+    assert(root == process_slot(current_task) + 1 && operation == LUME_NET_WIFI_SCAN);
+    assert(request->version == LUME_NET_CONTROL_VERSION && request->ifindex == 7);
+    ++netctl_attempts;
+    netctl_starts += !started;
+    if (signal_during_scan)
+        pending_signal = 1u << 17;
+    *pending = !netctl_ready;
+    if (*pending)
+        return -LUME_EAGAIN;
+    request->count = 1;
+    netctl_fault |= netctl_return_fault;
+    return 0;
+}
+
+int lume_wireless_scan_cancel(unsigned owner, uint32_t index)
+{
+    assert(worker_functions[LUME_WORK_NETWORK] && owner && owner <= LUME_TASK_LIMIT && index == 7);
+    ++netctl_cancels;
+    return cancel_scan_result;
+}
+
+uint32_t lume_net_compat_interface(void)
+{
+    assert(worker_functions[LUME_WORK_NETWORK]);
+    ++compat_interfaces;
+    return compat_index;
+}
+
+int64_t lume_net_compat_scan(const struct lume_net_control *request, int64_t result, char *out,
+                             size_t cap)
+{
+    assert(worker_functions[LUME_WORK_NETWORK] &&
+           cap == sizeof(((struct lume_net_request *)0)->output));
+    ++compat_formats;
+    out[0] = 0;
+    if (result < 0)
+    {
+        if (result == -LUME_EIO && !request->ifindex)
+            strcpy(out, "network unavailable\n");
+        return result;
+    }
+    assert(request->count == 1);
+    strcpy(out, "legacy scan\n");
+    return (int64_t)strlen(out);
 }
 
 static bool kernel_console_storage(unsigned task)
@@ -291,7 +360,8 @@ unsigned lume_work_drain_on(unsigned slot, unsigned budget)
 {
     assert(budget == 1);
     bool pending = work_pending[slot];
-    work_pending[slot] = false;
+    work_pending[slot] = pending && work_requeue[slot];
+    work_drained[slot] += pending;
     return pending ? 1 : 0;
 }
 
@@ -394,6 +464,7 @@ void *lume_kernel_allocate(size_t bytes)
 }
 
 #include "stream_calls.h"
+#include "netctl_calls.h"
 #include "io_calls.h"
 
 static void reset(void)
@@ -414,21 +485,31 @@ static void reset(void)
     memset(wake_at, 0, sizeof(wake_at));
     memset(context_replaced, 0, sizeof(context_replaced));
     assert(stream_waits_start());
+    assert(netctl_waits_start());
     memset(thread_slots, 0, sizeof(thread_slots));
     stream_attempts = stream_connects = stream_closes = pending_signal = 0;
     stream_ready = stream_event = stream_fault = stop_during_attempt = false;
+    netctl_attempts = netctl_starts = netctl_cancels = 0;
+    netctl_ready = netctl_fault = netctl_return_fault = signal_during_scan = false;
+    netctl_capable = true;
+    cancel_scan_result = 0;
+    compat_index = 7;
+    compat_formats = compat_interfaces = 0;
     memset(kernel_lanes, 0, sizeof(kernel_lanes));
     memset(worker_functions, 0, sizeof(worker_functions));
     memset(worker_arguments, 0, sizeof(worker_arguments));
     memset(worker_suspended, 0, sizeof(worker_suspended));
     memset(work_pending, 0, sizeof(work_pending));
+    memset(work_requeue, 0, sizeof(work_requeue));
+    memset(work_drained, 0, sizeof(work_drained));
     memset(worker_blocked, 0, sizeof(worker_blocked));
     memset(task_domain, 0, sizeof(task_domain));
     memset(task_mutation, 0, sizeof(task_mutation));
     kernel_control_queue = (struct io_queue){0};
     kernel_lane_cursor = 0;
-    kernel_parallel_epoch = kernel_drain_until = kernel_drain_retry = 0;
+    kernel_parallel_epoch = 0;
     counter_step = 1;
+    clock_ms = 0;
     worker_cost_ms = 0;
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         kernel_lanes[i].owner = LUME_TASK_LIMIT;
@@ -516,10 +597,8 @@ static void cancellation_and_exit(void)
     assert(!kernel_cleanup_ready(1) && kernel_wait[1] && states[1] == 4);
     assert(lume_worker_busy() && !executed[0]);
     kernel_step();
-    assert(executed[0] == 1 && !kernel_cleanup_ready(1));
-    kernel_step();
-    assert(states[1] == 1 && kernel_cleanup_ready(1));
-    assert(!kernel_queue.granted && !lume_worker_busy());
+    assert(executed[0] == 1 && states[1] == 1 && kernel_cleanup_ready(1));
+    assert(!kernel_control_queue.granted && !kernel_queue.granted && !lume_worker_busy());
 
     reset();
     process_owner[1] = process_owner[2] = 0;
@@ -750,7 +829,9 @@ static void bounded_resource_turn(void)
     assert(executed[0] == 1 && executed[1] == 1 && !executed[2] && !executed[3]);
     assert(kernel_lane_cursor == 2 && resumes == 2);
     kernel_step();
-    assert(executed[2] == 1 && executed[3] == 1 && !lume_worker_busy());
+    assert(executed[2] == 1 && executed[3] == 1 && !executed[4] && lume_worker_busy());
+    kernel_step();
+    assert(executed[4] == 1 && !lume_worker_busy());
 }
 
 static void independent_resources(void)
@@ -844,6 +925,7 @@ static void descriptor_conflicts(void)
 static void exclusive_wait_keeps_progress(void)
 {
     reset();
+    counter_step = 0;
     worker_blocked[LUME_WORK_NETWORK] = true;
     enqueue_domain(0, LUME_WORK_NETWORK);
     kernel_step();
@@ -852,15 +934,18 @@ static void exclusive_wait_keeps_progress(void)
     enqueue_domain(2, LUME_WORK_DISPLAY);
     enqueue_domain(3, LUME_WORK_GENERAL);
     kernel_step();
+    clock_ms = 10000;
     kernel_step();
-    assert(executed[2] == 1 && executed[3] == 1 && !executed[0]);
+    assert(!executed[2] && !executed[3] && !executed[0]);
     assert(states[1] == 4 && kernel_control_queue.queued[1]);
     worker_blocked[LUME_WORK_NETWORK] = false;
     kernel_step();
-    kernel_step();
     assert(states[1] == 1 && kernel_cleanup_ready(1) && !lume_worker_busy());
+    kernel_step();
+    assert(executed[2] == 1 && executed[3] == 1);
 
     reset();
+    counter_step = 0;
     clock_ms = 100;
     worker_blocked[LUME_WORK_NETWORK] = worker_blocked[LUME_WORK_STORAGE] = true;
     enqueue_domain(0, LUME_WORK_NETWORK);
@@ -872,7 +957,7 @@ static void exclusive_wait_keeps_progress(void)
     assert(!executed[2] && !kernel_exclusive_active());
     clock_ms = 110;
     kernel_step();
-    assert(executed[2] == 1 && !kernel_exclusive_active());
+    assert(!executed[2] && !kernel_exclusive_active());
     worker_blocked[LUME_WORK_NETWORK] = false;
     kernel_step();
     kernel_step();
@@ -880,6 +965,123 @@ static void exclusive_wait_keeps_progress(void)
     worker_blocked[LUME_WORK_STORAGE] = false;
     kernel_step();
     assert(!kernel_exclusive_active() && !lume_worker_busy());
+    assert(!executed[2]);
+    kernel_step();
+    assert(executed[2] == 1);
+}
+
+static void exclusive_continuous_traffic(void)
+{
+    reset();
+    counter_step = 0;
+    const unsigned domains[] = {LUME_WORK_STORAGE, LUME_WORK_NETWORK};
+    const unsigned duration[] = {3, 4};
+    uint64_t due[2] = {0};
+    bool started[2] = {false}, control = false, renewed = false;
+    unsigned admitted_at = 0;
+    for (unsigned tick = 0; tick < 30; ++tick)
+    {
+        clock_ms = tick;
+        bool busy_before[2];
+        for (unsigned task = 0; task < 2; ++task)
+        {
+            unsigned domain = domains[task];
+            busy_before[task] = lume_worker_busy_on(domain);
+            worker_blocked[domain] = !busy_before[task] || tick < due[task];
+            if (tick >= task && !busy_before[task] && !kernel_lanes[domain].queue.queued[task])
+            {
+                enqueue_domain(task, domain);
+                renewed |= started[task];
+            }
+        }
+        if (!control && started[0] && started[1])
+        {
+            process_exiting[2] = true;
+            assert(!kernel_cleanup_ready(2));
+            control = true;
+        }
+        kernel_step();
+        for (unsigned task = 0; task < 2; ++task)
+            if (!busy_before[task] && lume_worker_busy_on(domains[task]))
+            {
+                due[task] = tick + duration[task];
+                started[task] = true;
+            }
+        if (control && states[2] == 1)
+        {
+            admitted_at = tick;
+            break;
+        }
+    }
+    assert(control && renewed && admitted_at == 5);
+    assert(executed[0] == 1 && executed[1] == 1 && kernel_cleanup_ready(2));
+    assert(kernel_lanes[LUME_WORK_STORAGE].queue.queued[0]);
+    assert(!kernel_control_queue.count && !kernel_any_grant());
+    worker_blocked[LUME_WORK_STORAGE] = worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    assert(executed[0] == 2);
+}
+
+static void exclusive_existing_grant(void)
+{
+    reset();
+    counter_step = 0;
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    enqueue_domain(3, LUME_WORK_DISPLAY);
+    struct io_ticket ticket;
+    struct io_queue *queue = &kernel_lanes[LUME_WORK_DISPLAY].queue;
+    assert(io_queue_take(queue, 0, &ticket));
+    io_queue_grant(queue, ticket);
+    process_exiting[1] = true;
+    assert(!kernel_cleanup_ready(1));
+    assert(!kernel_request_ready(LUME_WORK_DISPLAY, 3, &tasks[3].context, false));
+    assert(kernel_claim(3));
+    assert(kernel_request_ready(LUME_WORK_DISPLAY, 3, &tasks[3].context, true));
+    struct kernel_io_lane *lane = &kernel_lanes[LUME_WORK_DISPLAY];
+    lane->owner = 3;
+    assert(lume_worker_submit_on(LUME_WORK_DISPLAY, kernel_call, lane));
+    kernel_step();
+    assert(executed[3] == 1 && !executed[0] && states[1] == 4);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    assert(states[1] == 1 && kernel_cleanup_ready(1));
+
+    reset();
+    counter_step = 0;
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_exiting[1] = true;
+    assert(!kernel_cleanup_ready(1) && kernel_regular_draining());
+    kernel_cancel(1);
+    assert(!kernel_regular_draining());
+    enqueue_domain(2, LUME_WORK_DISPLAY);
+    kernel_step();
+    assert(executed[2] == 1 && !executed[0]);
+}
+
+static void exclusive_background_continuation(void)
+{
+    reset();
+    counter_step = 0;
+    work_pending[LUME_WORK_STORAGE] = work_requeue[LUME_WORK_STORAGE] = true;
+    worker_blocked[LUME_WORK_STORAGE] = true;
+    kernel_step();
+    assert(lume_worker_busy_on(LUME_WORK_STORAGE));
+    work_pending[LUME_WORK_NETWORK] = true;
+    process_exiting[1] = true;
+    assert(!kernel_cleanup_ready(1));
+    kernel_step();
+    assert(!lume_worker_busy_on(LUME_WORK_NETWORK) && !work_drained[LUME_WORK_STORAGE]);
+    worker_blocked[LUME_WORK_STORAGE] = false;
+    kernel_step();
+    assert(work_drained[LUME_WORK_STORAGE] == 1 && work_pending[LUME_WORK_STORAGE]);
+    assert(!work_drained[LUME_WORK_NETWORK] && work_pending[LUME_WORK_NETWORK]);
+    assert(states[1] == 1 && kernel_cleanup_ready(1));
+    kernel_step();
+    assert(work_drained[LUME_WORK_NETWORK] == 1 && work_drained[LUME_WORK_STORAGE] > 1);
 }
 
 static void begin_stream(struct lume_stream_request *request, unsigned operation)
@@ -964,14 +1166,233 @@ static void stream_parking(void)
     assert((int64_t)tasks[0].context.x[0] == -4 && !stream_waits[0].active && stream_closes == 1);
 }
 
+static void begin_scan(struct lume_net_control *request)
+{
+    current_task = 0;
+    root = 1;
+    tasks[0].context = (struct lume_context){
+        .x = {LUME_NET_WIFI_SCAN, (uintptr_t)request, sizeof(*request)}, .pc = 0x3004};
+    tasks[0].context.x[8] = LUME_SYS_NETCTL;
+    task_domain[0] = LUME_WORK_NETWORK;
+    kernel_wait[0] = true;
+    states[0] = 4;
+    kernel_lanes[LUME_WORK_NETWORK].owner = 0;
+    assert(lume_worker_submit_on(LUME_WORK_NETWORK, kernel_call, &kernel_lanes[LUME_WORK_NETWORK]));
+    kernel_step();
+}
+
+static void scan_parking(void)
+{
+    reset();
+    counter_step = 0;
+    struct lume_net_control request = {.version = LUME_NET_CONTROL_VERSION, .ifindex = 7};
+    begin_scan(&request);
+    assert(netctl_attempts == 1 && netctl_starts == 1 && !lume_worker_busy());
+    assert(states[0] == 4 && !kernel_wait[0] && netctl_waits[0].pending);
+    uint64_t deadline = netctl_waits[0].deadline;
+    assert(netctl_waits[0].retry_at == 10 && deadline == 30000);
+    assert(netctl_wake(0, 9) && !kernel_wait[0]);
+    enqueue_domain(1, LUME_WORK_STORAGE);
+    enqueue_domain(2, LUME_WORK_NETWORK);
+    kernel_step();
+    assert(executed[1] == 1 && executed[2] == 1 && netctl_attempts == 1);
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms) && netctl_wake(0, clock_ms));
+    assert(kernel_lanes[LUME_WORK_NETWORK].queue.count == 1);
+    kernel_step();
+    assert(netctl_attempts == 2 && netctl_starts == 1 && !lume_worker_busy());
+    assert(netctl_waits[0].deadline == deadline && netctl_waits[0].retry_at == 20);
+    request.ifindex = 99;
+    netctl_ready = true;
+    clock_ms = 20;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert(states[0] == 1 && !tasks[0].context.x[0] && !netctl_waits[0].active);
+    assert(request.ifindex == 7 && request.count == 1 && netctl_starts == 1 && !netctl_cancels);
+
+    reset();
+    counter_step = 0;
+    request = (struct lume_net_control){.version = LUME_NET_CONTROL_VERSION, .ifindex = 7};
+    begin_scan(&request);
+    clock_ms = netctl_waits[0].deadline;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EIO && !netctl_waits[0].active);
+    assert(netctl_cancels == 1 && !netctl_retired_pending());
+
+    reset();
+    counter_step = 0;
+    begin_scan(&request);
+    netctl_ready = true;
+    clock_ms = netctl_waits[0].deadline;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert(!tasks[0].context.x[0] && request.count == 1 && !netctl_cancels);
+    request = (struct lume_net_control){.version = LUME_NET_CONTROL_VERSION, .ifindex = 7};
+    reset();
+    netctl_fault = true;
+    begin_scan(&request);
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EFAULT && !netctl_attempts);
+    reset();
+    counter_step = 0;
+    begin_scan(&request);
+    netctl_ready = netctl_return_fault = true;
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EFAULT && netctl_cancels == 1);
+
+    reset();
+    counter_step = 0;
+    begin_scan(&request);
+    netctl_capable = false;
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EPERM && netctl_cancels == 1);
+    assert(netctl_attempts == 1 && !netctl_waits[0].active);
+
+    reset();
+    counter_step = 0;
+    begin_scan(&request);
+    pending_signal = 1u << 17;
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -4 && netctl_cancels == 1);
+    assert(!netctl_waits[0].active && netctl_attempts == 1);
+    reset();
+    signal_during_scan = true;
+    begin_scan(&request);
+    assert((int64_t)tasks[0].context.x[0] == -4 && netctl_cancels == 1);
+    assert(!netctl_waits[0].active && !lume_worker_busy());
+
+    reset();
+    counter_step = 0;
+    begin_scan(&request);
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(1, LUME_WORK_NETWORK);
+    kernel_step();
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms) && kernel_lanes[LUME_WORK_NETWORK].queue.queued[0]);
+    assert(netctl_interrupt(0) && !kernel_lanes[LUME_WORK_NETWORK].queue.queued[0]);
+    assert(netctl_retired_pending() && !netctl_cancels && !kernel_wait[0]);
+    cancel_scan_result = -LUME_EAGAIN;
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    assert(executed[1] == 1 && netctl_cancels == 1 && !netctl_retired_pending());
+    assert(netctl_waits[0].retire_index == 7 && netctl_waits[0].retire_at == 20);
+    kernel_step();
+    kernel_step();
+    assert(netctl_cancels == 1 && !lume_worker_busy());
+    begin_scan(&request);
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EBUSY && netctl_attempts == 1);
+    assert(netctl_waits[0].retire_index == 7 && !netctl_waits[0].active);
+    clock_ms = 19;
+    kernel_step();
+    assert(netctl_cancels == 1);
+    clock_ms = 20;
+    cancel_scan_result = 0;
+    kernel_step();
+    assert(netctl_cancels == 2 && !netctl_retired_pending());
+    begin_scan(&request);
+    assert(netctl_waits[0].active && netctl_attempts == 2 && netctl_starts == 2);
+}
+
+static void begin_legacy_call(unsigned operation, struct lume_net_request *request, size_t bytes)
+{
+    current_task = 0;
+    root = 1;
+    tasks[0].context =
+        (struct lume_context){.x = {operation, (uintptr_t)request, bytes}, .pc = 0x4004};
+    tasks[0].context.x[8] = LUME_SYS_NET;
+    task_domain[0] = LUME_WORK_NETWORK;
+    kernel_wait[0] = true;
+    states[0] = 4;
+    kernel_lanes[LUME_WORK_NETWORK].owner = 0;
+    assert(lume_worker_submit_on(LUME_WORK_NETWORK, kernel_call, &kernel_lanes[LUME_WORK_NETWORK]));
+    kernel_step();
+}
+
+static void legacy_scan_parking(void)
+{
+    reset();
+    counter_step = 0;
+    struct lume_net_request request;
+    memset(&request, 0x5a, sizeof(request));
+    strcpy(request.argument, "original argument");
+    strcpy(request.output, "original output");
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    assert(!lume_worker_busy() && states[0] == 4 && !kernel_wait[0]);
+    assert(netctl_waits[0].legacy && netctl_waits[0].pending && netctl_attempts == 1);
+    assert(compat_interfaces == 1 && !compat_formats && !strcmp(request.output, "original output"));
+    strcpy(request.argument, "changed argument");
+    netctl_ready = true;
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert(states[0] == 1 && tasks[0].context.x[0] == strlen("legacy scan\n"));
+    assert(!strcmp(request.output, "legacy scan\n") &&
+           !strcmp(request.argument, "changed argument"));
+    assert(request.output[strlen("legacy scan\n") + 1] == 'u');
+    assert(compat_interfaces == 1 && compat_formats == 1 && netctl_starts == 1);
+
+    reset();
+    memset(request.argument, 'x', sizeof(request.argument));
+    strcpy(request.output, "unchanged");
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EINVAL && !netctl_attempts && !compat_formats);
+    assert(!strcmp(request.output, "unchanged") && !compat_interfaces);
+    request.argument[0] = 0;
+    reset();
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request) - 1);
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EINVAL && !compat_interfaces);
+    reset();
+    netctl_capable = false;
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EPERM && !compat_interfaces);
+    reset();
+    netctl_fault = true;
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EFAULT && !compat_interfaces);
+
+    reset();
+    compat_index = 0;
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EIO && !netctl_attempts);
+    assert(!strcmp(request.output, "network unavailable\n") && compat_formats == 1);
+    reset();
+    counter_step = 0;
+    begin_legacy_call(LUME_NET_SCAN, &request, sizeof(request));
+    netctl_ready = netctl_return_fault = true;
+    clock_ms = 10;
+    assert(netctl_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EFAULT && netctl_cancels == 1);
+
+    for (unsigned operation = LUME_NET_STATUS; operation <= LUME_NET_TCP; ++operation)
+    {
+        if (operation == LUME_NET_SCAN)
+            continue;
+        reset();
+        begin_legacy_call(operation, &request, sizeof(request));
+        assert(executed[0] == 1 && !netctl_attempts && !compat_formats && !compat_interfaces);
+    }
+}
+
 int main(void)
 {
+    legacy_scan_parking();
+    scan_parking();
     stream_parking();
     bounded_resource_turn();
     independent_resources();
     local_messages_during_loading();
     descriptor_conflicts();
     exclusive_wait_keeps_progress();
+    exclusive_continuous_traffic();
+    exclusive_existing_grant();
+    exclusive_background_continuation();
     ownership();
     cancellation_and_exit();
     pipe_and_fairness();

@@ -10,6 +10,7 @@
 #include "lume/wifi_protocol.h"
 #include "lume/wpa.h"
 #include "lume/worker.h"
+#include <string.h>
 #define RAM_BASE 0x198000u
 static const struct lume_sdio_bus *bus;
 static uint32_t registered_interface;
@@ -28,6 +29,8 @@ static bool operational, configured, carrier, ssid_ok, psk_ok, joining, scan_run
 static uint16_t scan_id;
 static struct lume_access_point scan_results[LUME_SCAN_MAX];
 static unsigned scan_count, scan_errors;
+static uint32_t scan_started;
+static bool scan_retiring;
 static unsigned char receive_queue[8][1514];
 static uint16_t receive_size[8];
 static unsigned receive_head, receive_count, receive_drops;
@@ -789,8 +792,9 @@ static void dispatch(const struct lume_wifi_frame *h)
             return;
         if (e.status == 8)
         {
-            if (e.bytes < 12 || get32(e.data) > e.bytes || get32(e.data) < 12 ||
-                (e.data[8] | (unsigned)e.data[9] << 8) != scan_id)
+            if (e.bytes >= 12 && (e.data[8] | (unsigned)e.data[9] << 8) != scan_id)
+                return;
+            if (e.bytes < 12 || get32(e.data) > e.bytes || get32(e.data) < 12)
             {
                 ++scan_errors;
                 return;
@@ -832,6 +836,8 @@ static void dispatch(const struct lume_wifi_frame *h)
         else
         {
             scan_done = true;
+            if (scan_retiring)
+                scan_running = scan_retiring = false;
             if (e.status)
                 ++scan_errors;
         }
@@ -871,6 +877,7 @@ static bool prepare_owned(const unsigned char mac[6])
     if (!mac || (mac[0] & 1))
         return false;
     operational = carrier = ssid_ok = psk_ok = joining = scan_running = scan_done = false;
+    scan_retiring = false;
     receive_head = receive_count = receive_drops = 0;
     authentication_ready = false;
     auth_head = auth_count = 0;
@@ -1115,10 +1122,10 @@ static bool start_interface(void)
            lume_wifi_prepare(station_mac);
 }
 
-static int scan_owned(struct lume_access_point *out, size_t capacity)
+static int scan_begin_owned(void)
 {
     if (!start_interface() || scan_running)
-        return -1;
+        return -LUME_EBUSY;
     unsigned char params[72] = {0};
     put32(params, 1);
     params[4] = 1;
@@ -1134,18 +1141,30 @@ static int scan_owned(struct lume_access_point *out, size_t capacity)
     scan_count = scan_errors = 0;
     scan_running = true;
     scan_done = false;
+    scan_retiring = false;
     bool ok = set_variable("escan", params, sizeof(params));
-    uint32_t start = lume_clock_millis();
-    while (ok && !scan_done && (uint32_t)(lume_clock_millis() - start) < 30000)
+    scan_started = lume_clock_millis();
+    if (!ok)
+        scan_retiring = true;
+    return ok ? 0 : -LUME_EIO;
+}
+
+static int scan_result_owned(struct lume_access_point *out, size_t capacity)
+{
+    if (!scan_running)
+        return -LUME_EIO;
+    if (!scan_done && (uint32_t)(lume_clock_millis() - scan_started) < 30000)
+        return -LUME_EAGAIN;
+    if (!scan_done)
     {
-        lume_wifi_poll();
-        bus->delay_us(1000);
+        scan_retiring = true;
+        return -LUME_EIO;
     }
     scan_running = false;
     lume_value("WIFI_SCAN_RESULTS", scan_count);
     lume_value("WIFI_SCAN_PARSE_ERRORS", scan_errors);
-    if (!ok || !scan_done || scan_errors)
-        return -1;
+    if (!scan_done || scan_errors)
+        return -LUME_EIO;
     unsigned count = scan_count;
     if (count > capacity)
         count = (unsigned)capacity;
@@ -1158,13 +1177,14 @@ static void leave_owned(void)
 {
     /* The installed firmware does not reliably acknowledge DOWN/DISASSOC
      * after traffic. WL_ON provides a deterministic, bounded radio stop. */
-    if (operational && (carrier || authentication_ready))
+    if (operational && (carrier || authentication_ready || scan_running))
     {
         settle_data();
         lume_wifi_stop();
         operational = false;
     }
     carrier = ssid_ok = psk_ok = joining = false;
+    scan_running = scan_done = scan_retiring = false;
     receive_count = 0;
     authentication_ready = false;
     auth_count = 0;
@@ -1279,6 +1299,56 @@ static int cyw_scan(void *ctx, struct lume_wifi_bss_info *out, unsigned cap)
     return n;
 }
 
+static int cyw_scan_begin(void *ctx)
+{
+    (void)ctx;
+    if (!operation_begin(true))
+        return -LUME_EBUSY;
+    int result = scan_begin_owned();
+    operation_end();
+    return result;
+}
+
+static int cyw_scan_result(void *ctx, struct lume_wifi_bss_info *out, unsigned cap)
+{
+    (void)ctx;
+    if (!operation_begin(false))
+        return -LUME_EAGAIN;
+    struct lume_access_point aps[LUME_SCAN_MAX];
+    int count = scan_result_owned(aps, cap);
+    if (count >= 0)
+        for (int i = 0; i < count; ++i)
+        {
+            out[i] = (struct lume_wifi_bss_info){0};
+            memcpy(out[i].bssid, aps[i].bssid, sizeof(out[i].bssid));
+            out[i].channel = aps[i].channel;
+            out[i].rssi = aps[i].rssi;
+            out[i].security = aps[i].security;
+            out[i].ssid_bytes = aps[i].ssid_len;
+            memcpy(out[i].ssid, aps[i].ssid, aps[i].ssid_len);
+        }
+    operation_end();
+    return count;
+}
+
+static int cyw_scan_cancel(void *ctx)
+{
+    (void)ctx;
+    if (!operation_begin(false))
+        return -LUME_EAGAIN;
+    if (scan_running && !scan_done)
+    {
+        /* Terminal events may omit the scan identifier. Consume the old terminal before
+         * accepting another scan. A radio reset also ends this reservation. */
+        scan_retiring = true;
+        operation_end();
+        return -LUME_EAGAIN;
+    }
+    scan_running = scan_done = scan_retiring = false;
+    operation_end();
+    return 0;
+}
+
 static bool cyw_connect(void *ctx, const unsigned char *s, size_t sn, const unsigned char *k,
                         size_t kn)
 {
@@ -1331,8 +1401,15 @@ static bool register_owned(const unsigned char mac[6])
 {
     static const struct lume_netif_ops data = {cyw_poll, cyw_link, cyw_receive, cyw_transmit,
                                                cyw_admin};
-    static const struct lume_wireless_ops control = {
-        cyw_scan, cyw_connect, cyw_disconnect, cyw_peer, cyw_connect_begin, cyw_connect_status};
+    static const struct lume_wireless_ops control = {.scan = cyw_scan,
+                                                     .connect = cyw_connect,
+                                                     .disconnect = cyw_disconnect,
+                                                     .peer = cyw_peer,
+                                                     .connect_begin = cyw_connect_begin,
+                                                     .connect_status = cyw_connect_status,
+                                                     .scan_begin = cyw_scan_begin,
+                                                     .scan_result = cyw_scan_result,
+                                                     .scan_cancel = cyw_scan_cancel};
     const struct lume_wifi_caps caps = {LUME_WIFI_STATION | LUME_WIFI_SCAN | LUME_WIFI_WPA2_CCMP,
                                         LUME_WIFI_BAND_2GHZ | LUME_WIFI_BAND_5GHZ,
                                         32,
@@ -1431,8 +1508,19 @@ int lume_wifi_scan(struct lume_access_point *out, size_t capacity)
 {
     if (!operation_begin(true))
         return -LUME_EBUSY;
-    int result = scan_owned(out, capacity);
+    int result = scan_begin_owned();
     operation_end();
+    while (!result || result == -LUME_EAGAIN)
+    {
+        lume_wifi_poll();
+        if (!operation_begin(true))
+            return -LUME_EBUSY;
+        result = scan_result_owned(out, capacity);
+        operation_end();
+        if (result != -LUME_EAGAIN)
+            break;
+        bus->delay_us(1000);
+    }
     return result;
 }
 

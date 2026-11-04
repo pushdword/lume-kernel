@@ -325,7 +325,7 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h include/kernel/lume/net.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h include/kernel/lume/net.h include/kernel/lume/wireless.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -334,6 +334,20 @@ $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c s
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS := -Itests/fixtures/counter $(TEST_CPPFLAGS) -Ivendor/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
+.PHONY: check-sdio-host-wait
+check: check-sdio-host-wait
+check-sdio-host-wait: $(OUT)/tests/sdio-host-wait$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/sdio-host-wait$(HOSTEXE): tests/unit/sdio_host_wait_test.c drivers/storage/bcm2712_sdio/host.c include/kernel/lume/worker.h include/kernel/lume/sdio.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+.PHONY: check-wifi-scan
+check: check-wifi-scan
+check-wifi-scan: $(OUT)/tests/wifi-scan$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/wifi-scan$(HOSTEXE): tests/unit/wifi_scan_test.c drivers/net/cyw43455/firmware.c src/net/wifi/wifi_net.c include/kernel/lume/wifi_protocol.h include/kernel/lume/wireless.h include/kernel/lume/worker.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -flto -fwhole-program -ffunction-sections -fdata-sections $(TEST_CPPFLAGS) "$<" src/net/wifi/wifi_net.c -Wl,--gc-sections -o "$@"
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
@@ -637,3 +651,11 @@ $(OUT)/tests/realtime$(HOSTEXE): tests/unit/realtime_test.c src/core/realtime.c 
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 check: check-realtime
+
+.PHONY: check-net-compat-scan
+check-net-compat-scan: $(OUT)/tests/net-compat-scan$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/net-compat-scan$(HOSTEXE): tests/unit/net_compat_scan_test.c src/net/net_compat.c include/kernel/lume/net.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -flto -fwhole-program -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -o "$@"
+check: check-net-compat-scan

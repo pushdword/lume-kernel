@@ -26,6 +26,9 @@ int lume_icmp_call(unsigned, unsigned, struct lume_stream_request *);
 void lume_icmp_release(unsigned);
 bool lume_icmp_busy(void);
 int64_t lume_net_control(unsigned, struct lume_net_control *);
+int64_t lume_net_control_progress(unsigned, unsigned, struct lume_net_control *, bool, bool *);
+uint32_t lume_net_compat_interface(void);
+int64_t lume_net_compat_scan(const struct lume_net_control *, int64_t, char *, size_t);
 int64_t lume_net_command(unsigned, const char *, char *, size_t);
 #include "lume/net_commands.h"
 #endif

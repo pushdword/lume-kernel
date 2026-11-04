@@ -201,6 +201,17 @@ static bool stream_interrupt(unsigned task)
     return false;
 }
 
+static void netctl_cancel(unsigned task)
+{
+    (void)task;
+}
+
+static bool netctl_interrupt(unsigned task)
+{
+    (void)task;
+    return false;
+}
+
 static void service_wait_cancel(unsigned task);
 static bool service_alive = true;
 

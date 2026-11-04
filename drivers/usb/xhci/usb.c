@@ -166,12 +166,14 @@ static void wait_progress(struct host *h, uint32_t mask, uint64_t deadline)
 static bool wait_register(struct host *h, uint64_t a, uint32_t mask, uint32_t value, unsigned ms)
 {
     uint64_t deadline = lume_counter_read() + h->frequency * ms / 1000;
-    do
+    for (;;)
     {
         if ((lume_mmio_read32(a) & mask) == value)
             return true;
+        if ((int64_t)(lume_counter_read() - deadline) >= 0)
+            break;
         wait_progress(h, 0, deadline);
-    } while ((int64_t)(lume_counter_read() - deadline) < 0);
+    }
     return false;
 }
 
@@ -368,13 +370,15 @@ static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned 
     h->waiting_command = enqueue(&h->command, parameter, 0, (type << 10) | control);
     lume_mmio_write32(h->doorbells, 0);
     uint64_t deadline = lume_counter_read() + h->frequency;
-    do
+    for (;;)
     {
         events(h);
         if (h->command_code)
             break;
+        if ((int64_t)(lume_counter_read() - deadline) >= 0)
+            break;
         wait_progress(h, COMMAND_READY, deadline);
-    } while ((int64_t)(lume_counter_read() - deadline) < 0);
+    }
     h->waiting_command = 0;
     if (h->command_code != 1)
     {
@@ -411,13 +415,15 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
         enqueue(&d->ep0, 0, 0, (4u << 10) | 32 | ((!bytes || !input) ? 1u << 16 : 0));
     lume_mmio_write32(h->doorbells + d->slot * 4, 1);
     uint64_t deadline = lume_counter_read() + h->frequency / 2;
-    do
+    for (;;)
     {
         events(h);
         if (h->transfer_code)
             break;
+        if ((int64_t)(lume_counter_read() - deadline) >= 0)
+            break;
         wait_progress(h, TRANSFER_READY, deadline);
-    } while ((int64_t)(lume_counter_read() - deadline) < 0);
+    }
     h->waiting_transfer = 0;
     h->transfer_slot = 0;
     if (h->transfer_code != 1)

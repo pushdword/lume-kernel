@@ -9,6 +9,38 @@ static void wipe(void *p, size_t n)
         *b++ = 0;
 }
 
+int64_t lume_net_control_progress(unsigned owner, unsigned op, struct lume_net_control *r,
+                                  bool started, bool *pending)
+{
+    if (!pending)
+        return -LUME_EINVAL;
+    *pending = false;
+    if (op != LUME_NET_WIFI_SCAN)
+        return lume_net_control(op, r);
+    if (!r)
+        return -LUME_EINVAL;
+    uint32_t index = r->ifindex;
+    bool valid = r->version == LUME_NET_CONTROL_VERSION && index && !r->reserved && !r->count &&
+                 !r->lost && !r->cursor;
+    memset(r, 0, sizeof(*r));
+    r->version = LUME_NET_CONTROL_VERSION;
+    r->ifindex = index;
+    if (!valid)
+        return -LUME_EINVAL;
+    if (!lume_netif_find(index))
+        return -LUME_ENOENT;
+    lume_net_poll();
+    lume_wireless_sync();
+    int result = lume_wireless_scan_progress(owner, index, r->data.scan, LUME_NET_SCAN_MAX, started,
+                                             pending);
+    if (result >= 0)
+    {
+        r->count = (uint32_t)result;
+        return 0;
+    }
+    return result;
+}
+
 int64_t lume_net_control(unsigned op, struct lume_net_control *r)
 {
     if (!r)

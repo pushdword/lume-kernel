@@ -7,7 +7,8 @@ struct radio
     struct lume_wifi_caps caps;
     struct lume_wireless_ops ops;
     void *context;
-    bool busy, pending;
+    bool busy, pending, scanning;
+    unsigned scan_owner, scan_error;
     struct lume_wifi_state state;
 };
 static struct radio radios[LUME_NET_INTERFACES];
@@ -100,7 +101,8 @@ int lume_wireless_register(uint32_t n, const struct lume_wifi_caps *caps,
         (caps->bands & ~3u) || !caps->max_scan_results ||
         caps->max_scan_results > LUME_NET_SCAN_MAX || caps->max_ssid_bytes != 32 ||
         caps->country[0] < 'A' || caps->country[0] > 'Z' || caps->country[1] < 'A' ||
-        caps->country[1] > 'Z' || (!!ops->connect_begin != !!ops->connect_status))
+        caps->country[1] > 'Z' || (!!ops->connect_begin != !!ops->connect_status) ||
+        (!!ops->scan_begin != !!ops->scan_result) || (!!ops->scan_begin != !!ops->scan_cancel))
         return -LUME_EINVAL;
     for (unsigned i = 0; i < sizeof(caps->reserved); ++i)
         if (caps->reserved[i])
@@ -189,6 +191,97 @@ int lume_wireless_scan(uint32_t n, struct lume_wifi_bss_info *out, unsigned cap)
     lume_net_event_emit(n, LUME_EVENT_SCAN, error ? LUME_WIFI_FAILED : r->state.state,
                         (uint32_t)error, error ? 0 : (unsigned)count);
     return error ? -error : count;
+}
+
+int lume_wireless_scan_progress(unsigned owner, uint32_t n, struct lume_wifi_bss_info *out,
+                                unsigned cap, bool started, bool *pending)
+{
+    if (!pending)
+        return -LUME_EINVAL;
+    *pending = false;
+    struct radio *r = find(n);
+    if (!r)
+        return -LUME_ENOENT;
+    if (!owner || !out || !cap || cap > LUME_NET_SCAN_MAX)
+        return -LUME_EINVAL;
+    if (!(r->caps.features & LUME_WIFI_SCAN))
+        return -LUME_ENOSYS;
+    if (!r->ops.scan_begin)
+        return started ? -LUME_EIO : lume_wireless_scan(n, out, cap);
+    if (!started)
+    {
+        if (r->busy || r->pending)
+            return -LUME_EBUSY;
+        if (!up(r))
+            return -LUME_EPERM;
+        r->busy = r->scanning = true;
+        r->scan_owner = owner;
+        r->scan_error = 0;
+        lume_net_event_emit(n, LUME_EVENT_SCAN, LUME_WIFI_SCANNING, 0, 0);
+        int result = r->ops.scan_begin(r->context);
+        if (result)
+        {
+            r->scan_error = LUME_EIO;
+            (void)lume_wireless_scan_cancel(owner, n);
+            return result;
+        }
+    }
+    else if (!r->scanning || r->scan_owner != owner)
+        return -LUME_EIO;
+    struct lume_wifi_bss_info results[LUME_NET_SCAN_MAX] = {0};
+    unsigned limit = cap < r->caps.max_scan_results ? cap : r->caps.max_scan_results;
+    int count = r->ops.scan_result(r->context, results, limit);
+    if (count == -LUME_EAGAIN)
+    {
+        *pending = true;
+        return count;
+    }
+    int error = count < 0 || (unsigned)count > limit ? LUME_EIO : 0;
+    for (int i = 0; !error && i < count; ++i)
+    {
+        struct lume_wifi_bss_info *b = &results[i];
+        unsigned any = 0;
+        for (unsigned k = 0; k < 6; ++k)
+            any |= b->bssid[k];
+        if (!any || (b->bssid[0] & 1) || b->ssid_bytes > 32 || !b->channel || b->channel > 196 ||
+            (b->security & ~7u))
+            error = LUME_EIO;
+    }
+    if (!error)
+        for (int i = 0; i < count; ++i)
+        {
+            out[i] = results[i];
+            memset(out[i].reserved, 0, sizeof(out[i].reserved));
+            if (out[i].ssid_bytes < 32)
+                memset(out[i].ssid + out[i].ssid_bytes, 0, 32 - out[i].ssid_bytes);
+        }
+    if (error)
+    {
+        r->scan_error = (unsigned)error;
+        (void)lume_wireless_scan_cancel(owner, n);
+        return -error;
+    }
+    r->busy = r->scanning = false;
+    r->scan_owner = 0;
+    sync(r);
+    lume_net_event_emit(n, LUME_EVENT_SCAN, r->state.state, 0, (unsigned)count);
+    return count;
+}
+
+int lume_wireless_scan_cancel(unsigned owner, uint32_t n)
+{
+    struct radio *r = find(n);
+    if (!r || !r->scanning || r->scan_owner != owner)
+        return 0;
+    int result = r->ops.scan_cancel(r->context);
+    if (result)
+        return result;
+    r->busy = r->scanning = false;
+    r->scan_owner = 0;
+    sync(r);
+    lume_net_event_emit(n, LUME_EVENT_SCAN, LUME_WIFI_FAILED, r->scan_error ? r->scan_error : 4, 0);
+    r->scan_error = 0;
+    return 0;
 }
 
 int lume_wireless_disconnect(uint32_t n)

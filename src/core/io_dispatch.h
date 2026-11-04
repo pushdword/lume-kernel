@@ -35,7 +35,12 @@ static bool kernel_resource_available(unsigned domain, unsigned task, bool mutat
 
 static bool kernel_regular_draining(void)
 {
-    return kernel_drain_until && lume_clock_monotonic() < kernel_drain_until;
+    if (kernel_control_queue.count)
+        return true;
+    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+        if (lume_worker_busy_on(i) && kernel_lanes[i].exclusive_pending)
+            return true;
+    return false;
 }
 
 static bool kernel_request_ready(unsigned domain, unsigned task, const struct lume_context *frame,
@@ -65,13 +70,21 @@ static void kernel_call(void *context)
     unsigned task = lane->owner, process = process_slot(task);
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
     if (lane == &kernel_lanes[LUME_WORK_NETWORK])
+    {
         stream_reap();
+        netctl_reap();
+    }
     lane->result =
         LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FORK
             ? fork_program(&tasks[task].context)
         : lane->launch ? start_program(&tasks[task].context)
         : LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_STREAM
             ? stream_attempt(task)
+        : (LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) ==
+               LUME_SYS_NETCTL ||
+           (LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_NET &&
+            LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_NET_SCAN))
+            ? netctl_attempt(task)
             : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
 }
 
@@ -79,12 +92,15 @@ static void kernel_work(void *context)
 {
     unsigned domain = (unsigned)(uintptr_t)context;
     if (domain == LUME_WORK_NETWORK)
+    {
         stream_reap();
+        netctl_reap();
+    }
     for (unsigned n = 0; n < 8; ++n)
     {
         unsigned done = lume_work_drain_on(domain, 1);
         kernel_deferred += done;
-        if (!done || kernel_control_queue.count)
+        if (!done || kernel_regular_draining())
             break;
     }
 }
@@ -92,7 +108,7 @@ static void kernel_work(void *context)
 static bool kernel_background_pending(unsigned domain)
 {
     return lume_work_pending_on(domain) ||
-           (domain == LUME_WORK_NETWORK && stream_retired_pending());
+           (domain == LUME_WORK_NETWORK && (stream_retired_pending() || netctl_retired_pending()));
 }
 
 static void kernel_cancel(unsigned task)
@@ -103,6 +119,7 @@ static void kernel_cancel(unsigned task)
     if (!kernel_task_active(task))
     {
         stream_cancel(task);
+        netctl_cancel(task);
         kernel_wait[task] = false;
     }
 }
@@ -228,32 +245,13 @@ static bool kernel_commit_drain(void)
             lane->exclusive_pending = false;
             lane->exclusive = true;
             kernel_lane_cursor = i;
-            kernel_drain_until = kernel_drain_retry = 0;
             return true;
         }
         pending = true;
         break;
     }
-    if (!pending)
-    {
-        kernel_drain_until = kernel_drain_retry = 0;
-        return false;
-    }
-    uint64_t at = lume_clock_monotonic();
-    if (kernel_drain_until && at < kernel_drain_until)
-        return true;
-    if (kernel_drain_until)
-    {
-        kernel_drain_until = 0;
-        kernel_drain_retry = at + 8;
-    }
-    if (at >= kernel_drain_retry)
-    {
-        /* Quiescence attempts bound admission delays while older device waits continue. */
-        kernel_drain_until = at + 2;
-        return true;
-    }
-    return false;
+    /* Existing workers and grants finish before another regular request is admitted. */
+    return pending;
 }
 
 static void kernel_image_commit_begin(void)
@@ -380,7 +378,9 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             else if (lane->launch && lane->result >= 0 &&
                      LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
                 states[owner] = 3;
-            else if (!lane->launch && stream_waits[owner].active && stream_waits[owner].pending)
+            else if (!lane->launch &&
+                     ((stream_waits[owner].active && stream_waits[owner].pending) ||
+                      (netctl_waits[owner].active && netctl_waits[owner].pending)))
                 states[owner] = 4;
             else if (lane->launch || !kernel_pipe_block(owner, frame, lane->result))
             {

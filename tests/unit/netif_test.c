@@ -35,12 +35,14 @@ struct fake
     bool link, fail_tx, fail_admin, fail_connect, pending;
     int receive, scan_mode;
     unsigned sent, received, scans, connects, disconnects;
+    unsigned polled, scan_steps, scan_begins, scan_reads, scan_cancels;
+    bool fail_begin, cancel_busy;
     uint32_t index;
 };
 
 static void poll(void *ctx)
 {
-    (void)ctx;
+    ++((struct fake *)ctx)->polled;
     ++polls;
 }
 
@@ -145,8 +147,42 @@ static int connect_status(void *ctx)
     struct fake *f = ctx;
     return f->link ? 0 : f->pending ? -LUME_EAGAIN : -LUME_EIO;
 }
-static const struct lume_wireless_ops wifi_ops = {scan, connect,       disconnect,
-                                                  peer, connect_begin, connect_status};
+
+static int scan_begin(void *ctx)
+{
+    struct fake *f = ctx;
+    ++f->scan_begins;
+    return f->fail_begin ? -LUME_EIO : 0;
+}
+
+static int scan_result(void *ctx, struct lume_wifi_bss_info *out, unsigned cap)
+{
+    struct fake *f = ctx;
+    ++f->scan_reads;
+    if (f->scan_steps)
+    {
+        --f->scan_steps;
+        return -LUME_EAGAIN;
+    }
+    return scan(ctx, out, cap);
+}
+
+static int scan_cancel(void *ctx)
+{
+    struct fake *f = ctx;
+    ++f->scan_cancels;
+    return f->cancel_busy ? -LUME_EAGAIN : 0;
+}
+
+static const struct lume_wireless_ops wifi_ops = {.scan = scan,
+                                                  .connect = connect,
+                                                  .disconnect = disconnect,
+                                                  .peer = peer,
+                                                  .connect_begin = connect_begin,
+                                                  .connect_status = connect_status,
+                                                  .scan_begin = scan_begin,
+                                                  .scan_result = scan_result,
+                                                  .scan_cancel = scan_cancel};
 
 /* The dispatcher sees stack services only through the generic boundary. */
 void lume_net_poll(void)
@@ -324,6 +360,56 @@ int main(void)
         CHECK(aps[0].reserved[i] == 0);
     for (unsigned i = 4; i < 32; ++i)
         CHECK(aps[0].ssid[i] == 0);
+    bool scan_pending;
+    unsigned eth_polls = eth.polled;
+    wifi.scan_steps = 3;
+    init(2);
+    CHECK(lume_net_control_progress(7, LUME_NET_WIFI_SCAN, &request, false, &scan_pending) ==
+              -LUME_EAGAIN &&
+          scan_pending);
+    CHECK(wifi.scan_begins == 1 && request.count == 0);
+    CHECK(lume_wireless_scan_progress(8, 2, aps, 32, false, &scan_pending) == -LUME_EBUSY);
+    CHECK(lume_wireless_scan_progress(8, 2, aps, 32, true, &scan_pending) == -LUME_EIO);
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        init(2);
+        CHECK(lume_net_control_progress(7, LUME_NET_WIFI_SCAN, &request, true, &scan_pending) ==
+                  -LUME_EAGAIN &&
+              scan_pending);
+        CHECK(eth.polled > eth_polls);
+        eth_polls = eth.polled;
+        CHECK(lume_wireless_unregister(2) == -LUME_EBUSY);
+    }
+    init(2);
+    CHECK(lume_net_control_progress(7, LUME_NET_WIFI_SCAN, &request, true, &scan_pending) == 0 &&
+          !scan_pending && request.count == 1 && wifi.scan_begins == 1);
+    CHECK(request.data.scan[0].ssid_bytes == 4 && request.data.scan[0].ssid[4] == 0);
+    wifi.scan_steps = 2;
+    CHECK(lume_wireless_scan_progress(7, 2, aps, 32, false, &scan_pending) == -LUME_EAGAIN);
+    wifi.cancel_busy = true;
+    CHECK(lume_wireless_scan_cancel(8, 2) == 0 && wifi.scan_cancels == 0);
+    CHECK(lume_wireless_scan_cancel(7, 2) == -LUME_EAGAIN);
+    CHECK(lume_wireless_scan_progress(8, 2, aps, 32, false, &scan_pending) == -LUME_EBUSY);
+    CHECK(lume_wireless_unregister(2) == -LUME_EBUSY);
+    wifi.cancel_busy = false;
+    CHECK(lume_wireless_scan_cancel(7, 2) == 0);
+    wifi.scan_steps = 0;
+    for (unsigned mode = 0; mode <= 6; ++mode)
+    {
+        wifi.scan_mode = (int)mode;
+        int result = lume_wireless_scan_progress(7, 2, aps, 32, false, &scan_pending);
+        CHECK(result == ((mode == 0 || mode == 6) ? 1 : -LUME_EIO) && !scan_pending);
+    }
+    wifi.scan_mode = 0;
+    wifi.fail_begin = wifi.cancel_busy = true;
+    CHECK(lume_wireless_scan_progress(7, 2, aps, 32, false, &scan_pending) == -LUME_EIO);
+    CHECK(lume_wireless_scan_progress(8, 2, aps, 32, false, &scan_pending) == -LUME_EBUSY);
+    wifi.fail_begin = wifi.cancel_busy = false;
+    CHECK(lume_wireless_scan_cancel(7, 2) == 0);
+    init(2);
+    request.reserved = 1;
+    CHECK(lume_net_control_progress(7, LUME_NET_WIFI_SCAN, &request, false, &scan_pending) ==
+          -LUME_EINVAL);
     struct lume_wifi_connect credentials = {
         4, 8, {'t', 'e', 's', 't'}, {'p', 'a', 's', 's', 'w', 'o', 'r', 'd'}};
     struct lume_wifi_connect broken = credentials;

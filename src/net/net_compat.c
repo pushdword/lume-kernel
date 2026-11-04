@@ -54,7 +54,7 @@ static void mac_text(struct text *t, const unsigned char *mac)
     }
 }
 
-static uint32_t default_interface(void)
+uint32_t lume_net_compat_interface(void)
 {
     uint32_t fallback = 0;
     for (unsigned i = 0; i < lume_netif_count(); ++i)
@@ -67,6 +67,44 @@ static uint32_t default_interface(void)
             fallback = n.ifindex;
     }
     return fallback;
+}
+
+int64_t lume_net_compat_scan(const struct lume_net_control *request, int64_t result, char *out,
+                             size_t cap)
+{
+    if (!request || !out || !cap)
+        return -LUME_EINVAL;
+    struct text t = {out, cap, 0};
+    out[0] = 0;
+    if (result < 0)
+    {
+        if (result == -LUME_EIO && !request->ifindex)
+            add(&t, "network unavailable\n");
+        return result;
+    }
+    if (request->count > LUME_NET_SCAN_MAX)
+        return -LUME_EINVAL;
+    for (unsigned i = 0; i < request->count; ++i)
+    {
+        const struct lume_wifi_bss_info *a = &request->data.scan[i];
+        mac_text(&t, a->bssid);
+        add(&t, " ch ");
+        decimal(&t, a->channel);
+        add(&t, " -");
+        decimal(&t, a->rssi < 0 ? (unsigned)-a->rssi : (unsigned)a->rssi);
+        add(&t, "dBm ");
+        add(&t, (a->security & LUME_BSS_RSN)   ? "RSN "
+                : (a->security & LUME_BSS_WPA) ? "WPA "
+                : a->security                  ? "privacy "
+                                               : "open ");
+        for (unsigned j = 0; j < a->ssid_bytes; ++j)
+        {
+            char s[2] = {a->ssid[j] >= 32 && a->ssid[j] < 127 ? (char)a->ssid[j] : '?', 0};
+            add(&t, s);
+        }
+        add(&t, "\n");
+    }
+    return (int64_t)t.used;
 }
 
 static bool join_config(uint32_t index)
@@ -106,7 +144,7 @@ int64_t lume_net_command(unsigned op, const char *arg, char *out, size_t cap)
         return -LUME_EINVAL;
     struct text t = {out, cap, 0};
     out[0] = 0;
-    uint32_t index = default_interface();
+    uint32_t index = lume_net_compat_interface();
     if (!index)
     {
         add(&t, "network unavailable\n");
@@ -142,31 +180,12 @@ int64_t lume_net_command(unsigned op, const char *arg, char *out, size_t cap)
         break;
     case LUME_NET_SCAN:
     {
-        struct lume_wifi_bss_info aps[LUME_NET_SCAN_MAX];
-        int count = lume_wireless_scan(index, aps, LUME_NET_SCAN_MAX);
+        struct lume_net_control request = {.version = LUME_NET_CONTROL_VERSION, .ifindex = index};
+        int count = lume_wireless_scan(index, request.data.scan, LUME_NET_SCAN_MAX);
         if (count < 0)
             return count;
-        for (int i = 0; i < count; ++i)
-        {
-            struct lume_wifi_bss_info *a = &aps[i];
-            mac_text(&t, a->bssid);
-            add(&t, " ch ");
-            decimal(&t, a->channel);
-            add(&t, " -");
-            decimal(&t, a->rssi < 0 ? (unsigned)-a->rssi : (unsigned)a->rssi);
-            add(&t, "dBm ");
-            add(&t, (a->security & LUME_BSS_RSN)   ? "RSN "
-                    : (a->security & LUME_BSS_WPA) ? "WPA "
-                    : a->security                  ? "privacy "
-                                                   : "open ");
-            for (unsigned j = 0; j < a->ssid_bytes; ++j)
-            {
-                char s[2] = {a->ssid[j] >= 32 && a->ssid[j] < 127 ? (char)a->ssid[j] : '?', 0};
-                add(&t, s);
-            }
-            add(&t, "\n");
-        }
-        break;
+        request.count = (unsigned)count;
+        return lume_net_compat_scan(&request, 0, out, cap);
     }
     case LUME_NET_JOIN:
         if (!join_config(index))
