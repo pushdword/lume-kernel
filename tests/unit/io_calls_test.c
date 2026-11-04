@@ -366,6 +366,12 @@ void lume_storage_poll_background(void)
 
 static bool kernel_enqueue(unsigned, unsigned, bool);
 static void kernel_cancel(unsigned);
+
+void *lume_kernel_allocate(size_t bytes)
+{
+    return malloc(bytes);
+}
+
 #include "stream_calls.h"
 #include "io_calls.h"
 
@@ -384,7 +390,7 @@ static void reset(void)
     memset(pipe_queues, 0, sizeof(pipe_queues));
     memset(wake_at, 0, sizeof(wake_at));
     memset(context_replaced, 0, sizeof(context_replaced));
-    memset(stream_waits, 0, sizeof(stream_waits));
+    assert(stream_waits_start());
     memset(thread_slots, 0, sizeof(thread_slots));
     stream_attempts = stream_connects = stream_closes = pending_signal = 0;
     stream_ready = stream_event = stream_fault = stop_during_attempt = false;

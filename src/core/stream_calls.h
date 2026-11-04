@@ -1,6 +1,7 @@
 #ifndef LUME_STREAM_CALLS_H
 #define LUME_STREAM_CALLS_H
 #include "lume/io_call.h"
+#include "lume/kernel_memory.h"
 
 static struct stream_wait_state
 {
@@ -8,10 +9,22 @@ static struct stream_wait_state
     uint64_t pointer, deadline;
     unsigned owner, operation, retire_owner, retire_handle;
     bool active, pending, ready, started;
-} stream_waits[LUME_TASK_LIMIT];
+} *stream_waits;
+
+static bool stream_waits_start(void)
+{
+    if (!stream_waits)
+        stream_waits = lume_kernel_allocate(sizeof(*stream_waits) * LUME_TASK_LIMIT);
+    if (!stream_waits)
+        return false;
+    memset(stream_waits, 0, sizeof(*stream_waits) * LUME_TASK_LIMIT);
+    return true;
+}
 
 static bool stream_retired_pending(void)
 {
+    if (!stream_waits)
+        return false;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (stream_waits[i].retire_handle)
             return true;
@@ -20,6 +33,8 @@ static bool stream_retired_pending(void)
 
 static void stream_reap(void)
 {
+    if (!stream_waits)
+        return;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
     {
         struct stream_wait_state *wait = &stream_waits[i];
@@ -34,6 +49,8 @@ static void stream_reap(void)
 
 static void stream_cancel(unsigned task)
 {
+    if (!stream_waits)
+        return;
     struct stream_wait_state *wait = &stream_waits[task];
     if (wait->active && wait->operation == LUME_STREAM_CONNECT && wait->started)
     {
@@ -45,7 +62,7 @@ static void stream_cancel(unsigned task)
 
 static bool stream_interrupt(unsigned task)
 {
-    if (!stream_waits[task].active || kernel_task_active(task))
+    if (!stream_waits || !stream_waits[task].active || kernel_task_active(task))
         return false;
     kernel_cancel(task);
     return true;
@@ -53,6 +70,8 @@ static bool stream_interrupt(unsigned task)
 
 void lume_tasks_stream_notify(unsigned owner, unsigned handle)
 {
+    if (!stream_waits)
+        return;
     bool changed = false;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
     {
@@ -69,6 +88,8 @@ void lume_tasks_stream_notify(unsigned owner, unsigned handle)
 
 static int64_t stream_attempt(unsigned task)
 {
+    if (!stream_waits)
+        return -LUME_ENOMEM;
     struct stream_wait_state *wait = &stream_waits[task];
     struct lume_context *frame = &tasks[task].context;
     unsigned operation = (unsigned)LUME_CONTEXT_REG(frame, 0);
@@ -130,6 +151,8 @@ static int64_t stream_attempt(unsigned task)
 
 static bool stream_wake(unsigned task, uint64_t at)
 {
+    if (!stream_waits)
+        return false;
     struct stream_wait_state *wait = &stream_waits[task];
     if (!wait->active || !wait->pending)
         return false;

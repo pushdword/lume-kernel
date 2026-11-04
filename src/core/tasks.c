@@ -1893,6 +1893,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
     size_t bytes;
     if (!lume_vfs_image("/bin/sh", &elf, &bytes))
         return false;
+    if (!stream_waits_start())
+        return false;
     uint64_t before = lume_pages_free() + lume_program_staging_pages();
     public_mode = true;
     for (unsigned i = 0; i < LUME_CPU_LIMIT; ++i)
