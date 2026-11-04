@@ -26,6 +26,7 @@ static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint1
 static struct lume_virtio_desc descriptors[3];
 static unsigned char card[128][512];
 static unsigned submits, flushes, checkpoints, fail_at;
+static bool short_read;
 static bool registered;
 
 uint32_t lume_in32(uint16_t port)
@@ -68,17 +69,19 @@ bool lume_virtio_wait(struct lume_virtio *value, struct lume_virtqueue *q, unsig
     if (submits == fail_at)
         return false;
     assert(header.sector < 128);
+    unsigned bytes = q->descriptors[1].bytes;
+    assert(bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
     if (header.type == 0)
-        memcpy(data, card[header.sector], 512);
+        memcpy(data, card[header.sector], bytes);
     else if (header.type == 1)
-        memcpy(card[header.sector], data, 512);
+        memcpy(card[header.sector], data, bytes);
     else
     {
         assert(header.type == 4);
         ++flushes;
     }
     status = 0;
-    *written = header.type == 0 ? 513 : 1;
+    *written = header.type == 0 ? bytes + (short_read ? 0 : 1) : 1;
     return true;
 }
 
@@ -95,8 +98,8 @@ void lume_virtio_queue_release(struct lume_virtqueue *q)
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes == 512);
-    ++checkpoints;
+    assert(bytes && bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
+    checkpoints += bytes / 512;
 }
 
 void lume_value(const char *name, uint64_t value)
@@ -145,21 +148,30 @@ int main(void)
     assert(!read_blocks(16, 1, NULL));
     assert(!submits);
     assert(write_blocks(16, 32, bytes + 1));
-    assert(submits == 64 && flushes == 32 && checkpoints == 32);
+    assert(submits == 2 && flushes == 1 && checkpoints == 32);
     memset(output, 0, sizeof(output));
     assert(read_blocks(16, 32, output + 1));
     assert(!memcmp(bytes + 1, output + 1, 32 * 512));
-    assert(submits == 96 && flushes == 32 && checkpoints == 64);
+    assert(submits == 3 && flushes == 1 && checkpoints == 64);
     device.failed = true;
     assert(!read_blocks(16, 2, output));
-    assert(submits == 96);
+    assert(submits == 3);
     device.failed = false;
-    fail_at = submits + 3;
+    fail_at = submits + 1;
     assert(!write_blocks(16, 4, bytes));
-    assert(flushes == 33 && checkpoints == 65);
+    assert(submits == fail_at && flushes == 1 && checkpoints == 64);
     fail_at = submits + 2;
+    assert(!write_blocks(16, 4, bytes));
+    assert(submits == fail_at && flushes == 1 && checkpoints == 64);
+    fail_at = submits + 1;
     assert(!read_blocks(16, 4, output));
     fail_at = 0;
+    short_read = true;
+    memset(output, 0xa5, sizeof(output));
+    assert(!read_blocks(16, 4, output) && output[0] == 0xa5 && checkpoints == 64);
+    short_read = false;
+    assert(write_sector(16, bytes) && read_sector(16, output));
+    assert(!memcmp(bytes, output, 512) && flushes == 2);
     device.features = 0;
     unsigned before = submits;
     assert(!write_blocks(16, 4, bytes) && submits == before);

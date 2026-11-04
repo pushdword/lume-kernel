@@ -51,6 +51,26 @@ static void supervision_release(struct supervision_bus *bus, unsigned pid)
             bus->slot[i] = (struct supervision_slot){0};
 }
 
+static int supervision_ready(const struct supervision_bus *bus, unsigned pid, uint64_t sequence,
+                             bool manager_capable)
+{
+    if (!pid)
+        return -LUME_EINVAL;
+    if (!sequence)
+    {
+        if (!manager_capable || bus->manager != pid)
+            return -LUME_EPERM;
+        for (unsigned i = 0; i < LUME_SUPERVISION_COUNT; ++i)
+            if (bus->slot[i].state == 1)
+                return 1;
+        return 0;
+    }
+    for (unsigned i = 0; i < LUME_SUPERVISION_COUNT; ++i)
+        if (bus->slot[i].owner == pid && bus->slot[i].request.sequence == sequence)
+            return bus->slot[i].state == 3 ? 1 : 0;
+    return -LUME_ENOENT;
+}
+
 /* The caller serializes bus access and releases each process before PID reuse. */
 static int64_t supervision_call(struct supervision_bus *bus, unsigned pid, unsigned op,
                                 bool manager_capable, bool control_capable,

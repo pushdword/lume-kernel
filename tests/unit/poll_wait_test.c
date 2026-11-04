@@ -3,6 +3,8 @@
 #include "lume/process.h"
 #include "lume/vfs.h"
 #include "lume/wait.h"
+#include "lume/service.h"
+#include "lume/supervision.h"
 #include "poll_state.h"
 #include <assert.h>
 #include <stdio.h>
@@ -37,7 +39,7 @@ static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT], kernel_wait
 static unsigned wait_target[LUME_TASK_LIMIT];
 static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
 static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
-static uint64_t thread_waiting[LUME_TASK_LIMIT];
+static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT];
 static struct lume_wait_queue queue;
 static uint32_t watched[LUME_TASK_LIMIT];
@@ -187,7 +189,43 @@ static bool lume_context_signal(struct lume_context *frame, uint64_t handler, ui
 
 static void poll_cancel(unsigned);
 static void poll_interrupt(unsigned, struct lume_context *);
+
+static void stream_cancel(unsigned task)
+{
+    (void)task;
+}
+
+static bool stream_interrupt(unsigned task)
+{
+    (void)task;
+    return false;
+}
+
+static void service_wait_cancel(unsigned task);
+static bool service_alive = true;
+
+bool lume_task_capable(unsigned pid, uint64_t capability)
+{
+    return capability == LUME_CAP_SERVICE ? pid == 3 : capability == LUME_CAP_NET_ADMIN;
+}
+
+#include "service_bus.h"
+#include "supervision_bus.h"
+static struct supervision_bus supervision_test_bus;
+
+int lume_supervision_ready(unsigned pid, uint64_t sequence)
+{
+    return supervision_ready(&supervision_test_bus, pid, sequence, pid == 2);
+}
+
 #include "signal_calls.h"
+
+static bool task_signal_pending(unsigned owner)
+{
+    return (signals[owner].pending & ~signals[owner].mask) != 0;
+}
+
+#include "service_calls.h"
 #include "poll_calls.h"
 
 bool lume_vfs_poll_subscribe(struct lume_files *files, const struct lume_poll_watch *watch,
@@ -286,6 +324,11 @@ static void reset(void)
     memset(states, 0, sizeof(states));
     memset(pipe_wait, 0, sizeof(pipe_wait));
     memset(kernel_wait, 0, sizeof(kernel_wait));
+    memset(futex_address, 0, sizeof(futex_address));
+    service_bus_reset();
+    memset(service_waits, 0, sizeof(service_waits));
+    service_alive = true;
+    supervision_test_bus = (struct supervision_bus){0};
     memset(process_stopped, 0, sizeof(process_stopped));
     memset(process_adopted, 0, sizeof(process_adopted));
     memset(child_events, 0, sizeof(child_events));
@@ -458,6 +501,37 @@ static void check_signals(void)
     frame = frame_for(&request);
     assert(poll_call(&frame) == &frame && (int64_t)frame.x[0] == -4);
     assert(!blocked && !poll_waits[0].active && !queue.waiting);
+}
+
+static void check_futex_signal(void)
+{
+    for (unsigned restart = 0; restart < 2; ++restart)
+    {
+        reset();
+        signals[0].action[10].handler = 0x2000;
+        signals[0].action[10].restorer = 0x3000;
+        signals[0].action[10].flags = restart ? 1u << 3 : 0;
+        states[0] = 4;
+        futex_address[0] = 0x4000;
+        signals[0].mask = 1u << 10;
+        signal_queue(0, 10);
+        assert(states[0] == 4 && futex_address[0] == 0x4000);
+        signals[0].mask = signals[0].pending = 0;
+        signal_queue(0, 10);
+        assert(states[0] == 1 && !futex_address[0]);
+        assert((int64_t)tasks[0].context.x[0] == -4);
+        struct lume_context frame = tasks[0].context;
+        assert(lume_tasks_deliver_signals(&frame) == &frame);
+        frame.x[0] = LUME_SIGNAL_RETURN;
+        frame.x[1] = frame.x[2] = 0;
+        assert(signal_call(&frame, 0) == -4 && !futex_address[0]);
+        states[0] = 4;
+        pipe_wait[0] = true;
+        pipe_queues[0] = &queue;
+        assert(lume_wait_subscribe(&queue, 0));
+        signal_queue(0, 10);
+        assert(states[0] == 1 && !futex_address[0] && !pipe_wait[0] && !queue.waiting);
+    }
 }
 
 static void check_console(void)
@@ -656,15 +730,205 @@ static void check_targeted_wakes(void)
     assert(records[0].revents == 0xabcd && !blocked);
 }
 
+static int64_t submit_service(unsigned task)
+{
+    struct lume_service_message message = {.version = LUME_SERVICE_VERSION, .command = NETD_PAUSE};
+    return service_bus_call(task + 1, task, LUME_SERVICE_SUBMIT, &message);
+}
+
+static void complete_service(uint64_t sequence, int result)
+{
+    struct lume_service_message message;
+    assert(!service_bus_call(3, 2, LUME_SERVICE_RECEIVE, &message));
+    assert(message.sequence == sequence);
+    struct lume_net_service_status status = {
+        .version = 1, .acknowledged = sequence, .result = result};
+    assert(!service_bus_call(3, 2, LUME_SERVICE_PUBLISH, &status));
+}
+
+static struct lume_context service_frame(struct lume_service_wait *wait)
+{
+    struct lume_context frame = {.pc = 0x1004};
+    frame.x[0] = LUME_SERVICE_WAIT;
+    frame.x[1] = (uintptr_t)wait;
+    frame.x[2] = sizeof(*wait);
+    frame.x[8] = LUME_SYS_SERVICE;
+    return frame;
+}
+
+static void check_service_results(void)
+{
+    reset();
+    int64_t first = submit_service(0);
+    assert(first > 0);
+    complete_service((uint64_t)first, -LUME_EIO);
+    int64_t second = submit_service(1);
+    assert(second > first);
+    complete_service((uint64_t)second, 0);
+    struct lume_service_result result = {
+        .version = LUME_SERVICE_VERSION, .bytes = sizeof(result), .sequence = (uint64_t)first};
+    assert(service_bus_call(2, 1, LUME_SERVICE_RESULT, &result) == -LUME_ENOENT);
+    assert(!service_bus_call(1, 0, LUME_SERVICE_RESULT, &result) && result.result == -LUME_EIO);
+    assert(service_bus_call(1, 0, LUME_SERVICE_RESULT, &result) == -LUME_ENOENT);
+    result.sequence = (uint64_t)second;
+    assert(!service_bus_call(2, 1, LUME_SERVICE_RESULT, &result) && !result.result);
+    first = submit_service(0);
+    result.sequence = (uint64_t)first;
+    assert(!service_bus_call(1, 0, LUME_SERVICE_CANCEL, &result) && !message_pending);
+    first = submit_service(0);
+    struct lume_service_message message;
+    assert(!service_bus_call(3, 2, LUME_SERVICE_RECEIVE, &message));
+    result.sequence = (uint64_t)first;
+    assert(service_bus_call(1, 0, LUME_SERVICE_CANCEL, &result) == -LUME_EBUSY);
+    service_bus_stop();
+    assert(!service_bus_call(1, 0, LUME_SERVICE_RESULT, &result) && result.result == -LUME_EPIPE);
+    assert(service_bus_call(1, 0, LUME_SERVICE_GET, &message) == -LUME_ENOENT);
+    service_alive = true;
+    first = submit_service(0);
+    service_bus_release(0);
+    assert(!message_pending && !service_results[0].phase);
+    second = submit_service(0);
+    assert(second > first);
+    service_sequence = INT64_MAX;
+    service_bus_release(0);
+    assert(submit_service(0) == -LUME_ENOSPC);
+    reset();
+    struct lume_service_message legacy = {.version = 1, .command = NETD_PAUSE};
+    first = service_bus_call(1, 0, LUME_SERVICE_SEND, &legacy);
+    assert(first > 0);
+    complete_service((uint64_t)first, -LUME_EIO);
+    second = submit_service(1);
+    complete_service((uint64_t)second, 0);
+    struct lume_net_service_status status;
+    assert(!service_bus_call(1, 0, LUME_SERVICE_GET, &status));
+    assert(status.acknowledged == (uint64_t)first && status.result == -LUME_EIO);
+    assert(!service_bus_call(1, 0, LUME_SERVICE_GET, &status));
+    assert(status.acknowledged == (uint64_t)second);
+    result.sequence = (uint64_t)second;
+    assert(!service_bus_call(2, 1, LUME_SERVICE_RESULT, &result));
+    first = submit_service(0);
+    complete_service((uint64_t)first, 0);
+    second = service_bus_call(1, 0, LUME_SERVICE_SEND, &legacy);
+    result.sequence = (uint64_t)first;
+    assert(!service_bus_call(1, 0, LUME_SERVICE_RESULT, &result) && message_pending);
+    complete_service((uint64_t)second, 0);
+    assert(!service_bus_call(1, 0, LUME_SERVICE_GET, &status) &&
+           status.acknowledged == (uint64_t)second);
+    first = submit_service(0);
+    assert(!service_bus_call(3, 2, LUME_SERVICE_RECEIVE, &legacy));
+    service_bus_release(0);
+    second = submit_service(0);
+    status.acknowledged = (uint64_t)first;
+    assert(!service_bus_call(3, 2, LUME_SERVICE_PUBLISH, &status));
+    assert(!service_bus_ready(1, 0, (uint64_t)second));
+    complete_service((uint64_t)second, 0);
+}
+
+static void check_service_waits(void)
+{
+    reset();
+    struct lume_service_wait wait = {
+        .version = LUME_SERVICE_VERSION, .bytes = sizeof(wait), .timeout_ms = 100};
+    current_task = 2;
+    struct lume_context frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &suspended && states[2] == 4);
+    assert(!service_wait_wake(2, 199) || states[2] == 4);
+    int64_t sequence = submit_service(0);
+    assert(sequence > 0 && service_wait_wake(2, 101) && states[2] == 1);
+    assert(tasks[2].context.x[0] == 1 && !service_waits[2].active);
+    current_task = 0;
+    states[0] = 2;
+    wait.sequence = (uint64_t)sequence;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &suspended && service_waits[0].deadline == 200);
+    assert(service_wait_wake(0, 150) && states[0] == 4);
+    signals[0].action[10].handler = 0x2000;
+    signals[0].action[10].restorer = 0x3000;
+    signals[0].action[10].flags = 1u << 3;
+    signal_queue(0, 10);
+    assert(states[0] == 1 && !service_waits[0].active && !futex_address[0]);
+    assert(tasks[0].context.pc == 0x1004 && (int64_t)tasks[0].context.x[0] == -4);
+    frame = tasks[0].context;
+    assert(lume_tasks_deliver_signals(&frame) == &frame);
+    frame.x[0] = LUME_SIGNAL_RETURN;
+    frame.x[1] = frame.x[2] = 0;
+    assert(signal_call(&frame, 0) == -4 && !service_waits[0].active);
+    assert(!service_bus_ready(1, 0, (uint64_t)sequence));
+    wait.timeout_ms = 0;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &frame && !frame.x[0] && !service_waits[0].active);
+    wait.timeout_ms = 100;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &suspended);
+    assert(service_wait_wake(0, 200) && states[0] == 1 && !tasks[0].context.x[0]);
+    assert(!service_waits[0].active && !service_bus_ready(1, 0, (uint64_t)sequence));
+    complete_service((uint64_t)sequence, 0);
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &frame && frame.x[0] == 1);
+    service_bus_release(0);
+    sequence = submit_service(0);
+    wait.sequence = (uint64_t)sequence;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &suspended);
+    service_bus_stop();
+    assert(service_wait_wake(0, clock_ms) && states[0] == 1 && tasks[0].context.x[0] == 1);
+    struct lume_service_result result = {
+        .version = LUME_SERVICE_VERSION, .bytes = sizeof(result), .sequence = (uint64_t)sequence};
+    assert(!service_bus_call(1, 0, LUME_SERVICE_RESULT, &result) && result.result == -LUME_EPIPE);
+    reset();
+    wait.sequence = 0;
+    wait.timeout_ms = 100;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &frame && (int64_t)frame.x[0] == -LUME_EPERM);
+    reset();
+    sequence = submit_service(0);
+    wait.sequence = (uint64_t)sequence;
+    wait.timeout_ms = UINT64_MAX;
+    signals[0].pending = 1u << 17;
+    frame = service_frame(&wait);
+    assert(service_request(&frame, false) == &frame && (int64_t)frame.x[0] == -4 &&
+           !service_waits[0].active);
+}
+
+static void check_supervision_waits(void)
+{
+    reset();
+    struct lume_supervision_request request = {.version = 1, .command = LUME_SV_LIST};
+    assert(!supervision_call(&supervision_test_bus, 2, LUME_SV_REGISTER, true, false, &request));
+    struct lume_supervision_wait wait = {.version = 1, .bytes = sizeof(wait), .timeout_ms = 100};
+    struct lume_context frame = {.pc = 0x1004};
+    frame.x[0] = LUME_SV_WAIT;
+    frame.x[1] = (uintptr_t)&wait;
+    frame.x[2] = sizeof(wait);
+    current_task = 1;
+    assert(service_request(&frame, true) == &suspended && service_waits[1].supervision);
+    assert(!supervision_call(&supervision_test_bus, 1, LUME_SV_SUBMIT, false, true, &request));
+    assert(service_wait_wake(1, clock_ms) && states[1] == 1 && tasks[1].context.x[0] == 1);
+    current_task = 0;
+    wait.sequence = request.sequence;
+    frame.x[0] = LUME_SV_WAIT;
+    assert(service_request(&frame, true) == &suspended);
+    assert(!supervision_call(&supervision_test_bus, 2, LUME_SV_RECEIVE, true, false, &request));
+    request.result = -LUME_EIO;
+    assert(!supervision_call(&supervision_test_bus, 2, LUME_SV_REPLY, true, false, &request));
+    assert(service_wait_wake(0, clock_ms) && states[0] == 1 && tasks[0].context.x[0] == 1);
+    assert(!supervision_call(&supervision_test_bus, 1, LUME_SV_RESULT, false, true, &request));
+    assert(request.result == -LUME_EIO && !service_waits[0].active);
+}
+
 int main(void)
 {
     check_waits();
     check_signals();
+    check_futex_signal();
     check_console();
     check_tty_read_wait();
     check_validation();
     check_copyout_owner();
     check_targeted_wakes();
+    check_service_results();
+    check_service_waits();
+    check_supervision_waits();
     puts("PASS_POLL_WAIT snapshots, events, deadlines, copyout, cancellation and signal replay");
     return 0;
 }

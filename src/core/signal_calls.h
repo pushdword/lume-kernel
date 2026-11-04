@@ -73,6 +73,12 @@ static void signal_queue(unsigned owner, unsigned number)
         exit_signals[owner] = number;
         request_exit(owner, 128 + number);
     }
+    else if (!(s->mask & (1u << number)) && stream_interrupt(owner))
+    {
+        LUME_CONTEXT_REG(&tasks[owner].context, 0) = (uint64_t)-4;
+        states[owner] = 1;
+        sched_wake(&policy, owner, unit, 0);
+    }
     else if (!(s->mask & (1u << number)) && !kernel_wait[owner] &&
              ((states[owner] == 4 && !thread_waiting[owner]) ||
               (states[owner] == 3 && LUME_CONTEXT_REG(&tasks[owner].context, 8) == LUME_SYS_WAIT)))
@@ -87,6 +93,8 @@ static void signal_queue(unsigned owner, unsigned number)
         bool restart = (stopping || (s->action[number].flags & (1u << 3))) &&
                        (pipe_wait[owner] || states[owner] == 3);
         poll_interrupt(owner, &tasks[owner].context);
+        stream_cancel(owner);
+        service_wait_cancel(owner);
         if (pipe_wait[owner] && !restart)
             LUME_CONTEXT_PC(&tasks[owner].context) += LUME_SYSCALL_INSTRUCTION_BYTES;
         if (states[owner] == 3 && restart)
@@ -95,6 +103,7 @@ static void signal_queue(unsigned owner, unsigned number)
         pipe_queues[owner] = 0;
         pipe_wait[owner] = input_wait[owner] = false;
         wait_target[owner] = 0;
+        futex_address[owner] = 0;
         if (!restart)
             LUME_CONTEXT_REG(&tasks[owner].context, 0) = (uint64_t)-4;
         states[owner] = 1;

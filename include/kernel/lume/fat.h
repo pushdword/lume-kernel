@@ -17,8 +17,17 @@ struct lume_fat_file
     bool directory;
 };
 
+/* A zero-initialized cursor follows one immutable volume and file. */
+struct lume_fat_cursor
+{
+    const unsigned char *data;
+    uint32_t first, size, cluster, index;
+};
+
 bool lume_fat_mount(struct lume_fat *, const void *, size_t);
 int lume_fat_read(const struct lume_fat *, struct lume_fat_file, uint64_t, void *, size_t);
+int lume_fat_read_cursor(const struct lume_fat *, struct lume_fat_file, uint64_t, void *, size_t,
+                         struct lume_fat_cursor *);
 typedef bool (*lume_fat_visit)(const char *, struct lume_fat_file, void *);
 bool lume_fat_walk(const struct lume_fat *, lume_fat_visit, void *);
 #endif

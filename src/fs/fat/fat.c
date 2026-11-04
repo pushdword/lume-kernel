@@ -83,30 +83,39 @@ static bool chain(const struct lume_fat *f, struct lume_fat_file file)
     return false;
 }
 
-int lume_fat_read(const struct lume_fat *f, struct lume_fat_file file, uint64_t offset, void *out,
-                  size_t bytes)
+int lume_fat_read_cursor(const struct lume_fat *f, struct lume_fat_file file, uint64_t offset,
+                         void *out, size_t bytes, struct lume_fat_cursor *cursor)
 {
     if (file.directory || offset > file.size || bytes > file.size - offset)
-        return -1;
+        goto invalid;
     if (!bytes)
         return 0;
-    uint32_t c = file.cluster;
-    uint64_t skip = offset / f->cluster_bytes;
-    if (skip >= f->clusters)
-        return -1;
-    for (uint64_t i = 0; i < skip; ++i)
+    if (!f || !f->data || !f->cluster_bytes || !out)
+        goto invalid;
+    uint64_t target = offset / f->cluster_bytes;
+    if (target >= f->clusters)
+        goto invalid;
+    uint32_t c = file.cluster, index = 0;
+    if (cursor && cursor->data == f->data && cursor->first == file.cluster &&
+        cursor->size == file.size && cursor->cluster >= 2 && cursor->cluster < f->clusters + 2 &&
+        cursor->index <= target)
+    {
+        c = cursor->cluster;
+        index = cursor->index;
+    }
+    for (; index < target; ++index)
     {
         c = next(f, c);
         if (c < 2)
-            return -1;
+            goto invalid;
     }
     unsigned char *d = out;
     size_t pos = (size_t)(offset % f->cluster_bytes), done = 0;
-    for (uint32_t hops = 0; done < bytes && hops < f->clusters; ++hops)
+    while (done < bytes && index < f->clusters)
     {
         const unsigned char *s = cluster(f, c);
         if (!s)
-            return -1;
+            goto invalid;
         size_t n = f->cluster_bytes - pos;
         if (n > bytes - done)
             n = bytes - done;
@@ -115,9 +124,27 @@ int lume_fat_read(const struct lume_fat *f, struct lume_fat_file file, uint64_t 
         done += n;
         pos = 0;
         if (done < bytes)
+        {
             c = next(f, c);
+            ++index;
+        }
     }
-    return done == bytes ? 0 : -1;
+    if (done != bytes)
+        goto invalid;
+    if (cursor)
+        *cursor = (struct lume_fat_cursor){f->data, file.cluster, file.size, c, index};
+    return 0;
+
+invalid:
+    if (cursor)
+        *cursor = (struct lume_fat_cursor){0};
+    return -1;
+}
+
+int lume_fat_read(const struct lume_fat *f, struct lume_fat_file file, uint64_t offset, void *out,
+                  size_t bytes)
+{
+    return lume_fat_read_cursor(f, file, offset, out, bytes, 0);
 }
 
 static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned length,
@@ -160,7 +187,8 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
                     long_name[0] = 0;
                     continue;
                 }
-                static const unsigned char offsets[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+                static const unsigned char offsets[13] = {1,  3,  5,  7,  9,  14, 16,
+                                                          18, 20, 22, 24, 28, 30};
                 for (unsigned k = 0; k < 13; ++k)
                 {
                     unsigned index = (ordinal - 1) * 13 + k;

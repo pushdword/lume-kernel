@@ -58,17 +58,29 @@ static void kernel_call(void *context)
     struct kernel_io_lane *lane = context;
     unsigned task = lane->owner, process = process_slot(task);
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
+    if (lane == &kernel_lanes[LUME_WORK_NETWORK])
+        stream_reap();
     lane->result =
         LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FORK
             ? fork_program(&tasks[task].context)
         : lane->launch ? start_program(&tasks[task].context)
-                       : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
+        : LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_STREAM
+            ? stream_attempt(task)
+            : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
 }
 
 static void kernel_work(void *context)
 {
     unsigned domain = (unsigned)(uintptr_t)context;
+    if (domain == LUME_WORK_NETWORK)
+        stream_reap();
     kernel_deferred += lume_work_drain_on(domain, 8);
+}
+
+static bool kernel_background_pending(unsigned domain)
+{
+    return lume_work_pending_on(domain) ||
+           (domain == LUME_WORK_NETWORK && stream_retired_pending());
 }
 
 static void kernel_cancel(unsigned task)
@@ -77,7 +89,10 @@ static void kernel_cancel(unsigned task)
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         io_queue_cancel(&kernel_lanes[i].queue, task);
     if (!kernel_task_active(task))
+    {
+        stream_cancel(task);
         kernel_wait[task] = false;
+    }
 }
 
 static void kernel_memory_waiters(void)
@@ -261,7 +276,7 @@ static void kernel_step_admit(bool admit)
             bool background_ready =
                 domain != LUME_WORK_GENERAL ||
                 kernel_resource_available(KERNEL_IO_EXCLUSIVE, LUME_TASK_LIMIT, false);
-            if (lane->deferred_turn && background_ready && lume_work_pending_on(domain))
+            if (lane->deferred_turn && background_ready && kernel_background_pending(domain))
             {
                 lane->deferred_turn = false;
                 lane->owner = LUME_TASK_LIMIT;
@@ -271,7 +286,7 @@ static void kernel_step_admit(bool admit)
             }
             if (kernel_admit_queue(domain))
                 continue;
-            if (background_ready && lume_work_pending_on(domain))
+            if (background_ready && kernel_background_pending(domain))
             {
                 lane->deferred_turn = false;
                 lane->owner = LUME_TASK_LIMIT;
@@ -321,6 +336,8 @@ static void kernel_step_admit(bool admit)
             if (lane->launch && lane->result >= 0 &&
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
                 states[owner] = 3;
+            else if (!lane->launch && stream_waits[owner].active && stream_waits[owner].pending)
+                states[owner] = 4;
             else if (lane->launch || !kernel_pipe_block(owner, frame, lane->result))
             {
                 if (!context_replaced[owner])

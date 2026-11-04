@@ -14,6 +14,24 @@ static uint32_t features = 0x55, negotiated, pfn, command;
 static uint8_t status;
 static bool reset_failure, allocation_failure, high_allocation;
 static uint64_t ticks;
+static unsigned pauses;
+static struct lume_virtqueue *complete_on_pause;
+
+bool lume_worker_pause(uint64_t deadline)
+{
+    assert(deadline >= ticks && deadline <= ticks + 1);
+    ticks = deadline;
+    ++pauses;
+    if (complete_on_pause)
+    {
+        struct lume_virtqueue *q = complete_on_pause;
+        ((struct lume_virtio_used *)q->elements)[q->consumed % q->count] =
+            (struct lume_virtio_used){0, 1025};
+        q->used[1] = q->consumed + 1;
+        complete_on_pause = NULL;
+    }
+    return true;
+}
 
 uint64_t lume_q35_counter_frequency(void)
 {
@@ -135,6 +153,14 @@ int main(void)
     ((struct lume_virtio_used *)queue.elements)[0] = (struct lume_virtio_used){0, 513};
     queue.used[1] = 1;
     assert(lume_virtio_wait(&device, &queue, &bytes) && bytes == 513);
+    assert(!pauses);
+    complete_on_pause = &queue;
+    assert(lume_virtio_wait(&device, &queue, &bytes) && bytes == 1025 && pauses == 1);
+    uint64_t started = ticks;
+    unsigned reserved = released;
+    assert(!lume_virtio_wait(&device, &queue, &bytes) && device.failed);
+    assert(pauses > 1 && ticks - started >= 5000 && ticks - started < 5010);
+    assert(released == reserved && queue.descriptors && queue.allocation);
     reset_failure = true;
     unsigned previous = released;
     assert(!lume_virtio_reset(&device) && released == previous);

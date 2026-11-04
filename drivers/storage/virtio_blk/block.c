@@ -14,34 +14,37 @@ static struct
     uint64_t sector;
 } header;
 
-static _Alignas(16) unsigned char data[512];
+static _Alignas(16) unsigned char data[LUME_SD_MAX_SECTORS * 512];
 static volatile unsigned char status;
 
-static bool transfer(unsigned type, uint64_t sector, void *buffer)
+static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffer)
 {
-    if (device.failed || !capacity || (type != 4 && sector >= capacity))
+    if (device.failed || !capacity ||
+        (type != 4 && (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+                       count > capacity - sector)))
         return false;
+    unsigned bytes = count * 512;
     header.type = type;
     header.sector = sector;
     status = 0xff;
     if (type == 1)
-        memcpy(data, buffer, 512);
+        memcpy(data, buffer, bytes);
     queue.descriptors[0] = (struct lume_virtio_desc){(uintptr_t)&header, 16, 1, type == 4 ? 2 : 1};
-    queue.descriptors[1] = (struct lume_virtio_desc){(uintptr_t)data, 512, type == 0 ? 3 : 1, 2};
+    queue.descriptors[1] = (struct lume_virtio_desc){(uintptr_t)data, bytes, type == 0 ? 3 : 1, 2};
     queue.descriptors[2] = (struct lume_virtio_desc){(uintptr_t)&status, 1, 2, 0};
     lume_virtio_submit(&queue, 0);
     unsigned written;
     if (!lume_virtio_wait(&device, &queue, &written) || status ||
-        written != (type == 0 ? 513u : 1u))
+        written != (type == 0 ? bytes + 1 : 1u))
         return false;
     if (type == 0)
-        memcpy(buffer, data, 512);
+        memcpy(buffer, data, bytes);
     return true;
 }
 
 static bool read_sector(uint64_t sector, void *buffer)
 {
-    return transfer(0, sector, buffer);
+    return transfer(0, sector, 1, buffer);
 }
 
 static bool write_sector(uint64_t sector, const void *buffer)
@@ -49,7 +52,7 @@ static bool write_sector(uint64_t sector, const void *buffer)
     if (!allowed_count || sector < allowed_first || sector - allowed_first >= allowed_count ||
         !(device.features & (1u << 9)))
         return false;
-    return transfer(1, sector, (void *)buffer) && transfer(4, 0, NULL);
+    return transfer(1, sector, 1, (void *)buffer) && transfer(4, 0, 0, NULL);
 }
 
 static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
@@ -57,13 +60,9 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
         count > capacity - sector)
         return false;
-    unsigned char *bytes = buffer;
-    for (unsigned i = 0; i < count; ++i)
-    {
-        if (!read_sector(sector + i, bytes + (size_t)i * 512))
-            return false;
-        lume_worker_checkpoint(512);
-    }
+    if (!transfer(0, sector, count, buffer))
+        return false;
+    lume_worker_checkpoint(count * 512);
     return true;
 }
 
@@ -71,15 +70,12 @@ static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
 {
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
         count > capacity - sector || !allowed_count || sector < allowed_first ||
-        sector - allowed_first >= allowed_count || count > allowed_count - (sector - allowed_first))
+        sector - allowed_first >= allowed_count ||
+        count > allowed_count - (sector - allowed_first) || !(device.features & (1u << 9)))
         return false;
-    const unsigned char *bytes = buffer;
-    for (unsigned i = 0; i < count; ++i)
-    {
-        if (!write_sector(sector + i, bytes + (size_t)i * 512))
-            return false;
-        lume_worker_checkpoint(512);
-    }
+    if (!transfer(1, sector, count, (void *)buffer) || !transfer(4, 0, 0, NULL))
+        return false;
+    lume_worker_checkpoint(count * 512);
     return true;
 }
 

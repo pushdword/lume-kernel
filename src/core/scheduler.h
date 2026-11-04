@@ -157,6 +157,8 @@ static void sched_enter(struct sched_policy *s, unsigned core, int slot, uint32_
                         uint32_t unit, uint32_t quantum)
 {
     sched_charge(s, core, now);
+    if (slot >= 0)
+        s->cpu[core].yielded = SCHED_TASKS;
     s->cpu[core].owner = slot;
     if (slot < 0)
         return;

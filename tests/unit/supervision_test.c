@@ -17,6 +17,8 @@ int main(void)
     assert(supervision_call(&bus, 3, LUME_SV_SUBMIT, false, true, &r) == -LUME_ENOENT);
     assert(supervision_call(&bus, 2, LUME_SV_REGISTER, false, true, &r) == -LUME_EPERM);
     assert(supervision_call(&bus, 2, LUME_SV_REGISTER, true, false, &r) == 0);
+    assert(!supervision_ready(&bus, 2, 0, true));
+    assert(supervision_ready(&bus, 3, 0, true) == -LUME_EPERM);
     assert(supervision_call(&bus, 4, LUME_SV_REGISTER, true, false, &r) == -LUME_EBUSY);
     assert(supervision_call(&bus, 3, LUME_SV_SUBMIT, false, false, &r) == -LUME_EPERM);
     r = request(LUME_SV_START, "../bad");
@@ -24,6 +26,8 @@ int main(void)
     r = request(LUME_SV_START, "sshd");
     assert(supervision_call(&bus, 3, LUME_SV_SUBMIT, false, true, &r) == 0);
     uint64_t first = r.sequence;
+    assert(supervision_ready(&bus, 2, 0, true) == 1);
+    assert(!supervision_ready(&bus, 3, first, false));
     struct lume_supervision_request duplicate = request(LUME_SV_LIST, NULL);
     assert(supervision_call(&bus, 3, LUME_SV_SUBMIT, false, true, &duplicate) == -LUME_EBUSY);
     assert(supervision_call(&bus, 4, LUME_SV_RESULT, false, true, &r) == -LUME_ENOENT);

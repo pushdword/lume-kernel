@@ -7,6 +7,8 @@ static void thread_drop(unsigned task)
 {
     kernel_cancel(task);
     poll_cancel(task);
+    service_wait_cancel(task);
+    service_bus_release(task);
     unsigned owner = process_slot(task);
     uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
     for (unsigned i = 0; i < thread_pages[task]; ++i)

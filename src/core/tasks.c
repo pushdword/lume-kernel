@@ -99,6 +99,7 @@ static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 extern int64_t lume_supervision_call(unsigned, unsigned, struct lume_supervision_request *);
 extern void lume_supervision_release(unsigned);
 extern bool lume_supervision_manager(unsigned);
+extern int lume_supervision_ready(unsigned, uint64_t);
 
 uint64_t lume_task_capabilities(unsigned pid)
 {
@@ -121,58 +122,16 @@ int lume_task_drop_capabilities(unsigned pid, uint64_t mask)
     return 0;
 }
 
-static bool service_loaded, service_alive, message_pending;
-static unsigned char service_status[LUME_SERVICE_BYTES];
-static struct lume_service_message service_message;
-static uint64_t service_sequence;
+static bool service_loaded, service_alive;
 extern uint64_t lume_clock_monotonic(void);
+#include "service_bus.h"
 
 int64_t lume_service_call(unsigned pid, unsigned op, void *data, uint64_t bytes)
 {
     (void)bytes;
-    if (!service_alive)
-        return -LUME_ENOENT;
-    unsigned char *b = data;
-    if (op == LUME_SERVICE_GET)
-    {
-        for (unsigned i = 0; i < sizeof(service_status); ++i)
-            b[i] = service_status[i];
-        return 0;
-    }
-    if (op == LUME_SERVICE_SEND)
-    {
-        if (!lume_task_capable(pid, LUME_CAP_NET_ADMIN) || lume_task_capable(pid, LUME_CAP_SERVICE))
-            return -LUME_EPERM;
-        if (message_pending)
-            return -LUME_EBUSY;
-        const unsigned char *p = data;
-        unsigned char *q = (void *)&service_message;
-        for (unsigned i = 0; i < sizeof(service_message); ++i)
-            q[i] = p[i];
-        service_message.sequence = ++service_sequence;
-        message_pending = true;
-        return (int64_t)service_sequence;
-    }
-    if (!lume_task_capable(pid, LUME_CAP_SERVICE))
-        return -LUME_EPERM;
-    if (op == LUME_SERVICE_RECEIVE)
-    {
-        if (!message_pending)
-            return -LUME_EAGAIN;
-        const unsigned char *p = (void *)&service_message;
-        for (unsigned i = 0; i < sizeof(service_message); ++i)
-            b[i] = p[i];
-        service_message = (struct lume_service_message){0};
-        message_pending = false;
-        return 0;
-    }
-    if (op == LUME_SERVICE_PUBLISH)
-    {
-        for (unsigned i = 0; i < sizeof(service_status); ++i)
-            service_status[i] = b[i];
-        return 0;
-    }
-    return -LUME_EINVAL;
+    if (!pid || pid > LUME_TASK_LIMIT)
+        return -LUME_EINVAL;
+    return service_bus_call(pid, pid - 1, op, data);
 }
 
 static unsigned parents[LUME_TASK_LIMIT], exit_codes[LUME_TASK_LIMIT];
@@ -390,9 +349,12 @@ static int start_program(struct lume_context *);
 static int fork_program(struct lume_context *);
 static unsigned process_slot(unsigned);
 static void signal_queue(unsigned, unsigned);
+static uint32_t signal_interrupt_pending(unsigned);
+static bool task_signal_pending(unsigned);
 static void signal_inherit(unsigned, unsigned, bool);
 static void poll_cancel(unsigned);
 static void poll_interrupt(unsigned, struct lume_context *);
+static void service_wait_cancel(unsigned);
 static unsigned task_group(unsigned);
 static void signal_orphaned_groups(void);
 static bool signal_group_orphaned(unsigned, unsigned);
@@ -458,6 +420,9 @@ static void kernel_console_send(struct lume_console_output *output)
 
 #include "console_calls.h"
 #include "io_classify.h"
+static bool kernel_enqueue(unsigned, unsigned, bool);
+static void kernel_cancel(unsigned);
+#include "stream_calls.h"
 #include "io_calls.h"
 
 static void release_program(unsigned task)
@@ -466,6 +431,8 @@ static void release_program(unsigned task)
     lume_graphics_release(task + 1);
     kernel_cancel(task);
     poll_cancel(task);
+    service_wait_cancel(task);
+    service_bus_release(task);
     lume_supervision_release(task + 1);
     lume_wait_cancel(pipe_queues[task], task);
     pipe_queues[task] = 0;
@@ -516,6 +483,7 @@ static void request_exit(unsigned owner, unsigned status)
             if (kernel_task_active(i))
                 continue;
             poll_cancel(i);
+            service_wait_cancel(i);
             lume_wait_cancel(pipe_queues[i], i);
             pipe_queues[i] = 0;
             pipe_wait[i] = input_wait[i] = false;
@@ -640,6 +608,12 @@ static struct lume_context *finish_program(unsigned status)
 }
 
 #include "signal_calls.h"
+#include "service_calls.h"
+
+static bool task_signal_pending(unsigned owner)
+{
+    return (signals[owner].pending & ~signals[owner].mask) != 0;
+}
 
 static unsigned task_group(unsigned task)
 {
@@ -768,6 +742,10 @@ static void wake_tasks(void)
         if (states[i] == 4)
         {
             if (kernel_wait[i] || thread_waiting[i])
+                continue;
+            if (stream_wake(i, at))
+                continue;
+            if (service_wait_wake(i, at))
                 continue;
             if (poll_waits[i].active)
             {
@@ -1181,6 +1159,9 @@ static int start_program(struct lume_context *frame)
         LUME_CONTEXT_TLS(&tasks[owner].context) = owner + 1;
         kernel_image_commit_end();
         release_program(child);
+        service_wait_cancel(owner);
+        service_bus_release(owner);
+        lume_supervision_release(owner + 1);
         thread_new(thread_slots, owner, owner, false);
         main_thread_done[owner] = false;
         context_replaced[owner] = true;
@@ -1457,6 +1438,9 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_CPU ||
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SLEEP ||
                 kernel_local_control_call(frame) ||
+                LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SERVICE ||
+                (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SUPERVISE &&
+                 LUME_CONTEXT_REG(frame, 0) != LUME_SV_STOP_CHILD) ||
                 (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FD &&
                  (LUME_CONTEXT_REG(frame, 0) == LUME_FD_POLL ||
                   LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT)) ||
@@ -1502,12 +1486,12 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return process_terminate(139);
     if (public_mode && task == 2 && !lume_arch_is_syscall(esr, true))
     {
-        service_alive = false;
+        service_bus_stop();
         states[2] = 0;
         lume_puts("LUME NET SERVICE FAULT\n");
         sched_charge(&policy, lume_cpu_index(), now());
         int next = pick_task();
-        return next >= 0 ? select_task((unsigned)next) : NULL;
+        return next >= 0 ? select_task((unsigned)next) : wait_ready_task();
     }
     if (public_mode && owned[task] && !lume_arch_is_syscall(esr, true))
     {
@@ -1575,8 +1559,12 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return poll_call(frame);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_THREAD)
         return thread_call(frame);
+    if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SERVICE)
+        return service_request(frame, false);
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SUPERVISE)
     {
+        if (LUME_CONTEXT_REG(frame, 0) == LUME_SV_WAIT)
+            return service_request(frame, true);
         LUME_CONTEXT_REG(frame, 0) = (uint64_t)supervision_request(frame, process);
         return frame;
     }
@@ -1614,6 +1602,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         lume_watchdog_progress();
         tasks[task].context = *frame;
         sched_charge(&policy, lume_cpu_index(), now());
+        if (!terminal_wait && !delay)
+            policy.cpu[lume_cpu_index()].yielded = task;
         states[task] = 4;
         input_wait[task] = terminal_wait;
         wake_at[task] = lume_clock_monotonic() + delay;
@@ -1622,12 +1612,12 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     if (public_mode && task == 2 &&
         LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_EXIT)
     {
-        service_alive = false;
+        service_bus_stop();
         states[2] = 0;
         lume_puts("LUME NET SERVICE STOPPED\n");
         sched_charge(&policy, lume_cpu_index(), now());
         int next = pick_task();
-        return next >= 0 ? select_task((unsigned)next) : NULL;
+        return next >= 0 ? select_task((unsigned)next) : wait_ready_task();
     }
     if (public_mode &&
         (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN ||
@@ -1735,7 +1725,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
             lume_value("SHELL_EXIT_STATUS", LUME_CONTEXT_REG(frame, 0));
             if (LUME_CONTEXT_REG(frame, 0) && shell_script)
                 lume_fail("public shell exit status");
-            service_alive = false;
+            service_bus_stop();
             for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
                 states[i] = 0;
         }
@@ -1935,6 +1925,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
         lume_supervision_release(i + 1);
         thread_slots[i] = (struct thread_state){.process = i};
         poll_cancel(i);
+        stream_waits[i] = (struct stream_wait_state){0};
+        service_wait_cancel(i);
         observers[i] = false;
         input_wait[i] = false;
         pipe_wait[i] = false;
@@ -1951,10 +1943,8 @@ bool lume_shell_start(uint64_t frequency, bool script)
         wait_target[i] = 0;
         task_names[i][0] = 0;
     }
-    service_alive = service_loaded = message_pending = false;
-    service_sequence = 0;
-    for (unsigned i = 0; i < sizeof(service_status); ++i)
-        service_status[i] = 0;
+    service_alive = service_loaded = false;
+    service_bus_reset();
     unit = (uint32_t)(frequency / 1000);
     task_ticks = cpu_switches = 0;
     sched_init(&policy, now());

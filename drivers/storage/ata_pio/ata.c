@@ -42,13 +42,15 @@ static bool wait_status(bool data)
     return false;
 }
 
-static bool select_sector(uint64_t sector, uint8_t command)
+static bool select_sectors(uint64_t sector, unsigned count, uint8_t command)
 {
-    if (failed || sector >= capacity || sector >= UINT64_C(0x10000000) || !wait_status(false))
+    if (failed || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
+        count > capacity - sector || sector >= UINT64_C(0x10000000) ||
+        count > UINT64_C(0x10000000) - sector || !wait_status(false))
         return false;
     lume_out8(DATA + 6, (uint8_t)(0xe0 | (sector >> 24)));
     delay();
-    lume_out8(DATA + 2, 1);
+    lume_out8(DATA + 2, (uint8_t)count);
     lume_out8(DATA + 3, (uint8_t)sector);
     lume_out8(DATA + 4, (uint8_t)(sector >> 8));
     lume_out8(DATA + 5, (uint8_t)(sector >> 16));
@@ -57,55 +59,24 @@ static bool select_sector(uint64_t sector, uint8_t command)
     return wait_status(true);
 }
 
-static bool read_sector(uint64_t sector, void *buffer)
-{
-    if (!buffer || !select_sector(sector, 0x20))
-        return false;
-    unsigned char *out = buffer;
-    for (unsigned i = 0; i < 256; ++i)
-    {
-        uint16_t value = lume_in16(DATA);
-        out[i * 2] = (unsigned char)value;
-        out[i * 2 + 1] = (unsigned char)(value >> 8);
-    }
-    delay();
-    if (!wait_status(false))
-        return false;
-    ++reads;
-    return true;
-}
-
-static bool write_sector(uint64_t sector, const void *buffer)
-{
-    if (!buffer || !allowed_count || sector < allowed_first ||
-        sector - allowed_first >= allowed_count || !select_sector(sector, 0x30))
-        return false;
-    const unsigned char *in = buffer;
-    for (unsigned i = 0; i < 256; ++i)
-        lume_out16(DATA, (uint16_t)in[i * 2] | (uint16_t)in[i * 2 + 1] << 8);
-    delay();
-    if (!wait_status(false))
-        return false;
-    if (flush_supported)
-    {
-        lume_out8(DATA + 7, 0xe7);
-        delay();
-        if (!wait_status(false))
-            return false;
-    }
-    ++writes;
-    return true;
-}
-
 static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 {
-    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
-        count > capacity - sector)
+    if (!buffer || !select_sectors(sector, count, 0x20))
         return false;
-    for (unsigned i = 0; i < count; ++i)
+    unsigned char *out = buffer;
+    for (unsigned block = 0; block < count; ++block)
     {
-        if (!read_sector(sector + i, (unsigned char *)buffer + (size_t)i * 512))
+        for (unsigned i = 0; i < 256; ++i)
+        {
+            uint16_t value = lume_in16(DATA);
+            out[i * 2] = (unsigned char)value;
+            out[i * 2 + 1] = (unsigned char)(value >> 8);
+        }
+        out += 512;
+        delay();
+        if (!wait_status(block + 1 < count))
             return false;
+        ++reads;
         lume_worker_checkpoint(512);
     }
     return true;
@@ -113,17 +84,40 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 
 static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
 {
-    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
-        count > capacity - sector || !allowed_count || sector < allowed_first ||
-        sector - allowed_first >= allowed_count || count > allowed_count - (sector - allowed_first))
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || !allowed_count ||
+        sector < allowed_first || sector - allowed_first >= allowed_count ||
+        count > allowed_count - (sector - allowed_first) || !select_sectors(sector, count, 0x30))
         return false;
-    for (unsigned i = 0; i < count; ++i)
+    const unsigned char *in = buffer;
+    for (unsigned block = 0; block < count; ++block)
     {
-        if (!write_sector(sector + i, (const unsigned char *)buffer + (size_t)i * 512))
+        for (unsigned i = 0; i < 256; ++i)
+            lume_out16(DATA, (uint16_t)in[i * 2] | (uint16_t)in[i * 2 + 1] << 8);
+        in += 512;
+        delay();
+        if (!wait_status(block + 1 < count))
             return false;
         lume_worker_checkpoint(512);
     }
+    if (flush_supported)
+    {
+        lume_out8(DATA + 7, 0xe7);
+        delay();
+        if (!wait_status(false))
+            return false;
+    }
+    writes += count;
     return true;
+}
+
+static bool read_sector(uint64_t sector, void *buffer)
+{
+    return read_blocks(sector, 1, buffer);
+}
+
+static bool write_sector(uint64_t sector, const void *buffer)
+{
+    return write_blocks(sector, 1, buffer);
 }
 
 static bool start(uint64_t frequency)

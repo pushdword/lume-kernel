@@ -2,9 +2,18 @@
 #include "lume/early.h"
 #include "lume/net.h"
 #include "lume/socket_file.h"
+#include "lume/counter.h"
+#include "lume/worker.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include <string.h>
+
+static void stream_pause(void)
+{
+    uint64_t frequency = lume_counter_frequency();
+    uint64_t ticks = frequency / 1000 + (frequency % 1000 != 0);
+    (void)lume_worker_pause(lume_counter_read() + ticks);
+}
 
 struct stream
 {
@@ -30,6 +39,7 @@ static unsigned sequence;
 static void notify(struct stream *s)
 {
     lume_socket_stream_notify(s->owner, s->handle);
+    lume_tasks_stream_notify(s->owner, s->handle);
 }
 
 bool lume_stream_busy(void)
@@ -290,7 +300,11 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
             return 0;
         uint32_t start = lume_clock_millis();
         while (!s->connected && !s->failed && (uint32_t)(lume_clock_millis() - start) < 5000)
+        {
             lume_net_poll();
+            if (!s->connected && !s->failed)
+                stream_pause();
+        }
         if (!s->connected || s->failed)
         {
             close_stream(s);
@@ -384,7 +398,11 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
     {
         while (!nonblocking && !s->count && !s->eof && !s->failed &&
                (uint32_t)(lume_clock_millis() - start) < 5000)
+        {
             lume_net_poll();
+            if (!s->count && !s->eof && !s->failed)
+                stream_pause();
+        }
         if (!s->count)
             return s->failed ? -LUME_EIO : s->eof ? 0 : -LUME_EAGAIN;
         unsigned n = r->count < s->count ? r->count : s->count;
@@ -402,7 +420,11 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         return -LUME_EIO;
     while (!nonblocking && s->pcb && !s->failed && !tcp_sndbuf(s->pcb) &&
            (uint32_t)(lume_clock_millis() - start) < 5000)
+    {
         lume_net_poll();
+        if (s->pcb && !s->failed && !tcp_sndbuf(s->pcb))
+            stream_pause();
+    }
     if (!s->pcb || s->failed)
         return -LUME_EIO;
     unsigned n = r->count < tcp_sndbuf(s->pcb) ? r->count : tcp_sndbuf(s->pcb);
@@ -422,6 +444,55 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *requ
 int lume_stream_nowait(unsigned pid, unsigned op, struct lume_stream_request *request)
 {
     return stream_request(pid, op, request, true, 0);
+}
+
+int lume_stream_progress(unsigned pid, unsigned op, struct lume_stream_request *request,
+                         bool started, bool *pending)
+{
+    *pending = false;
+    int result;
+    if (op == LUME_STREAM_CONNECT)
+    {
+        if (!started)
+        {
+            result = stream_request(pid, LUME_STREAM_CONNECT_ASYNC, request, true, 0);
+            if (result)
+                return result;
+        }
+        else
+            lume_net_poll();
+        result = -LUME_EIO;
+    }
+    else
+    {
+        result = stream_request(pid, op, request, true, 0);
+        if (result != -LUME_EAGAIN)
+            return result;
+    }
+    for (unsigned i = 0; i < 16; ++i)
+    {
+        struct stream *s = &streams[i];
+        if (s->owner != pid || s->handle != request->handle)
+            continue;
+        if (op == LUME_STREAM_CONNECT)
+        {
+            if (s->failed || !s->pcb)
+                return -LUME_EIO;
+            if (s->connected)
+                return 0;
+            *pending = true;
+        }
+        else if (!s->udp && !s->listening && request->count)
+        {
+            if (op == LUME_STREAM_RECEIVE)
+                *pending = !s->count && !s->eof && !s->failed;
+            else if (op == LUME_STREAM_SEND)
+                *pending =
+                    s->pcb && s->connected && !s->failed && !s->write_closed && !tcp_sndbuf(s->pcb);
+        }
+        return result;
+    }
+    return -LUME_EBADF;
 }
 
 int lume_stream_socket_create(unsigned pid, unsigned op, struct lume_stream_request *request,

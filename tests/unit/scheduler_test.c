@@ -65,6 +65,28 @@ static void fair_service(uint32_t unit)
     assert(next != 0);
 }
 
+static void yield_once(void)
+{
+    struct sched_policy policy;
+    unsigned states[SCHED_TASKS] = {1, 1};
+    sched_init(&policy, 0);
+    sched_new(&policy, 0, 1);
+    sched_new(&policy, 1, 2);
+    policy.task[1].service = 1000000;
+    policy.cpu[0].yielded = 0;
+    assert(sched_pick(&policy, 0, states, 0, 1000) == 1);
+    assert(sched_pick(&policy, 0, states, 1u << 1, 1000) == 0);
+    sched_enter(&policy, 0, -1, 0, 1000, LUME_SCHED_QUANTUM);
+    assert(policy.cpu[0].yielded == 0);
+    sched_enter(&policy, 0, 1, 0, 1000, LUME_SCHED_QUANTUM);
+    assert(policy.cpu[0].yielded == SCHED_TASKS);
+    assert(policy.task[1].service == 1000000 && !policy.task[0].service);
+    assert(sched_pick(&policy, 0, states, 0, 1000) == 0);
+    states[1] = 0;
+    policy.cpu[0].yielded = 0;
+    assert(sched_pick(&policy, 0, states, 0, 1000) == 0);
+}
+
 int main(void)
 {
     struct sched_policy policy;
@@ -76,6 +98,7 @@ int main(void)
     assert(sched_pick(&policy, 0, states, UINT64_C(1) << (SCHED_TASKS - 1), 1000) == -1);
     fair_service(1000);
     fair_service(62500);
+    yield_once();
     printf("PASS_SCHEDULER cpus=%u quantum_ms=%u tick_ms=%u fairness/wake/reuse/counter-wrap\n",
            SCHED_CPUS, LUME_SCHED_QUANTUM, SCHED_TICK_MS);
 }

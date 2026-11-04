@@ -185,7 +185,7 @@ $(OUT)/tests/console-calls$(HOSTEXE): tests/unit/console_calls_test.c src/core/c
 .PHONY: check-poll-wait
 check-poll-wait: $(OUT)/tests/poll-wait$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_calls.h src/core/poll_state.h src/core/signal_calls.h
+$(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_calls.h src/core/poll_state.h src/core/signal_calls.h src/core/service_bus.h src/core/service_calls.h src/core/supervision_bus.h include/abi/native/lume/service.h include/abi/native/lume/supervision.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-poll-wait
@@ -305,7 +305,9 @@ $(OUT)/tests/volume$(HOSTEXE): tests/unit/volume_test.c src/storage/volume.c
 $(OUT)/tests/watchdog$(HOSTEXE): tests/unit/watchdog_test.c src/watchdog/watchdog.c
 $(OUT)/tests/icmp$(HOSTEXE): tests/unit/icmp_test.c src/net/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
-$(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c
+$(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c tests/fixtures/counter/lume/counter.h include/kernel/lume/net.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 HOST_LWIP_C := $(filter vendor/lwip/%,$(KERNEL_C_aarch64))
 $(OUT)/tests/net-service$(HOSTEXE): tests/unit/net_service_test.c src/net/net.c src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
@@ -323,23 +325,31 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h include/kernel/lume/net.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 $(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
-$(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
+$(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS := -Itests/fixtures/counter $(TEST_CPPFLAGS) -Ivendor/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service stream,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
 	rm -rf -- "$(OUT)"
+
+.PHONY: check-fat-cursor
+check: check-fat-cursor
+check-fat-cursor: $(OUT)/tests/fat-cursor$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/fat-cursor$(HOSTEXE): tests/unit/fat_cursor_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/kernel/lume/fat.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/fat_cursor_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c -o "$@"
 -include $(OBJECTS:=.d)
 
 .PHONY: FORCE

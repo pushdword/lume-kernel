@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+int lume_stream_nowait(unsigned pid, unsigned op, struct lume_stream_request *request);
+
 int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *request)
 {
     (void)owner;
@@ -28,6 +30,32 @@ static unsigned notification_owner[256], notification_handle[256];
 static bool connect_ok = true;
 static tcp_accept_fn accept_callback;
 static unsigned shutdowns;
+static unsigned pauses;
+static bool send_ready_on_pause;
+static bool write_failure;
+
+uint64_t lume_counter_read(void)
+{
+    return milliseconds;
+}
+
+uint64_t lume_counter_frequency(void)
+{
+    return 1000;
+}
+
+bool lume_worker_pause(uint64_t deadline)
+{
+    assert(deadline == (uint64_t)milliseconds + 1);
+    ++pauses;
+    milliseconds = (uint32_t)deadline;
+    if (send_ready_on_pause)
+    {
+        pcb.snd_buf = 4096;
+        send_ready_on_pause = false;
+    }
+    return true;
+}
 static struct udp_pcb udp;
 static udp_recv_fn udp_callback;
 static void *udp_context;
@@ -39,6 +67,11 @@ void lume_socket_stream_notify(unsigned owner, unsigned handle)
     assert(notifications < 256);
     notification_owner[notifications] = owner;
     notification_handle[notifications++] = handle;
+}
+
+void lume_tasks_stream_notify(unsigned owner, unsigned handle)
+{
+    assert(owner && handle);
 }
 
 err_t tcp_bind(struct tcp_pcb *p, const ip_addr_t *address, u16_t port)
@@ -180,7 +213,7 @@ err_t tcp_write(struct tcp_pcb *p, const void *data, u16_t count, u8_t flags)
 {
     (void)p;
     assert(data && count && flags == TCP_WRITE_FLAG_COPY);
-    return ERR_OK;
+    return write_failure ? ERR_MEM : ERR_OK;
 }
 
 err_t tcp_output(struct tcp_pcb *p)
@@ -252,6 +285,30 @@ int main(void)
     struct lume_stream_request r = {
         .version = LUME_IO_VERSION, .port = 8095, .address = {172, 30, 1, 163}};
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == 0 && r.handle);
+    assert(!pauses);
+    bool pending;
+    r.count = 1;
+    pcb.snd_buf = 0;
+    assert(lume_stream_progress(2, LUME_STREAM_SEND, &r, true, &pending) == -LUME_EAGAIN &&
+           pending);
+    pcb.snd_buf = 4096;
+    write_failure = true;
+    assert(lume_stream_progress(2, LUME_STREAM_SEND, &r, true, &pending) == -LUME_EAGAIN &&
+           !pending);
+    write_failure = false;
+    r.count = 0;
+    assert(!lume_stream_progress(2, LUME_STREAM_SEND, &r, true, &pending) && !pending);
+    pcb.snd_buf = 0;
+    r.count = 1;
+    assert(lume_stream_nowait(2, LUME_STREAM_SEND, &r) == -LUME_EAGAIN && !pauses);
+    send_ready_on_pause = true;
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == 1 && pauses == 1);
+    pcb.snd_buf = 0;
+    unsigned before_pause = pauses;
+    uint32_t before_wait = milliseconds;
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == -LUME_EAGAIN);
+    assert(pauses > before_pause && milliseconds - before_wait >= 5000 &&
+           milliseconds - before_wait < 5010);
     assert(notifications && pcb.sent);
     pcb.snd_buf = 0;
     uint32_t before_poll = milliseconds;
@@ -298,14 +355,22 @@ int main(void)
     assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == -LUME_EBADF);
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == 0 && r.handle != first);
     r.count = 1;
+    before_pause = pauses;
+    assert(lume_stream_nowait(2, LUME_STREAM_RECEIVE, &r) == -LUME_EAGAIN);
+    assert(pauses == before_pause);
+    before_wait = milliseconds;
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EAGAIN);
+    assert(pauses > before_pause && milliseconds - before_wait >= 5000 &&
+           milliseconds - before_wait < 5010);
     before_notify = notifications;
     pcb.errf(pcb.callback_arg, ERR_RST);
     assert(notifications > before_notify);
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EIO);
     assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == 0);
     connect_ok = false;
+    before_pause = pauses;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EIO);
+    assert(pauses > before_pause);
     r.count = 0;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT_ASYNC, &r) == 0);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == 0);
@@ -360,6 +425,9 @@ int main(void)
     assert(lume_stream_call(2, LUME_DATAGRAM_CONNECT, &r) == 0);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
     ip_addr_t peer;
+    r.count = 1;
+    assert(lume_stream_progress(2, LUME_STREAM_RECEIVE, &r, true, &pending) == -LUME_EAGAIN &&
+           !pending);
     IP_ADDR4(&peer, 172, 30, 1, 163);
     for (unsigned i = 0; i < 5; ++i)
         udp_callback(udp_context, &udp, &b, &peer, 8095);

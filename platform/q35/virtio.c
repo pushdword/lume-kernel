@@ -2,6 +2,7 @@
 #include "lume/counter.h"
 #include "lume/cpu.h"
 #include "lume/boot.h"
+#include "lume/worker.h"
 #include <string.h>
 
 bool lume_virtio_open(struct lume_virtio *device, uint32_t pci, uint16_t product, uint32_t wanted)
@@ -94,6 +95,8 @@ bool lume_virtio_take(struct lume_virtqueue *q, unsigned *id, unsigned *bytes)
 bool lume_virtio_wait(struct lume_virtio *device, struct lume_virtqueue *q, unsigned *bytes)
 {
     uint64_t start = lume_counter_read();
+    uint64_t frequency = lume_counter_frequency();
+    uint64_t pause_ticks = frequency / 1000 + (frequency % 1000 != 0);
     while (!device->failed)
     {
         unsigned id;
@@ -103,9 +106,18 @@ bool lume_virtio_wait(struct lume_virtio *device, struct lume_virtqueue *q, unsi
                 return true;
             break;
         }
-        if (lume_counter_read() - start > lume_counter_frequency() * 5)
+        uint64_t at = lume_counter_read();
+        uint64_t elapsed = at - start;
+        if (elapsed >= frequency * 5)
             break;
-        lume_cpu_relax();
+        if (elapsed < frequency / 10000)
+            lume_cpu_relax();
+        else
+        {
+            uint64_t remaining = frequency * 5 - elapsed;
+            if (!lume_worker_pause(at + (remaining < pause_ticks ? remaining : pause_ticks)))
+                lume_cpu_relax();
+        }
     }
     lume_virtio_fail(device);
     return false;

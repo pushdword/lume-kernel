@@ -16,6 +16,11 @@ bool lume_net_ping(const char *, unsigned char[4]);
 bool lume_net_tcp(const char *);
 #include "lume/io.h"
 int lume_stream_call(unsigned, unsigned, struct lume_stream_request *);
+int lume_stream_nowait(unsigned, unsigned, struct lume_stream_request *);
+/* Pending is set only for TCP readiness waits. CONNECT resumes with started set after its
+ * initial attempt. Callers retain the request until completion or cancellation. */
+int lume_stream_progress(unsigned, unsigned, struct lume_stream_request *, bool, bool *);
+void lume_tasks_stream_notify(unsigned, unsigned);
 void lume_stream_release(unsigned);
 int lume_icmp_call(unsigned, unsigned, struct lume_stream_request *);
 void lume_icmp_release(unsigned);

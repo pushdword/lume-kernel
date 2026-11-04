@@ -5,6 +5,7 @@
 #define LUME_SUPERVISION_VERSION 1u
 #define LUME_SUPERVISION_COUNT 8u
 #define LUME_SUPERVISION_NAME 24u
+#define LUME_SUPERVISION_SIGNAL_EPOCH 1u
 
 enum
 {
@@ -14,8 +15,20 @@ enum
     LUME_SV_REPLY,
     LUME_SV_RESULT,
     LUME_SV_CANCEL,
-    LUME_SV_STOP_CHILD
+    LUME_SV_STOP_CHILD,
+    LUME_SV_WAIT
 };
+
+/* Sequence zero waits for a manager request. Other sequences wait for an owned result.
+ * WAIT returns one when ready and zero at its deadline. Results remain available to RESULT. */
+struct lume_supervision_wait
+{
+    uint32_t version, bytes;
+    uint64_t sequence, timeout_ms, signal_epoch;
+    uint32_t flags, reserved;
+};
+
+_Static_assert(sizeof(struct lume_supervision_wait) == 40, "supervision wait ABI");
 
 enum
 {

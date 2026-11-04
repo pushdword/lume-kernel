@@ -4,6 +4,7 @@
 #include "lume/wait.h"
 #include "lume/worker.h"
 #include "lume/work.h"
+#include "lume/net.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,70 @@ void lume_files_release(struct lume_files *files)
     assert(files == &tasks[current_task].files && root == current_task + 1);
     assert(!kernel_console_scope);
     ++files_released[current_task];
+}
+
+static struct
+{
+    bool thread;
+} thread_slots[LUME_TASK_LIMIT];
+
+static unsigned stream_attempts, stream_connects, stream_closes;
+static bool stream_ready, stream_event, stream_fault, stop_during_attempt;
+static uint32_t pending_signal;
+
+static bool task_signal_pending(unsigned owner)
+{
+    (void)owner;
+    return pending_signal;
+}
+
+bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool writing)
+{
+    assert(pointer && bytes == sizeof(struct lume_stream_request));
+    return !writing || !stream_fault;
+}
+
+int64_t lume_io_call(unsigned owner, bool stream, uint64_t operation, uint64_t pointer,
+                     uint64_t bytes)
+{
+    (void)owner;
+    (void)stream;
+    (void)operation;
+    (void)pointer;
+    (void)bytes;
+    return -LUME_EINVAL;
+}
+
+int lume_stream_progress(unsigned owner, unsigned operation, struct lume_stream_request *request,
+                         bool started, bool *pending)
+{
+    assert(worker_functions[LUME_WORK_NETWORK] && root == owner);
+    ++stream_attempts;
+    if (stop_during_attempt)
+        pending_signal = 1u << 17;
+    if (operation == LUME_STREAM_CONNECT && !started)
+    {
+        ++stream_connects;
+        request->handle = 37;
+    }
+    if (stream_event)
+    {
+        stream_event = false;
+        lume_tasks_stream_notify(owner, request->handle);
+    }
+    *pending = !stream_ready;
+    if (*pending)
+        return -LUME_EAGAIN;
+    request->data[0] = 0x7b;
+    return operation == LUME_STREAM_CONNECT ? 0 : (int)request->count;
+}
+
+int lume_stream_nowait(unsigned owner, unsigned operation, struct lume_stream_request *request)
+{
+    assert(worker_functions[LUME_WORK_NETWORK] && owner && operation == LUME_STREAM_CLOSE &&
+           request->handle == 37);
+    ++stream_closes;
+    return 0;
 }
 
 static unsigned process_slot(unsigned task)
@@ -299,6 +364,9 @@ void lume_storage_poll_background(void)
     ++storage_checks;
 }
 
+static bool kernel_enqueue(unsigned, unsigned, bool);
+static void kernel_cancel(unsigned);
+#include "stream_calls.h"
 #include "io_calls.h"
 
 static void reset(void)
@@ -316,6 +384,10 @@ static void reset(void)
     memset(pipe_queues, 0, sizeof(pipe_queues));
     memset(wake_at, 0, sizeof(wake_at));
     memset(context_replaced, 0, sizeof(context_replaced));
+    memset(stream_waits, 0, sizeof(stream_waits));
+    memset(thread_slots, 0, sizeof(thread_slots));
+    stream_attempts = stream_connects = stream_closes = pending_signal = 0;
+    stream_ready = stream_event = stream_fault = stop_during_attempt = false;
     memset(kernel_lanes, 0, sizeof(kernel_lanes));
     memset(worker_functions, 0, sizeof(worker_functions));
     memset(worker_arguments, 0, sizeof(worker_arguments));
@@ -781,8 +853,91 @@ static void exclusive_wait_keeps_progress(void)
     assert(!kernel_exclusive_active() && !lume_worker_busy());
 }
 
+static void begin_stream(struct lume_stream_request *request, unsigned operation)
+{
+    current_task = 0;
+    root = 1;
+    tasks[0].context =
+        (struct lume_context){.x = {operation, (uintptr_t)request, sizeof(*request)}, .pc = 0x2004};
+    tasks[0].context.x[8] = LUME_SYS_STREAM;
+    states[0] = 4;
+    kernel_wait[0] = true;
+    task_domain[0] = LUME_WORK_NETWORK;
+    struct kernel_io_lane *lane = &kernel_lanes[LUME_WORK_NETWORK];
+    lane->owner = 0;
+    assert(lume_worker_submit_on(LUME_WORK_NETWORK, kernel_call, lane));
+    kernel_step();
+}
+
+static void stream_parking(void)
+{
+    reset();
+    struct lume_stream_request request = {.version = LUME_IO_VERSION, .count = 1};
+    stream_event = true;
+    begin_stream(&request, LUME_STREAM_CONNECT);
+    assert(!lume_worker_busy() && kernel_lanes[LUME_WORK_NETWORK].owner == LUME_TASK_LIMIT &&
+           !kernel_wait[0]);
+    assert(states[0] == 4 && stream_waits[0].pending && stream_waits[0].ready);
+    assert(stream_connects == 1 && !request.handle && tasks[0].context.pc == 0x2004);
+    uint64_t deadline = stream_waits[0].deadline;
+    states[1] = 4;
+    kernel_wait[1] = true;
+    tasks[1].context.x[8] = LUME_SYS_WRITE;
+    assert(io_queue_push(&kernel_queue, 1, false));
+    kernel_step();
+    assert(executed[1] == 1 && states[1] == 1 && states[0] == 4 && root == 1);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        lume_tasks_stream_notify(1, 37);
+        assert(stream_wake(0, clock_ms) && stream_wake(0, clock_ms));
+        assert(kernel_lanes[LUME_WORK_NETWORK].queue.count == 1);
+        kernel_step();
+        assert(stream_connects == 1 && stream_waits[0].deadline == deadline);
+    }
+    request.count = 99;
+    clock_ms = deadline;
+    assert(stream_wake(0, clock_ms));
+    kernel_step();
+    assert(!stream_waits[0].active && (int64_t)tasks[0].context.x[0] == -LUME_EIO);
+    assert(stream_closes == 1 && request.count == 1);
+
+    reset();
+    begin_stream(&request, LUME_STREAM_CONNECT);
+    lume_tasks_stream_notify(1, 37);
+    assert(stream_wake(0, clock_ms) && kernel_lanes[LUME_WORK_NETWORK].queue.count == 1);
+    assert(stream_interrupt(0) && !kernel_lanes[LUME_WORK_NETWORK].queue.count && !kernel_wait[0]);
+    assert(stream_retired_pending() && !stream_closes && !stream_waits[0].active);
+    kernel_step();
+    assert(stream_closes == 1 && !stream_retired_pending());
+
+    reset();
+    request.handle = 37;
+    begin_stream(&request, LUME_STREAM_RECEIVE);
+    assert(stream_interrupt(0) && !stream_retired_pending() && !stream_closes);
+    reset();
+    begin_stream(&request, LUME_STREAM_CONNECT);
+    stream_ready = true;
+    lume_tasks_stream_notify(1, 37);
+    assert(stream_wake(0, clock_ms));
+    kernel_step();
+    assert(!tasks[0].context.x[0] && request.handle == 37 && !stream_closes);
+
+    reset();
+    begin_stream(&request, LUME_STREAM_CONNECT);
+    stream_fault = stream_ready = true;
+    lume_tasks_stream_notify(1, 37);
+    assert(stream_wake(0, clock_ms));
+    kernel_step();
+    assert((int64_t)tasks[0].context.x[0] == -LUME_EFAULT && stream_closes == 1);
+    reset();
+    stop_during_attempt = true;
+    begin_stream(&request, LUME_STREAM_CONNECT);
+    assert((int64_t)tasks[0].context.x[0] == -4 && !stream_waits[0].active && stream_closes == 1);
+}
+
 int main(void)
 {
+    stream_parking();
     bounded_resource_turn();
     independent_resources();
     local_messages_during_loading();

@@ -133,6 +133,7 @@ static struct open_file
     uint32_t flags;
     bool closing;
     uint64_t offset;
+    struct lume_fat_cursor fat_cursor;
     const struct lume_file_ops *external;
     void *context;
     void *storage_handle;
@@ -949,7 +950,8 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
     }
     else if (bytes && n->on_fat)
     {
-        if (lume_fat_read(&root_fat, n->fat_file, d->offset, data, (size_t)bytes))
+        if (lume_fat_read_cursor(&root_fat, n->fat_file, d->offset, data, (size_t)bytes,
+                                 &d->fat_cursor))
             return -LUME_EIO;
     }
     else if (bytes)
@@ -1866,13 +1868,16 @@ static bool import_fat(const char *path, struct lume_fat_file file, void *unused
 
 bool lume_vfs_mount_fat(const void *data, size_t bytes)
 {
+    if (root_fat.data)
+        return false;
     unsigned before = count;
-    if (!lume_fat_mount(&root_fat, data, bytes) || !lume_fat_walk(&root_fat, import_fat, 0))
+    struct lume_fat candidate;
+    if (!lume_fat_mount(&candidate, data, bytes) || !lume_fat_walk(&candidate, import_fat, 0))
     {
         count = before;
-        root_fat = (struct lume_fat){0};
         return false;
     }
+    root_fat = candidate;
     return true;
 }
 
