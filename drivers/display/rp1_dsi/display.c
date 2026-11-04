@@ -1,6 +1,7 @@
 #include "lume/board.h"
 /* SPDX-License-Identifier: GPL-2.0-only
- * RP1 DSI1 / TC358762, fixed 800x480 RGB888, one data lane.
+ * RP1 DSI1 / TC358762, 800x480 RGB888, one data lane.
+ * Explicit virtual panel modes vary the raster without claiming physical timing support.
  * Register programming adapted from Raspberry Pi's Linux RP1 DSI driver
  * (Copyright (c) 2023 Raspberry Pi Limited), and its Circle port by Rene
  * Stange. TC358762/ATTiny sequence follows the Linux drivers by Marek Vasut
@@ -27,23 +28,55 @@
 #define CFG (RP1 + 0x138000)
 #define I2C (RP1 + 0x80000)
 #define PCIE LUME_BOARD_PCIE_BASE
-#define WIDTH 800u
-#define HEIGHT 480u
+#define WIDTH display_width
+#define HEIGHT display_height
+#define MAX_WIDTH 2560u
+#define MAX_HEIGHT 1600u
 #define FRAME_BYTES (WIDTH * HEIGHT * 4u)
 #define FRAME_PAGES ((FRAME_BYTES + 4095) / 4096)
+#define MAX_FRAME_PAGES ((MAX_WIDTH * MAX_HEIGHT * 4u + 4095) / 4096)
+static unsigned display_width = 800, display_height = 480;
 static uint32_t *fb;
-static uint64_t frequency, framebuffer[FRAME_PAGES];
+static uint64_t frequency, framebuffer[MAX_FRAME_PAGES];
 static struct terminal terminal;
-static uint32_t cells[132 * 48], shown[132 * 48];
+#define MAX_COLUMNS 132u
+#define MAX_ROWS 48u
+static uint32_t cells[MAX_COLUMNS * MAX_ROWS], shown[MAX_COLUMNS * MAX_ROWS];
 static unsigned columns = 65, rows = 24, font_index = 7;
 static unsigned char custom_font[256][16];
 static struct console_font_bitmap font_bitmap;
 static unsigned prepared_font = UINT32_MAX;
 static bool custom_loaded;
+static bool enabled, graphics_owned;
 
 static unsigned font_cell(void)
 {
     return font_index == CONSOLE_FONT_COUNT ? 8 | 16u << 16 : console_font_cell(font_index);
+}
+
+static void console_geometry(void)
+{
+    unsigned cell = font_cell();
+    columns = (WIDTH - 16) / (cell & 65535);
+    rows = (HEIGHT - 48) / (cell >> 16);
+    /* Console storage remains bounded when a virtual panel exceeds the fixed panel size. */
+    if (columns > MAX_COLUMNS)
+        columns = MAX_COLUMNS;
+    if (rows > MAX_ROWS)
+        rows = MAX_ROWS;
+}
+
+bool lume_display_mode(unsigned width, unsigned height)
+{
+    if (frequency || enabled || width < 640 || width > MAX_WIDTH || height < 480 ||
+        height > MAX_HEIGHT || (width & 7))
+        return false;
+    display_width = width;
+    display_height = height;
+    font_index = width > 1280 ? 5 : 7;
+    prepared_font = UINT32_MAX;
+    console_geometry();
+    return true;
 }
 
 static void prepare_font(void)
@@ -57,7 +90,6 @@ static void prepare_font(void)
     prepared_font = font_index;
 }
 
-static bool enabled, graphics_owned;
 static bool dma_active, dma_idle = true;
 
 static void delay(unsigned us)
@@ -232,7 +264,7 @@ static bool host_start(void)
     lume_mmio_write32(DSI + 0x78, ((24u * 978 * 480 / (7 * 0x50)) << 16) | 0x40);
     lume_mmio_write32(DSI + 0x8c, 0xd00);
     lume_mmio_write32(DSI + 8, 0x5005);
-    lume_mmio_write32(DSI + 0x3c, 800);
+    lume_mmio_write32(DSI + 0x3c, WIDTH);
     lume_mmio_write32(DSI + 0x40, 0);
     lume_mmio_write32(DSI + 0x44, 0);
     lume_mmio_write32(DSI + 0x48, 6);
@@ -241,7 +273,7 @@ static bool host_start(void)
     lume_mmio_write32(DSI + 0x54, 2);
     lume_mmio_write32(DSI + 0x58, 22);
     lume_mmio_write32(DSI + 0x5c, 7);
-    lume_mmio_write32(DSI + 0x60, 480);
+    lume_mmio_write32(DSI + 0x60, HEIGHT);
     lume_mmio_write32(DSI + 0xa0, 0);
     lume_mmio_write32(DSI + 0xb4, 2);
     lume_mmio_write32(DSI + 0xb8, 0);
@@ -299,7 +331,7 @@ static bool bridge_start(void)
         return false;
     delay(100000);
 
-    static const struct
+    const struct
     {
         uint16_t reg;
         uint32_t value;
@@ -313,9 +345,9 @@ static bool bridge_start(void)
                   {0x420, 0x1a0150},
                   {0x464, 0x40f},
                   {0x424, (45u << 16) | 2},
-                  {0x428, (131u << 16) | 800},
+                  {0x428, (131u << 16) | WIDTH},
                   {0x42c, (22u << 16) | 2},
-                  {0x430, (7u << 16) | 480}};
+                  {0x430, (7u << 16) | HEIGHT}};
 
     for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
         if (!bridge_write(values[i].reg, values[i].value))
@@ -338,7 +370,7 @@ static bool dma_start(void)
     lume_mmio_write32(DSI + 0x34, 0);
     lume_mmio_write32(DMA + 4, 0);
     lume_mmio_write32(DMA + 8, 0xffffffff);
-    lume_mmio_write32(DMA + 0x18, (799u << 16) | 479);
+    lume_mmio_write32(DMA + 0x18, ((WIDTH - 1) << 16) | (HEIGHT - 1));
     lume_mmio_write32(DMA + 0x1c, (1u << 16) | 1);
     lume_mmio_write32(DMA + 0x20, (46u << 16) | 23);
     lume_mmio_write32(DMA + 0x24, (130u << 16) | 6);
@@ -524,7 +556,12 @@ bool lume_display_start(uint64_t freq)
     for (unsigned i = 0; i < columns * rows; ++i)
         shown[i] = UINT32_MAX;
     enabled = true;
-    lume_puts("LUME MIPI NATIVE SCANOUT READY 800x480\n");
+    lume_value("MIPI_WIDTH", WIDTH);
+    lume_value("MIPI_HEIGHT", HEIGHT);
+    lume_puts("LUME MIPI NATIVE SCANOUT READY");
+    if (WIDTH == 800 && HEIGHT == 480)
+        lume_puts(" 800x480");
+    lume_putc('\n');
     return true;
 fail:
     lume_puts("LUME MIPI UNAVAILABLE stage=");
@@ -610,8 +647,7 @@ int64_t lume_display_video(unsigned action, unsigned value, const unsigned char 
         if (value >= CONSOLE_FONT_COUNT + custom_loaded)
             return -LUME_EINVAL;
         font_index = value;
-        columns = (WIDTH - 16) / (font_cell() & 65535);
-        rows = (HEIGHT - 48) / (font_cell() >> 16);
+        console_geometry();
         for (unsigned y = 48; y < HEIGHT; ++y)
         {
             for (unsigned x = 0; x < WIDTH; ++x)

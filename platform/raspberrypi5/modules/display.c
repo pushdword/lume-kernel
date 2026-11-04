@@ -14,12 +14,13 @@
 #include "lume/vfs.h"
 #include "lume/abi.h"
 bool lume_display_release(void);
+bool lume_display_mode(unsigned width, unsigned height);
 extern const struct lume_platform_graphics_ops lume_dsi_graphics_operations;
 
 struct binding
 {
     bool registered;
-    unsigned instance;
+    unsigned instance, width, height;
 };
 
 static const struct lume_platform_display_ops operations = {
@@ -41,6 +42,19 @@ static int probe(struct lume_hardware *hardware, void *context)
         binding->instance = 0;
     else
         return -LUME_ENOENT;
+    binding->width = 800;
+    binding->height = 480;
+    struct lume_property property;
+    if (!lume_hardware_property(hardware, "qemu,virtual-panel", LUME_PROPERTY_BOOLEAN, 0,
+                                &property))
+    {
+        if (lume_hardware_property(hardware, "width", LUME_PROPERTY_U32, 0, &property))
+            return -LUME_EINVAL;
+        binding->width = property.values[0];
+        if (lume_hardware_property(hardware, "height", LUME_PROPERTY_U32, 0, &property))
+            return -LUME_EINVAL;
+        binding->height = property.values[0];
+    }
     return 0;
 }
 
@@ -48,6 +62,8 @@ static int start(struct lume_hardware *hardware, void *context)
 {
     (void)hardware;
     struct binding *binding = context;
+    if (!lume_display_mode(binding->width, binding->height))
+        return -LUME_EINVAL;
     int result =
         lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
     binding->registered = !result;

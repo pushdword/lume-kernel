@@ -60,6 +60,11 @@ _Noreturn void lume_fail(const char *why)
 
 int main(void)
 {
+    assert(!lume_display_mode(0, 480));
+    assert(!lume_display_mode(1921, 1200));
+    assert(!lume_display_mode(2568, 1600));
+    assert(!lume_display_mode(1920, 1601));
+    assert(lume_display_mode(800, 480));
     uint32_t *memory = malloc(FRAME_BYTES + 64);
     assert(memory);
     memset(memory, 0xa5, FRAME_BYTES + 64);
@@ -110,6 +115,39 @@ int main(void)
     enabled = false;
     assert(lume_display_video(LUME_VIDEO_FONT_SELECT, 0, NULL) == -LUME_ENOSYS);
     free(memory);
+    assert(lume_display_mode(1920, 1200));
+    assert(columns == 119 && rows == 36);
+    memory = malloc(FRAME_BYTES + 64);
+    assert(memory);
+    memset(memory, 0xa5, FRAME_BYTES + 64);
+    fb = memory + 8;
+    enabled = true;
+    assert(!lume_display_mode(800, 480));
+    assert(!graphics_query(&screen));
+    assert(screen.width == 1920 && screen.height == 1200 && screen.pitch == 7680);
+    assert(!graphics_claim(true));
+    update.x = WIDTH - 3;
+    update.y = HEIGHT - 1;
+    assert(!graphics_present(&update));
+    assert(fb[WIDTH * HEIGHT - 3] == 0xffff0000);
+    assert(fb[WIDTH * HEIGHT - 2] == 0xff00ff00);
+    assert(fb[WIDTH * HEIGHT - 1] == 0xff0000ff);
+    ++update.x;
+    assert(graphics_present(&update) == -LUME_EINVAL);
+    assert(!graphics_claim(false));
+    for (unsigned font = 0; font < CONSOLE_FONT_COUNT; ++font)
+    {
+        assert(!lume_display_video(LUME_VIDEO_FONT_SELECT, font, NULL));
+        assert(columns <= MAX_COLUMNS && rows <= MAX_ROWS);
+        assert(columns * rows <= sizeof(cells) / sizeof(cells[0]));
+    }
+    for (unsigned i = 0; i < 8; ++i)
+        assert(memory[i] == 0xa5a5a5a5 && fb[FRAME_BYTES / 4 + i] == 0xa5a5a5a5);
+    enabled = false;
+    free(memory);
+    assert(lume_display_mode(MAX_WIDTH, MAX_HEIGHT));
+    assert(FRAME_PAGES <= MAX_FRAME_PAGES);
+    assert(lume_display_mode(800, 480));
     puts(
-        "PASS DSI fixed panel, font geometry, ANSI, scrolling, DMA cleaning and framebuffer bounds");
+        "PASS DSI fixed and virtual panels, font geometry, ANSI, scrolling, DMA cleaning and framebuffer bounds");
 }
