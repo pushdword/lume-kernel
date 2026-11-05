@@ -225,6 +225,7 @@ typedef char TCHAR;
 #if !FF_FS_READONLY
         LBA_t dir_sect; /* Sector number containing the directory entry (not used in exFAT) */
         BYTE *dir_ptr;  /* Pointer to the directory entry in the win[] (not used in exFAT) */
+        BYTE detached;
 #endif
 #if FF_USE_FASTSEEK
         DWORD
@@ -334,6 +335,11 @@ typedef char TCHAR;
                      const TCHAR *path_new);                  /* Rename/Move a file or directory */
     /* Closed regular-file replacement for serialized filesystem callers. */
     FRESULT f_replace(const TCHAR *path_old, const TCHAR *path_new, BYTE *state);
+    /* Serialized FAT namespace operations retain open objects across name changes. */
+    FRESULT f_unlink_live(const TCHAR *path, FIL *file, BYTE *state);
+    FRESULT f_rename_live(const TCHAR *path_old, const TCHAR *path_new, FIL *file, BYTE *state);
+    FRESULT f_replace_live(const TCHAR *path_old, const TCHAR *path_new, FIL *source,
+                          FIL *target, BYTE *state);
 #define FF_REPLACE_UNCHANGED 0
 #define FF_REPLACE_UNCERTAIN 1
 #define FF_REPLACE_COMMITTED 2

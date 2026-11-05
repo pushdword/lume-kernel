@@ -4,9 +4,13 @@
 #include "lume/socket_file.h"
 #include "lume/counter.h"
 #include "lume/worker.h"
+#include "lume/net_limits.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include <string.h>
+
+#define STREAM_RECEIVE_BYTES 8192u
+#define STREAM_PACKET_COUNT 4u
 
 static void stream_pause(void)
 {
@@ -23,18 +27,77 @@ struct stream
     ip_addr_t peer;
     u16_t peer_port;
     unsigned owner, handle, first, count;
+    unsigned error, failure, data_pages;
     bool connected, eof, failed, listening, write_closed;
-    unsigned char data[8192];
+    unsigned char *data;
     unsigned packet_first, packets;
-
-    struct
-    {
-        unsigned count;
-        unsigned char data[LUME_IO_BYTES];
-    } packet[4];
+    unsigned packet_count[STREAM_PACKET_COUNT];
 };
-static struct stream streams[16];
+static struct stream streams[LUME_NET_STREAM_LIMIT];
 static unsigned sequence;
+
+static bool receive_buffer(struct stream *stream, unsigned pages)
+{
+    if (stream->data)
+        return true;
+    uint64_t memory = lume_pages_alloc_span(pages);
+    if (!memory)
+        return false;
+    stream->data = (void *)(uintptr_t)memory;
+    stream->data_pages = pages;
+    return true;
+}
+
+static unsigned socket_error(err_t error, bool established)
+{
+    switch (error)
+    {
+    case ERR_OK:
+        return 0;
+    case ERR_MEM:
+        return LUME_ENOMEM;
+    case ERR_BUF:
+        return LUME_ENOBUFS;
+    case ERR_TIMEOUT:
+        return LUME_ETIMEDOUT;
+    case ERR_RTE:
+        return LUME_ENETUNREACH;
+    case ERR_INPROGRESS:
+        return LUME_EINPROGRESS;
+    case ERR_VAL:
+    case ERR_ARG:
+        return LUME_EINVAL;
+    case ERR_WOULDBLOCK:
+        return LUME_EAGAIN;
+    case ERR_USE:
+        return LUME_EADDRINUSE;
+    case ERR_ALREADY:
+        return LUME_EALREADY;
+    case ERR_ISCONN:
+        return LUME_EISCONN;
+    case ERR_CONN:
+        return LUME_ENOTCONN;
+    case ERR_ABRT:
+        return LUME_ECONNABORTED;
+    case ERR_RST:
+        return established ? LUME_ECONNRESET : LUME_ECONNREFUSED;
+    case ERR_CLSD:
+        return LUME_ECONNRESET;
+    default:
+        return LUME_EIO;
+    }
+}
+
+static void stream_failure(struct stream *stream, err_t error)
+{
+    unsigned native = socket_error(error, stream->connected);
+    if (!native)
+        native = LUME_EIO;
+    if (!stream->error)
+        stream->error = native;
+    stream->failure = native;
+    stream->failed = true;
+}
 
 static void notify(struct stream *s)
 {
@@ -62,7 +125,7 @@ bool lume_stream_needs_poll(void)
 
 static struct stream *allocate(unsigned owner)
 {
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (!streams[i].owner)
         {
             struct stream *s = &streams[i];
@@ -80,10 +143,10 @@ static void failed(void *context, err_t error)
 {
     struct stream *s = context;
     s->pcb = 0;
-    if (error == ERR_CLSD)
+    if (error == ERR_CLSD && s->connected)
         s->eof = true;
     else
-        s->failed = true;
+        stream_failure(s, error);
     notify(s);
 }
 
@@ -106,14 +169,15 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
         notify(s);
         return ERR_OK;
     }
-    if (error != ERR_OK || p->tot_len > sizeof(s->data) - s->count)
+    if (error != ERR_OK || p->tot_len > STREAM_RECEIVE_BYTES - s->count ||
+        !receive_buffer(s, STREAM_RECEIVE_BYTES / 4096u))
         return ERR_MEM;
     for (struct pbuf *q = p; q; q = q->next)
     {
         if (!q->len)
             continue;
-        unsigned end = (s->first + s->count) % sizeof(s->data);
-        unsigned first = q->len < sizeof(s->data) - end ? q->len : sizeof(s->data) - end;
+        unsigned end = (s->first + s->count) % STREAM_RECEIVE_BYTES;
+        unsigned first = q->len < STREAM_RECEIVE_BYTES - end ? q->len : STREAM_RECEIVE_BYTES - end;
         memcpy(s->data + end, q->payload, first);
         memcpy(s->data, (const unsigned char *)q->payload + first, q->len - first);
         s->count += q->len;
@@ -128,15 +192,17 @@ static err_t connected(void *context, struct tcp_pcb *pcb, err_t error)
 {
     (void)pcb;
     struct stream *s = context;
-    s->connected = error == ERR_OK;
-    s->failed = error != ERR_OK;
+    if (error == ERR_OK)
+        s->connected = true;
+    else
+        stream_failure(s, error);
     notify(s);
     return ERR_OK;
 }
 
 static void close_stream(struct stream *s)
 {
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].pending == s)
         {
             streams[i].pending = 0;
@@ -160,6 +226,9 @@ static void close_stream(struct stream *s)
         if (tcp_close(s->pcb) != ERR_OK)
             tcp_abort(s->pcb);
     }
+    for (unsigned i = 0; i < s->data_pages; ++i)
+        if (!lume_page_free((uintptr_t)s->data + (uint64_t)i * 4096u))
+            lume_fail("stream receive buffer release");
     notify(s);
     *s = (struct stream){0};
 }
@@ -190,7 +259,7 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
 {
     (void)pcb;
     struct stream *s = context;
-    if (p->tot_len <= LUME_IO_BYTES && s->packets < 4 &&
+    if (p->tot_len <= LUME_IO_BYTES && s->packets < STREAM_PACKET_COUNT &&
         (!s->connected || (ip_addr_cmp(address, &s->peer) && port == s->peer_port)))
     {
         if (!s->connected)
@@ -199,9 +268,9 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
             s->peer_port = port;
             s->connected = true;
         }
-        unsigned slot = (s->packet_first + s->packets) % 4;
-        s->packet[slot].count = p->tot_len;
-        pbuf_copy_partial(p, s->packet[slot].data, p->tot_len, 0);
+        unsigned slot = (s->packet_first + s->packets) % STREAM_PACKET_COUNT;
+        s->packet_count[slot] = p->tot_len;
+        pbuf_copy_partial(p, s->data + slot * LUME_IO_BYTES, p->tot_len, 0);
         ++s->packets;
         notify(s);
     }
@@ -211,7 +280,7 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
 void lume_stream_release(unsigned pid)
 {
     lume_icmp_release(pid);
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner == pid)
             close_stream(&streams[i]);
 }
@@ -239,6 +308,11 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         IP_ADDR4(&address, r->address[0], r->address[1], r->address[2], r->address[3]);
         if (op == LUME_DATAGRAM_CONNECT || op == LUME_DATAGRAM_LISTEN)
         {
+            if (!receive_buffer(s, STREAM_PACKET_COUNT * LUME_IO_BYTES / 4096u))
+            {
+                close_stream(s);
+                return -LUME_ENOMEM;
+            }
             s->udp = udp_new();
             err_t result = s->udp ? (listening ? udp_bind(s->udp, &address, (u16_t)r->port)
                                                : udp_connect(s->udp, &address, (u16_t)r->port))
@@ -290,10 +364,11 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         tcp_err(s->pcb, failed);
         tcp_recv(s->pcb, received);
         tcp_sent(s->pcb, sent);
-        if (tcp_connect(s->pcb, &address, (u16_t)r->port, connected) != ERR_OK)
+        err_t connect_error = tcp_connect(s->pcb, &address, (u16_t)r->port, connected);
+        if (connect_error != ERR_OK)
         {
             close_stream(s);
-            return -LUME_EIO;
+            return -(int)socket_error(connect_error, false);
         }
         r->handle = s->handle;
         if (op == LUME_STREAM_CONNECT_ASYNC)
@@ -307,13 +382,14 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         }
         if (!s->connected || s->failed)
         {
+            int failure = s->failure ? -(int)s->failure : -LUME_ETIMEDOUT;
             close_stream(s);
-            return -LUME_EIO;
+            return failure;
         }
         r->handle = s->handle;
         return 0;
     }
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner == pid && streams[i].handle == r->handle)
             s = &streams[i];
     if (!s)
@@ -371,12 +447,12 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
             if (!s->packets)
                 return -LUME_EAGAIN;
             unsigned slot = s->packet_first;
-            unsigned n = r->count < s->packet[slot].count ? r->count : s->packet[slot].count;
-            memcpy(r->data, s->packet[slot].data, n);
+            unsigned n = r->count < s->packet_count[slot] ? r->count : s->packet_count[slot];
+            memcpy(r->data, s->data + slot * LUME_IO_BYTES, n);
             memcpy(r->address, &ip_2_ip4(&s->peer)->addr, 4);
             r->port = s->peer_port;
             r->count = n;
-            s->packet_first = (slot + 1) % 4;
+            s->packet_first = (slot + 1) % STREAM_PACKET_COUNT;
             --s->packets;
             return (int)n;
         }
@@ -404,20 +480,24 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
                 stream_pause();
         }
         if (!s->count)
-            return s->failed ? -LUME_EIO : s->eof ? 0 : -LUME_EAGAIN;
+            return s->failed ? -(int)s->failure : s->eof ? 0 : -LUME_EAGAIN;
         unsigned n = r->count < s->count ? r->count : s->count;
-        unsigned first = n < sizeof(s->data) - s->first ? n : sizeof(s->data) - s->first;
+        unsigned first = n < STREAM_RECEIVE_BYTES - s->first ? n : STREAM_RECEIVE_BYTES - s->first;
         memcpy(r->data, s->data + s->first, first);
         memcpy(r->data + first, s->data, n - first);
-        s->first = (s->first + n) % sizeof(s->data);
+        s->first = (s->first + n) % STREAM_RECEIVE_BYTES;
         s->count -= n;
         if (s->pcb)
             tcp_recved(s->pcb, (u16_t)n);
         r->count = n;
         return (int)n;
     }
-    if (s->write_closed || !s->connected)
-        return -LUME_EIO;
+    if (s->failed)
+        return -(int)s->failure;
+    if (s->write_closed)
+        return -LUME_EPIPE;
+    if (!s->connected)
+        return -LUME_ENOTCONN;
     while (!nonblocking && s->pcb && !s->failed && !tcp_sndbuf(s->pcb) &&
            (uint32_t)(lume_clock_millis() - start) < 5000)
     {
@@ -426,7 +506,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
             stream_pause();
     }
     if (!s->pcb || s->failed)
-        return -LUME_EIO;
+        return s->failure ? -(int)s->failure : -LUME_EPIPE;
     unsigned n = r->count < tcp_sndbuf(s->pcb) ? r->count : tcp_sndbuf(s->pcb);
     if (!n)
         return -LUME_EAGAIN;
@@ -469,7 +549,7 @@ int lume_stream_progress(unsigned pid, unsigned op, struct lume_stream_request *
         if (result != -LUME_EAGAIN)
             return result;
     }
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
     {
         struct stream *s = &streams[i];
         if (s->owner != pid || s->handle != request->handle)
@@ -477,7 +557,7 @@ int lume_stream_progress(unsigned pid, unsigned op, struct lume_stream_request *
         if (op == LUME_STREAM_CONNECT)
         {
             if (s->failed || !s->pcb)
-                return -LUME_EIO;
+                return s->failure ? -(int)s->failure : -LUME_EPIPE;
             if (s->connected)
                 return 0;
             *pending = true;
@@ -501,9 +581,27 @@ int lume_stream_socket_create(unsigned pid, unsigned op, struct lume_stream_requ
     return stream_request(pid, op, request, true, options);
 }
 
+int lume_stream_socket_error(unsigned owner, unsigned handle, unsigned *error, bool *pending)
+{
+    if (!owner || !handle || !error || !pending)
+        return -LUME_EINVAL;
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
+    {
+        struct stream *stream = &streams[i];
+        if (stream->owner != owner || stream->handle != handle)
+            continue;
+        *error = stream->error;
+        *pending = !stream->listening && !stream->connected && !stream->failed && !stream->eof &&
+                   stream->pcb;
+        stream->error = 0;
+        return 0;
+    }
+    return -LUME_EBADF;
+}
+
 int lume_stream_socket_options(unsigned owner, unsigned handle, unsigned options)
 {
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner == owner && streams[i].handle == handle && streams[i].pcb)
         {
             struct tcp_pcb *pcb = streams[i].pcb;
@@ -529,7 +627,7 @@ int lume_stream_socket_options(unsigned owner, unsigned handle, unsigned options
 int lume_stream_socket_local(unsigned owner, unsigned handle, unsigned char address[4],
                              unsigned *port)
 {
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner == owner && streams[i].handle == handle && streams[i].pcb)
         {
             memcpy(address, &ip_2_ip4(&streams[i].pcb->local_ip)->addr, 4);

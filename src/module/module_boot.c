@@ -124,7 +124,11 @@ static int entry(struct lume_files *files, char *line)
 void lume_platform_modules_boot(void)
 {
     struct lume_files files;
-    lume_files_init(&files);
+    if (!lume_files_init(&files))
+    {
+        lume_value("MODULE_BOOT_CONFIG_ERROR", (uint64_t)(int64_t)-LUME_ENOMEM);
+        return;
+    }
     void *data = NULL;
     size_t bytes = 0;
     int result = read_file(&files, "/etc/modules", 4096, &data, &bytes);

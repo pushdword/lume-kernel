@@ -1,14 +1,20 @@
 #include "lume/graphics_device.h"
 
+static bool poll_wait_active(unsigned task)
+{
+    return poll_waits && poll_waits[task].active;
+}
+
 static void poll_cancel(unsigned task)
 {
     lume_vfs_poll_cancel(task);
-    poll_waits[task] = (struct poll_wait_state){0};
+    if (poll_waits)
+        poll_waits[task] = (struct poll_wait_state){0};
 }
 
 static void poll_interrupt(unsigned task, struct lume_context *frame)
 {
-    if (!poll_waits[task].active)
+    if (!poll_wait_active(task))
         return;
     poll_cancel(task);
     LUME_CONTEXT_PC(frame) += LUME_SYSCALL_INSTRUCTION_BYTES;
@@ -17,13 +23,13 @@ static void poll_interrupt(unsigned task, struct lume_context *frame)
 
 static bool poll_wake(unsigned task, uint64_t at)
 {
-    return lume_vfs_poll_take(task) || at >= poll_waits[task].deadline;
+    return poll_waits && (lume_vfs_poll_take(task) || at >= poll_waits[task].deadline);
 }
 
 static bool poll_signal_changed(unsigned task)
 {
     unsigned process = process_slot(task);
-    return !thread_slots[task].thread &&
+    return poll_waits && !thread_slots[task].thread &&
            (signal_interrupt_pending(process) ||
             (poll_waits[task].check_epoch &&
              poll_waits[task].signal_epoch != signals[process].epoch));
@@ -39,7 +45,7 @@ static void poll_console_pump(void)
         return;
     }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (states[i] == 4 && poll_waits[i].active &&
+        if (states[i] == 4 && poll_wait_active(i) &&
             lume_vfs_poll_console(&tasks[process_slot(i)].files, &poll_waits[i].watch))
         {
             (void)kernel_console_ready();
@@ -50,6 +56,11 @@ static void poll_console_pump(void)
 static struct lume_context *poll_result(struct lume_context *frame, int64_t result)
 {
     unsigned task = current_task;
+    if (!poll_waits)
+    {
+        LUME_CONTEXT_REG(frame, 0) = (uint64_t)-LUME_ENOMEM;
+        return frame;
+    }
     struct poll_wait_state *wait = &poll_waits[task];
     if (result >= 0)
     {
@@ -70,6 +81,11 @@ static struct lume_context *poll_result(struct lume_context *frame, int64_t resu
 
 static struct lume_context *poll_call(struct lume_context *frame)
 {
+    if (!poll_waits)
+    {
+        LUME_CONTEXT_REG(frame, 0) = (uint64_t)-LUME_ENOMEM;
+        return frame;
+    }
     unsigned task = current_task, process = process_slot(task);
     struct poll_wait_state *wait = &poll_waits[task];
     unsigned operation = (unsigned)LUME_CONTEXT_REG(frame, 0);
@@ -130,7 +146,8 @@ static struct lume_context *poll_call(struct lume_context *frame)
             .check_epoch = (request.flags & LUME_POLL_SIGNAL_EPOCH) != 0,
             .tty_read = (request.flags & LUME_POLL_TTY_READ) != 0};
         wait->watch.count = request.count;
-        memcpy(wait->watch.records, (const void *)(uintptr_t)request.buffer, bytes);
+        if (bytes)
+            memcpy(wait->watch.records, (const void *)(uintptr_t)request.buffer, bytes);
         if (wait->tty_read && wait->watch.records[0].events != LUME_POLLIN)
             return poll_result(frame, -LUME_EINVAL);
         lume_vfs_poll_prepare(&tasks[process].files, &wait->watch);

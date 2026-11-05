@@ -30,9 +30,10 @@ void lume_kernel_free(void *p)
     }
 }
 
-void lume_files_init(struct lume_files *files)
+bool lume_files_init(struct lume_files *files)
 {
     memset(files, 0, sizeof(*files));
+    return true;
 }
 
 void lume_files_release(struct lume_files *files)

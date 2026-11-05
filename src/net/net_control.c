@@ -128,7 +128,6 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
             result = -LUME_EPERM;
         if (!result)
         {
-            lume_net_release(index);
             result = op == LUME_NET_WIFI_CONNECT_BEGIN
                          ? lume_wireless_connect_begin(index, &connect)
                          : lume_wireless_connect(index, &connect);
@@ -146,7 +145,6 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         result = lume_wireless_capabilities(index, &caps);
         if (!result)
         {
-            lume_net_release(index);
             result = lume_wireless_disconnect(index);
             lume_net_poll();
         }

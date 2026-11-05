@@ -69,10 +69,26 @@ static void kernel_call(void *context)
     struct kernel_io_lane *lane = context;
     unsigned task = lane->owner, process = process_slot(task);
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
+    /* Each retired description yields admission before the original operation begins. */
+    if (lane == &kernel_lanes[LUME_WORK_STORAGE] && lume_vfs_reap_pending())
+    {
+        (void)lume_vfs_reap(1);
+        lane->result = LUME_IO_RETRY_STORAGE;
+        return;
+    }
     if (lane == &kernel_lanes[LUME_WORK_NETWORK])
     {
         stream_reap();
         netctl_reap();
+    }
+    int permission = lume_sandbox_check(&tasks[process].files, process + 1, &tasks[task].context);
+    if (permission)
+    {
+        stream_cancel(task);
+        netctl_cancel(task);
+        dns_cancel(task);
+        lane->result = permission;
+        return;
     }
     lane->result =
         LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FORK
@@ -85,12 +101,21 @@ static void kernel_call(void *context)
            (LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_NET &&
             LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_NET_SCAN))
             ? netctl_attempt(task)
+        : (LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_NET &&
+           LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_NET_DNS)
+            ? dns_attempt(task)
             : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
 }
 
 static void kernel_work(void *context)
 {
     unsigned domain = (unsigned)(uintptr_t)context;
+    if (domain == LUME_WORK_STORAGE)
+    {
+        (void)lume_vfs_reap(1);
+        if (kernel_regular_draining())
+            return;
+    }
     if (domain == LUME_WORK_NETWORK)
     {
         stream_reap();
@@ -108,11 +133,17 @@ static void kernel_work(void *context)
 static bool kernel_background_pending(unsigned domain)
 {
     return lume_work_pending_on(domain) ||
+           (domain == LUME_WORK_STORAGE && lume_vfs_reap_pending()) ||
            (domain == LUME_WORK_NETWORK && (stream_retired_pending() || netctl_retired_pending()));
 }
 
 static void kernel_cancel(unsigned task)
 {
+    if (task < LUME_TASK_LIMIT)
+    {
+        kernel_socket_network[task] = false;
+        kernel_retry_launch[task] = false;
+    }
     io_queue_cancel(&kernel_control_queue, task);
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         io_queue_cancel(&kernel_lanes[i].queue, task);
@@ -120,6 +151,8 @@ static void kernel_cancel(unsigned task)
     {
         stream_cancel(task);
         netctl_cancel(task);
+        dns_cancel(task);
+        lume_vfs_poll_release(task);
         kernel_wait[task] = false;
     }
 }
@@ -156,6 +189,7 @@ static void kernel_memory_waiters(void)
             io_queue_cancel(queue, task);
             if (!ticket.replay)
                 LUME_CONTEXT_PC(frame) -= LUME_SYSCALL_INSTRUCTION_BYTES;
+            kernel_retry_launch[task] = false;
             kernel_wait[task] = false;
             states[task] = 1;
             sched_wake(&policy, task, unit, 0);
@@ -172,7 +206,7 @@ static bool kernel_admit_queue(unsigned domain)
     unsigned slot = domain == KERNEL_IO_EXCLUSIVE ? LUME_WORK_GENERAL : domain;
     if (lume_worker_busy_on(slot) || io_queue_granted(queue, lume_clock_monotonic()))
         return false;
-    uint64_t blocked_processes = 0;
+    uint64_t blocked_processes[SCHED_MASK_WORDS] = {0};
     for (unsigned i = 0; i < queue->count;)
     {
         struct io_ticket ticket = queue->entries[(queue->head + i) % LUME_TASK_LIMIT];
@@ -197,10 +231,12 @@ static bool kernel_admit_queue(unsigned domain)
             continue;
         }
         bool mutation = kernel_call_mutates(&tasks[task].context);
-        if ((blocked_processes & (UINT64_C(1) << process)) ||
+        unsigned process_word = process / 64u;
+        uint64_t process_bit = UINT64_C(1) << (process % 64u);
+        if ((blocked_processes[process_word] & process_bit) ||
             !kernel_resource_available(domain, task, mutation))
         {
-            blocked_processes |= UINT64_C(1) << process;
+            blocked_processes[process_word] |= process_bit;
             ++i;
             continue;
         }
@@ -208,6 +244,7 @@ static bool kernel_admit_queue(unsigned domain)
         if (ticket.replay)
         {
             io_queue_grant(queue, ticket);
+            kernel_retry_launch[task] = false;
             kernel_wait[task] = false;
             states[task] = 1;
             sched_wake(&policy, task, unit, 0);
@@ -216,9 +253,11 @@ static bool kernel_admit_queue(unsigned domain)
         {
             struct kernel_io_lane *lane = kernel_lanes + slot;
             lane->owner = task;
-            lane->launch = false;
+            lane->launch = kernel_retry_launch[task];
+            kernel_retry_launch[task] = false;
             lane->exclusive = domain == KERNEL_IO_EXCLUSIVE;
             lane->mutation = mutation;
+            lane->cancel_generation = kernel_lanes[LUME_WORK_NETWORK].queue.generation[task];
             lane->deferred_turn = true;
             if (!lume_worker_submit_on(slot, kernel_call, lane))
                 lume_fail("queued resource submission");
@@ -280,6 +319,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         return;
     lume_net_poll_background();
     lume_storage_poll_background();
+    lume_vm_poll_background();
     bool draining = kernel_commit_drain();
     if (admit && !lume_worker_busy() && !kernel_any_grant())
         (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
@@ -332,10 +372,15 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         unsigned owner = lane->owner;
         current_task = owner < LUME_TASK_LIMIT ? owner : previous;
         bool reclaim = lane->reclaim;
+        uint64_t worker_root =
+            owner < LUME_TASK_LIMIT && !reclaim ? lume_mmu_task_root(owner) : lume_mmu_root();
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+        bool change_root = !lume_mmu_root_active(worker_root);
+#else
         bool change_root = owner != previous || reclaim;
+#endif
         if (change_root)
-            lume_mmu_switch(owner < LUME_TASK_LIMIT && !reclaim ? lume_mmu_task_root(owner)
-                                                                : lume_mmu_root());
+            lume_mmu_switch(worker_root);
         uint64_t began = counter();
         local.worker_slot = domain;
         local.worker_owner = owner;
@@ -359,10 +404,14 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         if (account_inside)
             account_start += elapsed;
         current_task = previous;
+        uint64_t previous_root = previous < LUME_TASK_LIMIT && !(reclaim && previous == owner)
+                                     ? lume_mmu_task_root(previous)
+                                     : lume_mmu_root();
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+        change_root = !lume_mmu_root_active(previous_root);
+#endif
         if (change_root)
-            lume_mmu_switch(previous < LUME_TASK_LIMIT && !(reclaim && previous == owner)
-                                ? lume_mmu_task_root(previous)
-                                : lume_mmu_root());
+            lume_mmu_switch(previous_root);
         if (!lume_worker_busy_on(domain) && owner < LUME_TASK_LIMIT)
         {
             struct lume_context *frame = &tasks[owner].context;
@@ -370,7 +419,49 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             lane->exclusive = lane->mutation = lane->exclusive_pending = false;
             lane->reclaim = false;
             kernel_wait[owner] = false;
-            if (reclaim)
+            kernel_socket_network[owner] = false;
+            kernel_retry_launch[owner] = false;
+            bool redirect = lane->result == LUME_IO_RETRY_NETWORK;
+            bool storage_retry = lane->result == LUME_IO_RETRY_STORAGE;
+            /* Cancellation advances every resource queue generation for this task. */
+            bool cancelled =
+                lane->cancel_generation != kernel_lanes[LUME_WORK_NETWORK].queue.generation[owner];
+            bool socket_call =
+                LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SOCKET &&
+                (LUME_CONTEXT_REG(frame, 0) == LUME_SOCKET_SEND_MESSAGE ||
+                 LUME_CONTEXT_REG(frame, 0) == LUME_SOCKET_RECEIVE_MESSAGE ||
+                 LUME_CONTEXT_REG(frame, 0) == LUME_SOCKET_SHUTDOWN);
+            if (redirect && !reclaim && !lane->launch && domain == LUME_WORK_GENERAL &&
+                socket_call && !cancelled && !process_exiting[process_slot(owner)])
+            {
+                kernel_socket_network[owner] = true;
+                kernel_wait[owner] = true;
+                states[owner] = 4;
+                lane->result = 0;
+                if (!kernel_enqueue(owner, LUME_WORK_NETWORK, false))
+                    lume_fail("socket resource requeue");
+            }
+            else if (storage_retry && !reclaim && domain == LUME_WORK_STORAGE && !cancelled &&
+                     !process_exiting[process_slot(owner)])
+            {
+                kernel_retry_launch[owner] = lane->launch;
+                kernel_wait[owner] = true;
+                states[owner] = 4;
+                lane->result = 0;
+                if (!kernel_enqueue(owner, LUME_WORK_STORAGE, false))
+                    lume_fail("storage resource requeue");
+            }
+            else if (redirect || storage_retry)
+            {
+                kernel_socket_network[owner] = false;
+                LUME_CONTEXT_REG(frame, 0) =
+                    (uint64_t)(cancelled || process_exiting[process_slot(owner)] ? -LUME_EINTR
+                                                                                 : -LUME_EIO);
+                lane->result = 0;
+                states[owner] = 1;
+                sched_wake(&policy, owner, unit, 0);
+            }
+            else if (reclaim)
             {
                 states[owner] = 1;
                 sched_wake(&policy, owner, unit, 0);
@@ -380,10 +471,12 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                 states[owner] = 3;
             else if (!lane->launch &&
                      ((stream_waits[owner].active && stream_waits[owner].pending) ||
-                      (netctl_waits[owner].active && netctl_waits[owner].pending)))
+                      (netctl_waits[owner].active && netctl_waits[owner].pending) ||
+                      (dns_waits[owner].active && dns_waits[owner].pending)))
                 states[owner] = 4;
             else if (lane->launch || !kernel_pipe_block(owner, frame, lane->result))
             {
+                kernel_socket_network[owner] = false;
                 if (!context_replaced[owner])
                     LUME_CONTEXT_REG(frame, 0) = (uint64_t)lane->result;
                 states[owner] = 1;

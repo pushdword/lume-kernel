@@ -44,6 +44,17 @@ static void address(struct text *t, const unsigned char ip[4])
     }
 }
 
+int64_t lume_net_compat_address(const unsigned char ip[4], char *out, size_t cap)
+{
+    if (!ip || !out || !cap)
+        return -LUME_EINVAL;
+    struct text text = {out, cap, 0};
+    out[0] = 0;
+    address(&text, ip);
+    add(&text, "\n");
+    return (int64_t)text.used;
+}
+
 static void mac_text(struct text *t, const unsigned char *mac)
 {
     const char *h = "0123456789abcdef";
@@ -110,7 +121,8 @@ int64_t lume_net_compat_scan(const struct lume_net_control *request, int64_t res
 static bool join_config(uint32_t index)
 {
     struct lume_files f;
-    lume_files_init(&f);
+    if (!lume_files_init(&f))
+        return false;
     unsigned char cfg[104] = {0};
     struct lume_wifi_connect request = {0};
     int64_t fd = lume_vfs_open(&f, "/data/system/wifi.cfg", LUME_O_RDONLY);
@@ -126,7 +138,6 @@ static bool join_config(uint32_t index)
         request.key_bytes = cfg[5];
         memcpy(request.ssid, cfg + 8, request.ssid_bytes);
         memcpy(request.key, cfg + 40, request.key_bytes);
-        lume_net_release(index);
         ok = lume_wireless_connect(index, &request) == 0;
     }
     volatile unsigned char *wipe = cfg;
@@ -205,11 +216,14 @@ int64_t lume_net_command(unsigned op, const char *arg, char *out, size_t cap)
         add(&t, "DHCP ready\n");
         break;
     case LUME_NET_LEAVE:
-        lume_net_release(index);
-        (void)lume_wireless_disconnect(index);
+    {
+        int result = lume_wireless_disconnect(index);
+        if (result)
+            return result;
         lume_net_poll();
         add(&t, "disconnected\n");
         break;
+    }
     case LUME_NET_DNS:
     case LUME_NET_PING:
     {

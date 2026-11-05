@@ -38,10 +38,26 @@ static struct local_pair *pair_allocate(void)
         struct local_pair *pair = local_pairs + i;
         if (pair->open[0] || pair->open[1])
             continue;
-        pair->end[0] = (struct local_end){.pair = pair, .side = 0};
-        pair->end[1] = (struct local_end){.pair = pair, .side = 1};
-        lume_poll_source_reset(&pair->end[0].source);
-        lume_poll_source_reset(&pair->end[1].source);
+        uint64_t first = lume_page_alloc(0);
+        if (!first)
+            return NULL;
+        uint64_t second = lume_page_alloc(0);
+        if (!second)
+        {
+            if (!lume_page_free(first))
+                lume_fail("socket buffer allocation rollback");
+            return NULL;
+        }
+        /* Single-page allocation and rollback keep endpoint publication serialized. */
+        for (unsigned side = 0; side < 2; ++side)
+        {
+            pair->ring[side] =
+                (struct local_ring){.data = (void *)(uintptr_t)(side ? second : first)};
+            pair->end[side].pair = pair;
+            pair->end[side].side = side;
+            pair->end[side].uid = pair->end[side].gid = 0;
+            lume_poll_source_reset(&pair->end[side].source);
+        }
         pair->open[0] = pair->open[1] = true;
         return pair;
     }
@@ -103,8 +119,13 @@ static struct lume_poll_source *named_source(void *context)
     return socket->end ? local_source(socket->end) : &socket->source;
 }
 
-static const struct lume_file_ops named_ops = {
-    LUME_NODE_SOCKET, named_close, named_read, named_write, named_poll, named_source, true};
+static const struct lume_file_ops named_ops = {.kind = LUME_NODE_SOCKET,
+                                               .close = named_close,
+                                               .read = named_read,
+                                               .write = named_write,
+                                               .poll = named_poll,
+                                               .source = named_source,
+                                               .memory_io = true};
 
 static int named_operation(struct lume_files *files, struct named_socket *socket,
                            unsigned operation, struct lume_socket_request *r)

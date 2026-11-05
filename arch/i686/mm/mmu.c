@@ -1,5 +1,6 @@
 #include "lume/mmu.h"
 #include "lume/elf.h"
+#include "lume/vm.h"
 #include <string.h>
 #define PRESENT 1u
 #define WRITE 2u
@@ -259,7 +260,8 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
     for (uint64_t p = pointer, end = pointer + bytes; p < end; p = (p & ~UINT64_C(4095)) + 4096)
     {
         uint64_t physical;
-        if (!lume_mmu_translate(active, p, write, true, false, &physical))
+        if (!lume_mmu_translate(active, p, write, true, false, &physical) &&
+            !lume_vm_resolve_buffer(active, p, write))
             return false;
     }
     return true;

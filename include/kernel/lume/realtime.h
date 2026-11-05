@@ -15,4 +15,5 @@ bool lume_realtime_set(struct lume_realtime *, uint64_t, uint32_t, uint64_t);
 bool lume_realtime_read(const struct lume_realtime *, uint64_t, uint64_t *, uint32_t *);
 int lume_realtime_control(struct lume_realtime *, unsigned, struct lume_realtime_request *,
                           uint64_t, bool);
+int lume_clock_realtime_ms(uint64_t, uint64_t *);
 #endif

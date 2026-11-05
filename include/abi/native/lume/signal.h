@@ -4,6 +4,14 @@
 #define LUME_SIGNAL_VERSION 1u
 #define LUME_SIGNAL_COUNT 32u
 
+/* MASK queries and updates the calling thread's mask. New threads inherit their
+ * creator's mask. TRY_WAIT consumes one pending process signal selected by mask.
+ * Every selected signal must be blocked by the calling thread. Zero, KILL and
+ * STOP bits are invalid. Version and bytes identify the request. Fields other
+ * than mask, version and bytes are zero on input. The result is zero with the
+ * selected number, or EAGAIN when none is pending. Secondary threads support
+ * MASK and TRY_WAIT. */
+
 enum
 {
     LUME_SIGNAL_ACTION,
@@ -15,7 +23,8 @@ enum
     LUME_SIGNAL_SESSION,
     LUME_SIGNAL_GROUP,
     LUME_SIGNAL_SET_SESSION,
-    LUME_SIGNAL_SET_GROUP
+    LUME_SIGNAL_SET_GROUP,
+    LUME_SIGNAL_TRY_WAIT
 };
 
 struct lume_signal_request

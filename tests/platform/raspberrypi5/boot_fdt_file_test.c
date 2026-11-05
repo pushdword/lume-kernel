@@ -10,9 +10,10 @@ static size_t position, file_bytes;
 static int open_error, read_error;
 static unsigned file_kind;
 
-void lume_files_init(struct lume_files *files)
+bool lume_files_init(struct lume_files *files)
 {
     memset(files, 0, sizeof(*files));
+    return true;
 }
 
 void lume_files_release(struct lume_files *files)

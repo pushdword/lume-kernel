@@ -1,4 +1,6 @@
-#define SIGNAL_UNMASKABLE ((1u << 9) | (1u << 17))
+#include "signal_mask.h"
+#include "signal_wait.h"
+#define SIGNAL_UNMASKABLE LUME_SIGNAL_UNMASKABLE
 #define SIGNAL_ACTION_FLAGS ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 6))
 #define SIGNAL_DEPTH 4u
 
@@ -16,6 +18,17 @@ static struct signal_state
     struct lume_context saved[SIGNAL_DEPTH];
     uint32_t saved_mask[SIGNAL_DEPTH];
 } signals[LUME_TASK_LIMIT];
+
+static void signal_thread_initialize(unsigned child, unsigned creator)
+{
+    uint32_t mask = signals[creator].mask;
+    signals[child] = (struct signal_state){.mask = mask};
+}
+
+static void signal_thread_reset(unsigned task)
+{
+    signals[task] = (struct signal_state){0};
+}
 
 static bool signal_child_notify(unsigned parent)
 {
@@ -62,7 +75,7 @@ static void signal_queue(unsigned owner, unsigned number)
     }
     else if (number == 17 || number == 18 || number == 21 || number == 22)
         s->pending &= ~(1u << 19);
-    if (signal_ignored(owner, number))
+    if (!signal_pending_keep(number, s->action[number].handler, s->mask))
         return;
     bool stopping = signal_default_stop(owner, number);
     if (!(s->mask & (1u << number)) && !stopping)
@@ -73,7 +86,8 @@ static void signal_queue(unsigned owner, unsigned number)
         exit_signals[owner] = number;
         request_exit(owner, 128 + number);
     }
-    else if (!(s->mask & (1u << number)) && (stream_interrupt(owner) || netctl_interrupt(owner)))
+    else if (!(s->mask & (1u << number)) &&
+             (stream_interrupt(owner) || netctl_interrupt(owner) || dns_interrupt(owner)))
     {
         LUME_CONTEXT_REG(&tasks[owner].context, 0) = (uint64_t)-4;
         states[owner] = 1;
@@ -83,7 +97,7 @@ static void signal_queue(unsigned owner, unsigned number)
              ((states[owner] == 4 && !thread_waiting[owner]) ||
               (states[owner] == 3 && LUME_CONTEXT_REG(&tasks[owner].context, 8) == LUME_SYS_WAIT)))
     {
-        if (stopping && poll_waits[owner].active)
+        if (stopping && poll_waits && poll_waits[owner].active)
         {
             states[owner] = 1;
             sched_wake(&policy, owner, unit, 0);
@@ -95,6 +109,7 @@ static void signal_queue(unsigned owner, unsigned number)
         poll_interrupt(owner, &tasks[owner].context);
         stream_cancel(owner);
         netctl_cancel(owner);
+        dns_cancel(owner);
         service_wait_cancel(owner);
         if (pipe_wait[owner] && !restart)
             LUME_CONTEXT_PC(&tasks[owner].context) += LUME_SYSCALL_INSTRUCTION_BYTES;
@@ -160,7 +175,11 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     unsigned operation = LUME_CONTEXT_REG(frame, 0);
     struct signal_state *s = &signals[owner];
     if (thread_slots[current_task].thread)
-        return -LUME_ENOSYS;
+    {
+        if (operation != LUME_SIGNAL_MASK && operation != LUME_SIGNAL_TRY_WAIT)
+            return -LUME_ENOSYS;
+        s = &signals[current_task];
+    }
     if (operation == LUME_SIGNAL_RETURN)
     {
         if (LUME_CONTEXT_REG(frame, 1) || LUME_CONTEXT_REG(frame, 2) || !s->depth)
@@ -176,6 +195,13 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     struct lume_signal_request *out = (void *)(uintptr_t)LUME_CONTEXT_REG(frame, 1), r = *out;
     if (r.version != LUME_SIGNAL_VERSION || r.bytes != sizeof(r))
         return -LUME_EINVAL;
+    if (operation == LUME_SIGNAL_TRY_WAIT)
+    {
+        int64_t result = signal_try_wait(&signals[owner].pending, s->mask, &r);
+        if (!result)
+            *out = r;
+        return result;
+    }
     if (operation == LUME_SIGNAL_ACTION)
     {
         if (!r.number || r.number >= LUME_SIGNAL_COUNT || r.number == 9 || r.number == 17 ||
@@ -207,15 +233,10 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     }
     if (operation == LUME_SIGNAL_MASK)
     {
-        if (r.operation > 2 || r.flags > 1)
-            return -LUME_EINVAL;
-        uint32_t old = s->mask, mask = r.mask & ~SIGNAL_UNMASKABLE;
-        if (r.flags)
-            s->mask = r.operation == 0 ? mask : r.operation == 1 ? old | mask : old & ~mask;
-        out->mask = old;
-        out->delay_ms = s->epoch;
-        out->interval_ms = s->pending & ~s->mask;
-        return 0;
+        int64_t result = signal_mask_update(&s->mask, s->pending, s->epoch, &r);
+        if (!result)
+            *out = r;
+        return result;
     }
     if (operation == LUME_SIGNAL_TIMER)
     {

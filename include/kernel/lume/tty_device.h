@@ -5,6 +5,7 @@
 struct lume_files;
 int lume_tty_call(struct lume_files *, unsigned, unsigned, struct lume_tty_request *);
 int64_t lume_tty_terminal(struct lume_files *, unsigned);
+bool lume_tty_slave_output(struct lume_files *, unsigned);
 unsigned lume_tasks_tty_session(unsigned);
 unsigned lume_tasks_tty_group(unsigned);
 bool lume_tasks_tty_group_valid(unsigned, unsigned);

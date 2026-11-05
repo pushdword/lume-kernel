@@ -1,6 +1,11 @@
 #include "lume/mmu.h"
 #include "lume/elf.h"
 #include "lume/module_memory.h"
+#include "lume/kernel_memory.h"
+#include "lume/worker.h"
+#include "lume/vm.h"
+#include "lume/abi.h"
+#include "lume/heap.h"
 
 #define PAGE UINT64_C(4096)
 #define BLOCK UINT64_C(0x200000)
@@ -10,6 +15,7 @@
 #define INNER (UINT64_C(3) << 8)
 #define RO (UINT64_C(1) << 7)
 #define USER (UINT64_C(1) << 6)
+#define NG (UINT64_C(1) << 11)
 #define PXN (UINT64_C(1) << 53)
 #define UXN (UINT64_C(1) << 54)
 #define NORMAL (AF | INNER | (UINT64_C(1) << 2))
@@ -17,11 +23,18 @@ static _Alignas(4096) uint64_t root[512], ram_l2[8][512], image_l3[3][512];
 static _Alignas(4096) uint64_t soc_l2[512], rp1_l2[512], pcie_l2[512];
 static _Alignas(4096) uint64_t module_l3[2][512];
 static uint64_t module_first, module_base, module_end;
-#define USER_BLOCKS ((LUME_USER_LIMIT - LUME_USER_BASE) / BLOCK)
-static uint64_t *user_tables[LUME_TASK_LIMIT][USER_BLOCKS];
+static _Alignas(4096) uint64_t top_root[512];
+
+struct user_table
+{
+    uint64_t *entries;
+    struct user_table *next;
+};
+
+static uint64_t *user_root[LUME_TASK_LIMIT][2];
+static unsigned jit_depth[LUME_TASK_LIMIT];
+static struct user_table *owned_tables[LUME_TASK_LIMIT];
 static unsigned shared_user[LUME_TASK_LIMIT];
-static _Alignas(4096) uint64_t user_root[LUME_TASK_LIMIT][512], user_l2[LUME_TASK_LIMIT][512],
-    user_l3[LUME_TASK_LIMIT][512];
 
 static uint64_t table(const uint64_t *p)
 {
@@ -58,9 +71,15 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     zero(pcie_l2, 512);
     zero(&module_l3[0][0], 1024);
     module_first = module_base = module_end = 0;
-    zero(&user_root[0][0], LUME_TASK_LIMIT * 512);
-    zero(&user_l2[0][0], LUME_TASK_LIMIT * 512);
-    zero(&user_l3[0][0], LUME_TASK_LIMIT * 512);
+    zero(top_root, 512);
+    top_root[0] = table(root);
+    for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
+    {
+        user_root[task][0] = user_root[task][1] = 0;
+        jit_depth[task] = 0;
+        owned_tables[task] = 0;
+        shared_user[task] = 0;
+    }
     for (unsigned bank = 0; bank < fdt->ram_count; ++bank)
     {
         if (fdt->ram[bank].base >= RAM_END)
@@ -100,8 +119,8 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     /* GIC, PCIe inbound DMA controls, and inherited RP1 MMIO. */
     root[UINT64_C(0x1000000000) >> 30] = table(pcie_l2);
     pcie_l2[0] = UINT64_C(0x1000000000) | AF | PXN | UXN | 1;
-    pcie_l2[7] = UINT64_C(0x1000e00000) | AF | PXN | UXN | 1; /* BCM2712 SDHCI */
-    pcie_l2[8] = UINT64_C(0x1001000000) | AF | PXN | UXN | 1; /* Separate Wi-Fi SDIO host */
+    pcie_l2[7] = UINT64_C(0x1000e00000) | AF | PXN | UXN | 1;  /* BCM2712 SDHCI */
+    pcie_l2[8] = UINT64_C(0x1001000000) | AF | PXN | UXN | 1;  /* Separate Wi-Fi SDIO host */
     pcie_l2[16] = UINT64_C(0x1002000000) | AF | PXN | UXN | 1; /* V3D hub, core and SMS */
     root[UINT64_C(0x107fff9000) >> 30] = table(soc_l2);
     soc_l2[(UINT64_C(0x107c013880) >> 21) & 511] = UINT64_C(0x107c000000) | AF | PXN | UXN | 1;
@@ -117,54 +136,101 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
 
 uint64_t lume_mmu_root(void)
 {
-    return (uintptr_t)root;
+    return (uintptr_t)top_root;
+}
+
+static unsigned user_owner(unsigned task)
+{
+    return task < LUME_TASK_LIMIT && shared_user[task] ? shared_user[task] - 1 : task;
+}
+
+uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
+{
+    task = user_owner(task);
+    if (task >= LUME_TASK_LIMIT || !user_root[task][writer ? 1 : 0])
+        return 0;
+    return (uintptr_t)user_root[task][writer ? 1 : 0] | ((uint64_t)(writer ? 2 : 1) << 48);
 }
 
 uint64_t lume_mmu_task_root(unsigned task)
 {
-    if (task < LUME_TASK_LIMIT && shared_user[task])
-        task = shared_user[task] - 1;
-    return task < LUME_TASK_LIMIT ? (uintptr_t)user_root[task] : 0;
+    return task < LUME_TASK_LIMIT ? lume_mmu_task_view_root(task, jit_depth[task] != 0) : 0;
+}
+
+bool lume_mmu_root_matches(unsigned task, uint64_t base)
+{
+    task = user_owner(task);
+    base &= ADDRESS;
+    return task < LUME_TASK_LIMIT && base &&
+           (base == (uintptr_t)user_root[task][0] || base == (uintptr_t)user_root[task][1]);
+}
+
+bool lume_mmu_jit_active(unsigned task)
+{
+#ifdef __aarch64__
+    uint64_t base;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(base));
+    return lume_mmu_root_matches(task, base) && (base >> 48) == 2;
+#else
+    (void)task;
+    return false;
+#endif
+}
+
+int lume_mmu_jit_scope(unsigned task, bool writable)
+{
+    if (task >= LUME_TASK_LIMIT || !lume_mmu_task_root(task) ||
+        (writable && jit_depth[task] == UINT32_MAX) || (!writable && !jit_depth[task]))
+        return -LUME_EINVAL;
+    bool before = jit_depth[task] != 0;
+    if (writable)
+        ++jit_depth[task];
+    else
+        --jit_depth[task];
+    if (before != (jit_depth[task] != 0))
+        lume_mmu_switch(lume_mmu_task_root(task));
+    return 0;
+}
+
+void lume_mmu_jit_copy(unsigned target, unsigned source)
+{
+    if (target >= LUME_TASK_LIMIT || source >= LUME_TASK_LIMIT)
+        lume_fail("invalid JIT scope owner");
+    jit_depth[target] = jit_depth[source];
 }
 
 void lume_mmu_share_user(unsigned task, unsigned owner)
 {
+    if (task >= LUME_TASK_LIMIT || owner >= LUME_TASK_LIMIT || task == owner)
+        lume_fail("invalid shared address space");
+    owner = user_owner(owner);
+    if (task == owner)
+        lume_fail("invalid shared address space");
     shared_user[task] = owner + 1;
+    jit_depth[task] = 0;
+}
+
+static void user_flush(void)
+{
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
+#endif
 }
 
 bool lume_mmu_swap_user(unsigned a, unsigned b)
 {
     if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared_user[a] || shared_user[b])
         return false;
-    for (unsigned i = 0; i < 512; ++i)
+    for (unsigned view = 0; view < 2; ++view)
     {
-        uint64_t value = user_root[a][i];
-        user_root[a][i] = user_root[b][i];
-        user_root[b][i] = value;
-        value = user_l2[a][i];
-        user_l2[a][i] = user_l2[b][i];
-        user_l2[b][i] = value;
-        value = user_l3[a][i];
-        user_l3[a][i] = user_l3[b][i];
-        user_l3[b][i] = value;
+        uint64_t *entries = user_root[a][view];
+        user_root[a][view] = user_root[b][view];
+        user_root[b][view] = entries;
     }
-    for (unsigned i = 0; i < USER_BLOCKS; ++i)
-    {
-        uint64_t *value = user_tables[a][i];
-        user_tables[a][i] = user_tables[b][i];
-        user_tables[b][i] = value;
-        if (user_tables[a][i] == user_l3[b])
-            user_tables[a][i] = user_l3[a];
-        if (user_tables[b][i] == user_l3[a])
-            user_tables[b][i] = user_l3[b];
-    }
-    user_root[a][LUME_USER_BASE >> 30] = table(user_l2[a]);
-    user_root[b][LUME_USER_BASE >> 30] = table(user_l2[b]);
-    user_l2[a][0] = table(user_l3[a]);
-    user_l2[b][0] = table(user_l3[b]);
-#ifdef __aarch64__
-    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
-#endif
+    struct user_table *owned = owned_tables[a];
+    owned_tables[a] = owned_tables[b];
+    owned_tables[b] = owned;
+    user_flush();
     return true;
 }
 
@@ -172,42 +238,129 @@ void lume_mmu_release_user(unsigned task)
 {
     if (task >= LUME_TASK_LIMIT)
         return;
+    jit_depth[task] = 0;
     if (shared_user[task])
     {
         shared_user[task] = 0;
         return;
     }
-    if (user_root[task][LUME_USER_BASE >> 30])
+    bool detached = false;
+    for (unsigned view = 0; view < 2; ++view)
+        if (user_root[task][view])
+        {
+            zero(user_root[task][view], 512);
+            user_root[task][view] = 0;
+            detached = true;
+        }
+    if (detached)
+        user_flush();
+    unsigned released = 0;
+    while (owned_tables[task])
     {
-        user_root[task][LUME_USER_BASE >> 30] = 0;
-#ifdef __aarch64__
-        __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
-#endif
-    }
-    for (unsigned block = 0; block < USER_BLOCKS; ++block)
-    {
-        uint64_t *p = user_tables[task][block];
-        if (p && p != user_l3[task] && !lume_page_free((uintptr_t)p))
+        struct user_table *node = owned_tables[task];
+        owned_tables[task] = node->next;
+        if (!lume_page_free((uintptr_t)node->entries))
             lume_fail("user page table release");
-        user_tables[task][block] = 0;
+        lume_kernel_free(node);
+        if (++released % 16 == 0)
+            lume_worker_checkpoint(65536);
     }
-    zero(user_l2[task], 512);
-    zero(user_root[task], 512);
 }
 
-static uint64_t *user_entry(unsigned task, uint64_t va, bool create)
+static uint64_t *user_allocate(unsigned task)
 {
-    unsigned block = (unsigned)((va - LUME_USER_BASE) / BLOCK);
-    uint64_t *p = user_tables[task][block];
-    if (!p && create)
+    struct user_table *node = lume_kernel_allocate(sizeof(*node));
+    if (!node)
+        return 0;
+    node->entries = (void *)(uintptr_t)lume_page_alloc(0);
+    if (!node->entries)
     {
-        p = (void *)(uintptr_t)lume_page_alloc(0);
-        if (!p)
-            return 0;
-        user_tables[task][block] = p;
-        user_l2[task][block] = table(p);
+        lume_kernel_free(node);
+        return 0;
     }
-    return p ? &p[(va >> 12) & 511] : 0;
+    node->next = owned_tables[task];
+    owned_tables[task] = node;
+    return node->entries;
+}
+
+static void detach_empty(unsigned task, unsigned view, uint64_t va, struct user_table **retired)
+{
+    task = user_owner(task);
+    if (task >= LUME_TASK_LIMIT || !user_root[task][view])
+        return;
+    uint64_t *entries = user_root[task][view], *parents[3], *children[3];
+    const unsigned shifts[] = {39, 30, 21};
+    unsigned depth = 0;
+    for (; depth < 3; ++depth)
+    {
+        parents[depth] = entries + ((va >> shifts[depth]) & 511);
+        if ((*parents[depth] & 3) != 3)
+            break;
+        children[depth] = (void *)(uintptr_t)(*parents[depth] & ADDRESS);
+        entries = children[depth];
+    }
+    while (depth)
+    {
+        --depth;
+        bool empty = true;
+        for (unsigned i = 0; i < 512; ++i)
+            empty &= children[depth][i] == 0;
+        if (!empty)
+            break;
+        struct user_table **position = &owned_tables[task];
+        while (*position && (*position)->entries != children[depth])
+            position = &(*position)->next;
+        if (!*position)
+            break;
+        struct user_table *node = *position;
+        *position = node->next;
+        *parents[depth] = 0;
+        node->next = *retired;
+        *retired = node;
+    }
+}
+
+static void free_tables(struct user_table *retired)
+{
+    while (retired)
+    {
+        struct user_table *node = retired;
+        retired = node->next;
+        if (!lume_page_free((uintptr_t)node->entries))
+            lume_fail("user page table release");
+        lume_kernel_free(node);
+    }
+}
+
+static bool user_address(uint64_t va)
+{
+    return (va >= LUME_USER_BASE && va < LUME_USER_LIMIT) ||
+           (va >= LUME_HEAP_EXTENDED_BASE && va < LUME_HEAP_EXTENDED_LIMIT) ||
+           (va >= LUME_LARGE_ELF_BASE && va < LUME_LARGE_ELF_LIMIT) || lume_vm_address(va);
+}
+
+static uint64_t *user_entry(unsigned task, unsigned view, uint64_t va, bool create)
+{
+    task = user_owner(task);
+    if (task >= LUME_TASK_LIMIT || !user_address(va) || !user_root[task][view])
+        return 0;
+    uint64_t *entries = user_root[task][view];
+    const unsigned shifts[] = {39, 30, 21};
+    for (unsigned level = 0; level < 3; ++level)
+    {
+        uint64_t *entry = entries + ((va >> shifts[level]) & 511);
+        if (!*entry && create)
+        {
+            uint64_t *next = user_allocate(task);
+            if (!next)
+                return 0;
+            *entry = table(next);
+        }
+        if ((*entry & 3) != 3)
+            return 0;
+        entries = (void *)(uintptr_t)(*entry & ADDRESS);
+    }
+    return entries + ((va >> 12) & 511);
 }
 
 bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack)
@@ -218,64 +371,115 @@ bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack)
         if (!stack[i] || (stack[i] & 4095))
             return false;
     lume_mmu_release_user(task);
-    for (unsigned i = 0; i < 512; ++i)
-        user_root[task][i] = root[i];
-    for (unsigned i = 0; i < 512; ++i)
-        user_l2[task][i] = ram_l2[LUME_USER_BASE >> 30][i];
-    for (unsigned i = 0; i < USER_BLOCKS; ++i)
-        user_l2[task][i] = 0;
-    zero(user_l3[task], 512);
-    user_root[task][LUME_USER_BASE >> 30] = table(user_l2[task]);
-    user_tables[task][0] = user_l3[task];
-    user_l2[task][0] = table(user_l3[task]);
-    user_l3[task][0] = (uintptr_t)__user_code_start | NORMAL | USER | RO | PXN | 3;
-    user_l3[task][16] = data | NORMAL | USER | PXN | UXN | 3;
+    for (unsigned view = 0; view < 2; ++view)
+    {
+        uint64_t *l0 = user_allocate(task), *l1 = user_allocate(task), *l2 = user_allocate(task);
+        if (!l0 || !l1 || !l2)
+            goto fail;
+        for (unsigned i = 0; i < 512; ++i)
+        {
+            l0[i] = top_root[i];
+            l1[i] = root[i];
+            l2[i] = ram_l2[LUME_USER_BASE >> 30][i];
+        }
+        for (unsigned i = 0; i < (LUME_USER_LIMIT - LUME_USER_BASE) / BLOCK; ++i)
+            l2[i] = 0;
+        l0[0] = table(l1);
+        l1[LUME_USER_BASE >> 30] = table(l2);
+        user_root[task][view] = l0;
+        uint64_t *code = user_entry(task, view, LUME_USER_BASE, true);
+        uint64_t *user_data = user_entry(task, view, LUME_USER_DATA, true);
+        if (!code || !user_data)
+            goto fail;
+        *code = (uintptr_t)__user_code_start | NORMAL | USER | NG | RO | PXN | 3;
+        *user_data = data | NORMAL | USER | NG | PXN | UXN | 3;
+    }
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
         if (!lume_mmu_map_user(task, LUME_USER_STACK + (uint64_t)i * 4096, stack[i], true, false))
-        {
-            lume_mmu_release_user(task);
-            return false;
-        }
+            goto fail;
+    return true;
+fail:
+    lume_mmu_release_user(task);
+    return false;
+}
+
+static bool map_user_views(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute,
+                           bool jit)
+{
+    if (task >= LUME_TASK_LIMIT || !user_address(va) || va < LUME_ELF_BASE || !pa ||
+        pa >= RAM_END || ((va | pa) & 4095) || (write && execute && !jit))
+        return false;
+    uint64_t *entries[2];
+    entries[0] = user_entry(task, 0, va, true);
+    entries[1] = user_entry(task, 1, va, true);
+    if (!entries[0] || !entries[1])
+    {
+        struct user_table *retired = 0;
+        for (unsigned view = 0; view < 2; ++view)
+            detach_empty(task, view, va, &retired);
+        if (retired)
+            user_flush();
+        free_tables(retired);
+        return false;
+    }
+    if (*entries[0] || *entries[1])
+        return false;
+    for (unsigned view = 0; view < 2; ++view)
+    {
+        bool writable = write && (!jit || !execute || view == 1);
+        bool executable = execute && (!jit || view == 0);
+        *entries[view] =
+            pa | NORMAL | USER | NG | PXN | 3 | (writable ? 0 : RO) | (executable ? 0 : UXN);
+    }
+#ifdef __aarch64__
+    __asm__ volatile("dsb ishst; isb" ::: "memory");
+#endif
     return true;
 }
 
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute)
 {
-    if (task >= LUME_TASK_LIMIT || va < LUME_ELF_BASE || va >= LUME_USER_LIMIT || !pa ||
-        pa >= RAM_END || ((va | pa) & 4095) || (write && execute))
-        return false;
-    uint64_t *entry = user_entry(task, va, true);
-    if (!entry || *entry)
-        return false;
-    *entry = pa | NORMAL | USER | PXN | 3 | (write ? 0 : RO) | (execute ? 0 : UXN);
-#ifdef __aarch64__
-    __asm__ volatile("dsb ishst" ::: "memory");
-#endif
-    return true;
+    return map_user_views(task, va, pa, write, execute, false);
+}
+
+bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute)
+{
+    return map_user_views(task, va, pa, write, execute, true);
 }
 
 bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
 {
     if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
         return false;
-    uint64_t *entries[LUME_MMU_BATCH_PAGES];
+    uint64_t *entries[LUME_MMU_BATCH_PAGES][2];
     for (unsigned i = 0; i < count; ++i)
     {
-        uint64_t va = addresses[i];
-        if (va < LUME_USER_BASE || va >= LUME_USER_LIMIT || (va & 4095))
+        if (!user_address(addresses[i]) || (addresses[i] & 4095))
             return false;
-        entries[i] = user_entry(task, va, false);
-        if (!entries[i] || !(*entries[i] & 1))
-            return false;
+        for (unsigned view = 0; view < 2; ++view)
+        {
+            entries[i][view] = user_entry(task, view, addresses[i], false);
+            if (!entries[i][view] || !(*entries[i][view] & 1))
+                return false;
+        }
     }
     for (unsigned i = 0; i < count; ++i)
-        *entries[i] = 0;
+        for (unsigned view = 0; view < 2; ++view)
+            *entries[i][view] = 0;
+    struct user_table *retired = 0;
+    for (unsigned i = 0; i < count; ++i)
+        for (unsigned view = 0; view < 2; ++view)
+            detach_empty(task, view, addresses[i], &retired);
 #ifdef __aarch64__
     __asm__ volatile("dsb ishst" ::: "memory");
-    for (unsigned i = 0; i < count; ++i)
-        __asm__ volatile("tlbi vaae1is, %0" ::"r"(addresses[i] >> 12) : "memory");
+    if (retired)
+        __asm__ volatile("tlbi vmalle1is" ::: "memory");
+    else
+        for (unsigned i = 0; i < count; ++i)
+            __asm__ volatile("tlbi vaae1is, %0" ::"r"(addresses[i] >> 12) : "memory");
     __asm__ volatile("dsb ish; isb" ::: "memory");
 #endif
+    free_tables(retired);
     return true;
 }
 
@@ -287,21 +491,21 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
 bool lume_mmu_translate(uint64_t base, uint64_t va, bool write, bool user, bool execute,
                         uint64_t *physical)
 {
-    if (va >= (UINT64_C(1) << 39))
+    if (!base || va >= (UINT64_C(1) << 48))
         return false;
-    uint64_t *p = (void *)(uintptr_t)base;
-    unsigned shifts[] = {30, 21, 12};
-    for (unsigned level = 0; level < 3; ++level)
+    uint64_t *p = (void *)(uintptr_t)(base & ADDRESS);
+    unsigned shifts[] = {39, 30, 21, 12};
+    for (unsigned level = 0; level < 4; ++level)
     {
         uint64_t d = p[(va >> shifts[level]) & 511];
         if (!(d & 1))
             return false;
-        if (level != 2 && (d & 3) == 3)
+        if (level != 3 && (d & 3) == 3)
         {
             p = (void *)(uintptr_t)(d & ADDRESS);
             continue;
         }
-        if (level == 2 && (d & 3) != 3)
+        if ((level == 0) || (level == 3 && (d & 3) != 3))
             return false;
         if ((write && (d & RO)) || (user && !(d & USER)) || (execute && (d & (user ? UXN : PXN))))
             return false;
@@ -367,7 +571,7 @@ bool lume_mmu_module_prepare(uint64_t physical, size_t bytes)
         physical >= RAM_END || bytes > RAM_END - physical || bytes > BLOCK)
         return false;
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
-        if (user_root[task][0])
+        if (user_root[task][0] || user_root[task][1])
             return false;
     uint64_t first = physical & ~(BLOCK - 1);
     uint64_t end = (physical + bytes + BLOCK - 1) & ~(BLOCK - 1);

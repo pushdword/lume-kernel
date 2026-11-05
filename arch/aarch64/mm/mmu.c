@@ -1,5 +1,6 @@
 #include "lume/mmu.h"
 #include "lume/smp.h"
+#include "lume/vm.h"
 #define ADDRESS UINT64_C(0x0000fffffffff000)
 
 void lume_sync_code_defer(uint64_t address, size_t bytes)
@@ -39,7 +40,8 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
     while (pointer < end)
     {
         uint64_t physical;
-        if (!lume_mmu_translate(base, pointer, write, true, false, &physical))
+        if (!lume_mmu_translate(base, pointer, write, true, false, &physical) &&
+            !lume_vm_resolve_buffer(base, pointer, write))
             return false;
         uint64_t next = (pointer & ~UINT64_C(4095)) + 4096;
         if (next <= pointer)
@@ -49,8 +51,17 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
     return true;
 }
 
+bool lume_mmu_root_active(uint64_t base)
+{
+    uint64_t current;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(current));
+    return current == base;
+}
+
 void lume_mmu_switch(uint64_t base)
 {
+    /* Shared ASIDs distinguish views. Every root switch invalidates local translations. */
+    base &= ~UINT64_C(1);
     __asm__ volatile("dsb ish; msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb ish; isb" ::"r"(base)
                      : "memory");
 }
@@ -72,8 +83,8 @@ bool lume_mmu_start(const struct lume_fdt *fdt)
 void lume_mmu_secondary(void)
 {
     uint64_t mair = 0xff00;
-    /* 39-bit VA, 4 KiB, inner shareable WB walks, TTBR1 disabled, 40-bit PA. */
-    uint64_t tcr = 25 | (UINT64_C(1) << 8) | (UINT64_C(1) << 10) | (UINT64_C(3) << 12) |
+    /* 48-bit VA, 4 KiB, inner shareable WB walks, TTBR1 disabled, 40-bit PA. */
+    uint64_t tcr = 16 | (UINT64_C(1) << 8) | (UINT64_C(1) << 10) | (UINT64_C(3) << 12) |
                    (UINT64_C(25) << 16) | (UINT64_C(1) << 23) | (UINT64_C(2) << 30) |
                    (UINT64_C(2) << 32);
     uint64_t sctlr, base = lume_mmu_root();

@@ -3,6 +3,7 @@
 #include "lume/net.h"
 #include "lume/boot_storage.h"
 #include "lume/heap.h"
+#include "lume/vm.h"
 #include "lume/device.h"
 #include "lume/boot.h"
 #include "lume/smp.h"
@@ -21,9 +22,34 @@
 #include "lume/platform_driver.h"
 #include "lume/realtime.h"
 #include "lume/gpu_device.h"
+#include "lume/file_io_call.h"
+#include "lume/files_call.h"
+#include "lume/vfs_paths.h"
+#include "lume/sandbox_policy.h"
+#include "lume/worker.h"
+#include "lume/work.h"
+#include "lume/io_redirect.h"
 #include <string.h>
+#include "process_file_lock.h"
 
 static struct lume_realtime realtime;
+
+int lume_clock_realtime_ms(uint64_t monotonic, uint64_t *out)
+{
+    if (!out)
+        return -LUME_EINVAL;
+    if (!realtime.valid)
+        return -LUME_EAGAIN;
+    uint64_t seconds;
+    uint32_t nanoseconds;
+    if (!lume_realtime_read(&realtime, monotonic, &seconds, &nanoseconds))
+        return -LUME_EOVERFLOW;
+    uint64_t fraction = nanoseconds / 1000000u;
+    if (seconds > (UINT64_MAX - fraction) / 1000u)
+        return -LUME_EOVERFLOW;
+    *out = seconds * 1000u + fraction;
+    return 0;
+}
 
 extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
 
@@ -42,6 +68,9 @@ static int string(uint64_t p, char out[LUME_PATH_MAX])
 
 int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsigned pid)
 {
+    int permission = lume_sandbox_check(files, pid, c);
+    if (permission)
+        return permission;
     uint64_t a = LUME_CONTEXT_REG(c, 0), b = LUME_CONTEXT_REG(c, 1), n = LUME_CONTEXT_REG(c, 2);
     char p[LUME_PATH_MAX];
     int r;
@@ -81,6 +110,10 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         r = a == LUME_FILE_MODE_FD ? 0 : string(request.path, p);
         return r ? r : lume_vfs_file_mode(files, (unsigned)a, &request, p);
     }
+    case LUME_SYS_FILE_IO:
+        return process_file_io_call(files, pid, a, b, n);
+    case LUME_SYS_FILES:
+        return lume_files_call(files, a, b, n);
     case LUME_SYS_RANDOM:
     {
         if (n || b > 256)
@@ -108,6 +141,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return a == 2 ? LUME_SCHED_QUANTUM : a ? lume_cpu_index() : lume_cpu_count();
     case LUME_SYS_CAP_DROP:
         return b || n ? -LUME_EINVAL : lume_task_drop_capabilities(pid, a);
+    case LUME_SYS_SANDBOX:
+        return lume_sandbox_call(files, pid, a, b, n);
     case LUME_SYS_FEATURES:
     {
         if (b != sizeof(struct lume_system_features) || n != LUME_FEATURE_VERSION)
@@ -200,7 +235,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return result;
     }
     case LUME_SYS_BRK:
-        return lume_heap_brk(pid, a);
+        return n ? -LUME_EINVAL : lume_heap_brk_flags(pid, a, b);
     case LUME_SYS_TERMINAL:
     {
         int64_t terminal = lume_tty_terminal(files, (unsigned)a);
@@ -225,14 +260,10 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         }
         if (a == 5 && b <= 1000)
         {
-            uint32_t start = lume_clock_millis();
-            do
-            {
-                if (lume_console_ready())
-                    return 0;
-                lume_net_poll();
-            } while ((uint32_t)(lume_clock_millis() - start) < b);
-            return -LUME_EAGAIN;
+            if (lume_console_ready())
+                return 0;
+            /* Timed console waits are parked by the task dispatcher. */
+            return b ? -LUME_ENOSYS : -LUME_EAGAIN;
         }
         return -LUME_EINVAL;
     }
@@ -293,6 +324,18 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         *(struct lume_tty_request *)(uintptr_t)b = request;
         return result;
     }
+    case LUME_SYS_VM:
+    {
+        if (a > LUME_VM_SYNC || n != sizeof(struct lume_vm_request))
+            return -LUME_EINVAL;
+        if (!lume_user_buffer(b, n, false) || (a == LUME_VM_INFO && !lume_user_buffer(b, n, true)))
+            return -LUME_EFAULT;
+        struct lume_vm_request request = *(const struct lume_vm_request *)(uintptr_t)b;
+        int64_t result = lume_vm_call(files, pid, (unsigned)a, &request);
+        if (a == LUME_VM_INFO)
+            *(struct lume_vm_request *)(uintptr_t)b = request;
+        return result;
+    }
     case LUME_SYS_MEMORY:
         if (b != sizeof(struct lume_memory_snapshot))
             return -LUME_EINVAL;
@@ -306,6 +349,15 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         if (!lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
         return lume_task_info((unsigned)a, (void *)(uintptr_t)b);
+    case LUME_SYS_EXEPATH:
+    {
+        if (a > LUME_TASK_LIMIT || !n)
+            return -LUME_EINVAL;
+        size_t capacity = n > LUME_PATH_MAX ? LUME_PATH_MAX : (size_t)n;
+        if (!lume_user_buffer(b, capacity, true))
+            return -LUME_EFAULT;
+        return lume_task_executable(a ? (unsigned)a : pid, (void *)(uintptr_t)b, capacity);
+    }
     case LUME_SYS_TELEMETRY:
         if (n >= LUME_ACTIVITY_READ && n <= LUME_ACTIVITY_STOP)
         {
@@ -403,6 +455,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         int result = lume_realtime_control(&realtime, (unsigned)a, &request, lume_clock_monotonic(),
                                            !files->identity.euid &&
                                                lume_task_capable(pid, LUME_CAP_CLOCK_ADMIN));
+        if (!result && a == LUME_REALTIME_SET)
+            lume_smp_wake();
         if (!result && a == LUME_REALTIME_GET)
             memcpy((void *)(uintptr_t)b, &request, sizeof(request));
         return result;
@@ -475,9 +529,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         r = string(a, p);
         return r ? r : lume_vfs_chdir(files, p);
     case LUME_SYS_CLOSE:
-        return lume_vfs_close(files, a);
+        return lume_vfs_process_close(files, a, pid);
     case LUME_SYS_DUP2:
-        return lume_vfs_dup2(files, a, b);
+        return lume_vfs_process_dup2(files, a, b, pid);
     case LUME_SYS_FD:
     {
         if (n != sizeof(struct lume_fd_request) || a > LUME_FD_PATH)
@@ -497,18 +551,58 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             (!lume_user_buffer(request.buffer, request.count * sizeof(struct lume_pollfd), false) ||
              !lume_user_buffer(request.buffer, request.count * sizeof(struct lume_pollfd), true)))
             return -LUME_EFAULT;
-        int64_t result = lume_vfs_fd_call(files, (unsigned)a, &request);
+        int64_t result = lume_vfs_process_fd_call(files, (unsigned)a, &request, pid);
         *(struct lume_fd_request *)(uintptr_t)b = request;
         return result;
     }
     case LUME_SYS_SOCKET:
     {
-        if (a > LUME_SOCKET_CREDENTIALS || n != sizeof(struct lume_socket_request))
+        if (a > LUME_SOCKET_RECVFROM || n != sizeof(struct lume_socket_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
         struct lume_socket_request request = *(const struct lume_socket_request *)(uintptr_t)b;
-        if (request.count > LUME_FILE_IO_MAX)
+        if (a == LUME_SOCKET_SEND_MESSAGE || a == LUME_SOCKET_RECEIVE_MESSAGE)
+        {
+            int permission = lume_sandbox_socket(files, (unsigned)a, &request, NULL);
+            if (permission)
+                return permission;
+            if (request.version != LUME_SOCKET_VERSION || request.bytes != sizeof(request) ||
+                request.other || request.family || request.type || request.flags || request.port ||
+                request.address[0] || request.address[1] || request.address[2] ||
+                request.address[3] || request.reserved || request.reserved2 ||
+                request.count != sizeof(struct lume_socket_message))
+                return -LUME_EINVAL;
+            if (lume_socket_network_io(files, (unsigned)request.fd) &&
+                lume_worker_current() != LUME_WORK_NETWORK)
+                return LUME_IO_RETRY_NETWORK;
+            if (!lume_user_buffer(request.buffer, sizeof(struct lume_socket_message), false) ||
+                !lume_user_buffer(request.buffer, sizeof(struct lume_socket_message), true))
+                return -LUME_EFAULT;
+            struct lume_socket_message message =
+                *(const struct lume_socket_message *)(uintptr_t)request.buffer;
+            if (message.count > LUME_FILE_IO_MAX)
+                return -LUME_EINVAL;
+            if (message.count &&
+                !lume_user_buffer(message.buffer, message.count, a == LUME_SOCKET_RECEIVE_MESSAGE))
+                return -LUME_EFAULT;
+            int64_t result = lume_socket_message_call_metadata(files, (unsigned)a, request.fd,
+                                                               &message, &request);
+            *(struct lume_socket_message *)(uintptr_t)request.buffer = message;
+            *(struct lume_socket_request *)(uintptr_t)b = request;
+            return result;
+        }
+        if (a == LUME_SOCKET_SENDTO || a == LUME_SOCKET_RECVFROM)
+        {
+            if (a == LUME_SOCKET_SENDTO && request.count > LUME_SOCKET_DATAGRAM_MAX)
+                return -LUME_EMSGSIZE;
+            if (request.count > LUME_SOCKET_DATAGRAM_MAX)
+                request.count = LUME_SOCKET_DATAGRAM_MAX;
+            if (request.count &&
+                !lume_user_buffer(request.buffer, request.count, a == LUME_SOCKET_RECVFROM))
+                return -LUME_EFAULT;
+        }
+        if (a != LUME_SOCKET_OPTION && request.count > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
         if (request.family == 1 && (a == LUME_SOCKET_BIND || a == LUME_SOCKET_CONNECT ||
                                     a == LUME_SOCKET_LOCAL || a == LUME_SOCKET_PEER))
@@ -530,7 +624,35 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             if (!lume_user_buffer(request.buffer, request.count, true))
                 return -LUME_EFAULT;
         }
+        char socket_path[LUME_PATH_MAX];
+        uint64_t original_buffer = request.buffer;
+        bool input_path =
+            request.family == 1 && (a == LUME_SOCKET_BIND || a == LUME_SOCKET_CONNECT);
+        if (input_path)
+        {
+            if (request.count < 2)
+                return -LUME_EINVAL;
+            memcpy(socket_path, (const void *)(uintptr_t)request.buffer, request.count);
+            if (socket_path[request.count - 1] || memchr(socket_path, 0, request.count - 1))
+                return -LUME_EINVAL;
+            request.buffer = (uintptr_t)socket_path;
+        }
+        int permission =
+            lume_sandbox_socket(files, (unsigned)a, &request, input_path ? socket_path : NULL);
+        if (permission)
+            return permission;
+        if (a == LUME_SOCKET_SHUTDOWN)
+        {
+            if (request.version != LUME_SOCKET_VERSION || request.bytes != sizeof(request) ||
+                request.reserved || request.reserved2 ||
+                (request.flags & ~(LUME_FD_CLOEXEC | LUME_FD_NONBLOCK)))
+                return -LUME_EINVAL;
+            if (lume_socket_network_io(files, (unsigned)request.fd) &&
+                lume_worker_current() != LUME_WORK_NETWORK)
+                return LUME_IO_RETRY_NETWORK;
+        }
         int64_t result = lume_socket_call(files, (unsigned)a, &request);
+        request.buffer = original_buffer;
         *(struct lume_socket_request *)(uintptr_t)b = request;
         return result;
     }
@@ -552,16 +674,21 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_stat(files, a, (void *)(uintptr_t)b);
     case LUME_SYS_GETCWD:
     {
+        const char *cwd = lume_files_cwd(files);
+        if (!cwd)
+            return -LUME_ENOENT;
         size_t bytes = 0;
-        while (files->cwd[bytes])
+        while (cwd[bytes])
             ++bytes;
         ++bytes;
+        if (bytes > LUME_PATH_MAX)
+            return -LUME_ENAMETOOLONG;
         if (b < bytes)
             return -LUME_EINVAL;
         if (!lume_user_buffer(a, bytes, true))
             return -LUME_EFAULT;
         for (size_t i = 0; i < bytes; ++i)
-            ((char *)(uintptr_t)a)[i] = files->cwd[i];
+            ((char *)(uintptr_t)a)[i] = cwd[i];
         return (int64_t)bytes;
     }
     case LUME_SYS_READ:

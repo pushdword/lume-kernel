@@ -41,6 +41,29 @@ bool lume_stream_busy(void)
     return active_stream;
 }
 
+bool lume_datagram_busy(void)
+{
+    return false;
+}
+
+bool lume_datagram_reap_pending(void)
+{
+    return false;
+}
+
+bool lume_socket_reap_pending(void)
+{
+    return false;
+}
+
+void lume_socket_reap(void)
+{
+}
+
+void lume_datagram_reap(void)
+{
+}
+
 bool lume_stream_needs_poll(void)
 {
     return active_stream;

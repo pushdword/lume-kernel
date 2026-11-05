@@ -1,4 +1,5 @@
 #include "lume/wireless.h"
+#include "lume/net.h"
 #include <string.h>
 
 struct radio
@@ -284,6 +285,18 @@ int lume_wireless_scan_cancel(unsigned owner, uint32_t n)
     return 0;
 }
 
+static void disconnect_owned(struct radio *r)
+{
+    lume_net_release(r->ifindex);
+    r->pending = false;
+    r->ops.disconnect(r->context);
+    r->state.ssid_bytes = 0;
+    memset(r->state.ssid, 0, sizeof(r->state.ssid));
+    memset(r->state.bssid, 0, 6);
+    state(r, up(r) ? LUME_WIFI_DISCONNECTED : LUME_WIFI_DOWN, 0);
+    lume_netif_sync(lume_netif_find(r->ifindex));
+}
+
 int lume_wireless_disconnect(uint32_t n)
 {
     struct radio *r = find(n);
@@ -292,14 +305,8 @@ int lume_wireless_disconnect(uint32_t n)
     if (r->busy)
         return -LUME_EBUSY;
     r->busy = true;
-    r->pending = false;
-    r->ops.disconnect(r->context);
+    disconnect_owned(r);
     r->busy = false;
-    r->state.ssid_bytes = 0;
-    memset(r->state.ssid, 0, sizeof(r->state.ssid));
-    memset(r->state.bssid, 0, 6);
-    state(r, up(r) ? LUME_WIFI_DISCONNECTED : LUME_WIFI_DOWN, 0);
-    lume_netif_sync(lume_netif_find(n));
     return 0;
 }
 
@@ -317,8 +324,8 @@ int lume_wireless_connect(uint32_t n, const struct lume_wifi_connect *request)
         return -LUME_EBUSY;
     if (!up(r))
         return -LUME_EPERM;
-    (void)lume_wireless_disconnect(n);
     r->busy = true;
+    disconnect_owned(r);
     state(r, LUME_WIFI_CONNECTING, 0);
     bool ok = r->ops.connect(r->context, request->ssid, request->ssid_bytes, request->key,
                              request->key_bytes);
@@ -357,8 +364,8 @@ int lume_wireless_connect_begin(uint32_t n, const struct lume_wifi_connect *requ
         return -LUME_EBUSY;
     if (!up(r))
         return -LUME_EPERM;
-    (void)lume_wireless_disconnect(n);
     r->busy = true;
+    disconnect_owned(r);
     state(r, LUME_WIFI_CONNECTING, 0);
     bool ok = r->ops.connect_begin(r->context, request->ssid, request->ssid_bytes, request->key,
                                    request->key_bytes);

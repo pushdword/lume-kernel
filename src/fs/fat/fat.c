@@ -1,6 +1,7 @@
 /* Read-only FAT32 volume, independent of its block transport. Initial medium
  * is a firmware-loaded RAM disk. No writes to the Pi OS partitions occur. */
 #include "lume/fat.h"
+#include "lume/files.h"
 
 static uint32_t u16(const unsigned char *p)
 {
@@ -147,13 +148,46 @@ int lume_fat_read(const struct lume_fat *f, struct lume_fat_file file, uint64_t 
     return lume_fat_read_cursor(f, file, offset, out, bytes, 0);
 }
 
-static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned length,
-                 unsigned depth, lume_fat_visit visit, void *context)
+static int long_name_utf8(const uint16_t *input, char output[LUME_FILES_NAME_MAX + 1])
+{
+    unsigned used = 0;
+    for (unsigned i = 0; i < 255 && input[i]; ++i)
+    {
+        uint32_t value = input[i];
+        if (value >= 0xd800 && value <= 0xdbff)
+        {
+            if (++i == 255 || input[i] < 0xdc00 || input[i] > 0xdfff)
+                return -1;
+            value = 0x10000 + ((value - 0xd800) << 10) + input[i] - 0xdc00;
+        }
+        else if (value >= 0xdc00 && value <= 0xdfff)
+            return -1;
+        unsigned count = value < 0x80 ? 1 : value < 0x800 ? 2 : value < 0x10000 ? 3 : 4;
+        if (count > LUME_FILES_NAME_MAX - used)
+            return -1;
+        if (count == 1)
+            output[used++] = (char)value;
+        else
+        {
+            output[used++] = (char)((count == 2   ? 0xc0
+                                     : count == 3 ? 0xe0
+                                                  : 0xf0) |
+                                    (value >> ((count - 1) * 6)));
+            while (--count)
+                output[used++] = (char)(0x80 | ((value >> ((count - 1) * 6)) & 0x3f));
+        }
+    }
+    output[used] = 0;
+    return (int)used;
+}
+
+static bool walk(const struct lume_fat *f, uint32_t c, char path[LUME_FILES_PATH_MAX],
+                 unsigned length, unsigned depth, lume_fat_visit visit, void *context)
 {
     if (depth > 8)
         return false;
     uint32_t slow = c, fast = c;
-    char long_name[256] = {0};
+    uint16_t long_name[256] = {0};
     unsigned sequence = 0, checksum = 0;
     for (uint32_t hops = 0; hops < f->clusters; ++hops)
     {
@@ -175,7 +209,7 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
                 unsigned ordinal = e[0] & 31;
                 if (e[0] & 0x40)
                 {
-                    for (unsigned k = 0; k < sizeof(long_name); ++k)
+                    for (unsigned k = 0; k < sizeof(long_name) / sizeof(long_name[0]); ++k)
                         long_name[k] = 0;
                     sequence = ordinal;
                     checksum = e[13];
@@ -193,9 +227,9 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
                 {
                     unsigned index = (ordinal - 1) * 13 + k;
                     unsigned character = u16(e + offsets[k]);
-                    if (index < 255 && character >= 32 && character < 127 && character != '/' &&
-                        character != '\\')
-                        long_name[index] = (char)character;
+                    if (index < 255 && character >= 32 && character != 127 && character != 0xffff &&
+                        character != '/' && character != '\\')
+                        long_name[index] = (uint16_t)character;
                     else if (character && character != 0xffff)
                     {
                         sequence = 0;
@@ -217,32 +251,40 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
                 long_name[0] = 0;
                 continue;
             }
-            unsigned n = length;
-            if (n && n < 126)
-                path[n++] = '/';
-            for (unsigned k = 0; k < (use_long ? 255u : 11u); ++k)
+            char name[LUME_FILES_NAME_MAX + 1];
+            unsigned name_bytes = 0;
+            if (use_long)
             {
-                if (use_long)
-                {
-                    if (!long_name[k])
-                        break;
-                    if (n >= 126)
-                        return false;
-                    path[n++] = long_name[k];
-                    continue;
-                }
-                if (e[k] == ' ')
-                    continue;
-                if (k == 8)
-                {
-                    if (n >= 126)
-                        return false;
-                    path[n++] = '.';
-                }
-                if (n >= 126 || e[k] < 33 || e[k] >= 127 || e[k] == '/' || e[k] == '\\')
+                int bytes = long_name_utf8(long_name, name);
+                if (bytes <= 0)
                     return false;
-                path[n++] = e[k] >= 'A' && e[k] <= 'Z' ? (char)(e[k] + 32) : (char)e[k];
+                name_bytes = (unsigned)bytes;
             }
+            else
+            {
+                for (unsigned k = 0; k < 11; ++k)
+                {
+                    if (e[k] == ' ')
+                        continue;
+                    if (k == 8)
+                        name[name_bytes++] = '.';
+                    unsigned character = e[k];
+                    if (character < 33 || character >= 127 || character == '/' || character == '\\')
+                        return false;
+                    bool lower = e[12] & (k < 8 ? 0x08 : 0x10);
+                    if (lower && character >= 'A' && character <= 'Z')
+                        character += 'a' - 'A';
+                    name[name_bytes++] = (char)character;
+                }
+                name[name_bytes] = 0;
+            }
+            unsigned n = length;
+            if (n + (n != 0) + name_bytes >= LUME_FILES_PATH_MAX - 1)
+                return false;
+            if (n)
+                path[n++] = '/';
+            for (unsigned k = 0; k < name_bytes; ++k)
+                path[n++] = name[k];
             long_name[0] = 0;
             path[n] = 0;
             if (n == length)
@@ -276,6 +318,6 @@ static bool walk(const struct lume_fat *f, uint32_t c, char path[128], unsigned 
 
 bool lume_fat_walk(const struct lume_fat *f, lume_fat_visit visit, void *context)
 {
-    char path[128] = "";
+    char path[LUME_FILES_PATH_MAX] = "";
     return f->data && walk(f, f->root, path, 0, 0, visit, context);
 }

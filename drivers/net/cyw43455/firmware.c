@@ -382,8 +382,8 @@ static void settle_data(void)
     data_in_flight = false;
 }
 
-static int control(uint32_t op, bool set, const void *input, size_t bytes, void *output, size_t cap,
-                   size_t *got)
+static int control_attempt(uint32_t op, bool set, const void *input, size_t bytes, void *output,
+                           size_t cap, size_t *got, bool *attempted)
 {
     settle_data();
     if (request_id == UINT16_MAX)
@@ -395,6 +395,8 @@ static int control(uint32_t op, bool set, const void *input, size_t bytes, void 
                                              set ? 0 : cap);
     if (!count)
         return -1;
+    if (attempted)
+        *attempted = true;
     if (!fifo(true, tx, count))
         return -1;
     ++tx_sequence;
@@ -439,6 +441,12 @@ static int control(uint32_t op, bool set, const void *input, size_t bytes, void 
     }
     lume_value("WIFI_FW_TIMEOUT_COMMAND", op);
     return -1;
+}
+
+static int control(uint32_t op, bool set, const void *input, size_t bytes, void *output, size_t cap,
+                   size_t *got)
+{
+    return control_attempt(op, set, input, bytes, output, cap, got, 0);
 }
 
 static int get_variable(const char *name, void *out, size_t cap, size_t *got)
@@ -683,8 +691,7 @@ static bool firmware_owned(void)
     hardware_flow = false;
     data_in_flight = false;
     struct lume_files files;
-    lume_files_init(&files);
-    bool ok = run(&files);
+    bool ok = lume_files_init(&files) && run(&files);
     lume_files_release(&files);
     if (!ok)
         lume_value("WIFI_FW_FAILED_STAGE", stage);
@@ -694,7 +701,7 @@ static bool firmware_owned(void)
     return ok;
 }
 
-static bool set_variable(const char *name, const void *data, size_t bytes)
+static bool set_variable_attempt(const char *name, const void *data, size_t bytes, bool *attempted)
 {
     size_t n = 0, got;
     while (name[n])
@@ -707,7 +714,8 @@ static bool set_variable(const char *name, const void *data, size_t bytes)
     const unsigned char *p = data;
     for (size_t i = 0; i < bytes; ++i)
         iov[n + i] = p[i];
-    int result = control(263, true, iov, n + bytes, answer, sizeof(answer), &got);
+    int result =
+        control_attempt(263, true, iov, n + bytes, answer, sizeof(answer), &got, attempted);
     if (result != 1)
     {
         lume_puts("WIFI_SET_FAILED=");
@@ -722,6 +730,11 @@ static bool set_variable(const char *name, const void *data, size_t bytes)
     for (size_t i = 0; i < sizeof(tx); ++i)
         wipe[i] = 0;
     return result == 1;
+}
+
+static bool set_variable(const char *name, const void *data, size_t bytes)
+{
+    return set_variable_attempt(name, data, bytes, 0);
 }
 
 static bool set_u32(const char *name, uint32_t v)
@@ -1124,7 +1137,11 @@ static bool start_interface(void)
 
 static int scan_begin_owned(void)
 {
-    if (!start_interface() || scan_running)
+    if (scan_running)
+        return scan_retiring && (uint32_t)(lume_clock_millis() - scan_started) >= 30000
+                   ? -LUME_ETIMEDOUT
+                   : -LUME_EBUSY;
+    if (!start_interface())
         return -LUME_EBUSY;
     unsigned char params[72] = {0};
     put32(params, 1);
@@ -1142,10 +1159,14 @@ static int scan_begin_owned(void)
     scan_running = true;
     scan_done = false;
     scan_retiring = false;
-    bool ok = set_variable("escan", params, sizeof(params));
+    bool attempted = false;
+    bool ok = set_variable_attempt("escan", params, sizeof(params), &attempted);
     scan_started = lume_clock_millis();
     if (!ok)
-        scan_retiring = true;
+    {
+        /* A failed FIFO write may have reached firmware. Earlier failures cannot start a scan. */
+        scan_running = scan_retiring = attempted;
+    }
     return ok ? 0 : -LUME_EIO;
 }
 
@@ -1338,11 +1359,13 @@ static int cyw_scan_cancel(void *ctx)
         return -LUME_EAGAIN;
     if (scan_running && !scan_done)
     {
-        /* Terminal events may omit the scan identifier. Consume the old terminal before
-         * accepting another scan. A radio reset also ends this reservation. */
+        /* Keep a timed out scan quarantined until its terminal event or a radio stop.
+         * The caller can retire after the deadline without admitting another scan.
+         * An explicit reconnect or administrative stop resets the firmware session. */
         scan_retiring = true;
+        bool expired = (uint32_t)(lume_clock_millis() - scan_started) >= 30000;
         operation_end();
-        return -LUME_EAGAIN;
+        return expired ? 0 : -LUME_EAGAIN;
     }
     scan_running = scan_done = scan_retiring = false;
     operation_end();

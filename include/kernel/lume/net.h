@@ -5,6 +5,7 @@ bool lume_net_start(void);
 int lume_net_detach(uint32_t);
 bool lume_stream_busy(void);
 bool lume_stream_needs_poll(void);
+int lume_stream_socket_error(unsigned, unsigned, unsigned *, bool *);
 void lume_net_poll(void);
 void lume_net_poll_background(void);
 int lume_net_snapshot(uint32_t, struct lume_netif_info *);
@@ -12,6 +13,11 @@ void lume_net_release(uint32_t);
 bool lume_net_dhcp(uint32_t);
 int lume_net_dhcp_begin(uint32_t);
 bool lume_net_resolve(const char *, unsigned char[4]);
+/* Begin and progress run in the NETWORK domain. Cancellation invalidates the retained result
+ * without touching lwIP state. Late callbacks cannot complete a newer request. */
+int lume_net_resolve_progress(unsigned, const char *, unsigned char[4], bool, bool *);
+void lume_net_resolve_cancel(unsigned);
+void lume_tasks_dns_notify(unsigned);
 bool lume_net_ping(const char *, unsigned char[4]);
 bool lume_net_tcp(const char *);
 #include "lume/io.h"
@@ -29,6 +35,7 @@ int64_t lume_net_control(unsigned, struct lume_net_control *);
 int64_t lume_net_control_progress(unsigned, unsigned, struct lume_net_control *, bool, bool *);
 uint32_t lume_net_compat_interface(void);
 int64_t lume_net_compat_scan(const struct lume_net_control *, int64_t, char *, size_t);
+int64_t lume_net_compat_address(const unsigned char[4], char *, size_t);
 int64_t lume_net_command(unsigned, const char *, char *, size_t);
 #include "lume/net_commands.h"
 #endif

@@ -3,6 +3,9 @@
 #include "lume/module_memory.h"
 #include "lume/acpi.h"
 #include "lume/apic.h"
+#include "lume/vm.h"
+#include "lume/kernel_memory.h"
+#include "lume/worker.h"
 #include <string.h>
 #define PRESENT UINT64_C(1)
 #define WRITE UINT64_C(2)
@@ -20,6 +23,13 @@ static _Alignas(4096) uint64_t task_pdpt[LUME_TASK_LIMIT][512];
 static _Alignas(4096) uint64_t task_pd[LUME_TASK_LIMIT][512];
 static uint64_t *task_pt[LUME_TASK_LIMIT][USER_BLOCKS];
 static unsigned shared[LUME_TASK_LIMIT];
+
+struct sparse_table
+{
+    uint64_t *entries;
+    struct sparse_table *next;
+};
+static struct sparse_table *sparse[LUME_TASK_LIMIT];
 static _Alignas(4096) uint64_t trampoline_pages[512];
 static uint64_t module_base, module_end, module_first;
 extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[];
@@ -155,7 +165,7 @@ bool lume_mmu_start(const struct lume_fdt *description)
 bool lume_mmu_translate(uint64_t physical, uint64_t va, bool write, bool user, bool execute,
                         uint64_t *out)
 {
-    if (!physical || !out || va >= RAM_END)
+    if (!physical || !out || va >= (UINT64_C(1) << 47))
         return false;
     uint64_t *p = (void *)(uintptr_t)(physical & ADDRESS);
     const unsigned shifts[] = {39, 30, 21, 12};
@@ -209,10 +219,20 @@ void lume_mmu_release_user(unsigned task)
         shared[task] = 0;
         return;
     }
-    if (task_pdpt[task][1])
+    task_pdpt[task][1] = 0;
+    for (unsigned i = 1; i < 128; ++i)
+        task_root[task][i] = 0;
+    lume_arch_flush_user_tlb();
+    unsigned count = 0;
+    while (sparse[task])
     {
-        task_pdpt[task][1] = 0;
-        lume_arch_flush_user_tlb();
+        struct sparse_table *entry = sparse[task];
+        sparse[task] = entry->next;
+        if (!lume_page_free((uintptr_t)entry->entries))
+            lume_fail("sparse page table release");
+        lume_kernel_free(entry);
+        if (++count % 16 == 0)
+            lume_worker_checkpoint(65536);
     }
     for (unsigned i = 0; i < USER_BLOCKS; ++i)
     {
@@ -228,6 +248,36 @@ void lume_mmu_release_user(unsigned task)
 static uint64_t *entry(unsigned task, uint64_t va, bool create)
 {
     task = owner(task);
+    if (lume_vm_address(va) && va >= LUME_THREAD_VM_BASE)
+    {
+        uint64_t *entries = task_root[task];
+        const unsigned shifts[] = {39, 30, 21};
+        for (unsigned level = 0; level < 3; ++level)
+        {
+            uint64_t *value = entries + ((va >> shifts[level]) & 511);
+            if (!*value && create)
+            {
+                struct sparse_table *node = lume_kernel_allocate(sizeof(*node));
+                if (!node)
+                    return NULL;
+                node->entries = (void *)(uintptr_t)lume_page_alloc(0);
+                if (!node->entries)
+                {
+                    lume_kernel_free(node);
+                    return NULL;
+                }
+                node->next = sparse[task];
+                sparse[task] = node;
+                *value = table(node->entries, true);
+            }
+            if (!(*value & PRESENT) || (*value & HUGE))
+                return NULL;
+            entries = (void *)(uintptr_t)(*value & ADDRESS);
+        }
+        return entries + ((va >> 12) & 511);
+    }
+    if (va < LUME_USER_BASE || va >= LUME_USER_LIMIT)
+        return NULL;
     unsigned block = (unsigned)((va - LUME_USER_BASE) / BLOCK);
     if (!task_pt[task][block] && create)
     {
@@ -240,13 +290,72 @@ static uint64_t *entry(unsigned task, uint64_t va, bool create)
     return task_pt[task][block] ? &task_pt[task][block][(va >> 12) & 511] : NULL;
 }
 
+static void detach_empty(unsigned task, uint64_t va, struct sparse_table **retired)
+{
+    if (!lume_vm_address(va) || va < LUME_THREAD_VM_BASE)
+        return;
+    task = owner(task);
+    uint64_t *entries = task_root[task], *parents[3], *children[3];
+    const unsigned shifts[] = {39, 30, 21};
+    unsigned depth = 0;
+    for (; depth < 3; ++depth)
+    {
+        parents[depth] = entries + ((va >> shifts[depth]) & 511);
+        if (!(*parents[depth] & PRESENT) || (*parents[depth] & HUGE))
+            break;
+        children[depth] = (void *)(uintptr_t)(*parents[depth] & ADDRESS);
+        entries = children[depth];
+    }
+    while (depth)
+    {
+        --depth;
+        bool empty = true;
+        for (unsigned i = 0; i < 512; ++i)
+            empty &= children[depth][i] == 0;
+        if (!empty)
+            break;
+        struct sparse_table **position = &sparse[task];
+        while (*position && (*position)->entries != children[depth])
+            position = &(*position)->next;
+        if (!*position)
+            break;
+        struct sparse_table *node = *position;
+        *position = node->next;
+        *parents[depth] = 0;
+        node->next = *retired;
+        *retired = node;
+    }
+}
+
+static void free_tables(struct sparse_table *retired)
+{
+    while (retired)
+    {
+        struct sparse_table *node = retired;
+        retired = node->next;
+        if (!lume_page_free((uintptr_t)node->entries))
+            lume_fail("sparse page table release");
+        lume_kernel_free(node);
+    }
+}
+
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute)
 {
-    if (task >= LUME_TASK_LIMIT || va < LUME_USER_BASE || va >= LUME_USER_LIMIT || !pa ||
+    if (task >= LUME_TASK_LIMIT ||
+        (!(va >= LUME_USER_BASE && va < LUME_USER_LIMIT) && !lume_vm_address(va)) || !pa ||
         pa >= RAM_END || ((va | pa) & 4095) || (write && execute))
         return false;
     uint64_t *p = entry(task, va, true);
-    if (!p || *p)
+    if (!p)
+    {
+        struct sparse_table *retired = NULL;
+        detach_empty(task, va, &retired);
+        if (retired)
+            lume_arch_flush_user_tlb();
+        free_tables(retired);
+        return false;
+    }
+    if (*p)
         return false;
     *p = pa | PRESENT | USER | (write ? WRITE : 0) | (execute ? 0 : NX);
     return true;
@@ -260,7 +369,8 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
     for (unsigned i = 0; i < count; ++i)
     {
         uint64_t va = addresses[i];
-        if (va < LUME_USER_BASE || va >= LUME_USER_LIMIT || (va & 4095))
+        if ((!(va >= LUME_USER_BASE && va < LUME_USER_LIMIT) && !lume_vm_address(va)) ||
+            (va & 4095))
             return false;
         entries[i] = entry(task, va, false);
         if (!entries[i] || !(*entries[i] & PRESENT))
@@ -268,7 +378,11 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
     }
     for (unsigned i = 0; i < count; ++i)
         *entries[i] = 0;
+    struct sparse_table *retired = NULL;
+    for (unsigned i = 0; i < count; ++i)
+        detach_empty(task, addresses[i], &retired);
     lume_arch_flush_user_tlb();
+    free_tables(retired);
     return true;
 }
 
@@ -315,6 +429,15 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
         task_pt[a][i] = task_pt[b][i];
         task_pt[b][i] = value;
     }
+    for (unsigned i = 1; i < 128; ++i)
+    {
+        uint64_t value = task_root[a][i];
+        task_root[a][i] = task_root[b][i];
+        task_root[b][i] = value;
+    }
+    struct sparse_table *tables = sparse[a];
+    sparse[a] = sparse[b];
+    sparse[b] = tables;
     lume_arch_flush_user_tlb();
     return true;
 }
@@ -323,7 +446,7 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
 {
     if (!bytes)
         return true;
-    if (pointer < LUME_USER_BASE || pointer >= LUME_USER_LIMIT || bytes > LUME_USER_LIMIT - pointer)
+    if (pointer > UINT64_MAX - bytes)
         return false;
     uint64_t active;
     __asm__ volatile("movq %%cr3, %0" : "=r"(active));
@@ -331,7 +454,8 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write)
     for (uint64_t p = pointer; p < end; p = (p & ~UINT64_C(4095)) + 4096)
     {
         uint64_t physical;
-        if (!lume_mmu_translate(active, p, write, true, false, &physical))
+        if (!lume_mmu_translate(active, p, write, true, false, &physical) &&
+            !lume_vm_resolve_buffer(active, p, write))
             return false;
     }
     return true;

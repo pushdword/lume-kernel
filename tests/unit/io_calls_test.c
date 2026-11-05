@@ -70,6 +70,17 @@ static bool task_mutation[LUME_TASK_LIMIT];
 static unsigned files_released[LUME_TASK_LIMIT];
 static unsigned counter_step = 1, worker_cost_ms;
 
+bool lume_vfs_reap_pending(void)
+{
+    return false;
+}
+
+unsigned lume_vfs_reap(unsigned budget)
+{
+    (void)budget;
+    return 0;
+}
+
 void lume_files_release(struct lume_files *files)
 {
     assert(worker_function && current_task < LUME_TASK_LIMIT);
@@ -215,6 +226,27 @@ int64_t lume_net_compat_scan(const struct lume_net_control *request, int64_t res
     assert(request->count == 1);
     strcpy(out, "legacy scan\n");
     return (int64_t)strlen(out);
+}
+
+int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char out[4], bool resumed,
+                              bool *pending)
+{
+    (void)owner;
+    (void)name;
+    (void)out;
+    (void)resumed;
+    *pending = false;
+    return -LUME_EIO;
+}
+
+void lume_net_resolve_cancel(unsigned owner)
+{
+    (void)owner;
+}
+
+int64_t lume_net_compat_address(const unsigned char address[4], char *out, size_t cap)
+{
+    return snprintf(out, cap, "%u.%u.%u.%u\n", address[0], address[1], address[2], address[3]);
 }
 
 static bool kernel_console_storage(unsigned task)
@@ -465,6 +497,7 @@ void *lume_kernel_allocate(size_t bytes)
 
 #include "stream_calls.h"
 #include "netctl_calls.h"
+#include "dns_calls.h"
 #include "io_calls.h"
 
 static void reset(void)
@@ -486,6 +519,7 @@ static void reset(void)
     memset(context_replaced, 0, sizeof(context_replaced));
     assert(stream_waits_start());
     assert(netctl_waits_start());
+    assert(dns_waits_start());
     memset(thread_slots, 0, sizeof(thread_slots));
     stream_attempts = stream_connects = stream_closes = pending_signal = 0;
     stream_ready = stream_event = stream_fault = stop_during_attempt = false;

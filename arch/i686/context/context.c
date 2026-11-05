@@ -150,7 +150,7 @@ struct lume_context *lume_i686_exception(struct lume_context *frame, uint32_t ve
         }
         if (vector == 14)
             __asm__ volatile("movl %%cr2, %0" : "=r"(address));
-        next = lume_tasks_sync(frame, vector | ((error & 1) << 8), address);
+        next = lume_tasks_sync(frame, vector | ((error & 31) << 8), address);
     }
     else
     {

@@ -23,6 +23,12 @@ static bool bounded(uint64_t offset, uint64_t bytes, uint64_t size)
     return offset <= size && bytes <= size - offset;
 }
 
+static bool image_range(uint64_t address, uint64_t bytes)
+{
+    return (address >= LUME_ELF_BASE && bounded(address, bytes, LUME_ELF_LIMIT)) ||
+           (address >= LUME_LARGE_ELF_BASE && bounded(address, bytes, LUME_LARGE_ELF_LIMIT));
+}
+
 bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
 {
     const unsigned char *b = data;
@@ -70,8 +76,8 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
             if (!align)
                 align = 1;
             if (!memory || memory > 65536 || file > memory || !bounded(offset, file, size) ||
-                address < LUME_ELF_BASE || !bounded(address, memory, LUME_ELF_LIMIT) ||
-                align > 64 || (align & (align - 1)) || ((address - offset) & (align - 1)))
+                !image_range(address, memory) || align > 64 || (align & (align - 1)) ||
+                ((address - offset) & (align - 1)))
                 return false;
             plan->tls_address = address;
             plan->tls_file = file;
@@ -93,8 +99,7 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
         struct lume_elf_segment s = {offset, address, file, memory, flags};
         if ((flags & ~7u) || !(flags & 4) || (flags & 3) == 3 || !s.memory_size ||
             s.file_size > s.memory_size || !bounded(s.offset, s.file_size, size) ||
-            s.address < LUME_ELF_BASE || !bounded(s.address, s.memory_size, LUME_ELF_LIMIT) ||
-            (s.address & 4095) != (s.offset & 4095) ||
+            !image_range(s.address, s.memory_size) || (s.address & 4095) != (s.offset & 4095) ||
             (align > 1 && ((align & (align - 1)) || align > 0x200000 ||
                            (s.address & (align - 1)) != (s.offset & (align - 1)))))
             return false;

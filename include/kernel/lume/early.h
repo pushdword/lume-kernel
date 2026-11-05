@@ -53,6 +53,14 @@ void lume_mmu_switch(uint64_t root);
 bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack);
 void lume_mmu_release_user(unsigned task);
 uint64_t lume_mmu_task_root(unsigned task);
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+uint64_t lume_mmu_task_view_root(unsigned task, bool writer);
+bool lume_mmu_root_matches(unsigned task, uint64_t root);
+bool lume_mmu_root_active(uint64_t root);
+bool lume_mmu_jit_active(unsigned task);
+int lume_mmu_jit_scope(unsigned task, bool writable);
+void lume_mmu_jit_copy(unsigned target, unsigned source);
+#endif
 void lume_mmu_share_user(unsigned, unsigned);
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool write);
 void lume_pages_start(const struct lume_fdt *, uint64_t dtb, uint64_t image_start,
@@ -78,6 +86,7 @@ struct lume_context *lume_tasks_irq(struct lume_context *);
 struct lume_context *lume_tasks_device_irq(struct lume_context *);
 struct lume_context *lume_tasks_sync(struct lume_context *, uint64_t esr, uint64_t far);
 bool lume_tasks_active(void);
+int64_t lume_task_executable(unsigned, char *, size_t);
 bool lume_task_capable(unsigned pid, uint64_t capabilities);
 uint64_t lume_task_capabilities(unsigned pid);
 int lume_task_drop_capabilities(unsigned pid, uint64_t);
@@ -91,13 +100,18 @@ extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_HEAP_BASE UINT64_C(0x48000000)
 #define LUME_THREAD_BASE UINT64_C(0x5a000000)
 #define LUME_HEAP_LIMIT (LUME_THREAD_BASE - 4096)
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#define LUME_TASK_LIMIT 256u
+#elif defined(LUME_ARCH_AMD64)
 #define LUME_TASK_LIMIT 64u
 #else
 #define LUME_TASK_LIMIT 16u
 #endif
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64)
 _Static_assert(LUME_THREAD_BASE + (uint64_t)LUME_TASK_LIMIT * 0x100000 <= LUME_USER_STACK,
                "thread stacks overlap the main stack");
+#endif
+_Static_assert(LUME_TASK_LIMIT <= 256u, "thread identifiers reserve eight slot bits");
 
 struct lume_context *lume_tasks_deliver_signals(struct lume_context *);
 

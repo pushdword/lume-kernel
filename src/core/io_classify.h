@@ -6,6 +6,7 @@
 #include "lume/credential.h"
 #include "lume/thread.h"
 #include "lume/signal.h"
+#include "lume/vm.h"
 
 #define KERNEL_IO_EXCLUSIVE LUME_WORK_DOMAINS
 
@@ -14,8 +15,10 @@ static bool kernel_local_control_call(const struct lume_context *frame)
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     uint64_t action = LUME_CONTEXT_REG(frame, 0);
     return (number == LUME_SYS_THREAD &&
-            (action == LUME_THREAD_WAIT || action == LUME_THREAD_WAKE)) ||
-           (number == LUME_SYS_SIGNAL && action == LUME_SIGNAL_MASK);
+            (action == LUME_THREAD_WAIT || action == LUME_THREAD_WAKE ||
+             action == LUME_THREAD_WAIT_REALTIME)) ||
+           (number == LUME_SYS_SIGNAL &&
+            (action == LUME_SIGNAL_MASK || action == LUME_SIGNAL_TRY_WAIT));
 }
 
 static bool kernel_call_mutates(const struct lume_context *frame)
@@ -28,6 +31,7 @@ static bool kernel_call_mutates(const struct lume_context *frame)
     case LUME_SYS_READ:
     case LUME_SYS_WRITE:
     case LUME_SYS_SEEK:
+    case LUME_SYS_FILE_IO:
     case LUME_SYS_STAT:
     case LUME_SYS_GETDENTS:
     case LUME_SYS_NET:
@@ -39,7 +43,7 @@ static bool kernel_call_mutates(const struct lume_context *frame)
     case LUME_SYS_TTY:
         return false;
     case LUME_SYS_BRK:
-        return LUME_CONTEXT_REG(frame, 0) != 0;
+        return LUME_CONTEXT_REG(frame, 0) != 0 || LUME_CONTEXT_REG(frame, 1) != 0;
     case LUME_SYS_GRAPHICS:
         return LUME_CONTEXT_REG(frame, 0) == LUME_GRAPHICS_ACQUIRE;
     case LUME_SYS_GPU:
@@ -81,6 +85,8 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_EXEC:
     case LUME_SYS_OPEN:
     case LUME_SYS_FILE_MODE:
+    case LUME_SYS_FILE_IO:
+    case LUME_SYS_FILES:
     case LUME_SYS_SEEK:
     case LUME_SYS_STAT:
     case LUME_SYS_GETDENTS:
@@ -99,12 +105,15 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
         /* Descriptor messages move references and bounded data in local memory queues. */
         if (action == LUME_SOCKET_SEND_FD || action == LUME_SOCKET_RECEIVE_FD)
             return LUME_WORK_GENERAL;
-        if (action == LUME_SOCKET_SHUTDOWN)
-            return KERNEL_IO_EXCLUSIVE;
+        if (action == LUME_SOCKET_SEND_MESSAGE || action == LUME_SOCKET_RECEIVE_MESSAGE ||
+            action == LUME_SOCKET_SHUTDOWN)
+            return kernel_socket_network[task] ? LUME_WORK_NETWORK : LUME_WORK_GENERAL;
         return LUME_WORK_NETWORK;
     case LUME_SYS_GRAPHICS:
     case LUME_SYS_GPU:
         return LUME_WORK_DISPLAY;
+    case LUME_SYS_VM:
+        return action == LUME_VM_MAP ? LUME_WORK_STORAGE : LUME_WORK_GENERAL;
     case LUME_SYS_BRK:
     case LUME_SYS_MEMORY:
     case LUME_SYS_TELEMETRY:

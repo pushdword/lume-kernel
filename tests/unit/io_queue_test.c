@@ -138,6 +138,7 @@ int main(void)
     grants();
     model();
     assert(io_queue_direct(LUME_SYS_READ) && io_queue_direct(LUME_SYS_FILE_MODE));
+    assert(io_queue_direct(LUME_SYS_FILE_IO));
     assert(!io_queue_direct(LUME_SYS_FORK) && !io_queue_direct(LUME_SYS_THREAD) &&
            !io_queue_direct(LUME_SYS_SIGNAL) && !io_queue_direct(LUME_SYS_FD));
     puts("PASS_IO_QUEUE FIFO, generations, cancellation, bounded admission and progress");

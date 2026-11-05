@@ -1,5 +1,6 @@
 #include "lume/poll.h"
 #include "lume/socket_file.h"
+#include "lume/datagram.h"
 #include "lume/io.h"
 #include "lume/wait.h"
 #include <assert.h>
@@ -21,6 +22,39 @@ static struct
 } mock_streams[16];
 
 static unsigned stream_count;
+
+bool lume_datagram_file(struct lume_files *files, unsigned fd)
+{
+    (void)files;
+    (void)fd;
+    return false;
+}
+
+bool lume_datagram_busy(void)
+{
+    return false;
+}
+
+int64_t lume_datagram_call(struct lume_files *files, unsigned operation,
+                           struct lume_socket_request *request)
+{
+    (void)files;
+    (void)operation;
+    (void)request;
+    return -LUME_EOPNOTSUPP;
+}
+
+int64_t lume_datagram_message(struct lume_files *files, unsigned operation, int fd,
+                              struct lume_socket_message *message,
+                              struct lume_socket_request *metadata)
+{
+    (void)files;
+    (void)operation;
+    (void)fd;
+    (void)message;
+    (void)metadata;
+    return -LUME_EOPNOTSUPP;
+}
 
 void lume_smp_wake(void)
 {

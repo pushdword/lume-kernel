@@ -3,7 +3,12 @@
 #define LUME_FD_H
 #include <stdint.h>
 #define LUME_FD_VERSION 1u
+#if defined(__aarch64__) || defined(__x86_64__) || defined(LUME_ARCH_AARCH64) ||                   \
+    defined(LUME_ARCH_AMD64)
+#define LUME_FD_LIMIT 256u
+#else
 #define LUME_FD_LIMIT 32u
+#endif
 #define LUME_PIPE_BYTES 4096u
 #define LUME_PIPE_ATOMIC 512u
 
@@ -42,7 +47,7 @@ enum
 };
 
 /* GETMODE returns the native access mode and append flag. SETMODE changes only append.
- * POLL reads up to 32 pollfd records from buffer using count as the record count. timeout_ms
+ * POLL reads up to LUME_FD_LIMIT records from buffer using count as the record count. timeout_ms
  * accepts 0 through 60000 or UINT32_MAX for an infinite wait. PIPE and SOCKETPAIR return
  * descriptors in fd and other. DUP uses other as the minimum result and DUP2 uses it as the
  * exact destination. SPAWN reads the 20-byte lume_spawn_request from buffer and inherits

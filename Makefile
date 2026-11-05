@@ -175,6 +175,28 @@ TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif
 TEST_NAMES += io-queue io-calls vfs-storage-handles ip4-route
 TEST_NAMES += net-service
 .PHONY: check-console-calls
+.PHONY: check-file-io
+.PHONY: check-file-locks
+FILE_IO_HOST_FIXTURE := $(if $(wildcard include/kernel/lume/sandbox_policy.h),tests/fixtures/vfs_unrestricted_services.c,)
+FILE_IO_HOST_FLAGS := $(if $(FILE_IO_HOST_FIXTURE),-DLUME_ARCH_AMD64=1,)
+$(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE) $(OUT)/tests/vfs-file-lock$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS)
+$(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE) $(OUT)/tests/vfs-file-lock$(HOSTEXE): $(FILE_IO_HOST_FIXTURE)
+check: check-file-locks
+check-file-locks: $(OUT)/tests/vfs-file-lock$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/abi/native/lume/file_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+check: check-file-io
+check-file-io: $(OUT)/tests/file-io-call$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE)
+	env "$(OUT)/tests/file-io-call$(HOSTEXE)"
+	env "$(OUT)/tests/vfs-file-io$(HOSTEXE)"
+$(OUT)/tests/file-io-call$(HOSTEXE): tests/unit/file_io_call_test.c src/syscall/file_io.c include/abi/native/lume/file_io.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+$(OUT)/tests/vfs-file-io$(HOSTEXE): tests/unit/vfs_file_io_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
 check: check-console-calls
 check-console-calls: $(OUT)/tests/console-calls$(HOSTEXE)
 	env "$<"
@@ -325,7 +347,7 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h include/kernel/lume/net.h include/kernel/lume/wireless.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h include/kernel/lume/net.h include/kernel/lume/wireless.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -659,3 +681,35 @@ $(OUT)/tests/net-compat-scan$(HOSTEXE): tests/unit/net_compat_scan_test.c src/ne
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -flto -fwhole-program -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -o "$@"
 check: check-net-compat-scan
+
+check: check-signal-mask
+.PHONY: check-signal-mask
+check-signal-mask: $(OUT)/tests/signal-mask$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/signal-mask$(HOSTEXE): tests/unit/signal_mask_test.c src/core/signal_mask.h include/abi/native/lume/signal.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+
+.PHONY: check-vm-memory
+check-vm-memory: $(OUT)/tests/vm-memory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c include/kernel/lume/vm.h include/abi/native/lume/memory.h $(wildcard tests/fixtures/vm_host/lume/*.h)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/vm_host -Iinclude/kernel -Iinclude/abi/native "$<" -o "$@"
+check: check-vm-memory
+
+.PHONY: check-vfs-append
+check-vfs-append: $(OUT)/tests/vfs-append$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vfs-append$(HOSTEXE): tests/unit/vfs_external_append_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/vfs/file_locks.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+check: check-vfs-append
+
+.PHONY: check-signal-wait
+check: check-signal-wait
+check-signal-wait: $(OUT)/tests/signal-wait$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/signal-wait$(HOSTEXE): tests/unit/signal_wait_test.c src/core/signal_wait.h src/core/signal_mask.h include/abi/native/lume/signal.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"

@@ -7,8 +7,12 @@
 #include "lume/boot_storage.h"
 #include "lume/worker.h"
 #include "lume/work.h"
+#include "lume/kernel_memory.h"
+#include "lume/path.h"
+#include "lume/files.h"
 #include "ff.h"
 #include "diskio.h"
+#include <string.h>
 #define STORAGE_HANDLES 256u
 
 static struct storage_file
@@ -19,6 +23,7 @@ static struct storage_file
     size_t dirty_bytes;
     int write_error;
     bool dirty;
+    bool retired;
 } storage_files[STORAGE_HANDLES];
 
 static struct storage_handle
@@ -37,7 +42,7 @@ static struct lume_volume boot_volume;
 static FATFS boot_filesystem;
 static bool boot_mounted;
 static void *read_cache;
-static char read_path[128];
+static char read_path[LUME_FILES_PATH_MAX];
 static uint64_t next_flush_at = UINT64_MAX;
 static unsigned flush_cursor;
 static void flush_one(void *);
@@ -179,6 +184,30 @@ static int error(FRESULT r)
     }
 }
 
+static int volume_info(struct lume_files_volume *out)
+{
+    if (!mounted || data_faulted)
+        return -LUME_EIO;
+    DWORD free_clusters;
+    FATFS *fs;
+    int result = error(f_getfree("0:", &free_clusters, &fs));
+    if (result)
+        return result;
+    if (fs != &filesystem || fs->n_fatent < 2 || !fs->csize || free_clusters > fs->n_fatent - 2)
+        return -LUME_EIO;
+    uint64_t cluster_bytes = (uint64_t)fs->csize * FF_MAX_SS;
+    *out = (struct lume_files_volume){.version = LUME_FILES_VERSION,
+                                      .bytes = sizeof(*out),
+                                      .block_bytes = cluster_bytes,
+                                      .fragment_bytes = cluster_bytes,
+                                      .total_blocks = fs->n_fatent - 2,
+                                      .free_blocks = free_clusters,
+                                      .available_blocks = free_clusters,
+                                      .filesystem_id = volume.first,
+                                      .name_max = LUME_FILES_NAME_MAX};
+    return 0;
+}
+
 static void flush_deadline(void)
 {
     next_flush_at = UINT64_MAX;
@@ -217,6 +246,19 @@ static void dirty_file(struct storage_file *file, size_t bytes)
         next_flush_at = file->dirty_at + STORAGE_FLUSH_MS;
 }
 
+static int restore_file_size(struct storage_file *file, FSIZE_t bytes)
+{
+    FRESULT result = f_lseek(&file->file, bytes);
+    if (result == FR_OK)
+        result = f_truncate(&file->file);
+    if (result == FR_OK)
+        return sync_file(file);
+    int failed = error(result);
+    if (!file->write_error)
+        file->write_error = failed;
+    return failed;
+}
+
 /* FatFs retains one shared partial-sector and metadata window.
  * Complete sectors still reach the device during f_write. Deferred work flushes one file. */
 static void flush_one(void *context)
@@ -246,13 +288,31 @@ static const char *name(const char *path)
     if (path[0] != '/' || path[1] != 'd' || path[2] != 'a' || path[3] != 't' || path[4] != 'a' ||
         (path[5] && path[5] != '/'))
         return 0;
-    return path[5] ? path + 5 : "/";
+    const char *result = path[5] ? path + 5 : "/";
+    /* Reject component spellings that FatFs would trim to another name. */
+    const char *part = result;
+    for (const char *cursor = result;; ++cursor)
+    {
+        unsigned byte = (unsigned char)*cursor;
+        if (byte && (byte < 32 || byte == 127 || strchr("\\:*?\"<>|", (int)byte)))
+            return NULL;
+        if (!byte || byte == '/')
+        {
+            if (cursor != part && (cursor[-1] == '.' || cursor[-1] == ' '))
+                return NULL;
+            if (!byte)
+                break;
+            part = cursor + 1;
+        }
+    }
+    return lume_path_equal_folded(result, result) ? result : NULL;
 }
 
 static struct storage_file *find_file(const FIL *file)
 {
     for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
-        if (storage_files[i].references && storage_files[i].file.dir_sect == file->dir_sect &&
+        if (storage_files[i].references && !storage_files[i].file.detached &&
+            storage_files[i].file.dir_sect == file->dir_sect &&
             storage_files[i].file.dir_ptr == file->dir_ptr)
             return storage_files + i;
     return 0;
@@ -273,6 +333,8 @@ static struct storage_handle *find_handle(void *handle)
  * Aliases share one FIL so size and cluster-chain changes remain coherent. */
 static int open_handle(const char *path, unsigned flags, void **handle)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     const char *p = name(path);
     if (!p || !handle || flags > LUME_O_RDWR)
         return -LUME_EINVAL;
@@ -309,7 +371,7 @@ static int open_handle(const char *path, unsigned flags, void **handle)
     else
     {
         for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
-            if (!storage_files[i].references)
+            if (!storage_files[i].references && !storage_files[i].retired)
             {
                 file = storage_files + i;
                 break;
@@ -336,13 +398,21 @@ static int close_handle(void *handle)
     *description = (struct storage_handle){0};
     if (--file->references)
         return file->write_error;
-    int result = error(f_close(&file->file));
+    int result = data_faulted ? -LUME_EIO : error(f_close(&file->file));
+    if (result)
+    {
+        file->retired = true;
+        if (file->file.detached)
+            data_faulted = true;
+    }
     flush_deadline();
     return file->write_error ? file->write_error : result;
 }
 
 static int read_handle(void *handle, uint64_t offset, void *data, size_t bytes)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     struct storage_handle *description = find_handle(handle);
     if (!description || description->flags == LUME_O_WRONLY)
         return -LUME_EBADF;
@@ -360,6 +430,8 @@ static int read_handle(void *handle, uint64_t offset, void *data, size_t bytes)
 
 static int write_handle(void *handle, uint64_t offset, const void *data, size_t bytes)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     struct storage_handle *description = find_handle(handle);
     if (!description || !description->flags)
         return -LUME_EBADF;
@@ -371,6 +443,7 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
         return 0;
     dirty_file(description->file, bytes);
     FIL *file = &description->file->file;
+    FSIZE_t previous = f_size(file);
     FRESULT result;
     if (offset > f_size(file))
     {
@@ -384,7 +457,10 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
             result = f_write(file, zero, gap, &done);
             lume_worker_checkpoint(done);
             if (result == FR_OK && done != gap)
-                result = FR_DENIED;
+            {
+                int restored = restore_file_size(description->file, previous);
+                return restored ? restored : -LUME_ENOSPC;
+            }
         }
     }
     else
@@ -394,6 +470,11 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
     UINT count = 0;
     if (result == FR_OK)
         result = f_write(file, data, (UINT)bytes, &count);
+    if (result == FR_OK && !count && f_size(file) > previous)
+    {
+        int restored = restore_file_size(description->file, previous);
+        return restored ? restored : -LUME_ENOSPC;
+    }
     if (result == FR_OK &&
         (description->file->dirty_bytes >= STORAGE_FLUSH_BYTES || count < bytes ||
          lume_clock_monotonic() - description->file->dirty_at >= STORAGE_FLUSH_MS))
@@ -404,19 +485,47 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
     }
     if (result != FR_OK && !description->file->write_error)
         description->file->write_error = error(result);
-    return result == FR_OK ? (int)count : error(result);
+    return result == FR_OK ? count ? (int)count : -LUME_ENOSPC : error(result);
 }
 
 static int resize_handle(void *handle, uint64_t bytes)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     struct storage_handle *description = find_handle(handle);
     if (!description || !description->flags)
         return -LUME_EBADF;
     if (description->file->write_error)
         return description->file->write_error;
     FIL *file = &description->file->file;
-    if (bytes > UINT32_MAX || bytes > f_size(file))
+    if (bytes > UINT32_MAX)
         return -LUME_EINVAL;
+    FSIZE_t previous = f_size(file);
+    if (bytes > previous)
+    {
+        static const unsigned char zero[4096] = {0};
+        FRESULT result = f_lseek(file, previous);
+        while (result == FR_OK && f_tell(file) < bytes)
+        {
+            UINT take =
+                bytes - f_tell(file) > sizeof(zero) ? sizeof(zero) : (UINT)(bytes - f_tell(file));
+            UINT done = 0;
+            dirty_file(description->file, take);
+            result = f_write(file, zero, take, &done);
+            lume_worker_checkpoint(done);
+            if (result == FR_OK && done != take)
+            {
+                int restored = restore_file_size(description->file, previous);
+                return restored ? restored : -LUME_ENOSPC;
+            }
+        }
+        if (result == FR_OK)
+            return sync_file(description->file);
+        int failed = error(result);
+        if (!description->file->write_error)
+            description->file->write_error = failed;
+        return failed;
+    }
     FRESULT result = f_lseek(file, (FSIZE_t)bytes);
     if (result == FR_OK)
         result = f_truncate(file);
@@ -427,6 +536,8 @@ static int resize_handle(void *handle, uint64_t bytes)
 
 static int sync_handle(void *handle)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     struct storage_handle *description = find_handle(handle);
     return description ? sync_file(description->file) : -LUME_EBADF;
 }
@@ -436,22 +547,13 @@ static int invalidate_read_cache(const char *path)
     const char *p = name(path);
     if (!read_cache || !p)
         return 0;
-    for (unsigned i = 0;; ++i)
-    {
-        unsigned a = (unsigned char)p[i], b = (unsigned char)read_path[i];
-        if (a >= 'A' && a <= 'Z')
-            a += 'a' - 'A';
-        if (b >= 'A' && b <= 'Z')
-            b += 'a' - 'A';
-        if (a != b)
-            return 0;
-        if (!a)
-            return close_read_cache();
-    }
+    return lume_path_equal_folded(p, read_path) ? close_read_cache() : 0;
 }
 
 static int create(const char *path, bool directory)
 {
+    if (data_faulted)
+        return -LUME_EIO;
     int cached = invalidate_read_cache(path);
     if (cached)
         return cached;
@@ -486,10 +588,7 @@ static int read_file(const char *path, uint64_t offset, void *data, size_t bytes
         ++length;
     if (length == sizeof(read_path))
         return -LUME_ENAMETOOLONG;
-    bool same = read_cache != 0;
-    for (unsigned i = 0; same && i <= length; ++i)
-        if (read_path[i] != p[i])
-            same = false;
+    bool same = read_cache && lume_path_equal_folded(p, read_path);
     int result = 0;
     if (!same)
     {
@@ -521,29 +620,62 @@ static int write_file(const char *path, uint64_t offset, const void *data, size_
     return result < 0 ? result : end ? end : result;
 }
 
-static int busy_file(const char *path)
+static int live_file(const char *path, struct storage_file **file)
 {
+    *file = 0;
     FIL candidate;
     FRESULT result = f_open(&candidate, path, FA_READ);
     if (result == FR_NO_FILE)
         return 0;
     if (result != FR_OK)
         return error(result);
-    bool busy = find_file(&candidate) != 0;
+    *file = find_file(&candidate);
     result = f_close(&candidate);
-    return result == FR_OK ? busy ? -LUME_EBUSY : 0 : error(result);
+    return result == FR_OK ? *file ? sync_file(*file) : 0 : error(result);
 }
 
-static int remove_file(const char *path)
+static int namespace_result(FRESULT result, unsigned progress, unsigned *state)
 {
+    replacing = false;
+    if (replacement_io_failed)
+        result = FR_DISK_ERR;
+    *state = progress;
+    if (result != FR_OK && progress != FF_REPLACE_UNCHANGED)
+    {
+        data_faulted = true;
+        lume_puts("FAT32 namespace update failed. Restart before accessing /data.\n");
+    }
+    return error(result);
+}
+
+static int remove_state(const char *path, unsigned *state)
+{
+    if (!state)
+        return -LUME_EINVAL;
+    *state = LUME_STORAGE_REPLACE_UNCHANGED;
+    if (data_faulted)
+        return -LUME_EIO;
     int cached = close_read_cache();
     if (cached)
         return cached;
     const char *p = name(path);
     if (!p)
         return -LUME_EINVAL;
-    int busy = busy_file(p);
-    return busy ? busy : error(f_unlink(p));
+    struct storage_file *file;
+    int result = live_file(p, &file);
+    if (result)
+        return result;
+    BYTE progress;
+    replacing = true;
+    replacement_io_failed = false;
+    FRESULT removed = f_unlink_live(p, file ? &file->file : 0, &progress);
+    return namespace_result(removed, progress, state);
+}
+
+static int remove_file(const char *path)
+{
+    unsigned state;
+    return remove_state(path, &state);
 }
 
 static int resize_file(const char *path, uint64_t bytes)
@@ -559,16 +691,34 @@ static int resize_file(const char *path, uint64_t bytes)
     return result ? result : end;
 }
 
-static int rename_file(const char *from, const char *to)
+static int rename_state(const char *from, const char *to, unsigned *state)
 {
+    if (!state)
+        return -LUME_EINVAL;
+    *state = LUME_STORAGE_REPLACE_UNCHANGED;
+    if (data_faulted)
+        return -LUME_EIO;
     int cached = close_read_cache();
     if (cached)
         return cached;
     const char *a = name(from), *b = name(to);
     if (!a || !b)
         return -LUME_EINVAL;
-    int busy = busy_file(a);
-    return busy ? busy : error(f_rename(a, b));
+    struct storage_file *file;
+    int result = live_file(a, &file);
+    if (result)
+        return result;
+    BYTE progress;
+    replacing = true;
+    replacement_io_failed = false;
+    FRESULT renamed = f_rename_live(a, b, file ? &file->file : 0, &progress);
+    return namespace_result(renamed, progress, state);
+}
+
+static int rename_file(const char *from, const char *to)
+{
+    unsigned state;
+    return rename_state(from, to, &state);
 }
 
 static int replace_file(const char *from, const char *to, unsigned *state)
@@ -584,55 +734,79 @@ static int replace_file(const char *from, const char *to, unsigned *state)
     const char *a = name(from), *b = name(to);
     if (!a || !b)
         return -LUME_EINVAL;
-    int busy = busy_file(a);
-    if (!busy)
-        busy = busy_file(b);
-    if (busy)
-        return busy;
+    struct storage_file *source, *target;
+    int prepared = live_file(a, &source);
+    if (!prepared)
+        prepared = live_file(b, &target);
+    if (prepared)
+        return prepared;
     BYTE progress;
     replacing = true;
     replacement_io_failed = false;
-    FRESULT result = f_replace(a, b, &progress);
-    replacing = false;
-    if (replacement_io_failed)
-        result = FR_DISK_ERR;
+    FRESULT result =
+        f_replace_live(a, b, source ? &source->file : 0, target ? &target->file : 0, &progress);
     _Static_assert(FF_REPLACE_UNCHANGED == LUME_STORAGE_REPLACE_UNCHANGED &&
                        FF_REPLACE_UNCERTAIN == LUME_STORAGE_REPLACE_UNCERTAIN &&
                        FF_REPLACE_COMMITTED == LUME_STORAGE_REPLACE_COMMITTED,
                    "replacement state contract");
-    *state = progress;
-    if (result != FR_OK && progress != FF_REPLACE_UNCHANGED)
-    {
-        data_faulted = true;
-        lume_puts("FAT32 metadata replacement failed. Restart before accessing /data.\n");
-    }
-    return error(result);
+    return namespace_result(result, progress, state);
 }
 
-static bool walk_directory(char path[128], unsigned length, unsigned depth,
-                           lume_storage_visit visit, void *context)
+static bool walk(lume_storage_visit visit, void *context)
 {
-    if (depth > 128u / 2u)
-        return false;
-    DIR dir;
-    FRESULT r = f_opendir(&dir, name(path));
-    if (r != FR_OK)
-        return false;
-    FILINFO entry;
-    bool ok = true;
-    for (;;)
+    struct walk_frame
     {
-        r = f_readdir(&dir, &entry);
+        DIR directory;
+        unsigned length;
+    };
+
+    enum
+    {
+        WALK_DEPTH = LUME_FILES_PATH_MAX / 2u
+    };
+
+    if (data_faulted || !visit)
+        return false;
+    struct walk_frame *frames = lume_kernel_allocate(WALK_DEPTH * sizeof(*frames));
+    if (!frames)
+        return false;
+    char path[LUME_FILES_PATH_MAX] = "/data";
+    unsigned depth = 0;
+    bool ok = f_opendir(&frames[0].directory, name(path)) == FR_OK;
+    if (ok)
+    {
+        frames[0].length = 5;
+        depth = 1;
+    }
+    FILINFO entry;
+    while (ok && depth)
+    {
+        struct walk_frame *frame = frames + depth - 1;
+        FRESULT result = f_readdir(&frame->directory, &entry);
         lume_worker_checkpoint(sizeof(entry));
-        if (r != FR_OK)
+        if (result != FR_OK)
         {
             ok = false;
             break;
         }
         if (!entry.fname[0])
+        {
+            ok = f_closedir(&frame->directory) == FR_OK;
+            --depth;
+            if (depth)
+                path[frames[depth - 1].length] = 0;
+            continue;
+        }
+        unsigned n = frame->length;
+        if (n + 1 >= sizeof(path))
+        {
+            ok = false;
             break;
-        unsigned n = length;
-        if (n >= 126)
+        }
+        unsigned filename_bytes = 0;
+        while (entry.fname[filename_bytes])
+            ++filename_bytes;
+        if (filename_bytes > LUME_FILES_NAME_MAX || filename_bytes >= sizeof(path) - n - 1)
         {
             ok = false;
             break;
@@ -641,36 +815,38 @@ static bool walk_directory(char path[128], unsigned length, unsigned depth,
         for (unsigned i = 0; entry.fname[i]; ++i)
         {
             unsigned char c = (unsigned char)entry.fname[i];
-            if (n >= 126 || c < 32 || c == 127)
+            if (c < 32 || c == 127 || c == '/' || c == '\\')
             {
                 ok = false;
                 break;
             }
-            path[n++] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+            path[n++] = (char)c;
         }
         path[n] = 0;
         bool directory = (entry.fattrib & AM_DIR) != 0;
-        if (!ok || !visit(path, directory, entry.fsize, context) ||
-            (directory && !walk_directory(path, n, depth + 1, visit, context)))
+        if (!ok || !name(path) || !visit(path, directory, entry.fsize, context))
         {
-            if (ok)
-            {
-                lume_puts("FAT32 import failed at ");
-                lume_puts(path);
-                lume_puts("\n");
-            }
             ok = false;
             break;
         }
-        path[length] = 0;
+        if (directory)
+        {
+            if (depth == WALK_DEPTH || f_opendir(&frames[depth].directory, name(path)) != FR_OK)
+            {
+                ok = false;
+                break;
+            }
+            frames[depth].length = n;
+            ++depth;
+        }
+        else
+            path[frame->length] = 0;
     }
-    return f_closedir(&dir) == FR_OK && ok;
-}
-
-static bool walk(lume_storage_visit visit, void *context)
-{
-    char path[128] = "/data";
-    return walk_directory(path, 5, 0, visit, context);
+    while (depth)
+        if (f_closedir(&frames[--depth].directory) != FR_OK)
+            ok = false;
+    lume_kernel_free(frames);
+    return ok;
 }
 
 const struct lume_storage_ops *lume_storage_start(void)
@@ -720,7 +896,12 @@ const struct lume_storage_ops *lume_storage_start(void)
                                                 .resize_handle = resize_handle,
                                                 .close = close_handle,
                                                 .sync_handle = sync_handle,
-                                                .replace = replace_file};
+                                                .replace = replace_file,
+                                                .path_equal = lume_path_equal_folded,
+                                                .remove_state = remove_state,
+                                                .rename_state = rename_state,
+                                                .path_hash = lume_path_hash_folded,
+                                                .volume_info = volume_info};
     return &ops;
 }
 

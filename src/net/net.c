@@ -3,6 +3,8 @@
  * adapter. */
 #include "lume/early.h"
 #include "lume/net.h"
+#include "lume/datagram.h"
+#include "lume/socket_file.h"
 #include "lume/activity.h"
 #include "lume/work.h"
 #include "lume/worker.h"
@@ -120,7 +122,9 @@ static bool attach(struct lume_netif *device)
 
 bool lume_net_start(void)
 {
-    if (started || !lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
+    if (started)
+        return true;
+    if (!lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
         return false;
     struct lume_netif_info first = {0};
     lume_netif_info(lume_netif_at(0), &first);
@@ -176,7 +180,7 @@ static struct lume_work service_work = {.run = network_service, .domain = LUME_W
 
 void lume_net_poll_background(void)
 {
-    if (!lume_netif_count())
+    if (!lume_netif_count() && !lume_datagram_reap_pending() && !lume_socket_reap_pending())
         return;
     uint64_t now = lume_clock_monotonic();
     uint64_t interval = tx_waiting || lume_stream_needs_poll() || now < traffic_until ? 1 : 10;
@@ -194,9 +198,16 @@ static void network_service(void *context)
 
 void lume_net_poll(void)
 {
-    if ((!started && !lume_net_start()) || polling)
+    if (polling)
         return;
     polling = true;
+    lume_socket_reap();
+    lume_datagram_reap();
+    if (!started && !lume_net_start())
+    {
+        polling = false;
+        return;
+    }
     repoll = tx_waiting = false;
     last_poll = lume_clock_monotonic();
     poll_valid = true;
@@ -264,7 +275,7 @@ void lume_net_poll(void)
 
 int lume_net_detach(uint32_t index)
 {
-    if (polling || lume_stream_busy() || lume_icmp_busy())
+    if (polling || lume_stream_busy() || lume_icmp_busy() || lume_datagram_busy())
         return -LUME_EBUSY;
     struct adapter *a = find(index);
     if (!a)
@@ -353,45 +364,104 @@ bool lume_net_dhcp(uint32_t index)
     return dhcp_supplied_address(&a->ip) != 0;
 }
 
-static bool dns_finished, dns_ok;
-static ip_addr_t dns_result;
+static struct dns_lookup
+{
+    ip_addr_t address;
+    uintptr_t generation;
+    bool active, finished, ok;
+} dns_lookups[LUME_TASK_LIMIT + 1];
+
 static uintptr_t dns_generation;
 
 static void resolved(const char *name, const ip_addr_t *ip, void *arg)
 {
     (void)name;
-    if ((uintptr_t)arg != dns_generation)
+    uintptr_t generation = (uintptr_t)arg;
+    for (unsigned owner = 0; owner <= LUME_TASK_LIMIT; ++owner)
+    {
+        struct dns_lookup *lookup = &dns_lookups[owner];
+        if (!lookup->active || lookup->generation != generation)
+            continue;
+        lookup->ok = ip != 0;
+        if (ip)
+            lookup->address = *ip;
+        lookup->finished = true;
+        if (owner)
+            lume_tasks_dns_notify(owner);
         return;
-    dns_ok = ip != 0;
-    if (ip)
-        dns_result = *ip;
-    dns_finished = true;
+    }
+}
+
+void lume_net_resolve_cancel(unsigned owner)
+{
+    if (owner <= LUME_TASK_LIMIT)
+        dns_lookups[owner] = (struct dns_lookup){0};
+}
+
+int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char out[4], bool resumed,
+                              bool *pending)
+{
+    if (!pending)
+        return -LUME_EINVAL;
+    *pending = false;
+    if (owner > LUME_TASK_LIMIT || !out)
+        return -LUME_EINVAL;
+    struct dns_lookup *lookup = &dns_lookups[owner];
+    if (!resumed)
+    {
+        if (!name || !*name)
+            return -LUME_EINVAL;
+        if (lookup->active)
+            return -LUME_EBUSY;
+        if (!started || !netif_default || ip4_addr_isany_val(*netif_ip4_addr(netif_default)))
+            return -LUME_EIO;
+        /* Callback tokens are never reused because lwIP may complete cancelled requests later. */
+        if (dns_generation == UINTPTR_MAX)
+            return -LUME_ENOSPC;
+        *lookup = (struct dns_lookup){.generation = ++dns_generation, .active = true};
+        err_t result =
+            dns_gethostbyname(name, &lookup->address, resolved, (void *)lookup->generation);
+        if (result == ERR_OK)
+            lookup->finished = lookup->ok = true;
+        else if (result != ERR_INPROGRESS)
+        {
+            lume_net_resolve_cancel(owner);
+            return -LUME_EIO;
+        }
+    }
+    else if (!lookup->active)
+        return -LUME_EIO;
+    lume_net_poll();
+    if (!lookup->finished)
+    {
+        *pending = true;
+        return -LUME_EAGAIN;
+    }
+    bool ok = lookup->ok;
+    if (ok)
+        memcpy(out, &ip_2_ip4(&lookup->address)->addr, 4);
+    lume_net_resolve_cancel(owner);
+    return ok ? 0 : -LUME_EIO;
 }
 
 static bool resolve(const char *name, ip_addr_t *out)
 {
     if (ipaddr_aton(name, out))
         return true;
-    dns_finished = dns_ok = false;
-    if (!++dns_generation)
-        ++dns_generation;
-    err_t r = dns_gethostbyname(name, &dns_result, resolved, (void *)dns_generation);
-    if (r == ERR_OK)
+    unsigned char address[4];
+    bool pending;
+    int result = lume_net_resolve_progress(0, name, address, false, &pending);
+    uint32_t at = lume_clock_millis();
+    while (pending && (uint32_t)(lume_clock_millis() - at) < 15000)
     {
-        *out = dns_result;
-        return true;
-    }
-    if (r != ERR_INPROGRESS)
-        return false;
-    uint32_t t = lume_clock_millis();
-    while (!dns_finished && (uint32_t)(lume_clock_millis() - t) < 15000)
         wait_ms(1);
-    if (!dns_finished || !dns_ok)
-    {
-        ++dns_generation;
-        return false;
+        result = lume_net_resolve_progress(0, 0, address, true, &pending);
     }
-    *out = dns_result;
+    lume_net_resolve_cancel(0);
+    if (pending || result)
+        return false;
+    ip_addr_set_zero(out);
+    memcpy(&ip_2_ip4(out)->addr, address, 4);
     return true;
 }
 

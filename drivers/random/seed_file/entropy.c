@@ -40,7 +40,8 @@ int lume_pc_entropy_start(void)
     if (seeded)
         return 0;
     struct lume_files files;
-    lume_files_init(&files);
+    if (!lume_files_init(&files))
+        return -LUME_ENOMEM;
     int result = -LUME_EIO;
     int64_t fd = lume_vfs_open(&files, "/data/system/rngseed.bin", LUME_O_RDWR);
     struct lume_stat metadata;

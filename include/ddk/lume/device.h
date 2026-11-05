@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "resource.h"
 
-#define LUME_DDK_VERSION 4u
+#define LUME_DDK_VERSION 7u
 #define LUME_DEVICE_LIMIT 32u
 
 enum lume_device_state

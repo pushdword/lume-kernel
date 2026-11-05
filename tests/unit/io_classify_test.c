@@ -55,6 +55,7 @@ static void check(unsigned number, uint64_t action, unsigned domain, bool mutati
 int main(void)
 {
     check(LUME_SYS_READ, 3, LUME_WORK_STORAGE, false);
+    check(LUME_SYS_FILE_IO, 0, LUME_WORK_STORAGE, false);
     check(LUME_SYS_WRITE, 7, LUME_WORK_NETWORK, false);
     check(LUME_SYS_CLOSE, 7, LUME_WORK_NETWORK, true);
     check(LUME_SYS_CLOSE, 3, LUME_WORK_STORAGE, true);
@@ -77,6 +78,7 @@ int main(void)
     check(LUME_SYS_THREAD, LUME_THREAD_CREATE, KERNEL_IO_EXCLUSIVE, true);
     check(LUME_SYS_THREAD, LUME_THREAD_EXIT, KERNEL_IO_EXCLUSIVE, true);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_MASK, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_SIGNAL, LUME_SIGNAL_TRY_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 0, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 4096, LUME_WORK_GENERAL, true);
     check(LUME_SYS_MEMORY, 0, LUME_WORK_GENERAL, false);

@@ -3,7 +3,11 @@
 #include <stdint.h>
 #define LUME_SPAWN_VERSION 1u
 #define LUME_SPAWN_OPTIONS_VERSION 2u
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#define LUME_SPAWN_ACTION_MAX 256u
+#else
 #define LUME_SPAWN_ACTION_MAX 32u
+#endif
 
 enum
 {

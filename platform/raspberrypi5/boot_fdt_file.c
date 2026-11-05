@@ -7,7 +7,8 @@ int lume_platform_fdt_configuration(char *buffer, size_t capacity, size_t *bytes
         return -LUME_EINVAL;
     *bytes = 0;
     struct lume_files files;
-    lume_files_init(&files);
+    if (!lume_files_init(&files))
+        return -LUME_ENOMEM;
     int64_t fd = lume_vfs_open(&files, "/etc/devices", LUME_O_RDONLY);
     if (fd < 0)
     {

@@ -8,7 +8,17 @@
 #include "lume/file_mode.h"
 #include "lume/poll.h"
 #include "lume/smp.h"
+#include "lume/sandbox_policy.h"
+#include "lume/socket_file.h"
+#include "lume/tty_device.h"
+#include "lume/kernel_memory.h"
+#include "lume/path.h"
+#include "lume/vfs_paths.h"
+#include "lume/files.h"
+#include "lume/worker.h"
 #include <string.h>
+#include "file_locks.h"
+
 #define NODES 192u
 #define CAPACITY 4096u
 #define RAM_FILES 32u
@@ -16,17 +26,23 @@ static unsigned char ram_data[RAM_FILES][CAPACITY];
 static bool ram_used[RAM_FILES];
 static uint64_t descriptor_sequence;
 static uint64_t poll_source_sequence;
-static uint64_t poll_pending;
+static uint64_t poll_pending[LUME_POLL_WORDS];
 static struct lume_poll_source console_source;
+
+struct poll_link
+{
+    struct lume_poll_source *source;
+    uint64_t generation;
+};
 
 static struct
 {
-    struct
-    {
-        struct lume_poll_source *source;
-        uint64_t generation;
-    } links[LUME_FD_LIMIT * 2];
-
+#if LUME_FILES_DYNAMIC
+    struct poll_link *links;
+    unsigned capacity;
+#else
+    struct poll_link links[LUME_FD_LIMIT * 2];
+#endif
     unsigned count;
 } poll_subscriptions[LUME_POLL_TASK_LIMIT];
 
@@ -45,8 +61,13 @@ bool lume_vfs_poll_input_ready(void)
 
 void lume_poll_source_notify(struct lume_poll_source *source)
 {
-    uint64_t changed = source->waiting & ~poll_pending;
-    poll_pending |= source->waiting;
+    bool changed = false;
+    for (unsigned word = 0; word < LUME_POLL_WORDS; ++word)
+    {
+        uint64_t waiting = word ? source->waiting_more[word - 1] : source->waiting;
+        changed |= (waiting & ~poll_pending[word]) != 0;
+        poll_pending[word] |= waiting;
+    }
     if (changed)
         lume_smp_wake();
 }
@@ -63,25 +84,80 @@ void lume_vfs_poll_cancel(unsigned task)
 {
     if (task >= LUME_POLL_TASK_LIMIT)
         return;
-    uint64_t bit = UINT64_C(1) << task;
+    unsigned word = task / 64u;
+    uint64_t bit = UINT64_C(1) << (task % 64u);
     for (unsigned i = 0; i < poll_subscriptions[task].count; ++i)
     {
         struct lume_poll_source *source = poll_subscriptions[task].links[i].source;
         if (source->generation == poll_subscriptions[task].links[i].generation)
-            source->waiting &= ~bit;
+        {
+            uint64_t *waiting = word ? &source->waiting_more[word - 1] : &source->waiting;
+            *waiting &= ~bit;
+        }
     }
     poll_subscriptions[task].count = 0;
-    poll_pending &= ~bit;
+    poll_pending[word] &= ~bit;
+}
+
+void lume_vfs_poll_release(unsigned task)
+{
+    if (task >= LUME_POLL_TASK_LIMIT)
+        return;
+    lume_vfs_poll_cancel(task);
+#if LUME_FILES_DYNAMIC
+    lume_kernel_free(poll_subscriptions[task].links);
+    poll_subscriptions[task].links = NULL;
+    poll_subscriptions[task].capacity = 0;
+#endif
 }
 
 bool lume_vfs_poll_take(unsigned task)
 {
     if (task >= LUME_POLL_TASK_LIMIT)
         return false;
-    uint64_t bit = UINT64_C(1) << task;
-    bool ready = (poll_pending & bit) != 0;
-    poll_pending &= ~bit;
+    unsigned word = task / 64u;
+    uint64_t bit = UINT64_C(1) << (task % 64u);
+    bool ready = (poll_pending[word] & bit) != 0;
+    poll_pending[word] &= ~bit;
     return ready;
+}
+
+void lume_poll_sources_retire_range(const void *allocation, size_t bytes)
+{
+    uintptr_t first = (uintptr_t)allocation;
+    if (!bytes || bytes > UINTPTR_MAX - first)
+        return;
+    uintptr_t end = first + bytes;
+    bool changed = false;
+    for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
+    {
+        unsigned word = task / 64u;
+        uint64_t bit = UINT64_C(1) << (task % 64u);
+        unsigned index = 0;
+        while (index < poll_subscriptions[task].count)
+        {
+            struct poll_link *link = &poll_subscriptions[task].links[index];
+            uintptr_t address = (uintptr_t)link->source;
+            if (address < first || address >= end)
+            {
+                ++index;
+                continue;
+            }
+            uint64_t *waiting =
+                word ? &link->source->waiting_more[word - 1] : &link->source->waiting;
+            *waiting &= ~bit;
+            changed |= (poll_pending[word] & bit) == 0;
+            poll_pending[word] |= bit;
+            *link = poll_subscriptions[task].links[--poll_subscriptions[task].count];
+        }
+    }
+    if (changed)
+        lume_smp_wake();
+}
+
+void lume_poll_source_retire(struct lume_poll_source *source)
+{
+    lume_poll_sources_retire_range(source, sizeof(*source));
 }
 
 static bool poll_subscribe_source(unsigned task, struct lume_poll_source *source)
@@ -90,16 +166,22 @@ static bool poll_subscribe_source(unsigned task, struct lume_poll_source *source
         return true;
     if (!source->generation)
         return false;
-    uint64_t bit = UINT64_C(1) << task;
-    if (source->waiting & bit)
+    unsigned word = task / 64u;
+    uint64_t bit = UINT64_C(1) << (task % 64u);
+    uint64_t *waiting = word ? &source->waiting_more[word - 1] : &source->waiting;
+    if (*waiting & bit)
         return true;
     unsigned count = poll_subscriptions[task].count;
-    if (count == LUME_FD_LIMIT * 2)
+    if (count == LUME_FD_LIMIT * 2
+#if LUME_FILES_DYNAMIC
+        || count == poll_subscriptions[task].capacity
+#endif
+    )
         return false;
     poll_subscriptions[task].links[count].source = source;
     poll_subscriptions[task].links[count].generation = source->generation;
     ++poll_subscriptions[task].count;
-    source->waiting |= bit;
+    *waiting |= bit;
     return true;
 }
 
@@ -123,7 +205,11 @@ static void bind_descriptor(struct lume_files *files, unsigned fd, int object, u
 
 /* Duplicated and inherited descriptors share one offset and access mode. Pipe endpoints
  * keep their channel alive until the last reference to each open description closes. */
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#define OPEN_FILES 512u
+#else
 #define OPEN_FILES 256u
+#endif
 #define PIPES (2u * LUME_TASK_LIMIT)
 
 static struct open_file
@@ -131,7 +217,8 @@ static struct open_file
     int node, pipe;
     unsigned references, status;
     uint32_t flags;
-    bool closing;
+    unsigned directory_authority_generation;
+    bool closing, deferred_close;
     uint64_t offset;
     struct lume_fat_cursor fat_cursor;
     const struct lume_file_ops *external;
@@ -139,23 +226,43 @@ static struct open_file
     void *storage_handle;
 } open_files[OPEN_FILES];
 
+static unsigned storage_reap_count, storage_reap_cursor;
+static bool storage_reap_enabled, storage_reaping;
+
+struct directory_authority
+{
+    int object;
+    bool active;
+};
+
+struct lume_directory_authorities
+{
+    unsigned generation;
+    struct directory_authority entry[LUME_SANDBOX_DIRECTORY_LIMIT];
+};
+
 static struct channel
 {
     unsigned readers, writers, head, count;
     struct lume_wait_queue readable, writable;
     struct lume_poll_source changed;
+#if LUME_FILES_DYNAMIC
+    unsigned char *data;
+#else
     unsigned char data[LUME_PIPE_BYTES];
+#endif
 } channels[PIPES];
 
 static struct node
 {
-    char path[LUME_PATH_MAX];
+    char *path;
     uint32_t kind;
-    bool writable, linked, on_fat, persistent;
-    bool mode_set;
+    bool writable, linked, on_fat, persistent, pending_fat;
+    bool mode_set, free_queued;
     unsigned mode;
     unsigned device;
     unsigned references;
+    uint32_t path_hash, path_next, parent;
     struct lume_fat_file fat_file;
     const unsigned char *image;
     uint64_t bytes;
@@ -164,8 +271,12 @@ static struct node
 } default_nodes[NODES];
 static struct node *nodes = default_nodes;
 static unsigned node_capacity = NODES;
+static uint32_t *name_buckets;
+static unsigned name_bucket_count;
 
 static unsigned count;
+static unsigned free_nodes;
+static unsigned namespace_generation;
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
@@ -185,10 +296,25 @@ static void *(*program_allocate)(size_t);
 bool lume_vfs_node_buffer(void *buffer, size_t bytes)
 {
     if (!buffer || count || (uintptr_t)buffer % _Alignof(struct node) ||
-        bytes / sizeof(struct node) < NODES || bytes / sizeof(struct node) > UINT32_MAX)
+        bytes / sizeof(struct node) < NODES || bytes / sizeof(struct node) > UINT32_MAX / 4u)
         return false;
+    unsigned capacity = (unsigned)(bytes / sizeof(struct node));
+    unsigned bucket_count = 1;
+    while (bucket_count < capacity * 2)
+        bucket_count *= 2;
+#if UINTPTR_MAX == UINT32_MAX
+    if (bucket_count > SIZE_MAX / sizeof(uint32_t))
+        return false;
+#endif
+    uint32_t *buckets = lume_kernel_allocate((size_t)bucket_count * sizeof(*buckets));
+    if (!buckets)
+        return false;
+    memset(buckets, 0, (size_t)bucket_count * sizeof(*buckets));
+    lume_kernel_free(name_buckets);
+    name_buckets = buckets;
+    name_bucket_count = bucket_count;
     nodes = buffer;
-    node_capacity = (unsigned)(bytes / sizeof(struct node));
+    node_capacity = capacity;
     return true;
 }
 
@@ -205,12 +331,21 @@ void lume_vfs_program_buffer(void *buffer, size_t bytes)
 
 static void release_ram(struct node *n)
 {
-    if (n->linked || n->references || !n->data)
+    if (n->linked || n->references)
         return;
-    for (unsigned i = 0; i < RAM_FILES; ++i)
-        if (n->data == ram_data[i])
-            ram_used[i] = false;
+    if (n->data)
+        for (unsigned i = 0; i < RAM_FILES; ++i)
+            if (n->data == ram_data[i])
+                ram_used[i] = false;
     n->data = 0;
+    lume_path_release(n->path);
+    n->path = NULL;
+    if (!n->block && !n->free_queued)
+    {
+        n->path_next = free_nodes;
+        free_nodes = (unsigned)(n - nodes) + 1;
+        n->free_queued = true;
+    }
 }
 
 static size_t length(const char *s)
@@ -239,67 +374,71 @@ static void copy(void *d, const void *s, size_t n)
         *a++ = *b++;
 }
 
-static int path(struct lume_files *f, const char *input, char out[LUME_PATH_MAX])
+static uint32_t namespace_hash(const char *path)
 {
-    if (!*input)
-        return -LUME_ENOENT;
-    size_t n = 1;
-    out[0] = '/';
-    out[1] = 0;
-    if (*input != '/')
-    {
-        n = length(f->cwd);
-        copy(out, f->cwd, n + 1);
-    }
-    while (*input)
-    {
-        while (*input == '/')
-            ++input;
-        const char *start = input;
-        size_t part = 0;
-        while (*input && *input != '/')
-        {
-            ++input;
-            ++part;
-        }
-        if (!part || (part == 1 && start[0] == '.'))
-            continue;
-        if (part == 2 && start[0] == '.' && start[1] == '.')
-        {
-            while (n > 1 && out[n - 1] != '/')
-                --n;
-            if (n > 1)
-                --n;
-            out[n] = 0;
-            continue;
-        }
-        if (part > LUME_NAME_MAX || n + part + (n > 1) >= LUME_PATH_MAX)
-            return -LUME_ENAMETOOLONG;
-        if (n > 1)
-            out[n++] = '/';
-        copy(out + n, start, part);
-        n += part;
-        out[n] = 0;
-    }
-    if (n >= 5 && out[1] == 'd' && out[2] == 'a' && out[3] == 't' && out[4] == 'a' &&
-        (n == 5 || out[5] == '/'))
-        for (size_t i = 6; i < n; ++i)
-            if (out[i] >= 'A' && out[i] <= 'Z')
-                out[i] = (char)(out[i] + 32);
-    return 0;
+    if (storage && storage->path_hash && !strncmp(path, "/data", 5) && (!path[5] || path[5] == '/'))
+        return storage->path_hash(path);
+    return lume_path_hash_folded(path);
+}
+
+static void index_insert_hashed(unsigned index, uint32_t hash)
+{
+    struct node *node = &nodes[index];
+    node->path_hash = hash;
+    unsigned bucket = node->path_hash & (name_bucket_count - 1);
+    node->path_next = name_buckets[bucket];
+    name_buckets[bucket] = index + 1;
+}
+
+static void index_insert(unsigned index)
+{
+    index_insert_hashed(index, namespace_hash(nodes[index].path));
+}
+
+static void index_remove(unsigned index)
+{
+    struct node *node = &nodes[index];
+    uint32_t *link = &name_buckets[node->path_hash & (name_bucket_count - 1)];
+    while (*link && *link != index + 1)
+        link = &nodes[*link - 1].path_next;
+    if (!*link)
+        lume_fail("namespace index removal");
+    *link = node->path_next;
+    node->path_next = 0;
 }
 
 static int find(const char *p)
 {
-    for (unsigned i = 0; i < count; ++i)
-        if (nodes[i].linked && equal(p, nodes[i].path))
+    if (!name_bucket_count)
+        return -LUME_ENOENT;
+    uint32_t hash = namespace_hash(p);
+    unsigned first = name_buckets[hash & (name_bucket_count - 1)];
+    for (unsigned link = first; link; link = nodes[link - 1].path_next)
+        if (equal(p, nodes[link - 1].path))
+            return (int)link - 1;
+    for (unsigned link = first; link; link = nodes[link - 1].path_next)
+    {
+        unsigned i = link - 1;
+        struct node *node = &nodes[i];
+        bool same = node->persistent && storage && storage->path_equal && storage->path_hash
+                        ? storage->path_equal(p, node->path)
+                        : node->on_fat && lume_path_equal_folded(p, node->path);
+        if (same)
             return (int)i;
+    }
+    if (storage && storage->path_equal && !storage->path_hash)
+        for (unsigned i = 0; i < count; ++i)
+            if (nodes[i].linked && nodes[i].persistent && storage->path_equal(p, nodes[i].path))
+                return (int)i;
     return -LUME_ENOENT;
 }
 
-/* Verify every prefix: /regular/../tmp must still fail with ENOTDIR. */
-static int resolve(struct lume_files *f, const char *input, char out[LUME_PATH_MAX])
+/* Resolve components in order so a regular file followed by /.. remains invalid. */
+static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_PATH_MAX])
 {
+    out[0] = 0;
+    if (!*input)
+        return -LUME_ENOENT;
     if (f->identity.jailed)
     {
         const char *part = input;
@@ -322,79 +461,168 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_PATH_M
     }
     if (f->identity.euid)
         return -LUME_EACCES;
-    char raw[LUME_PATH_MAX * 2];
-    size_t n = 0;
-    if (*input != '/')
-    {
-        n = length(f->cwd);
-        copy(raw, f->cwd, n);
-        raw[n++] = '/';
-    }
-    size_t m = length(input);
-    if (n + m >= sizeof(raw))
+    char raw[LUME_FILES_PATH_MAX * 2];
+    const char *cwd = lume_files_cwd(f);
+    if (*input != '/' && !cwd)
+        return -LUME_ENOENT;
+    size_t prefix = *input == '/' ? 0 : length(cwd);
+    size_t bytes = length(input);
+    if (prefix + (prefix != 0) + bytes >= sizeof(raw))
         return -LUME_ENAMETOOLONG;
-    copy(raw + n, input, m + 1);
-    for (size_t i = 1; i < n + m; ++i)
-        if (raw[i] == '/' && raw[i - 1] != '/')
+    if (prefix)
+    {
+        copy(raw, cwd, prefix);
+        raw[prefix++] = '/';
+    }
+    copy(raw + prefix, input, bytes + 1);
+    out[0] = '/';
+    out[1] = 0;
+    size_t used = 1;
+    int index = find("/");
+    const char *cursor = raw;
+    while (*cursor)
+    {
+        while (*cursor == '/')
+            ++cursor;
+        if (!*cursor)
+            break;
+        if (index < 0 || nodes[index].kind != LUME_NODE_DIR)
         {
-            char prefix[LUME_PATH_MAX];
-            char saved = raw[i];
-            raw[i] = 0;
-            int r = path(f, raw, prefix);
-            raw[i] = saved;
-            if (r < 0)
-                return r;
-            r = find(prefix);
-            if (r < 0)
-                return r;
-            if (nodes[r].kind != LUME_NODE_DIR)
-                return -LUME_ENOTDIR;
+            out[0] = 0;
+            return index < 0 ? index : -LUME_ENOTDIR;
         }
-    int r = path(f, input, out);
-    if (r < 0)
-        return r;
-    r = find(out);
-    if (r >= 0 && m && input[m - 1] == '/' && nodes[r].kind != LUME_NODE_DIR)
+        const char *part = cursor;
+        while (*cursor && *cursor != '/')
+            ++cursor;
+        size_t count = (size_t)(cursor - part);
+        if (count == 1 && part[0] == '.')
+            continue;
+        if (count == 2 && part[0] == '.' && part[1] == '.')
+        {
+            while (used > 1 && out[used - 1] != '/')
+                --used;
+            if (used > 1)
+                --used;
+            out[used] = 0;
+            index = find(out);
+            continue;
+        }
+        if (count > LUME_FILES_NAME_MAX || used + (used > 1) + count >= LUME_FILES_PATH_MAX)
+        {
+            out[0] = 0;
+            return -LUME_ENAMETOOLONG;
+        }
+        if (used > 1)
+            out[used++] = '/';
+        copy(out + used, part, count);
+        used += count;
+        out[used] = 0;
+        index = find(out);
+        if (index >= 0)
+        {
+            used = length(nodes[index].path);
+            copy(out, nodes[index].path, used + 1);
+        }
+    }
+    if (index >= 0 && bytes && input[bytes - 1] == '/' && nodes[index].kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
-    return r;
+    return index;
 }
 
-static void set_node(unsigned index, const char *p, unsigned kind, const void *data, size_t bytes,
+static unsigned parent_node(const char *path)
+{
+    if (!path[0] || (path[0] == '/' && !path[1]))
+        return 0;
+    char parent[LUME_FILES_PATH_MAX];
+    copy(parent, path, length(path) + 1);
+    char *last = strrchr(parent, '/');
+    if (!last)
+        return UINT32_MAX;
+    if (last == parent)
+        parent[1] = 0;
+    else
+        *last = 0;
+    int index = find(parent);
+    if (index < 0 || nodes[index].kind != LUME_NODE_DIR)
+        return UINT32_MAX;
+    return (unsigned)index + 1;
+}
+
+static void set_node(unsigned index, char *p, unsigned kind, const void *data, size_t bytes,
                      bool writable)
 {
     struct node *n = &nodes[index];
+    if (index < count)
+        lume_path_release(n->path);
     *n = (struct node){0};
-    copy(n->path, p, length(p) + 1);
+    n->path = p;
+    n->parent = parent_node(p);
+    if (n->parent == UINT32_MAX)
+        lume_fail("namespace parent missing");
     n->kind = kind;
     n->image = data;
     n->bytes = bytes;
     n->writable = writable;
     n->linked = true;
+    index_insert(index);
 }
 
-static void add(const char *p, unsigned kind, const void *data, size_t bytes, bool writable)
+static bool add(const char *p, unsigned kind, const void *data, size_t bytes, bool writable)
 {
-    set_node(count++, p, kind, data, bytes, writable);
+    char *owned = lume_path_duplicate(p);
+    if (!owned)
+        return false;
+    set_node(count, owned, kind, data, bytes, writable);
+    ++count;
+    return true;
+}
+
+static void add_required(const char *p, unsigned kind, const void *data, size_t bytes,
+                         bool writable)
+{
+    if (!add(p, kind, data, bytes, writable))
+        lume_fail("initial namespace allocation");
 }
 
 static unsigned available_node(void)
 {
-    for (unsigned i = 0; i < count; ++i)
-        if (!nodes[i].linked && !nodes[i].references && !nodes[i].block)
-            return i;
-    return count;
+    return free_nodes ? free_nodes - 1 : count;
 }
 
-static unsigned create_node(const char *p, unsigned kind)
+static unsigned reserve_node(char *p, unsigned kind)
 {
     unsigned index = available_node();
+    if (index == node_capacity)
+        return UINT32_MAX;
+    if (free_nodes)
+        free_nodes = nodes[index].path_next;
+    nodes[index] = (struct node){.path = p, .kind = kind, .writable = true, .references = 1};
+    nodes[index].parent = parent_node(p);
+    if (nodes[index].parent == UINT32_MAX)
+        lume_fail("namespace parent missing");
     if (index == count)
         ++count;
-    set_node(index, p, kind, 0, 0, true);
     return index;
 }
 
-static void block_path(const struct lume_block *b, char out[LUME_PATH_MAX])
+static void publish_node(unsigned index)
+{
+    if (nodes[index].linked || nodes[index].references != 1)
+        lume_fail("namespace reservation publication");
+    nodes[index].references = 0;
+    nodes[index].linked = true;
+    index_insert(index);
+}
+
+static void cancel_node(unsigned index)
+{
+    if (nodes[index].linked || nodes[index].references != 1)
+        lume_fail("namespace reservation cancellation");
+    nodes[index].references = 0;
+    release_ram(&nodes[index]);
+}
+
+static void block_path(const struct lume_block *b, char out[LUME_FILES_PATH_MAX])
 {
     copy(out, "/dev/", 5);
     copy(out + 5, b->device->name, length(b->device->name) + 1);
@@ -402,7 +630,7 @@ static void block_path(const struct lume_block *b, char out[LUME_PATH_MAX])
 
 static int add_block(struct lume_block *b)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     block_path(b, p);
     if (find(p) >= 0)
         return -LUME_EEXIST;
@@ -414,15 +642,16 @@ static int add_block(struct lume_block *b)
     {
         if (count == node_capacity)
             return -LUME_ENOSPC;
-        add(p, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes), !b->read_only);
+        if (!add(p, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes), !b->read_only))
+            return -LUME_ENOMEM;
     }
     else
     {
-        nodes[slot] = (struct node){.kind = LUME_NODE_BLOCK,
-                                    .writable = !b->read_only,
-                                    .linked = true,
-                                    .bytes = b->sectors * b->sector_bytes};
-        copy(nodes[slot].path, p, length(p) + 1);
+        char *owned = lume_path_duplicate(p);
+        if (!owned)
+            return -LUME_ENOMEM;
+        set_node(slot, owned, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes),
+                 !b->read_only);
     }
     nodes[slot].block = b;
     return 0;
@@ -468,7 +697,11 @@ int lume_devfs_unregister_block(struct lume_block *b)
                     return -LUME_EBUSY;
             for (unsigned j = 0; j < count; ++j)
                 if (nodes[j].linked && nodes[j].block == b)
+                {
+                    index_remove(j);
                     nodes[j].linked = false;
+                    release_ram(&nodes[j]);
+                }
             block_devices[i] = 0;
             return 0;
         }
@@ -479,34 +712,63 @@ void lume_vfs_init(const void *shell, size_t bytes)
 {
     if (storage_handles())
         for (unsigned i = 0; i < OPEN_FILES; ++i)
-            if (open_files[i].references && open_files[i].storage_handle)
+            if ((open_files[i].references || open_files[i].deferred_close) &&
+                open_files[i].storage_handle)
                 (void)storage->close(open_files[i].storage_handle);
-    poll_pending = 0;
+    for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
+        lume_vfs_poll_release(task);
+    memset(poll_pending, 0, sizeof(poll_pending));
     memset(poll_subscriptions, 0, sizeof(poll_subscriptions));
     console_source = (struct lume_poll_source){0};
     lume_poll_source_reset(&console_source);
     poll_input_ready = false;
     lume_file_modes_reset();
+    file_lock_count = 0;
     for (unsigned i = 0; i < OPEN_FILES; ++i)
         open_files[i] = (struct open_file){0};
+    storage_reap_count = storage_reap_cursor = 0;
+    storage_reap_enabled = storage_reaping = false;
     for (unsigned i = 0; i < PIPES; ++i)
+    {
+#if LUME_FILES_DYNAMIC
+        if (channels[i].data && !lume_page_free((uintptr_t)channels[i].data))
+            lume_fail("pipe backing release");
+#endif
         channels[i] = (struct channel){0};
+    }
+    for (unsigned i = 0; i < count; ++i)
+    {
+        lume_path_release(nodes[i].path);
+        nodes[i] = (struct node){0};
+    }
     count = 0;
+    free_nodes = 0;
+    if (!name_buckets)
+    {
+        name_bucket_count = 512;
+        name_buckets = lume_kernel_allocate(name_bucket_count * sizeof(*name_buckets));
+        if (!name_buckets)
+            lume_fail("namespace index allocation");
+    }
+    memset(name_buckets, 0, (size_t)name_bucket_count * sizeof(*name_buckets));
+    if (namespace_generation == UINT32_MAX)
+        lume_fail("namespace generation exhausted");
+    ++namespace_generation;
     root_fat = (struct lume_fat){0};
     storage = 0;
     for (unsigned i = 0; i < RAM_FILES; ++i)
         ram_used[i] = false;
-    add("/", LUME_NODE_DIR, 0, 0, false);
-    add("/dev", LUME_NODE_DIR, 0, 0, false);
-    add("/bin", LUME_NODE_DIR, 0, 0, false);
-    add("/etc", LUME_NODE_DIR, 0, 0, false);
-    add("/tmp", LUME_NODE_DIR, 0, 0, true);
-    add("/dev/console", LUME_NODE_CHAR, 0, 0, true);
-    add("/dev/null", LUME_NODE_CHAR, 0, 0, true);
+    add_required("/", LUME_NODE_DIR, 0, 0, false);
+    add_required("/dev", LUME_NODE_DIR, 0, 0, false);
+    add_required("/bin", LUME_NODE_DIR, 0, 0, false);
+    add_required("/etc", LUME_NODE_DIR, 0, 0, false);
+    add_required("/tmp", LUME_NODE_DIR, 0, 0, true);
+    add_required("/dev/console", LUME_NODE_CHAR, 0, 0, true);
+    add_required("/dev/null", LUME_NODE_CHAR, 0, 0, true);
     nodes[count - 1].device = 1;
-    add("/dev/zero", LUME_NODE_CHAR, 0, 0, true);
+    add_required("/dev/zero", LUME_NODE_CHAR, 0, 0, true);
     nodes[count - 1].device = 2;
-    add("/bin/sh", LUME_NODE_FILE, shell, bytes, false);
+    add_required("/bin/sh", LUME_NODE_FILE, shell, bytes, false);
     static const char motd[] =
 #if defined(LUME_ARCH_I686)
         "LumeOS i686 / PCI PC\nNative ABI 1.0. COM1 and PS/2 console.\n";
@@ -515,7 +777,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
 #else
         "LumeOS AArch64 / Raspberry Pi 5\nNative ABI 1.0. GPIO UART console.\n";
 #endif
-    add("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
+    add_required("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (block_devices[i])
             (void)add_block(block_devices[i]);
@@ -539,9 +801,87 @@ static int new_object(int node, int pipe, uint32_t flags)
     return -LUME_ENOMEM;
 }
 
-void lume_files_init(struct lume_files *f)
+static bool files_ready(const struct lume_files *f)
+{
+    if (f->cwd_generation != namespace_generation)
+        return false;
+#if LUME_FILES_DYNAMIC
+    return f->fd != NULL;
+#else
+    (void)f;
+    return true;
+#endif
+}
+
+static struct node *current_directory(const struct lume_files *files)
+{
+    return files->cwd_node && files->cwd_node <= count &&
+                   files->cwd_generation == namespace_generation
+               ? &nodes[files->cwd_node - 1]
+               : NULL;
+}
+
+const char *lume_files_cwd(const struct lume_files *files)
+{
+    if (files->cwd_generation != namespace_generation)
+        return NULL;
+    struct node *node = current_directory(files);
+    if (files->cwd_node)
+        return node && node->linked ? node->path : NULL;
+    return files->cwd;
+}
+
+static void drop_directory(struct lume_files *files)
+{
+    struct node *node = current_directory(files);
+    files->cwd_node = files->cwd_generation = 0;
+    if (node)
+    {
+        if (!node->references)
+            lume_fail("directory reference release");
+        --node->references;
+        release_ram(node);
+    }
+}
+
+static void hold_directory(struct lume_files *files, unsigned index)
+{
+    ++nodes[index].references;
+    drop_directory(files);
+    files->cwd_node = index + 1;
+    files->cwd_generation = namespace_generation;
+    size_t bytes = length(nodes[index].path) + 1;
+    if (bytes <= sizeof(files->cwd))
+        copy(files->cwd, nodes[index].path, bytes);
+    else
+    {
+        files->cwd[0] = '/';
+        files->cwd[1] = 0;
+    }
+}
+
+int lume_files_copy_cwd(struct lume_files *out, const struct lume_files *in)
+{
+    if (out == in)
+        return 0;
+    struct node *node = current_directory(in);
+    if (in->cwd_node && !node)
+        return -116;
+    if (node)
+        hold_directory(out, in->cwd_node - 1);
+    else
+    {
+        drop_directory(out);
+        copy(out->cwd, in->cwd, sizeof(out->cwd));
+        out->cwd_generation = namespace_generation;
+    }
+    return 0;
+}
+
+bool lume_files_init(struct lume_files *f)
 {
     *f = (struct lume_files){0};
+    f->cwd_generation = namespace_generation;
     f->identity.umask = 022;
     for (unsigned i = 0; i < LUME_LIMIT_COUNT; ++i)
         f->identity.limit[i].soft = f->identity.limit[i].hard = UINT64_MAX;
@@ -551,15 +891,83 @@ void lume_files_init(struct lume_files *f)
         LUME_TASK_LIMIT;
     f->identity.limit[LUME_LIMIT_CORE_SIZE].soft = f->identity.limit[LUME_LIMIT_CORE_SIZE].hard = 0;
     f->cwd[0] = '/';
+#if LUME_FILES_DYNAMIC
+    f->fd = lume_kernel_allocate(sizeof(*f->fd) * LUME_FD_MAX);
+    if (!f->fd)
+        return false;
+    memset(f->fd, 0, sizeof(*f->fd) * LUME_FD_MAX);
+#endif
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
         f->fd[i].object = -1;
     for (unsigned i = 0; i < 3; ++i)
-        bind_descriptor(f, i, new_object(5, -1, i ? LUME_O_WRONLY : LUME_O_RDONLY), 0);
+    {
+        int object = new_object(5, -1, i ? LUME_O_WRONLY : LUME_O_RDONLY);
+        if (object < 0)
+        {
+            lume_files_release(f);
+            return false;
+        }
+        bind_descriptor(f, i, object, 0);
+    }
+    if (count)
+        hold_directory(f, 0);
+    return true;
 }
 
-void lume_files_clone(struct lume_files *out, const struct lume_files *in)
+bool lume_files_clone(struct lume_files *out, const struct lume_files *in)
 {
+    if (out == in)
+        return false;
+    if (!files_ready(in))
+    {
+        *out = (struct lume_files){0};
+        return false;
+    }
+    *out = (struct lume_files){0};
+#if !LUME_FILES_DYNAMIC
+    for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+        out->fd[i].object = -1;
+#endif
+#if LUME_FILES_DYNAMIC
+    if (!in->fd)
+        return false;
+    struct lume_fd *table = lume_kernel_allocate(sizeof(*table) * LUME_FD_MAX);
+    if (!table)
+        return false;
+#endif
+    struct lume_directory_authorities *authorities = NULL;
+    if (in->directory_authorities)
+    {
+        authorities = lume_kernel_allocate(sizeof(*authorities));
+        if (!authorities)
+        {
+#if LUME_FILES_DYNAMIC
+            lume_kernel_free(table);
+#endif
+            return false;
+        }
+        memcpy(authorities, in->directory_authorities, sizeof(*authorities));
+    }
     *out = *in;
+    out->directory_authorities = authorities;
+    out->cwd_node = out->cwd_generation = 0;
+#if LUME_FILES_DYNAMIC
+    out->fd = table;
+    memcpy(out->fd, in->fd, sizeof(*table) * LUME_FD_MAX);
+#endif
+    if (lume_files_copy_cwd(out, in))
+    {
+        lume_kernel_free(out->directory_authorities);
+        out->directory_authorities = NULL;
+#if LUME_FILES_DYNAMIC
+        lume_kernel_free(out->fd);
+        out->fd = NULL;
+#else
+        for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+            out->fd[i].object = -1;
+#endif
+        return false;
+    }
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
     {
         out->fd[i].changed = (struct lume_poll_source){0};
@@ -567,25 +975,95 @@ void lume_files_clone(struct lume_files *out, const struct lume_files *in)
         if (out->fd[i].object >= 0)
             ++open_files[out->fd[i].object].references;
     }
+    if (authorities)
+        for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
+            if (authorities->entry[i].active)
+                ++open_files[authorities->entry[i].object].references;
+    return true;
 }
 
-void lume_files_inherit(struct lume_files *out, const struct lume_files *in)
+bool lume_files_inherit(struct lume_files *out, const struct lume_files *in)
 {
-    lume_files_clone(out, in);
+    if (!lume_files_clone(out, in))
+        return false;
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
         if (out->fd[i].flags & LUME_FD_CLOEXEC)
             (void)lume_vfs_close(out, i);
+    return true;
+}
+
+void lume_files_move(struct lume_files *out, struct lume_files *in)
+{
+    if (out == in)
+        return;
+    *out = *in;
+    in->cwd_node = in->cwd_generation = 0;
+    in->directory_authorities = NULL;
+#if LUME_FILES_DYNAMIC
+    in->fd = NULL;
+#else
+    for (unsigned i = 0; i < LUME_FD_MAX; ++i)
+        in->fd[i].object = -1;
+#endif
 }
 
 void lume_files_release(struct lume_files *f)
 {
+    struct lume_directory_authorities *authorities = f->directory_authorities;
+    f->directory_authorities = NULL;
+    if (authorities)
+    {
+        if (authorities->generation == namespace_generation)
+            for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
+                if (authorities->entry[i].active)
+                    lume_vfs_drop(authorities->entry[i].object);
+        lume_kernel_free(authorities);
+    }
+#if LUME_FILES_DYNAMIC
+    if (!f->fd)
+    {
+        drop_directory(f);
+        return;
+    }
+#endif
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
         (void)lume_vfs_close(f, i);
+    drop_directory(f);
+#if LUME_FILES_DYNAMIC
+    lume_poll_sources_retire_range(f->fd, sizeof(*f->fd) * LUME_FD_MAX);
+    struct lume_fd *table = f->fd;
+    f->fd = NULL;
+    lume_kernel_free(table);
+#endif
+}
+
+uint64_t lume_files_pages(const struct lume_files *f)
+{
+    uint64_t pages = 0;
+    if (f->directory_authorities)
+    {
+        uint64_t prefix = (uintptr_t)f->directory_authorities & UINT64_C(4095);
+        pages = (prefix + sizeof(*f->directory_authorities) + 4095) / 4096;
+    }
+#if LUME_FILES_DYNAMIC
+    if (!f->fd)
+        return pages;
+    uint64_t prefix = (uintptr_t)f->fd & UINT64_C(4095);
+    return pages + (prefix + sizeof(*f->fd) * LUME_FD_MAX + 4095) / 4096;
+#else
+    return pages;
+#endif
 }
 
 static struct open_file *descriptor(struct lume_files *f, uint64_t fd)
 {
-    return fd < LUME_FD_MAX && f->fd[fd].object >= 0 ? &open_files[f->fd[fd].object] : 0;
+    return fd < LUME_FD_MAX &&
+#if LUME_FILES_DYNAMIC
+                   f->fd &&
+#endif
+                   f->fd[fd].object >= 0
+               ? &open_files[f->fd[fd].object]
+               : 0;
 }
 
 bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
@@ -619,6 +1097,10 @@ bool lume_vfs_storage_io(struct lume_files *files, uint64_t fd)
 
 bool lume_vfs_exec_callbacks(const struct lume_files *files)
 {
+#if LUME_FILES_DYNAMIC
+    if (!files->fd)
+        return false;
+#endif
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
     {
         int object = files->fd[i].object;
@@ -631,6 +1113,10 @@ bool lume_vfs_exec_callbacks(const struct lume_files *files)
 int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, void *context,
                     unsigned flags)
 {
+#if LUME_FILES_DYNAMIC
+    if (!files->fd)
+        return -LUME_ENOMEM;
+#endif
     unsigned fd = 0;
     while (fd < files->identity.limit[LUME_LIMIT_FILES].soft && files->fd[fd].object >= 0)
         ++fd;
@@ -663,6 +1149,10 @@ int lume_vfs_hold(struct lume_files *files, unsigned fd)
 
 int lume_vfs_install(struct lume_files *files, int object)
 {
+#if LUME_FILES_DYNAMIC
+    if (!files->fd)
+        return -LUME_ENOMEM;
+#endif
     if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
         return -LUME_EBADF;
     for (unsigned i = 0; i < files->identity.limit[LUME_LIMIT_FILES].soft; ++i)
@@ -674,15 +1164,159 @@ int lume_vfs_install(struct lume_files *files, int object)
     return -LUME_EMFILE;
 }
 
-void lume_vfs_drop(int object)
+int lume_vfs_directory_authority(struct lume_files *files, unsigned operation, uint64_t fd)
 {
-    struct lume_files files = {0};
-    files.fd[0].object = object;
-    (void)lume_vfs_close(&files, 0);
+    if (operation < LUME_SANDBOX_DIRECTORY_MINT || operation > LUME_SANDBOX_DIRECTORY_RELEASE)
+        return -LUME_EINVAL;
+    unsigned profile = files->identity.sandbox_profile;
+    if ((operation == LUME_SANDBOX_DIRECTORY_MINT && profile != LUME_SANDBOX_NONE) ||
+        (operation != LUME_SANDBOX_DIRECTORY_MINT && profile != LUME_SANDBOX_NETWORK))
+        return -LUME_EPERM;
+    if (!files_ready(files))
+        return -LUME_EBADF;
+    struct open_file *file = descriptor(files, fd);
+    if (!file)
+        return -LUME_EBADF;
+    if (file->external || file->pipe >= 0 || file->node < 0 ||
+        nodes[file->node].kind != LUME_NODE_DIR ||
+        (!nodes[file->node].linked && operation != LUME_SANDBOX_DIRECTORY_RELEASE))
+        return -LUME_ENOTDIR;
+    if (operation == LUME_SANDBOX_DIRECTORY_MINT)
+    {
+        file->directory_authority_generation = namespace_generation;
+        return 0;
+    }
+    if (file->directory_authority_generation != namespace_generation)
+        return -LUME_EPERM;
+    struct lume_directory_authorities *authorities = files->directory_authorities;
+    if (!authorities && operation == LUME_SANDBOX_DIRECTORY_ACTIVATE)
+    {
+        authorities = lume_kernel_allocate(sizeof(*authorities));
+        if (!authorities)
+            return -LUME_ENOMEM;
+        memset(authorities, 0, sizeof(*authorities));
+        authorities->generation = namespace_generation;
+        files->directory_authorities = authorities;
+    }
+    if (!authorities || authorities->generation != namespace_generation)
+        return -LUME_EINVAL;
+    unsigned slot = LUME_SANDBOX_DIRECTORY_LIMIT;
+    for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
+    {
+        struct directory_authority *entry = &authorities->entry[i];
+        if (!entry->active)
+        {
+            if (slot == LUME_SANDBOX_DIRECTORY_LIMIT)
+                slot = i;
+            continue;
+        }
+        if (open_files[entry->object].node != file->node)
+            continue;
+        if (operation == LUME_SANDBOX_DIRECTORY_RELEASE)
+        {
+            int object = entry->object;
+            *entry = (struct directory_authority){0};
+            lume_vfs_drop(object);
+            return 0;
+        }
+        return 0;
+    }
+    if (operation == LUME_SANDBOX_DIRECTORY_RELEASE)
+        return -LUME_EINVAL;
+    if (slot == LUME_SANDBOX_DIRECTORY_LIMIT)
+        return -LUME_ENOSPC;
+    int object = lume_vfs_hold(files, (unsigned)fd);
+    if (object < 0)
+        return object;
+    authorities->entry[slot] = (struct directory_authority){.object = object, .active = true};
+    return 0;
+}
+
+static bool directory_contains(unsigned anchor, unsigned index)
+{
+    for (unsigned depth = 0; depth < count; ++depth)
+    {
+        struct node *node = &nodes[index];
+        if (!node->linked || (node->kind != LUME_NODE_DIR && node->kind != LUME_NODE_FILE))
+            return false;
+        if (index == anchor)
+            return node->kind == LUME_NODE_DIR;
+        if (!node->parent || node->parent > count)
+            return false;
+        index = node->parent - 1;
+        if (nodes[index].kind != LUME_NODE_DIR)
+            return false;
+    }
+    return false;
+}
+
+bool lume_vfs_sandbox_directory(struct lume_files *files, const char *canonical, bool parent)
+{
+    struct lume_directory_authorities *authorities = files->directory_authorities;
+    if (files->identity.sandbox_profile != LUME_SANDBOX_NETWORK || !authorities ||
+        authorities->generation != namespace_generation || !files_ready(files))
+        return false;
+    int index = find(canonical);
+    if (index >= 0 && nodes[index].kind != LUME_NODE_DIR && nodes[index].kind != LUME_NODE_FILE)
+        return false;
+    if (parent)
+    {
+        unsigned directory = index >= 0 ? nodes[index].parent : parent_node(canonical);
+        if (!directory || directory > count)
+            return false;
+        index = (int)directory - 1;
+    }
+    if (index < 0)
+        return false;
+    for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
+    {
+        struct directory_authority *entry = &authorities->entry[i];
+        if (entry->active &&
+            directory_contains((unsigned)open_files[entry->object].node, (unsigned)index))
+            return true;
+    }
+    return false;
+}
+
+static int sandbox_mutation(struct lume_files *files, const char *canonical, bool parent)
+{
+    return !files->identity.sandbox_profile || lume_vfs_sandbox_directory(files, canonical, parent)
+               ? 0
+               : -LUME_EPERM;
+}
+
+int lume_vfs_sandbox_access(struct lume_files *files, uint64_t fd, bool writing)
+{
+    unsigned profile = files->identity.sandbox_profile;
+    if (!profile)
+        return 0;
+    struct open_file *object = descriptor(files, fd);
+    if (!object)
+        return 0;
+    if (profile != LUME_SANDBOX_NETWORK && fd <= UINT32_MAX &&
+        lume_socket_network_io(files, (unsigned)fd))
+        return -LUME_EPERM;
+    unsigned kind = object->external    ? object->external->kind
+                    : object->pipe >= 0 ? LUME_NODE_PIPE
+                                        : nodes[object->node].kind;
+    bool inert = !object->external && object->pipe < 0 &&
+                 (nodes[object->node].device == 1 || nodes[object->node].device == 2);
+    if (kind == LUME_NODE_BLOCK || (kind == LUME_NODE_CHAR && !inert &&
+                                    (!writing || (!lume_vfs_console_io(files, fd) &&
+                                                  !lume_tty_slave_output(files, (unsigned)fd)))))
+        return -LUME_EPERM;
+    return 0;
 }
 
 int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
 {
+    int permission = lume_sandbox_open(f, input, flags);
+    if (permission)
+        return permission;
+#if LUME_FILES_DYNAMIC
+    if (!f->fd)
+        return -LUME_ENOMEM;
+#endif
     if (terminal_open)
     {
         int fd = terminal_open(f, input, flags);
@@ -698,7 +1332,7 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         ++fd;
     if (fd >= f->identity.limit[LUME_LIMIT_FILES].soft)
         return -LUME_EMFILE;
-    char p[LUME_PATH_MAX] = {0};
+    char p[LUME_FILES_PATH_MAX] = {0};
     int index = resolve(f, input, p);
     if (index >= 0 && (flags & LUME_O_CREAT) && (flags & LUME_O_EXCL))
         return -LUME_EEXIST;
@@ -706,7 +1340,7 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     {
         if (input[length(input) - 1] == '/')
             return -LUME_ENOENT;
-        char parent[LUME_PATH_MAX];
+        char parent[LUME_FILES_PATH_MAX];
         copy(parent, p, length(p) + 1);
         size_t k = length(parent);
         while (k && parent[k - 1] != '/')
@@ -719,14 +1353,27 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
             return -LUME_EROFS;
         if (available_node() == node_capacity)
             return -LUME_ENOSPC;
+        char *owned = lume_path_duplicate(p);
+        if (!owned)
+            return -LUME_ENOMEM;
+        unsigned reserved = reserve_node(owned, LUME_NODE_FILE);
+        if (reserved == UINT32_MAX)
+        {
+            lume_path_release(owned);
+            return -LUME_ENOSPC;
+        }
         if (nodes[directory].persistent)
         {
             int e = storage->create(p, false);
             if (e)
+            {
+                cancel_node(reserved);
                 return e;
+            }
         }
-        index = (int)create_node(p, LUME_NODE_FILE);
+        index = (int)reserved;
         nodes[index].persistent = nodes[directory].persistent;
+        publish_node((unsigned)index);
     }
     if (index < 0)
         return index;
@@ -765,50 +1412,113 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     return fd;
 }
 
+static int finish_object(struct open_file *d)
+{
+    int result = 0;
+    if (d->external)
+        d->external->close(d->context);
+    else if (d->pipe >= 0)
+    {
+        struct channel *c = &channels[d->pipe];
+        if (d->flags & 3)
+            --c->writers;
+        else
+            --c->readers;
+        lume_wait_wake(&c->readable);
+        lume_wait_wake(&c->writable);
+        lume_poll_source_notify(&c->changed);
+        if (!c->readers && !c->writers)
+        {
+#if LUME_FILES_DYNAMIC
+            if (c->data && !lume_page_free((uintptr_t)c->data))
+                lume_fail("pipe backing release");
+#endif
+            *c = (struct channel){0};
+        }
+    }
+    else
+    {
+        if (d->storage_handle)
+        {
+            result = storage->close(d->storage_handle);
+            d->storage_handle = 0;
+        }
+        --nodes[d->node].references;
+        release_ram(&nodes[d->node]);
+    }
+    d->closing = false;
+    return result;
+}
+
+static int release_object(struct open_file *d, bool deferred)
+{
+    if (!d->references)
+        return -LUME_EBADF;
+    if (--d->references)
+        return 0;
+    /* A suspended close callback retains its object until device cleanup returns. */
+    d->closing = true;
+    file_locks_drop((int)(d - open_files));
+    if (deferred && storage_reap_enabled && !d->external && d->pipe < 0 && d->storage_handle)
+    {
+        /* The description retains its node and handle until STORAGE finishes closing it. */
+        d->deferred_close = true;
+        ++storage_reap_count;
+        return 0;
+    }
+    return finish_object(d);
+}
+
+void lume_vfs_reap_start(void)
+{
+    storage_reap_enabled = true;
+}
+
+bool lume_vfs_reap_pending(void)
+{
+    return storage_reap_count != 0;
+}
+
+unsigned lume_vfs_reap(unsigned budget)
+{
+    if (storage_reaping || !budget || !storage_reap_count)
+        return 0;
+    storage_reaping = true;
+    unsigned done = 0;
+    for (unsigned seen = 0; seen < OPEN_FILES && done < budget && storage_reap_count; ++seen)
+    {
+        struct open_file *d = open_files + storage_reap_cursor;
+        if (++storage_reap_cursor == OPEN_FILES)
+            storage_reap_cursor = 0;
+        if (!d->deferred_close)
+            continue;
+        d->deferred_close = false;
+        --storage_reap_count;
+        (void)finish_object(d);
+        ++done;
+    }
+    storage_reaping = false;
+    return done;
+}
+
+void lume_vfs_drop(int object)
+{
+    if (object >= 0 && object < (int)OPEN_FILES)
+        (void)release_object(&open_files[object], true);
+}
+
 int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
 {
     struct open_file *d = descriptor(f, fd);
     if (!d)
         return -LUME_EBADF;
-    int result = 0;
     bind_descriptor(f, (unsigned)fd, -1, 0);
-    if (!--d->references)
-    {
-        /* A suspended close callback retains its object until device cleanup returns. */
-        d->closing = true;
-        if (d->external)
-            d->external->close(d->context);
-        else if (d->pipe >= 0)
-        {
-            struct channel *c = &channels[d->pipe];
-            if (d->flags & 3)
-                --c->writers;
-            else
-                --c->readers;
-            lume_wait_wake(&c->readable);
-            lume_wait_wake(&c->writable);
-            lume_poll_source_notify(&c->changed);
-            if (!c->readers && !c->writers)
-                *c = (struct channel){0};
-        }
-        else
-        {
-            if (d->storage_handle)
-            {
-                result = storage->close(d->storage_handle);
-                d->storage_handle = 0;
-            }
-            --nodes[d->node].references;
-            release_ram(&nodes[d->node]);
-        }
-        d->closing = false;
-    }
-    return result;
+    return release_object(d, false);
 }
 
 int64_t lume_vfs_open_compat(struct lume_files *f, const char *input, uint64_t flags)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     int index = resolve(f, input, p);
     if (index >= 0 && (flags & 3) && nodes[index].kind == LUME_NODE_FILE && nodes[index].references)
         return -LUME_EBUSY;
@@ -817,7 +1527,7 @@ int64_t lume_vfs_open_compat(struct lume_files *f, const char *input, uint64_t f
 
 int64_t lume_vfs_remove_compat(struct lume_files *f, const char *input, bool directory)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     int index = resolve(f, input, p);
     if (index >= 0 && nodes[index].writable && nodes[index].references)
         return -LUME_EBUSY;
@@ -887,9 +1597,9 @@ static int64_t block_io(struct open_file *d, struct node *n, void *data, uint64_
     return (int64_t)done;
 }
 
-int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t bytes)
+static int64_t read_description(struct lume_files *f, struct open_file *d, void *data,
+                                uint64_t bytes)
 {
-    struct open_file *d = descriptor(f, fd);
     if (!d || (d->flags & 3) == LUME_O_WRONLY)
         return -LUME_EBADF;
     if (d->external)
@@ -960,13 +1670,42 @@ int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t by
     return (int64_t)bytes;
 }
 
-int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint64_t bytes)
+int64_t lume_vfs_read(struct lume_files *f, uint64_t fd, void *data, uint64_t bytes)
 {
-    struct open_file *d = descriptor(f, fd);
+    int permission = lume_vfs_sandbox_access(f, fd, false);
+    if (permission)
+        return permission;
+    return read_description(f, descriptor(f, fd), data, bytes);
+}
+
+static int64_t write_description(struct lume_files *f, struct open_file *d, const void *data,
+                                 uint64_t bytes)
+{
     if (!d || !(d->flags & 3))
         return -LUME_EBADF;
     if (d->external)
+    {
+        if (bytes && (d->flags & LUME_O_APPEND) && d->external->kind == LUME_NODE_FILE)
+        {
+            if (!d->external->seek)
+                return -LUME_ESPIPE;
+            int64_t previous = d->external->seek(d->context, 0, LUME_SEEK_CUR);
+            if (previous < 0)
+                return previous;
+            int64_t position = d->external->seek(d->context, 0, LUME_SEEK_END);
+            if (position < 0)
+                return position;
+            int64_t result = d->external->write(d->context, data, bytes);
+            if (result <= 0)
+            {
+                int64_t restored = d->external->seek(d->context, previous, LUME_SEEK_SET);
+                if (restored < 0)
+                    return restored;
+            }
+            return result;
+        }
         return d->external->write(d->context, data, bytes);
+    }
     if (d->pipe < 0 && !nodes[d->node].device && (f->identity.euid || f->identity.jailed))
         return -LUME_EACCES;
     if (d->pipe >= 0)
@@ -1003,24 +1742,26 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
         return -LUME_EROFS;
     if (!bytes)
         return 0;
-    if (d->flags & LUME_O_APPEND)
-        d->offset = n->bytes;
-    if (d->offset > f->identity.limit[LUME_LIMIT_FILE_SIZE].soft ||
-        bytes > f->identity.limit[LUME_LIMIT_FILE_SIZE].soft - d->offset)
+    uint64_t offset = d->flags & LUME_O_APPEND ? n->bytes : d->offset;
+    if (offset > f->identity.limit[LUME_LIMIT_FILE_SIZE].soft ||
+        bytes > f->identity.limit[LUME_LIMIT_FILE_SIZE].soft - offset)
         return -27;
     if (n->persistent)
     {
         int r = d->storage_handle
-                    ? storage->write_handle(d->storage_handle, d->offset, data, (size_t)bytes)
-                    : storage->write(n->path, d->offset, data, (size_t)bytes);
+                    ? storage->write_handle(d->storage_handle, offset, data, (size_t)bytes)
+                    : storage->write(n->path, offset, data, (size_t)bytes);
         if (r < 0)
             return r;
-        d->offset += (uint64_t)r;
-        if (d->offset > n->bytes)
-            n->bytes = d->offset;
+        if (r)
+        {
+            d->offset = offset + (uint64_t)r;
+            if (d->offset > n->bytes)
+                n->bytes = d->offset;
+        }
         return r;
     }
-    if (d->offset > CAPACITY || bytes > CAPACITY - d->offset)
+    if (offset > CAPACITY || bytes > CAPACITY - offset)
         return -LUME_ENOSPC;
     if (!n->data)
     {
@@ -1034,17 +1775,91 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
         if (!n->data)
             return -LUME_ENOSPC;
     }
-    while (n->bytes < d->offset)
+    while (n->bytes < offset)
         n->data[n->bytes++] = 0;
-    copy(n->data + d->offset, data, (size_t)bytes);
-    d->offset += bytes;
+    copy(n->data + offset, data, (size_t)bytes);
+    d->offset = offset + bytes;
     if (d->offset > n->bytes)
         n->bytes = d->offset;
     return (int64_t)bytes;
 }
 
+int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint64_t bytes)
+{
+    int permission = lume_vfs_sandbox_access(f, fd, true);
+    if (permission)
+        return permission;
+    return write_description(f, descriptor(f, fd), data, bytes);
+}
+
+static int positioned_description(struct lume_files *files, uint64_t fd, uint64_t bytes,
+                                  int64_t offset, bool writing, struct open_file *positioned)
+{
+    struct open_file *description = descriptor(files, fd);
+    if (!description ||
+        (writing ? !(description->flags & 3) : (description->flags & 3) == LUME_O_WRONLY))
+        return -LUME_EBADF;
+    if (offset < 0 || bytes > LUME_FILE_IO_MAX || bytes > INT64_MAX - (uint64_t)offset)
+        return -LUME_EINVAL;
+    if (description->pipe >= 0)
+        return -LUME_ESPIPE;
+    if (description->external)
+    {
+        *positioned = *description;
+        positioned->offset = (uint64_t)offset;
+        return 0;
+    }
+    struct node *node = &nodes[description->node];
+    if (node->kind == LUME_NODE_DIR)
+        return -LUME_EISDIR;
+    if (node->kind != LUME_NODE_FILE && !node->block)
+        return -LUME_ESPIPE;
+    /* A transfer owns its cursor while duplicated descriptors keep their shared offset. */
+    *positioned = *description;
+    positioned->offset = (uint64_t)offset;
+    positioned->flags &= ~LUME_O_APPEND;
+    return 0;
+}
+
+int64_t lume_vfs_pread(struct lume_files *files, uint64_t fd, void *data, uint64_t bytes,
+                       int64_t offset)
+{
+    int permission = lume_vfs_sandbox_access(files, fd, false);
+    if (permission)
+        return permission;
+    struct open_file positioned;
+    int result = positioned_description(files, fd, bytes, offset, false, &positioned);
+    if (result)
+        return result;
+    if (positioned.external)
+        return positioned.external->pread
+                   ? positioned.external->pread(positioned.context, data, bytes, (uint64_t)offset)
+                   : -LUME_ESPIPE;
+    return read_description(files, &positioned, data, bytes);
+}
+
+int64_t lume_vfs_pwrite(struct lume_files *files, uint64_t fd, const void *data, uint64_t bytes,
+                        int64_t offset)
+{
+    int permission = lume_vfs_sandbox_access(files, fd, true);
+    if (permission)
+        return permission;
+    struct open_file positioned;
+    int result = positioned_description(files, fd, bytes, offset, true, &positioned);
+    if (result)
+        return result;
+    if (positioned.external)
+        return positioned.external->pwrite
+                   ? positioned.external->pwrite(positioned.context, data, bytes, (uint64_t)offset)
+                   : -LUME_ESPIPE;
+    return write_description(files, &positioned, data, bytes);
+}
+
 int64_t lume_vfs_sync(struct lume_files *f, uint64_t fd)
 {
+    int permission = lume_vfs_sandbox_access(f, fd, true);
+    if (permission)
+        return permission;
     struct open_file *d = descriptor(f, fd);
     if (!d)
         return -LUME_EBADF;
@@ -1056,12 +1871,49 @@ int64_t lume_vfs_sync(struct lume_files *f, uint64_t fd)
     return n->block ? lume_block_sync(n->block) : 0;
 }
 
+int64_t lume_vfs_ofd_lock(struct lume_files *files, bool query,
+                          struct lume_file_lock_request *request)
+{
+    if (request->version != LUME_FILE_LOCK_VERSION || request->bytes != sizeof(*request) ||
+        request->reserved || request->reserved2 || request->pid ||
+        request->whence > LUME_SEEK_END || request->type < LUME_FILE_LOCK_READ ||
+        request->type > LUME_FILE_LOCK_UNLOCK || (query && request->type == LUME_FILE_LOCK_UNLOCK))
+        return -LUME_EINVAL;
+    struct open_file *description = descriptor(files, (uint64_t)request->fd);
+    if (!description)
+        return -LUME_EBADF;
+    if (description->pipe >= 0 || description->external)
+        return -95;
+    struct node *node = &nodes[description->node];
+    if (node->kind == LUME_NODE_DIR)
+        return -LUME_EISDIR;
+    if (!query &&
+        ((request->type == LUME_FILE_LOCK_READ && (description->flags & 3) == LUME_O_WRONLY) ||
+         (request->type == LUME_FILE_LOCK_WRITE && !(description->flags & 3))))
+        return -LUME_EBADF;
+    uint64_t base = request->whence == LUME_SEEK_SET   ? 0
+                    : request->whence == LUME_SEEK_CUR ? description->offset
+                                                       : node->bytes;
+    struct file_lock_record range = {
+        .owner = (int)(description - open_files), .node = description->node, .type = request->type};
+    int result = file_lock_range(request, base, &range);
+    return result ? result : file_locks_apply(range, query, request);
+}
+
+#include "process_locks.h"
+
 int64_t lume_vfs_seek(struct lume_files *f, uint64_t fd, int64_t offset, uint64_t whence)
 {
+    int permission = lume_vfs_sandbox_access(f, fd, true);
+    if (permission)
+        return permission;
     struct open_file *d = descriptor(f, fd);
     if (!d)
         return -LUME_EBADF;
-    if (d->pipe >= 0 || d->external)
+    if (d->external)
+        return d->external->seek ? d->external->seek(d->context, offset, (unsigned)whence)
+                                 : -LUME_ESPIPE;
+    if (d->pipe >= 0)
         return -LUME_ESPIPE;
     struct node *n = &nodes[d->node];
     if (n->kind == LUME_NODE_CHAR)
@@ -1081,6 +1933,8 @@ int64_t lume_vfs_stat(struct lume_files *f, uint64_t fd, struct lume_stat *s)
         return -LUME_EBADF;
     if (d->external)
     {
+        if (d->external->stat)
+            return d->external->stat(d->context, s);
         *s = (struct lume_stat){UINT64_C(0x200000) + (unsigned)f->fd[fd].object, 0,
                                 d->external->kind, 0};
         return 0;
@@ -1095,7 +1949,8 @@ int64_t lume_vfs_stat(struct lume_files *f, uint64_t fd, struct lume_stat *s)
     return 0;
 }
 
-int64_t lume_vfs_getdents(struct lume_files *f, uint64_t fd, void *out, uint64_t bytes)
+static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, uint64_t bytes,
+                                 bool extended)
 {
     struct open_file *d = descriptor(f, fd);
     if (!d)
@@ -1109,11 +1964,17 @@ int64_t lume_vfs_getdents(struct lume_files *f, uint64_t fd, void *out, uint64_t
     struct node *n = &nodes[d->node];
     if (n->kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
-    if (bytes < sizeof(struct lume_dirent))
+    if (!n->linked)
+        return 0;
+    int permission = lume_sandbox_path(f, n->path);
+    if (permission)
+        return permission;
+    size_t record_bytes = extended ? sizeof(struct lume_files_dirent) : sizeof(struct lume_dirent);
+    if (bytes < record_bytes)
         return -LUME_EINVAL;
     size_t prefix = length(n->path);
     uint64_t used = 0;
-    while (d->offset < count && bytes - used >= sizeof(struct lume_dirent))
+    while (d->offset < count && bytes - used >= record_bytes)
     {
         unsigned i = (unsigned)d->offset++;
         if (!nodes[i].linked)
@@ -1133,20 +1994,40 @@ int64_t lume_vfs_getdents(struct lume_files *f, uint64_t fd, void *out, uint64_t
             ++k;
         if (p[k])
             continue;
-        struct lume_dirent entry = {0};
         size_t name_bytes = length(name);
-        if (name_bytes >= sizeof(entry.name))
+        size_t name_capacity =
+            extended ? LUME_FILES_NAME_MAX + 1 : sizeof(((struct lume_dirent *)0)->name);
+        if (name_bytes >= name_capacity)
         {
             --d->offset;
             return used ? (int64_t)used : -LUME_ENAMETOOLONG;
         }
-        entry.inode = i + 1;
-        entry.kind = nodes[i].kind;
-        copy(entry.name, name, name_bytes + 1);
-        copy((unsigned char *)out + used, &entry, sizeof(entry));
-        used += sizeof(entry);
+        if (extended)
+        {
+            struct lume_files_dirent entry = {
+                .inode = i + 1, .kind = nodes[i].kind, .name_bytes = (uint32_t)name_bytes};
+            copy(entry.name, name, name_bytes + 1);
+            copy((unsigned char *)out + used, &entry, sizeof(entry));
+        }
+        else
+        {
+            struct lume_dirent entry = {.inode = i + 1, .kind = nodes[i].kind};
+            copy(entry.name, name, name_bytes + 1);
+            copy((unsigned char *)out + used, &entry, sizeof(entry));
+        }
+        used += record_bytes;
     }
     return (int64_t)used;
+}
+
+int64_t lume_vfs_getdents(struct lume_files *files, uint64_t fd, void *out, uint64_t bytes)
+{
+    return directory_entries(files, fd, out, bytes, false);
+}
+
+int64_t lume_vfs_getdents_long(struct lume_files *files, uint64_t fd, void *out, uint64_t bytes)
+{
+    return directory_entries(files, fd, out, bytes, true);
 }
 
 static unsigned default_mode_at(const struct node *n, const char *path)
@@ -1179,7 +2060,7 @@ static int64_t stat_node(unsigned index, struct lume_stat *out)
     unsigned mode = default_mode(n);
     if (n->mode_set)
         mode = (mode & ~0777u) | n->mode;
-    return n->persistent ? lume_file_mode_get(n->path, mode, true) : mode;
+    return n->persistent && n->linked ? lume_file_mode_get(n->path, mode, true) : mode;
 }
 
 int64_t lume_vfs_stat_mode(struct lume_files *f, uint64_t fd, struct lume_stat *out)
@@ -1188,7 +2069,10 @@ int64_t lume_vfs_stat_mode(struct lume_files *f, uint64_t fd, struct lume_stat *
     if (d && (d->pipe >= 0 || d->external))
     {
         (void)lume_vfs_stat(f, fd, out);
-        return d->external ? (d->external->kind == LUME_NODE_SOCKET ? 0140600 : 0020600) : 0010600;
+        return d->external ? (d->external->kind == LUME_NODE_FILE     ? 0100600
+                              : d->external->kind == LUME_NODE_SOCKET ? 0140600
+                                                                      : 0020600)
+                           : 0010600;
     }
     return d ? stat_node((unsigned)d->node, out) : -LUME_EBADF;
 }
@@ -1202,13 +2086,49 @@ int64_t lume_vfs_stat_inode(uint64_t inode, struct lume_stat *out)
 
 int64_t lume_vfs_stat_path(struct lume_files *f, const char *input, struct lume_stat *out)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     int i = resolve(f, input, p);
+    if (i >= 0)
+    {
+        int permission = lume_sandbox_path(f, p);
+        if (permission)
+            return permission;
+    }
     return i < 0 ? i : stat_node((unsigned)i, out);
 }
 
-int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
-                           struct lume_file_mode_request *request, const char *input)
+static int volume_node(struct lume_files *files, const struct node *node,
+                       struct lume_files_volume *out)
+{
+    int permission = lume_sandbox_path(files, node->path);
+    if (permission)
+        return permission;
+    if (!node->persistent || !storage || !storage->volume_info)
+        return -LUME_EOPNOTSUPP;
+    return storage->volume_info(out);
+}
+
+int lume_vfs_volume_path(struct lume_files *files, const char *input, struct lume_files_volume *out)
+{
+    char path[LUME_FILES_PATH_MAX];
+    int index = resolve(files, input, path);
+    return index < 0 ? index : volume_node(files, &nodes[index], out);
+}
+
+int lume_vfs_volume_fd(struct lume_files *files, uint64_t fd, struct lume_files_volume *out)
+{
+    struct open_file *file = descriptor(files, fd);
+    if (!file)
+        return -LUME_EBADF;
+    if (files->identity.jailed || files->identity.euid)
+        return -LUME_EACCES;
+    if (file->node < 0 || file->external || file->pipe >= 0)
+        return -LUME_EOPNOTSUPP;
+    return volume_node(files, &nodes[file->node], out);
+}
+
+static int64_t file_mode(struct lume_files *files, unsigned operation,
+                         struct lume_file_mode_request *request, const char *input, bool compat)
 {
     if ((files->identity.euid || files->identity.jailed) &&
         !(files->identity.jailed && operation == LUME_FILE_MODE_OPEN &&
@@ -1222,7 +2142,7 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
         return -LUME_EINVAL;
     if (request->mode == UINT32_MAX && operation >= LUME_FILE_MODE_OPEN)
         return -LUME_EINVAL;
-    char canonical[LUME_PATH_MAX];
+    char canonical[LUME_FILES_PATH_MAX];
     int index;
     if (operation == LUME_FILE_MODE_FD)
     {
@@ -1239,7 +2159,8 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
     {
         if (request->descriptor_flags & ~(LUME_FD_CLOEXEC | LUME_FD_NONBLOCK))
             return -LUME_EINVAL;
-        fd = (int)lume_vfs_open_compat(files, input, request->flags);
+        fd = (int)(compat ? lume_vfs_open_compat(files, input, request->flags)
+                          : lume_vfs_open(files, input, request->flags));
         if (fd < 0)
             return fd;
         files->fd[fd].flags = request->descriptor_flags & LUME_FD_CLOEXEC;
@@ -1261,6 +2182,13 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
     struct node *node = &nodes[index];
     if (request->mode == UINT32_MAX || (operation == LUME_FILE_MODE_OPEN && !created))
         return fd >= 0 ? fd : 0;
+    int permission = sandbox_mutation(files, node->path, false);
+    if (permission)
+    {
+        if (fd >= 0)
+            (void)lume_vfs_close(files, (unsigned)fd);
+        return permission;
+    }
     if (!node->writable)
     {
         if (fd >= 0)
@@ -1271,7 +2199,7 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
     if (operation == LUME_FILE_MODE_OPEN || operation == LUME_FILE_MODE_MKDIR)
         mode &= ~files->identity.umask;
     int result = 0;
-    if (node->persistent)
+    if (node->persistent && node->linked)
         result = mode == (default_mode(node) & 0777u) ? lume_file_mode_remove(node->path, true)
                                                       : lume_file_mode_set(node->path, mode, true);
     if (result)
@@ -1285,167 +2213,334 @@ int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
     return fd >= 0 ? fd : 0;
 }
 
-int64_t lume_vfs_truncate(struct lume_files *f, uint64_t fd)
+int64_t lume_vfs_file_mode(struct lume_files *files, unsigned operation,
+                           struct lume_file_mode_request *request, const char *input)
 {
+    return file_mode(files, operation, request, input, true);
+}
+
+int64_t lume_vfs_file_mode_long(struct lume_files *files, unsigned operation,
+                                struct lume_file_mode_request *request, const char *input)
+{
+    return file_mode(files, operation, request, input, false);
+}
+
+int64_t lume_vfs_resize(struct lume_files *f, uint64_t fd, uint64_t length)
+{
+    int permission = lume_vfs_sandbox_access(f, fd, true);
+    if (permission)
+        return permission;
     struct open_file *d = descriptor(f, fd);
     if (!d || !(d->flags & 3))
         return -LUME_EBADF;
-    if (d->pipe >= 0 || d->external)
+    if (d->external)
+        return d->external->resize ? d->external->resize(d->context, length) : -LUME_EINVAL;
+    if (d->pipe >= 0)
         return -LUME_EINVAL;
     struct node *n = &nodes[d->node];
     if (n->kind != LUME_NODE_FILE)
         return -LUME_EINVAL;
-    if (d->offset > n->bytes)
+    if (!n->writable)
+        return -LUME_EROFS;
+    if (f->identity.euid || f->identity.jailed)
+        return -LUME_EACCES;
+    if (length > INT64_MAX)
         return -LUME_EINVAL;
+    if (length > n->bytes && length > f->identity.limit[LUME_LIMIT_FILE_SIZE].soft)
+        return -27;
     if (n->persistent)
     {
         if (!d->storage_handle && !storage->resize)
             return -LUME_ENOSYS;
-        int error = d->storage_handle ? storage->resize_handle(d->storage_handle, d->offset)
-                                      : storage->resize(n->path, d->offset);
+        int error = d->storage_handle ? storage->resize_handle(d->storage_handle, length)
+                                      : storage->resize(n->path, length);
         if (error)
             return error;
     }
-    n->bytes = d->offset;
+    else
+    {
+        if (length > CAPACITY)
+            return -LUME_ENOSPC;
+        if (length && !n->data)
+        {
+            for (unsigned i = 0; i < RAM_FILES; ++i)
+                if (!ram_used[i])
+                {
+                    ram_used[i] = true;
+                    n->data = ram_data[i];
+                    break;
+                }
+            if (!n->data)
+                return -LUME_ENOSPC;
+        }
+        if (length > n->bytes)
+            memset(n->data + n->bytes, 0, (size_t)(length - n->bytes));
+    }
+    n->bytes = length;
     return 0;
 }
 
-int64_t lume_vfs_rename(struct lume_files *f, const char *from, const char *to)
+int64_t lume_vfs_truncate(struct lume_files *f, uint64_t fd)
 {
-    char a[LUME_PATH_MAX], b[LUME_PATH_MAX] = {0}, parent[LUME_PATH_MAX];
-    int source = resolve(f, from, a), destination = resolve(f, to, b);
+    struct open_file *description = descriptor(f, fd);
+    return description ? lume_vfs_resize(f, fd, description->offset) : -LUME_EBADF;
+}
+
+static bool subtree(const char *path, const char *root)
+{
+    size_t bytes = length(root);
+    return !strncmp(path, root, bytes) && (!path[bytes] || path[bytes] == '/');
+}
+
+struct rename_path
+{
+    unsigned node, permissions, previous_mode;
+    uint32_t hash;
+    char *old_path, *new_path;
+};
+
+static int64_t rename_namespace(struct lume_files *files, const char *from, const char *to,
+                                bool replace)
+{
+    char a[LUME_FILES_PATH_MAX], b[LUME_FILES_PATH_MAX], parent[LUME_FILES_PATH_MAX];
+    int source = resolve(files, from, a), target = resolve(files, to, b);
     if (source < 0)
         return source;
-    if (destination == source)
+    if (target < 0 && (target != -LUME_ENOENT || !b[0]))
+        return target;
+    int permission = sandbox_mutation(files, a, true);
+    if (!permission)
+        permission = sandbox_mutation(files, b, true);
+    if (permission)
+        return permission;
+    int spelling = lume_path_final_spelling(to, b);
+    if (spelling)
+        return spelling;
+    bool same = target == source;
+    if (same && equal(a, b))
         return 0;
-    if (destination >= 0)
+    if (!same && target >= 0 && !replace)
         return -LUME_EEXIST;
-    if (destination != -LUME_ENOENT || !b[0])
-        return destination;
-    copy(parent, b, length(b) + 1);
-    size_t n = length(parent);
-    while (n && parent[n - 1] != '/')
-        --n;
-    parent[n > 1 ? n - 1 : 1] = 0;
-    int directory = find(parent);
-    if (directory < 0)
-        return directory;
-    struct node *file = &nodes[source];
-    if (file->kind != LUME_NODE_FILE)
-        return -LUME_EISDIR;
-    if (!file->writable || !nodes[directory].writable)
+    struct node *incoming = &nodes[source];
+    bool directory = incoming->kind == LUME_NODE_DIR;
+    if (incoming->kind != LUME_NODE_FILE && !directory)
+        return -LUME_EINVAL;
+    if (!incoming->writable || incoming->block || equal(a, "/tmp") || equal(a, "/data"))
         return -LUME_EROFS;
-    if (file->references)
+    if (lume_file_mode_namespace_busy(a) || lume_file_mode_namespace_busy(b))
         return -LUME_EBUSY;
-    if (file->persistent != nodes[directory].persistent)
+    size_t to_bytes = length(to);
+    if (!directory && to_bytes && to[to_bytes - 1] == '/')
+        return -LUME_ENOTDIR;
+    copy(parent, b, length(b) + 1);
+    char *last = strrchr(parent, '/');
+    if (last == parent)
+        parent[1] = 0;
+    else
+        *last = 0;
+    int parent_node = find(parent);
+    if (parent_node < 0)
+        return parent_node;
+    if (nodes[parent_node].kind != LUME_NODE_DIR)
+        return -LUME_ENOTDIR;
+    if (!nodes[parent_node].writable)
+        return -LUME_EROFS;
+    if (incoming->persistent != nodes[parent_node].persistent)
         return -18;
+    if (directory && !same && subtree(b, a))
+        return -LUME_EINVAL;
+    unsigned previous_permissions = 0;
+    struct node *previous = target >= 0 && !same ? &nodes[target] : NULL;
     struct lume_stat metadata;
-    int64_t original_mode = stat_node((unsigned)source, &metadata);
-    if (original_mode < 0)
-        return original_mode;
-    unsigned permissions = (unsigned)original_mode & 0777u;
-    if (file->persistent)
+    if (previous)
     {
-        if (!storage->rename)
-            return -LUME_ENOSYS;
-        int prepared = permissions == (default_mode_at(file, b) & 0777u)
-                           ? lume_file_mode_remove(b, true)
-                           : lume_file_mode_set(b, permissions, true);
-        if (prepared)
-            return prepared;
-        int error = storage->rename(a, b);
-        if (error)
-            return error;
+        if (previous->kind != incoming->kind)
+            return directory ? -LUME_ENOTDIR : -LUME_EISDIR;
+        if (!previous->writable || previous->block || equal(b, "/tmp") || equal(b, "/data"))
+            return -LUME_EROFS;
+        if (previous->persistent != incoming->persistent)
+            return -18;
+        if (directory)
+            for (unsigned i = 0; i < count; ++i)
+                if ((int)i != target && nodes[i].linked && subtree(nodes[i].path, previous->path))
+                    return -LUME_ENOTEMPTY;
+        int64_t mode = stat_node((unsigned)target, &metadata);
+        if (mode < 0)
+            return mode;
+        previous_permissions = (unsigned)mode & 0777u;
     }
-    copy(file->path, b, length(b) + 1);
-    file->mode_set = true;
-    file->mode = permissions;
-    return file->persistent ? lume_file_mode_remove(a, true) : 0;
+    bool persistent = incoming->persistent;
+    if (persistent && incoming->kind == LUME_NODE_FILE && incoming->references &&
+        !storage->rename_state)
+        return -LUME_EBUSY;
+    if (persistent && previous && previous->kind == LUME_NODE_FILE && previous->references &&
+        !storage->remove_state)
+        return -LUME_EBUSY;
+    unsigned affected = 0;
+    for (unsigned i = 0; i < count; ++i)
+        if (nodes[i].linked && subtree(nodes[i].path, a))
+            ++affected;
+    struct rename_path *paths = lume_kernel_allocate((size_t)affected * sizeof(*paths));
+    struct lume_file_mode_change *changes =
+        lume_kernel_allocate((size_t)(affected + 1) * sizeof(*changes));
+    if (!paths || !changes)
+    {
+        lume_kernel_free(changes);
+        lume_kernel_free(paths);
+        return -LUME_ENOMEM;
+    }
+    unsigned prepared = 0;
+    int result = 0;
+    size_t old_bytes = length(a), new_bytes = length(b);
+    for (unsigned i = 0; !result && i < count; ++i)
+    {
+        if (!nodes[i].linked || !subtree(nodes[i].path, a))
+            continue;
+        size_t tail = length(nodes[i].path + old_bytes);
+        if (new_bytes + tail >= sizeof(parent))
+        {
+            result = -LUME_ENAMETOOLONG;
+            break;
+        }
+        copy(parent, b, new_bytes);
+        copy(parent + new_bytes, nodes[i].path + old_bytes, tail + 1);
+        char *owned = lume_path_duplicate(parent);
+        if (!owned)
+        {
+            result = -LUME_ENOMEM;
+            break;
+        }
+        int64_t permissions = stat_node(i, &metadata);
+        if (permissions < 0)
+        {
+            lume_path_release(owned);
+            result = (int)permissions;
+            break;
+        }
+        struct rename_path *entry = &paths[prepared];
+        *entry = (struct rename_path){.node = i,
+                                      .permissions = (unsigned)permissions & 0777u,
+                                      .hash = namespace_hash(owned),
+                                      .old_path = nodes[i].path,
+                                      .new_path = owned};
+        if (persistent)
+        {
+            result = lume_file_mode_override(owned, &entry->previous_mode, true);
+            unsigned mode = entry->permissions;
+            if (previous && (int)i == source)
+                mode &= previous_permissions;
+            changes[prepared] = (struct lume_file_mode_change){
+                owned, mode == (default_mode_at(&nodes[i], owned) & 0777u) ? UINT32_MAX : mode};
+        }
+        ++prepared;
+        lume_worker_checkpoint(0);
+    }
+    if (!result && persistent)
+        result = lume_file_mode_batch(changes, affected, true);
+    if (result)
+        goto discard;
+    unsigned state = LUME_STORAGE_NAMESPACE_COMMITTED;
+    if (persistent)
+    {
+        state = LUME_STORAGE_NAMESPACE_UNCHANGED;
+        if (previous)
+            result = storage->replace ? storage->replace(a, b, &state) : -LUME_ENOSYS;
+        else if (storage->rename_state)
+            result = storage->rename_state(a, b, &state);
+        else
+        {
+            result = storage->rename ? storage->rename(a, b) : -LUME_ENOSYS;
+            if (!result)
+                state = LUME_STORAGE_NAMESPACE_COMMITTED;
+        }
+    }
+    if (state != LUME_STORAGE_NAMESPACE_COMMITTED)
+    {
+        if (persistent && state == LUME_STORAGE_NAMESPACE_UNCHANGED)
+        {
+            for (unsigned i = 0; i < prepared; ++i)
+                changes[i] =
+                    (struct lume_file_mode_change){paths[i].new_path, paths[i].previous_mode};
+            int restored = lume_file_mode_batch(changes, prepared, true);
+            if (!result)
+                result = restored;
+        }
+        if (!result)
+            result = -LUME_EIO;
+        goto discard;
+    }
+    /* Namespace publication contains no allocations, callbacks or worker checkpoints. */
+    incoming->parent = (unsigned)parent_node + 1;
+    if (previous)
+    {
+        previous->mode = previous_permissions;
+        previous->mode_set = true;
+        index_remove((unsigned)target);
+        previous->linked = false;
+    }
+    for (unsigned i = 0; i < prepared; ++i)
+        index_remove(paths[i].node);
+    for (unsigned i = 0; i < prepared; ++i)
+    {
+        struct node *node = &nodes[paths[i].node];
+        node->path = paths[i].new_path;
+        paths[i].new_path = NULL;
+        node->mode = paths[i].permissions;
+        node->mode_set = true;
+        index_insert_hashed(paths[i].node, paths[i].hash);
+    }
+    if (previous)
+        release_ram(previous);
+    unsigned cleanup = 0;
+    if (!result && persistent)
+    {
+        for (unsigned i = 0; i < prepared; ++i)
+            if (!lume_path_equal_folded(paths[i].old_path, nodes[paths[i].node].path))
+                changes[cleanup++] = (struct lume_file_mode_change){paths[i].old_path, UINT32_MAX};
+        if (previous)
+            changes[cleanup++] = (struct lume_file_mode_change){
+                incoming->path,
+                incoming->mode == (default_mode(incoming) & 0777u) ? UINT32_MAX : incoming->mode};
+        result = lume_file_mode_batch(changes, cleanup, true);
+    }
+    for (unsigned i = 0; i < prepared; ++i)
+        lume_path_release(paths[i].old_path);
+    lume_kernel_free(changes);
+    lume_kernel_free(paths);
+    return result;
+discard:
+    for (unsigned i = 0; i < prepared; ++i)
+        lume_path_release(paths[i].new_path);
+    lume_kernel_free(changes);
+    lume_kernel_free(paths);
+    return result;
+}
+
+int64_t lume_vfs_rename(struct lume_files *files, const char *from, const char *to)
+{
+    return rename_namespace(files, from, to, false);
 }
 
 int64_t lume_vfs_replace(struct lume_files *files, const char *from, const char *to)
 {
-    char a[LUME_PATH_MAX], b[LUME_PATH_MAX];
-    int source = resolve(files, from, a), target = resolve(files, to, b);
-    if (source < 0)
-        return source;
-    if (target == source)
-        return 0;
-    if (target == -LUME_ENOENT)
-        return lume_vfs_rename(files, from, to);
-    if (target < 0)
-        return target;
-    struct node *incoming = &nodes[source], *previous = &nodes[target];
-    if (incoming->kind != LUME_NODE_FILE || previous->kind != LUME_NODE_FILE)
-        return -LUME_EISDIR;
-    if (!incoming->writable || !previous->writable)
-        return -LUME_EROFS;
-    if (incoming->references || previous->references)
-        return -LUME_EBUSY;
-    if (incoming->persistent != previous->persistent)
-        return -18;
-    struct lume_stat metadata;
-    int64_t source_mode = stat_node((unsigned)source, &metadata);
-    if (source_mode < 0)
-        return source_mode;
-    int64_t target_mode = stat_node((unsigned)target, &metadata);
-    if (target_mode < 0)
-        return target_mode;
-    unsigned permissions = (unsigned)source_mode & 0777u;
-    int result = 0;
-    if (incoming->persistent)
-    {
-        if (!storage->replace)
-            return -LUME_ENOSYS;
-        /* Restrict both payloads before changing their directory entries. */
-        unsigned restricted = permissions & (unsigned)target_mode;
-        result = lume_file_mode_set(b, restricted, true);
-        if (result)
-            return result;
-        previous->mode_set = true;
-        previous->mode = restricted;
-        unsigned state = LUME_STORAGE_REPLACE_UNCHANGED;
-        result = storage->replace(a, b, &state);
-        if (state == LUME_STORAGE_REPLACE_UNCHANGED)
-        {
-            int restored = lume_file_mode_set(b, (unsigned)target_mode & 0777u, true);
-            if (!restored)
-                previous->mode = (unsigned)target_mode & 0777u;
-            return result ? result : -LUME_EIO;
-        }
-        if (state != LUME_STORAGE_REPLACE_COMMITTED)
-            return result ? result : -LUME_EIO;
-        incoming->mode = restricted;
-    }
-    else
-        incoming->mode = permissions;
-    previous->linked = false;
-    release_ram(previous);
-    copy(incoming->path, b, length(b) + 1);
-    incoming->mode_set = true;
-    if (result)
-        return result;
-    if (incoming->persistent)
-    {
-        result = permissions == (default_mode_at(incoming, b) & 0777u)
-                     ? lume_file_mode_remove(b, true)
-                     : lume_file_mode_set(b, permissions, true);
-        if (result)
-            return result;
-    }
-    incoming->mode = permissions;
-    return lume_file_mode_remove(a, incoming->persistent);
+    return rename_namespace(files, from, to, true);
 }
 
 int64_t lume_vfs_chdir(struct lume_files *f, const char *input)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     int i = resolve(f, input, p);
+    if (i >= 0)
+    {
+        int permission = lume_sandbox_path(f, p);
+        if (permission)
+            return permission;
+    }
     if (i < 0)
         return i;
     if (nodes[i].kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
-    copy(f->cwd, p, length(p) + 1);
+    hold_directory(f, (unsigned)i);
     return 0;
 }
 
@@ -1479,8 +2574,7 @@ int64_t lume_vfs_chroot(struct lume_files *files, const char *input)
     if (!result)
     {
         files->identity.jailed = true;
-        files->cwd[0] = '/';
-        files->cwd[1] = 0;
+        hold_directory(files, 0);
     }
     return result;
 }
@@ -1560,18 +2654,31 @@ void lume_vfs_poll_prepare(struct lume_files *files, struct lume_poll_watch *wat
     {
         int fd = watch->records[i].fd;
         watch->records[i].revents = 0;
-        watch->generations[i] = fd >= 0 && fd < (int)LUME_FD_MAX && files->fd[fd].object >= 0
-                                    ? files->fd[fd].generation
-                                    : 0;
+        watch->generations[i] =
+            files_ready(files) && fd >= 0 && fd < (int)LUME_FD_MAX && files->fd[fd].object >= 0
+                ? files->fd[fd].generation
+                : 0;
     }
 }
 
 bool lume_vfs_poll_subscribe(struct lume_files *files, const struct lume_poll_watch *watch,
                              unsigned task)
 {
-    if (task >= LUME_POLL_TASK_LIMIT || watch->count > LUME_FD_LIMIT)
+    if (task >= LUME_POLL_TASK_LIMIT || watch->count > LUME_FD_LIMIT || !files_ready(files))
         return false;
     lume_vfs_poll_cancel(task);
+#if LUME_FILES_DYNAMIC
+    unsigned capacity = watch->count * 2u;
+    if (capacity > poll_subscriptions[task].capacity)
+    {
+        struct poll_link *links = lume_kernel_allocate(sizeof(*links) * capacity);
+        if (!links)
+            return false;
+        lume_kernel_free(poll_subscriptions[task].links);
+        poll_subscriptions[task].links = links;
+        poll_subscriptions[task].capacity = capacity;
+    }
+#endif
     for (unsigned i = 0; i < watch->count; ++i)
     {
         int fd = watch->records[i].fd;
@@ -1607,7 +2714,7 @@ unsigned lume_vfs_poll_check(struct lume_files *files, struct lume_poll_watch *w
         unsigned result = 0;
         if (fd >= 0)
         {
-            if (fd >= (int)LUME_FD_MAX || files->fd[fd].object < 0 ||
+            if (!files_ready(files) || fd >= (int)LUME_FD_MAX || files->fd[fd].object < 0 ||
                 files->fd[fd].generation != watch->generations[i])
                 result = LUME_POLLNVAL;
             else
@@ -1622,6 +2729,8 @@ unsigned lume_vfs_poll_check(struct lume_files *files, struct lume_poll_watch *w
 
 bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_poll_watch *watch)
 {
+    if (!files_ready(files))
+        return false;
     for (unsigned i = 0; i < watch->count && i < LUME_FD_LIMIT; ++i)
     {
         int fd = watch->records[i].fd;
@@ -1638,6 +2747,8 @@ bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_pol
 
 int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_request *r)
 {
+    if (!files_ready(f))
+        return -LUME_ENOMEM;
     if (r->version != LUME_FD_VERSION || r->bytes != sizeof(*r))
         return -LUME_EINVAL;
     struct open_file *d = descriptor(f, (unsigned)r->fd);
@@ -1716,10 +2827,22 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
             ++channel;
         if (channel == PIPES)
             return -LUME_ENOMEM;
+#if LUME_FILES_DYNAMIC
+        channels[channel].data = (void *)(uintptr_t)lume_page_alloc(0);
+        if (!channels[channel].data)
+            return -LUME_ENOMEM;
+#endif
         lume_poll_source_reset(&channels[channel].changed);
         int a = new_object(-1, (int)channel, LUME_O_RDONLY);
         if (a < 0)
+        {
+#if LUME_FILES_DYNAMIC
+            if (!lume_page_free((uintptr_t)channels[channel].data))
+                lume_fail("pipe backing rollback");
+            channels[channel].data = NULL;
+#endif
             return a;
+        }
         bind_descriptor(f, first, a, r->flags & LUME_FD_CLOEXEC);
         int b = new_object(-1, (int)channel, LUME_O_WRONLY);
         if (b < 0)
@@ -1777,13 +2900,16 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
 
 int64_t lume_vfs_mkdir(struct lume_files *f, const char *input)
 {
-    char p[LUME_PATH_MAX] = {0};
+    char p[LUME_FILES_PATH_MAX] = {0};
     int r = resolve(f, input, p);
     if (r >= 0)
         return -LUME_EEXIST;
     if (r != -LUME_ENOENT || !p[0])
         return r;
-    char parent[LUME_PATH_MAX];
+    int permission = sandbox_mutation(f, p, true);
+    if (permission)
+        return permission;
+    char parent[LUME_FILES_PATH_MAX];
     copy(parent, p, length(p) + 1);
     size_t k = length(parent);
     while (k && parent[k - 1] != '/')
@@ -1796,74 +2922,153 @@ int64_t lume_vfs_mkdir(struct lume_files *f, const char *input)
         return -LUME_EROFS;
     if (available_node() == node_capacity)
         return -LUME_ENOSPC;
+    char *owned = lume_path_duplicate(p);
+    if (!owned)
+        return -LUME_ENOMEM;
+    unsigned reserved = reserve_node(owned, LUME_NODE_DIR);
+    if (reserved == UINT32_MAX)
+    {
+        lume_path_release(owned);
+        return -LUME_ENOSPC;
+    }
     if (nodes[r].persistent)
     {
         int e = storage->create(p, true);
         if (e)
+        {
+            cancel_node(reserved);
             return e;
+        }
     }
-    unsigned i = create_node(p, LUME_NODE_DIR);
-    nodes[i].persistent = nodes[r].persistent;
+    nodes[reserved].persistent = nodes[r].persistent;
+    publish_node(reserved);
     return 0;
 }
 
-int64_t lume_vfs_remove(struct lume_files *f, const char *input, bool directory)
+int64_t lume_vfs_remove(struct lume_files *files, const char *input, bool directory)
 {
-    char p[LUME_PATH_MAX];
-    int i = resolve(f, input, p);
-    if (i < 0)
-        return i;
-    struct node *n = &nodes[i];
-    if (!n->writable || n->block || equal(p, "/tmp") || equal(p, "/data"))
+    char path[LUME_FILES_PATH_MAX];
+    int index = resolve(files, input, path);
+    if (index < 0)
+        return index;
+    int permission = sandbox_mutation(files, path, true);
+    if (permission)
+        return permission;
+    struct node *node = &nodes[index];
+    if (!node->writable || node->block || equal(path, "/tmp") || equal(path, "/data"))
         return -LUME_EROFS;
-    if (directory && n->kind != LUME_NODE_DIR)
+    if (lume_file_mode_namespace_busy(path))
+        return -LUME_EBUSY;
+    if (directory && node->kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
-    if (!directory && n->kind == LUME_NODE_DIR)
+    if (!directory && node->kind == LUME_NODE_DIR)
         return -LUME_EISDIR;
-    size_t len = length(p);
     if (directory)
-        for (unsigned k = 0; k < count; ++k)
-        {
-            if (!nodes[k].linked)
-                continue;
-            size_t j = 0;
-            while (j < len && nodes[k].path[j] == p[j])
-                ++j;
-            if (j == len && nodes[k].path[j] == '/')
+        for (unsigned i = 0; i < count; ++i)
+            if ((int)i != index && nodes[i].linked && subtree(nodes[i].path, path))
                 return -LUME_ENOTEMPTY;
-        }
-    if (n->persistent)
+    struct lume_stat metadata;
+    int64_t permissions = stat_node((unsigned)index, &metadata);
+    if (permissions < 0)
+        return permissions;
+    unsigned state = LUME_STORAGE_NAMESPACE_COMMITTED;
+    int result = 0;
+    if (node->persistent)
     {
-        if (n->references)
-            return -LUME_EBUSY;
-        int e = storage->remove(p);
-        if (e)
-            return e;
+        state = LUME_STORAGE_NAMESPACE_UNCHANGED;
+        if (storage->remove_state)
+            result = storage->remove_state(path, &state);
+        else
+        {
+            if (node->references && node->kind == LUME_NODE_FILE)
+                return -LUME_EBUSY;
+            result = storage->remove(path);
+            if (!result)
+                state = LUME_STORAGE_NAMESPACE_COMMITTED;
+        }
     }
-    n->linked = false;
-    release_ram(n);
-    return lume_file_mode_remove(p, n->persistent);
+    if (state != LUME_STORAGE_NAMESPACE_COMMITTED)
+        return result ? result : -LUME_EIO;
+    node->mode = (unsigned)permissions & 0777u;
+    node->mode_set = true;
+    index_remove((unsigned)index);
+    node->linked = false;
+    bool persistent = node->persistent;
+    release_ram(node);
+    return result ? result : lume_file_mode_remove(path, persistent);
+}
+
+static int find_folded(const char *path)
+{
+    if (!name_bucket_count)
+        return -LUME_ENOENT;
+    uint32_t hash = namespace_hash(path);
+    for (unsigned link = name_buckets[hash & (name_bucket_count - 1)]; link;
+         link = nodes[link - 1].path_next)
+        if (lume_path_equal_folded(path, nodes[link - 1].path))
+            return (int)link - 1;
+    return -LUME_ENOENT;
 }
 
 static bool import_fat(const char *path, struct lume_fat_file file, void *unused)
 {
     (void)unused;
-    char p[LUME_PATH_MAX];
-    size_t n = length(path);
-    if (n + 1 >= sizeof(p))
+    char p[LUME_FILES_PATH_MAX], parent[LUME_FILES_PATH_MAX];
+    size_t bytes = length(path);
+    if (bytes + 1 >= sizeof(p))
         return false;
     p[0] = '/';
-    copy(p + 1, path, n + 1);
-    int i = find(p);
-    if (i >= 0)
-        return file.directory && nodes[i].kind == LUME_NODE_DIR;
+    copy(p + 1, path, bytes + 1);
+    int existing = find_folded(p);
+    if (existing >= 0)
+    {
+        bool same = file.directory && nodes[existing].kind == LUME_NODE_DIR;
+        if (same)
+            nodes[existing].pending_fat = true;
+        return same;
+    }
+    copy(parent, p, bytes + 2);
+    char *leaf = strrchr(parent, '/');
+    size_t leaf_bytes = length(leaf + 1);
+    if (!leaf_bytes || leaf_bytes > LUME_FILES_NAME_MAX)
+        return false;
+    *leaf = 0;
+    int directory = find_folded(parent[0] ? parent : "/");
+    if (directory < 0 || nodes[directory].kind != LUME_NODE_DIR)
+        return false;
+    size_t prefix = length(nodes[directory].path);
+    if (prefix + (prefix > 1) + leaf_bytes >= sizeof(p))
+        return false;
+    copy(p, nodes[directory].path, prefix);
+    if (prefix > 1)
+        p[prefix++] = '/';
+    copy(p + prefix, leaf + 1, leaf_bytes + 1);
     if (count == node_capacity)
         return false;
-    i = (int)count;
-    add(p, file.directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, file.size, false);
-    nodes[i].on_fat = true;
-    nodes[i].fat_file = file;
+    unsigned index = count;
+    if (!add(p, file.directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, file.size, false))
+        return false;
+    nodes[index].on_fat = true;
+    nodes[index].fat_file = file;
     return true;
+}
+
+static void import_finish(unsigned before, bool success)
+{
+    for (unsigned i = 0; i < before; ++i)
+    {
+        if (success && nodes[i].pending_fat)
+            nodes[i].on_fat = true;
+        nodes[i].pending_fat = false;
+    }
+    if (!success)
+        while (count > before)
+        {
+            struct node *node = &nodes[--count];
+            index_remove(count);
+            lume_path_release(node->path);
+            *node = (struct node){0};
+        }
 }
 
 bool lume_vfs_mount_fat(const void *data, size_t bytes)
@@ -1872,41 +3077,79 @@ bool lume_vfs_mount_fat(const void *data, size_t bytes)
         return false;
     unsigned before = count;
     struct lume_fat candidate;
-    if (!lume_fat_mount(&candidate, data, bytes) || !lume_fat_walk(&candidate, import_fat, 0))
-    {
-        count = before;
-        return false;
-    }
-    root_fat = candidate;
-    return true;
+    bool success =
+        lume_fat_mount(&candidate, data, bytes) && lume_fat_walk(&candidate, import_fat, 0);
+    import_finish(before, success);
+    if (success)
+        root_fat = candidate;
+    return success;
 }
 
 static bool import_storage(const char *path, bool directory, uint64_t bytes, void *unused)
 {
     (void)unused;
-    if (count == node_capacity || find(path) >= 0)
+    if (count == node_capacity || find(path) >= 0 || length(path) >= LUME_FILES_PATH_MAX)
         return false;
-    unsigned i = count;
-    add(path, directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, (size_t)bytes, true);
-    nodes[i].persistent = true;
+    unsigned index = count;
+    if (!add(path, directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, (size_t)bytes, true))
+        return false;
+    nodes[index].persistent = true;
     return true;
 }
 
 bool lume_vfs_mount_storage(const struct lume_storage_ops *ops)
 {
-    if (!ops || storage || count == node_capacity)
+    if (!ops || storage)
+        return false;
+    int mount = find("/data");
+    if (mount >= 0)
+    {
+        if (nodes[mount].kind != LUME_NODE_DIR || nodes[mount].references)
+            return false;
+        for (unsigned i = 0; i < count; ++i)
+            if ((int)i != mount && nodes[i].linked && subtree(nodes[i].path, "/data"))
+                return false;
+    }
+    else if (count == node_capacity)
         return false;
     unsigned before = count;
-    storage = ops;
-    add("/data", LUME_NODE_DIR, 0, 0, true);
-    nodes[before].persistent = true;
-    if (!ops->walk(import_storage, 0))
+    struct node previous = {0};
+    if (mount >= 0)
     {
-        count = before;
-        storage = 0;
-        return false;
+        previous = nodes[mount];
+        index_remove((unsigned)mount);
     }
-    return true;
+    storage = ops;
+    bool success;
+    if (mount >= 0)
+    {
+        nodes[mount].persistent = true;
+        nodes[mount].writable = true;
+        nodes[mount].on_fat = false;
+        nodes[mount].mode_set = false;
+        index_insert((unsigned)mount);
+        success = true;
+    }
+    else
+    {
+        success = add("/data", LUME_NODE_DIR, 0, 0, true);
+        if (success)
+            nodes[before].persistent = true;
+    }
+    if (success)
+        success = ops->walk(import_storage, 0);
+    import_finish(before, success);
+    if (!success)
+    {
+        if (mount >= 0)
+        {
+            index_remove((unsigned)mount);
+            nodes[mount] = previous;
+            index_insert_hashed((unsigned)mount, previous.path_hash);
+        }
+        storage = NULL;
+    }
+    return success;
 }
 
 static int program_image(unsigned i, const void **data, size_t *bytes)
@@ -1943,7 +3186,7 @@ static int program_image(unsigned i, const void **data, size_t *bytes)
 
 int lume_vfs_program(struct lume_files *f, const char *input, const void **data, size_t *bytes)
 {
-    char p[LUME_PATH_MAX];
+    char p[LUME_FILES_PATH_MAX];
     int i = resolve(f, input, p);
     if (i < 0)
         return i;
@@ -1957,4 +3200,121 @@ int lume_vfs_program(struct lume_files *f, const char *input, const void **data,
             return 0;
     i = resolve(f, LUME_BUSYBOX_ALIAS_TARGET, p);
     return i < 0 ? i : program_image((unsigned)i, data, bytes);
+}
+
+/* The caller owns a held open-file reference for the complete positioned read. */
+int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t bytes)
+{
+    if (object < 0 || object >= OPEN_FILES || !open_files[object].references)
+        return -LUME_EBADF;
+    struct open_file *file = &open_files[object];
+    if ((file->flags & 3) == LUME_O_WRONLY)
+        return -LUME_EACCES;
+    if (file->external)
+        return file->external->pread ? file->external->pread(file->context, data, bytes, offset)
+                                     : -LUME_ESPIPE;
+    if (file->pipe >= 0 || nodes[file->node].kind != LUME_NODE_FILE)
+        return -LUME_EINVAL;
+    struct node *node = &nodes[file->node];
+    if (offset >= node->bytes)
+        return 0;
+    if (bytes > node->bytes - offset)
+        bytes = node->bytes - offset;
+    if (node->persistent)
+        return file->storage_handle
+                   ? storage->read_handle(file->storage_handle, offset, data, bytes)
+                   : storage->read(node->path, offset, data, bytes);
+    if (node->on_fat)
+        return lume_fat_read(&root_fat, node->fat_file, offset, data, bytes) ? -LUME_EIO
+                                                                             : (int64_t)bytes;
+    copy(data, (const unsigned char *)(node->image ? node->image : node->data) + offset, bytes);
+    return (int64_t)bytes;
+}
+
+void lume_vfs_access_mode(struct lume_files *files, unsigned fd, unsigned mode)
+{
+    struct open_file *file = descriptor(files, fd);
+    if (file && file->external && mode <= LUME_O_RDWR)
+        file->flags = (file->flags & ~3u) | mode;
+}
+
+int lume_vfs_canonical_long(struct lume_files *files, const char *input,
+                            char output[LUME_FILES_PATH_MAX])
+{
+    for (unsigned i = 0; i < LUME_FILES_PATH_MAX; ++i)
+        output[i] = 0;
+    int result = resolve(files, input, output);
+    return result < 0 ? result : 0;
+}
+
+int lume_vfs_canonical(struct lume_files *files, const char *input, char output[LUME_PATH_MAX])
+{
+    char canonical[LUME_FILES_PATH_MAX];
+    output[0] = 0;
+    int result = lume_vfs_canonical_long(files, input, canonical);
+    if (result)
+        return result;
+    size_t bytes = length(canonical) + 1;
+    if (bytes > LUME_PATH_MAX)
+        return -LUME_ENAMETOOLONG;
+    copy(output, canonical, bytes);
+    return 0;
+}
+
+int lume_vfs_canonical_at(struct lume_files *files, int64_t directory, const char *input,
+                          char output[LUME_FILES_PATH_MAX])
+{
+    output[0] = 0;
+    struct lume_files base;
+    if (*input != '/' && directory != LUME_FILES_AT_CWD)
+    {
+        if (directory < 0 || directory >= LUME_FD_MAX)
+            return -LUME_EBADF;
+        struct open_file *file = descriptor(files, (uint64_t)directory);
+        if (!file)
+            return -LUME_EBADF;
+        if (file->node < 0 || file->external || file->pipe >= 0 ||
+            nodes[file->node].kind != LUME_NODE_DIR)
+            return -LUME_ENOTDIR;
+        if (!nodes[file->node].linked)
+            return -LUME_ENOENT;
+        base = *files;
+        base.cwd_node = (unsigned)file->node + 1;
+        base.cwd_generation = namespace_generation;
+        files = &base;
+    }
+    int result = resolve(files, input, output);
+    if (result < 0)
+    {
+        size_t bytes = length(input), used = length(output);
+        if (result == -LUME_ENOENT && used && bytes && input[bytes - 1] == '/')
+        {
+            if (used + 1 >= LUME_FILES_PATH_MAX)
+                return -LUME_ENAMETOOLONG;
+            output[used] = '/';
+            output[used + 1] = 0;
+        }
+        return result;
+    }
+    return lume_sandbox_path(files, output);
+}
+
+int lume_vfs_fd_path(struct lume_files *files, int64_t fd, char output[LUME_FILES_PATH_MAX])
+{
+    output[0] = 0;
+    if (fd < 0 || fd >= LUME_FD_MAX)
+        return -LUME_EBADF;
+    struct open_file *file = descriptor(files, (uint64_t)fd);
+    if (!file)
+        return -LUME_EBADF;
+    if (file->node < 0 || file->external || file->pipe >= 0 || !nodes[file->node].linked)
+        return -LUME_ENOENT;
+    if (files->identity.jailed || files->identity.euid)
+        return -LUME_EACCES;
+    const char *path = nodes[file->node].path;
+    int permission = lume_sandbox_path(files, path);
+    if (permission)
+        return permission;
+    copy(output, path, length(path) + 1);
+    return 0;
 }

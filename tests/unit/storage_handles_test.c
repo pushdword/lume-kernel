@@ -22,6 +22,7 @@ static unsigned write_attempts, fail_write_at;
 static unsigned read_attempts, fail_read_at;
 static bool fail_after_write;
 static bool track_transfers;
+static bool fail_after_zero_checkpoint;
 static unsigned checkpoint_calls, checkpoint_bytes, pending_transfers;
 static unsigned last_checkpoint, one_byte_checkpoints, directory_checkpoints;
 
@@ -36,6 +37,8 @@ void lume_worker_checkpoint(unsigned bytes)
     if (pending_transfers)
         assert(bytes >= pending_transfers * 512 && bytes <= LUME_SD_MAX_SECTORS * 512);
     pending_transfers = 0;
+    if (fail_after_zero_checkpoint && !bytes)
+        fail_writes = true;
 }
 
 static void transfer_started(void)
@@ -232,7 +235,8 @@ static bool aliases(const struct lume_storage_ops *ops)
     T(!memcmp(out + 1028, "end", 3));
     T(ops->resize("/data/empty.bin", 511) == 0);
     T(ops->read_handle(reader, 510, out, 3) == 1 && !out[0]);
-    T(ops->resize_handle(writer, 512) == -LUME_EINVAL);
+    T(ops->resize_handle(writer, 512) == 0);
+    T(ops->read_handle(reader, 511, out, 1) == 1 && !out[0]);
     T(ops->read_handle(reader, UINT64_MAX, out, 1) == -LUME_EINVAL);
     T(ops->write_handle(writer, UINT32_MAX, out, 2) == -LUME_EINVAL);
     T(!lume_storage_start());
@@ -432,6 +436,59 @@ static bool failures(const struct lume_storage_ops *ops)
     return true;
 }
 
+static bool growth(const struct lume_storage_ops *ops)
+{
+    unsigned char pattern[8192], out[sizeof(pattern)];
+    for (unsigned i = 0; i < sizeof(pattern); ++i)
+        pattern[i] = (unsigned char)(i * 59 + 11);
+    T(ops->create("/data/growth.bin", false) == 0);
+    void *writer, *reader;
+    T(ops->open("/data/growth.bin", LUME_O_RDWR, &writer) == 0);
+    T(ops->open("/data/growth.bin", LUME_O_RDONLY, &reader) == 0);
+    T(ops->write_handle(writer, 0, pattern, sizeof(pattern)) == sizeof(pattern));
+    T(ops->resize_handle(writer, 513) == 0);
+    T(ops->resize_handle(writer, sizeof(pattern)) == 0);
+    T(ops->read_handle(reader, 0, out, sizeof(out)) == sizeof(out));
+    T(!memcmp(out, pattern, 513));
+    for (unsigned i = 513; i < sizeof(out); ++i)
+        T(!out[i]);
+    T(ops->resize_handle(writer, (uint64_t)UINT32_MAX + 1) == -LUME_EINVAL);
+    T(ops->resize_handle(reader, sizeof(pattern) + 1) == -LUME_EBADF);
+    T(ops->read_handle(reader, sizeof(pattern), out, 1) == 0);
+    T(ops->resize("/data/growth.bin", sizeof(pattern) + 1) == 0);
+    T(ops->read_handle(reader, sizeof(pattern), out, 2) == 1 && !out[0]);
+    T(ops->resize_handle(writer, sizeof(pattern) + 1) == 0);
+    T(ops->close(writer) == 0 && ops->close(reader) == 0);
+    T(lume_storage_start());
+    T(ops->read("/data/growth.bin", 0, out, sizeof(out)) == sizeof(out));
+    T(!memcmp(out, pattern, 513));
+    for (unsigned i = 513; i < sizeof(out); ++i)
+        T(!out[i]);
+    T(ops->read("/data/growth.bin", sizeof(pattern), out, 2) == 1 && !out[0]);
+    return true;
+}
+
+static bool growth_failure(const struct lume_storage_ops *ops)
+{
+    unsigned char data[512], out[sizeof(data)];
+    memset(data, 0x63, sizeof(data));
+    T(ops->create("/data/growth-error.bin", false) == 0);
+    void *handle;
+    T(ops->open("/data/growth-error.bin", LUME_O_RDWR, &handle) == 0);
+    T(ops->write_handle(handle, 0, data, sizeof(data)) == sizeof(data));
+    T(ops->sync_handle(handle) == 0);
+    fail_writes = true;
+    T(ops->resize_handle(handle, sizeof(data) * 3) == -LUME_EIO);
+    fail_writes = false;
+    T(ops->resize_handle(handle, sizeof(data)) == -LUME_EIO);
+    T(ops->sync_handle(handle) == -LUME_EIO);
+    T(ops->close(handle) == -LUME_EIO);
+    T(lume_storage_start());
+    T(ops->read("/data/growth-error.bin", 0, out, sizeof(out)) == sizeof(out));
+    T(!memcmp(data, out, sizeof(data)));
+    return true;
+}
+
 static bool writeback(const struct lume_storage_ops *ops)
 {
     void *handle;
@@ -511,12 +568,54 @@ static bool partial(void)
     T(get32(disk[FIRST_DATA] + 28) == 1024);
     T(ops->read_handle(reader, 0, out, sizeof(out)) == 1024);
     T(!memcmp(data, out, 1024));
-    T(ops->write_handle(writer, 1024, data, 1) == 0);
+    T(ops->write_handle(writer, 1024, data, 1) == -LUME_ENOSPC);
+    T(ops->write_handle(writer, 1536, data, 1) == -LUME_ENOSPC);
+    T(ops->read_handle(reader, 1024, out, 1) == 0);
+    T(ops->resize_handle(writer, 1536) == -LUME_ENOSPC);
+    T(ops->read_handle(reader, 1024, out, 1) == 0);
+    T(ops->resize_handle(writer, 513) == 0);
+    T(ops->write_handle(writer, 2048, data, 1) == -LUME_ENOSPC);
+    T(ops->read_handle(reader, 0, out, sizeof(out)) == 513);
+    T(!memcmp(data, out, 513));
+    T(ops->resize_handle(writer, 512) == 0);
+    T(ops->write_handle(writer, 1024, data, 1) == -LUME_ENOSPC);
+    T(ops->read_handle(reader, 0, out, sizeof(out)) == 512);
+    T(!memcmp(data, out, 512));
+    T(ops->write_handle(writer, 512, data, 1) == 1);
+    T(ops->resize_handle(writer, 1536) == -LUME_ENOSPC);
+    T(ops->read_handle(reader, 0, out, sizeof(out)) == 513);
+    T(!memcmp(data, out, 513));
+    T(ops->resize_handle(writer, 1024) == 0);
+    T(ops->read_handle(reader, 513, out, sizeof(out)) == 511);
+    for (unsigned i = 0; i < 511; ++i)
+        T(!out[i]);
     T(ops->sync_handle(writer) == 0);
     T(ops->close(writer) == 0 && ops->close(reader) == 0);
     T(lume_storage_start());
     T(ops->read("/data/full.bin", 0, out, sizeof(out)) == 1024);
-    T(!memcmp(data, out, 1024));
+    T(!memcmp(data, out, 513));
+    for (unsigned i = 513; i < 1024; ++i)
+        T(!out[i]);
+    return true;
+}
+
+static bool full_disk_failure(void)
+{
+    const struct lume_storage_ops *ops = format(true);
+    T(ops && ops->create("/data/full-error.bin", false) == 0);
+    void *writer;
+    unsigned char data[512];
+    memset(data, 0x69, sizeof(data));
+    T(ops->open("/data/full-error.bin", LUME_O_RDWR, &writer) == 0);
+    T(ops->write_handle(writer, 0, data, sizeof(data)) == sizeof(data));
+    T(ops->sync_handle(writer) == 0);
+    fail_after_zero_checkpoint = true;
+    T(ops->write_handle(writer, 1536, data, 1) == -LUME_EIO);
+    fail_after_zero_checkpoint = false;
+    fail_writes = false;
+    T(ops->sync_handle(writer) == -LUME_EIO);
+    T(ops->resize_handle(writer, 0) == -LUME_EIO);
+    T(ops->close(writer) == -LUME_EIO);
     return true;
 }
 
@@ -525,8 +624,8 @@ int main(void)
     const struct lume_storage_ops *ops = format(false);
     if (!ops || !ops->open || !ops->read_handle || !ops->write_handle || !ops->resize_handle ||
         !ops->close || !ops->sync_handle || !aliases(ops) || !limits(ops) || !interleaved(ops) ||
-        !checkpoints(ops) || !unicode_remount(ops) || !failures(ops) || !writeback(ops) ||
-        !partial())
+        !checkpoints(ops) || !unicode_remount(ops) || !failures(ops) || !growth(ops) ||
+        !growth_failure(ops) || !writeback(ops) || !partial() || !full_disk_failure())
         return 1;
     printf("PASS_STORAGE_HANDLES checks=%u reads=%u writes=%u\n", checks, reads, writes);
     return 0;

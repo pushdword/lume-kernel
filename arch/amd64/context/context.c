@@ -182,7 +182,7 @@ struct lume_context *lume_amd64_exception(struct lume_context *frame, uint64_t v
         uint64_t address = 0;
         if (vector == 14)
             __asm__ volatile("movq %%cr2, %0" : "=r"(address));
-        next = lume_tasks_sync(frame, vector | ((error & 1) << 8), address);
+        next = lume_tasks_sync(frame, vector | ((error & 31) << 8), address);
     }
     else
     {

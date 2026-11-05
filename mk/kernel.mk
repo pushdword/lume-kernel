@@ -11,17 +11,20 @@ KERNEL_C_aarch64 := \
     src/storage/boot_storage.c \
     src/watchdog/boot_watchdog.c \
     src/security/credential.c \
+    src/security/sandbox.c \
     src/device/device.c \
     src/dma/dma.c \
     src/device/drivers.c \
     src/exec/elf.c \
     src/fs/fat/fat.c \
+    src/fs/path.c \
     platform/raspberrypi5/fdt.c \
     platform/raspberrypi5/fdt_irq.c \
     src/security/file_modes.c \
     platform/raspberrypi5/hardware_platform.c \
     platform/raspberrypi5/firmware.c \
     src/mm/heap.c \
+    src/mm/vm.c \
     drivers/input/usb_hid/hid_keyboard.c \
     src/net/icmp.c \
     src/device/irq.c \
@@ -46,10 +49,14 @@ KERNEL_C_aarch64 := \
     drivers/storage/sdio/sdio.c \
     arch/aarch64/smp/smp.c \
     src/net/socket.c \
+    src/net/datagram.c \
     src/storage/storage.c \
     src/net/stream.c \
     src/core/supervision.c \
     src/syscall/syscall.c \
+    src/syscall/file_io.c \
+    src/syscall/files.c \
+    src/syscall/file_lock.c \
     src/syscall/io.c \
     src/core/tasks.c \
     drivers/usb/xhci/usb_descriptors.c \

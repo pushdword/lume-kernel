@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+struct lume_files_volume;
+
 typedef bool (*lume_storage_visit)(const char *, bool, uint64_t, void *);
 
 enum
@@ -11,6 +13,10 @@ enum
     LUME_STORAGE_REPLACE_UNCERTAIN,
     LUME_STORAGE_REPLACE_COMMITTED
 };
+
+#define LUME_STORAGE_NAMESPACE_UNCHANGED LUME_STORAGE_REPLACE_UNCHANGED
+#define LUME_STORAGE_NAMESPACE_UNCERTAIN LUME_STORAGE_REPLACE_UNCERTAIN
+#define LUME_STORAGE_NAMESPACE_COMMITTED LUME_STORAGE_REPLACE_COMMITTED
 
 struct lume_storage_ops
 {
@@ -30,9 +36,17 @@ struct lume_storage_ops
     int (*resize_handle)(void *, uint64_t);
     int (*close)(void *);
     int (*sync_handle)(void *);
-    /* Replacement accepts closed regular files. The state records namespace changes
-     * even when reclaiming the previous contents reports an error. */
+    /* Replacement accepts objects of the same kind. Directory targets must be empty.
+     * Open regular files retain their backing until their final handle is closed.
+     * The state records namespace changes even when reclaiming old contents fails. */
     int (*replace)(const char *, const char *, unsigned *state);
+    /* Compare complete paths using the volume's filename case rules. */
+    bool (*path_equal)(const char *, const char *);
+    int (*remove_state)(const char *, unsigned *state);
+    int (*rename_state)(const char *, const char *, unsigned *state);
+    /* Equal paths must have equal hashes. Providers may omit the hash callback. */
+    uint32_t (*path_hash)(const char *);
+    int (*volume_info)(struct lume_files_volume *);
 };
 
 struct lume_volume

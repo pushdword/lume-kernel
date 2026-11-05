@@ -4629,6 +4629,7 @@ FRESULT f_open(FIL *fp,           /* Pointer to the blank file object */
                 mode |= FA_MODIFIED;    /* Set file change flag if created or overwritten */
             fp->dir_sect = fs->winsect; /* Pointer to the directory entry */
             fp->dir_ptr = dj.dir;
+            fp->detached = 0;
 #if FF_FS_LOCK
             fp->obj.lockid =
                 inc_share(&dj, (mode & ~FA_READ) ? 1 : 0); /* Lock the file for this session */
@@ -5023,6 +5024,13 @@ FRESULT f_sync(FIL *fp /* Open file to be synced */
                 fp->flag &= (BYTE)~FA_DIRTY;
             }
 #endif
+            if (fp->detached)
+            {
+                res = sync_fs(fs);
+                if (res == FR_OK)
+                    fp->flag &= (BYTE)~FA_MODIFIED;
+                LEAVE_FF(fs, res);
+            }
             /* Update the directory entry */
 #if FF_FS_EXFAT
             if (fs->fs_type == FS_EXFAT)
@@ -5112,6 +5120,17 @@ FRESULT f_close(FIL *fp /* Open file to be closed */
         res = validate(&fp->obj, &fs); /* Lock volume */
         if (res == FR_OK)
         {
+#if !FF_FS_READONLY
+            if (fp->detached)
+            {
+                if (fp->obj.sclust)
+                    res = remove_chain(&fp->obj, fp->obj.sclust, 0);
+                if (res == FR_OK)
+                    res = sync_fs(fs);
+                if (res != FR_OK)
+                    LEAVE_FF(fs, res);
+            }
+#endif
 #if FF_FS_LOCK
             res = dec_share(fp->obj.lockid); /* Decrement file open counter */
             if (res == FR_OK)
@@ -6451,6 +6470,309 @@ FRESULT f_replace(const TCHAR *path_old, const TCHAR *path_new, BYTE *state)
                     {
                         *state = FF_REPLACE_COMMITTED;
                         if (previous)
+                            res = remove_chain(&target.obj, previous, 0);
+                        if (res == FR_OK)
+                            res = sync_fs(fs);
+                    }
+                }
+            }
+        }
+        FREE_NAMEBUFF();
+    }
+    LEAVE_FF(fs, res);
+}
+
+static int live_file_matches(const FIL *file, const DIR *entry)
+{
+    return !file || (!file->detached && file->obj.fs == entry->obj.fs &&
+                     file->obj.id == entry->obj.fs->id && file->dir_sect == entry->sect &&
+                     file->dir_ptr == entry->dir && !(entry->dir[DIR_Attr] & AM_DIR));
+}
+
+static FRESULT live_sync_files(FIL *source, FIL *target)
+{
+    FRESULT res = FR_OK;
+    if (source)
+        res = source->detached ? FR_INVALID_OBJECT : f_sync(source);
+    if (res == FR_OK && target && target != source)
+        res = target->detached ? FR_INVALID_OBJECT : f_sync(target);
+    return res;
+}
+
+static FRESULT live_empty_directory(DIR *entry)
+{
+    DIR child;
+    FRESULT res;
+    if (!(entry->dir[DIR_Attr] & AM_DIR))
+        return FR_OK;
+    child.obj.fs = entry->obj.fs;
+    child.obj.sclust = ld_clust(entry->obj.fs, entry->dir);
+    res = dir_sdi(&child, 0);
+    if (res == FR_OK)
+        res = DIR_READ_FILE(&child);
+    return res == FR_NO_FILE ? FR_OK : res == FR_OK ? FR_DENIED : res;
+}
+
+static FRESULT live_parent(FATFS *fs, const BYTE entry[SZDIRE], DWORD old_parent, DWORD new_parent)
+{
+    FRESULT res;
+    LBA_t sector;
+    if (!(entry[DIR_Attr] & AM_DIR) || old_parent == new_parent)
+        return FR_OK;
+    sector = clst2sect(fs, ld_clust(fs, entry));
+    if (!sector)
+        return FR_INT_ERR;
+    res = move_window(fs, sector);
+    if (res == FR_OK)
+    {
+        if (fs->win[SZDIRE] != '.' || fs->win[SZDIRE + 1] != '.')
+            return FR_INT_ERR;
+        st_clust(fs, fs->win + SZDIRE, new_parent);
+        fs->wflag = 1;
+    }
+    return res;
+}
+
+/* Open files retain their chains after unlink. Their final close reclaims them. */
+FRESULT f_unlink_live(const TCHAR *path, FIL *file, BYTE *state)
+{
+    FRESULT res;
+    FATFS *fs;
+    DIR entry;
+    DWORD chain;
+    DEF_NAMEBUFF
+
+    if (!state)
+        return FR_INVALID_PARAMETER;
+    *state = FF_REPLACE_UNCHANGED;
+    res = live_sync_files(file, 0);
+    if (res != FR_OK)
+        return res;
+    res = mount_volume(&path, &fs, FA_WRITE);
+    if (res == FR_OK)
+    {
+        entry.obj.fs = fs;
+        INIT_NAMEBUFF(fs);
+        if (fs->fs_type != FS_FAT32 || FF_FS_LOCK)
+            res = FR_INVALID_PARAMETER;
+        else
+            res = follow_path(&entry, path);
+        if (res == FR_OK && (entry.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+            res = FR_INVALID_NAME;
+        if (res == FR_OK && (entry.dir[DIR_Attr] & AM_RDO))
+            res = FR_DENIED;
+        if (res == FR_OK && !live_file_matches(file, &entry))
+            res = FR_INVALID_OBJECT;
+        if (res == FR_OK)
+            res = live_empty_directory(&entry);
+        if (res == FR_OK)
+            res = move_window(fs, entry.sect);
+        if (res == FR_OK)
+        {
+            chain = ld_clust(fs, entry.dir);
+            *state = FF_REPLACE_UNCERTAIN;
+            res = dir_remove(&entry);
+            if (res == FR_OK)
+                res = sync_fs(fs);
+            if (res == FR_OK)
+            {
+                *state = FF_REPLACE_COMMITTED;
+                if (file)
+                {
+                    file->detached = 1;
+                    file->dir_sect = 0;
+                    file->dir_ptr = 0;
+                }
+                else if (chain)
+                    res = remove_chain(&entry.obj, chain, 0);
+                if (res == FR_OK)
+                    res = sync_fs(fs);
+            }
+        }
+        FREE_NAMEBUFF();
+    }
+    LEAVE_FF(fs, res);
+}
+
+/* Rebinding uses the destination entry captured before the source is removed. */
+FRESULT f_rename_live(const TCHAR *path_old, const TCHAR *path_new, FIL *file, BYTE *state)
+{
+    FRESULT res;
+    FATFS *fs;
+    DIR source, target;
+    BYTE entry[SZDIRE];
+    LBA_t target_sector = 0;
+    BYTE *target_pointer = 0;
+    const TCHAR *old_relative = path_old, *new_relative = path_new;
+    int old_drive, new_drive;
+    DEF_NAMEBUFF
+
+    if (!state)
+        return FR_INVALID_PARAMETER;
+    *state = FF_REPLACE_UNCHANGED;
+    old_drive = get_ldnumber(&old_relative);
+    new_drive = get_ldnumber(&new_relative);
+    if (old_drive < 0 || old_drive != new_drive)
+        return FR_INVALID_PARAMETER;
+    res = live_sync_files(file, 0);
+    if (res != FR_OK)
+        return res;
+    res = mount_volume(&path_old, &fs, FA_WRITE);
+    if (res == FR_OK)
+    {
+        source.obj.fs = target.obj.fs = fs;
+        INIT_NAMEBUFF(fs);
+        if (fs->fs_type != FS_FAT32 || FF_FS_LOCK)
+            res = FR_INVALID_PARAMETER;
+        else
+            res = follow_path(&source, path_old);
+        if (res == FR_OK && (source.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+            res = FR_INVALID_NAME;
+        if (res == FR_OK && !live_file_matches(file, &source))
+            res = FR_INVALID_OBJECT;
+        if (res == FR_OK)
+        {
+            memcpy(entry, source.dir, SZDIRE);
+            res = follow_path(&target, new_relative);
+            if (res == FR_OK)
+                res = source.obj.sclust == target.obj.sclust && source.dptr == target.dptr
+                          ? FR_NO_FILE
+                          : FR_EXIST;
+            if (res == FR_NO_FILE)
+            {
+                *state = FF_REPLACE_UNCERTAIN;
+                res = dir_register(&target);
+                if (res == FR_OK)
+                {
+                    target_sector = target.sect;
+                    target_pointer = target.dir;
+                    memcpy(target.dir + 13, entry + 13, SZDIRE - 13);
+                    target.dir[DIR_Attr] = entry[DIR_Attr];
+                    if (!(entry[DIR_Attr] & AM_DIR))
+                        target.dir[DIR_Attr] |= AM_ARC;
+                    fs->wflag = 1;
+                    res = live_parent(fs, entry, source.obj.sclust, target.obj.sclust);
+                }
+                if (res == FR_OK)
+                    res = dir_remove(&source);
+                if (res == FR_OK)
+                    res = sync_fs(fs);
+                if (res == FR_OK)
+                {
+                    if (file)
+                    {
+                        file->dir_sect = target_sector;
+                        file->dir_ptr = target_pointer;
+                    }
+                    *state = FF_REPLACE_COMMITTED;
+                }
+            }
+        }
+        FREE_NAMEBUFF();
+    }
+    LEAVE_FF(fs, res);
+}
+
+/* Replacement preserves both live objects. The previous target becomes unlinked. */
+FRESULT f_replace_live(const TCHAR *path_old, const TCHAR *path_new, FIL *source_file,
+                       FIL *target_file, BYTE *state)
+{
+    FRESULT res;
+    FATFS *fs;
+    DIR source, target;
+    BYTE entry[SZDIRE];
+    DWORD incoming, previous;
+    LBA_t target_sector;
+    BYTE *target_pointer;
+    const TCHAR *old_relative = path_old, *new_relative = path_new;
+    int old_drive, new_drive;
+    DEF_NAMEBUFF
+
+    if (!state)
+        return FR_INVALID_PARAMETER;
+    *state = FF_REPLACE_UNCHANGED;
+    old_drive = get_ldnumber(&old_relative);
+    new_drive = get_ldnumber(&new_relative);
+    if (old_drive < 0 || old_drive != new_drive)
+        return FR_INVALID_PARAMETER;
+    res = live_sync_files(source_file, target_file);
+    if (res != FR_OK)
+        return res;
+    res = mount_volume(&path_old, &fs, FA_WRITE);
+    if (res == FR_OK)
+    {
+        source.obj.fs = target.obj.fs = fs;
+        INIT_NAMEBUFF(fs);
+        if (fs->fs_type != FS_FAT32 || FF_FS_LOCK)
+            res = FR_INVALID_PARAMETER;
+        else
+            res = follow_path(&source, path_old);
+        if (res == FR_OK && (source.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+            res = FR_INVALID_NAME;
+        if (res == FR_OK && (source.dir[DIR_Attr] & AM_RDO))
+            res = FR_DENIED;
+        if (res == FR_OK && !live_file_matches(source_file, &source))
+            res = FR_INVALID_OBJECT;
+        if (res == FR_OK)
+        {
+            memcpy(entry, source.dir, SZDIRE);
+            incoming = ld_clust(fs, entry);
+            res = follow_path(&target, new_relative);
+            if (res == FR_OK && (target.fn[NSFLAG] & (NS_DOT | NS_NONAME)))
+                res = FR_INVALID_NAME;
+            if (res == FR_OK && ((target.dir[DIR_Attr] & AM_RDO) ||
+                                 ((target.dir[DIR_Attr] ^ entry[DIR_Attr]) & AM_DIR)))
+                res = FR_DENIED;
+            if (res == FR_OK && !live_file_matches(target_file, &target))
+                res = FR_INVALID_OBJECT;
+            if (res == FR_OK && source.obj.sclust == target.obj.sclust &&
+                source.dptr == target.dptr)
+                *state = FF_REPLACE_COMMITTED;
+            else if (res == FR_OK)
+            {
+                res = live_empty_directory(&target);
+                if (res == FR_OK)
+                    res = move_window(fs, target.sect);
+                if (res == FR_OK)
+                {
+                    previous = ld_clust(fs, target.dir);
+                    if ((incoming && (incoming < 2 || incoming >= fs->n_fatent)) ||
+                        (previous && (previous < 2 || previous >= fs->n_fatent)) ||
+                        (incoming && incoming == previous))
+                        res = FR_INT_ERR;
+                }
+                if (res == FR_OK)
+                {
+                    target_sector = target.sect;
+                    target_pointer = target.dir;
+                    *state = FF_REPLACE_UNCERTAIN;
+                    memcpy(target.dir + 13, entry + 13, SZDIRE - 13);
+                    target.dir[DIR_Attr] = entry[DIR_Attr];
+                    if (!(entry[DIR_Attr] & AM_DIR))
+                        target.dir[DIR_Attr] |= AM_ARC;
+                    fs->wflag = 1;
+                    res = live_parent(fs, entry, source.obj.sclust, target.obj.sclust);
+                    if (res == FR_OK)
+                        res = sync_fs(fs);
+                    if (res == FR_OK)
+                        res = dir_remove(&source);
+                    if (res == FR_OK)
+                        res = sync_fs(fs);
+                    if (res == FR_OK)
+                    {
+                        if (target_file)
+                        {
+                            target_file->detached = 1;
+                            target_file->dir_sect = 0;
+                            target_file->dir_ptr = 0;
+                        }
+                        if (source_file)
+                        {
+                            source_file->dir_sect = target_sector;
+                            source_file->dir_ptr = target_pointer;
+                        }
+                        *state = FF_REPLACE_COMMITTED;
+                        if (!target_file && previous)
                             res = remove_chain(&target.obj, previous, 0);
                         if (res == FR_OK)
                             res = sync_fs(fs);

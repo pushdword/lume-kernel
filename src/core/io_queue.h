@@ -139,6 +139,7 @@ static inline bool io_queue_direct(unsigned number)
     case LUME_SYS_RMDIR:
     case LUME_SYS_FS:
     case LUME_SYS_FILE_MODE:
+    case LUME_SYS_FILE_IO:
         return true;
     default:
         return false;

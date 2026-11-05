@@ -290,6 +290,12 @@ static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
     return fd;
 }
 
+bool lume_tty_slave_output(struct lume_files *files, unsigned fd)
+{
+    struct tty_end *end = lume_vfs_external(files, fd, &tty_ops);
+    return end && end->side == 1;
+}
+
 int64_t lume_tty_terminal(struct lume_files *files, unsigned action)
 {
     struct tty_end *end = lume_vfs_external(files, 0, &tty_ops);

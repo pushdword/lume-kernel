@@ -2,8 +2,11 @@
 #define LUME_HEAP_H
 #include "lume/process.h"
 #include <stdint.h>
+#define LUME_HEAP_EXTENDED_BASE UINT64_C(0x4100000000)
+#define LUME_HEAP_EXTENDED_LIMIT UINT64_C(0x5100000000)
 struct lume_context;
 int64_t lume_heap_brk(unsigned, uint64_t);
+int64_t lume_heap_brk_flags(unsigned, uint64_t, uint64_t);
 bool lume_heap_contains(unsigned, uint64_t, uint64_t);
 void lume_heap_release(unsigned);
 bool lume_heap_clone(unsigned, unsigned);

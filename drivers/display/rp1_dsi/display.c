@@ -15,6 +15,7 @@
 #include "lume/counter.h"
 #include "lume/display.h"
 #include "lume/dma.h"
+#include "lume/worker.h"
 #include "terminal.h"
 #include "font5x7.h"
 #include "console_font.h"
@@ -94,19 +95,43 @@ static bool dma_active, dma_idle = true;
 
 static void delay(unsigned us)
 {
-    lume_counter_delay_us(frequency, us);
+    if (us < 25 || !frequency)
+    {
+        lume_counter_delay_us(frequency, us);
+        return;
+    }
+    uint64_t ticks = frequency / 1000000 * us +
+                     (frequency % 1000000 * us + 999999) / 1000000;
+    uint64_t start = lume_counter_read();
+    while (lume_counter_read() - start < ticks)
+    {
+        if (!lume_worker_pause(start + ticks))
+            lume_counter_delay_us(frequency, 1);
+    }
 }
 
 static bool wait(uint64_t address, uint32_t mask, uint32_t value, unsigned us)
 {
     uint64_t start = lume_counter_read();
-    do
+    uint64_t ticks = frequency / 1000000 * us +
+                     (frequency % 1000000 * us + 999999) / 1000000;
+    for (;;)
     {
         if ((lume_mmio_read32(address) & mask) == value)
             return true;
-        delay(10);
-    } while (lume_counter_read() - start < frequency * us / 1000000);
-    return false;
+        uint64_t now = lume_counter_read();
+        if (now - start >= ticks)
+            return false;
+        if (frequency && now - start >= frequency / 40000)
+        {
+            uint64_t next = now + frequency / 1000 + (frequency % 1000 != 0);
+            if (next - start > ticks)
+                next = start + ticks;
+            if (lume_worker_pause(next))
+                continue;
+        }
+        lume_counter_delay_us(frequency, 1);
+    }
 }
 
 static void clean(const void *p, size_t bytes)
@@ -706,15 +731,54 @@ static int graphics_claim(bool acquire)
     return 0;
 }
 
+struct framebuffer_update
+{
+    uint32_t *memory;
+    unsigned width, height;
+    struct lume_graphics_request request;
+    int result;
+};
+
+static void present_compute(void *context)
+{
+    struct framebuffer_update *update = context;
+    const struct lume_graphics_request *request = &update->request;
+    update->result = lume_framebuffer_present((uintptr_t)update->memory, update->width,
+                                              update->height, update->width * 4, 32, 1, request);
+    if (update->result)
+        return;
+    uint32_t *first = update->memory + (size_t)request->y * update->width + request->x;
+    if (!lume_dma_sync_rect_for_device(first, request->width * 4, update->width * 4,
+                                       request->height, LUME_DMA_TO_DEVICE))
+        update->result = -LUME_EIO;
+}
+
 static int graphics_present(const struct lume_graphics_request *request)
 {
     if (!enabled || !graphics_owned)
         return -LUME_EBADF;
-    int result = lume_framebuffer_present((uintptr_t)fb, WIDTH, HEIGHT, WIDTH * 4, 32, 1, request);
-    if (!result)
-        for (unsigned y = 0; y < request->height; ++y)
-            clean(fb + (request->y + y) * WIDTH + request->x, request->width * 4);
-    return result;
+    struct framebuffer_update update = {.memory = fb, .width = WIDTH, .height = HEIGHT};
+    const struct lume_graphics_request full = *request;
+    if (!update.memory || full.format != LUME_GRAPHICS_XRGB8888 || !full.width || !full.height ||
+        full.x > update.width || full.y > update.height || full.width > update.width - full.x ||
+        full.height > update.height - full.y || (uint64_t)full.width * 4 > full.pitch)
+        return -LUME_EINVAL;
+    unsigned batch = LUME_WORKER_SLICE_BYTES / ((uint64_t)full.width * 4);
+    if (!batch)
+        batch = 1;
+    for (unsigned row = 0; row < full.height;)
+    {
+        update.request = full;
+        update.request.y += row;
+        update.request.pixels += (uint64_t)row * full.pitch;
+        update.request.height = full.height - row < batch ? full.height - row : batch;
+        lume_worker_compute(present_compute, &update);
+        if (update.result)
+            return update.result;
+        row += update.request.height;
+        lume_worker_checkpoint(update.request.width * update.request.height * 4u);
+    }
+    return 0;
 }
 
 const struct lume_platform_graphics_ops lume_dsi_graphics_operations = {

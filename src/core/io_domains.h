@@ -2,6 +2,7 @@
 #define LUME_IO_DOMAINS_H
 #include "lume/work.h"
 #include "lume/worker.h"
+#include "lume/io_redirect.h"
 
 _Static_assert(LUME_WORKER_LIMIT == LUME_WORK_DOMAINS, "one worker per resource domain");
 
@@ -10,6 +11,7 @@ struct kernel_io_lane
     struct io_queue queue;
     unsigned owner;
     int64_t result;
+    uint64_t cancel_generation;
     bool launch, deferred_turn, exclusive, mutation, exclusive_pending, reclaim;
 };
 
@@ -17,6 +19,9 @@ static struct kernel_io_lane kernel_lanes[LUME_WORK_DOMAINS];
 static struct io_queue kernel_control_queue;
 static unsigned kernel_lane_cursor;
 static uint64_t kernel_parallel_epoch;
+static bool kernel_socket_network[LUME_TASK_LIMIT];
+/* Direct continuations retain launch semantics until their next admission. */
+static bool kernel_retry_launch[LUME_TASK_LIMIT];
 
 enum kernel_memory_phase
 {

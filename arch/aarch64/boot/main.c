@@ -45,15 +45,19 @@ unsigned lume_program_staging_pages(void)
 
 static void *allocate_program(size_t bytes)
 {
-    if (!bytes || bytes > 128u * 1024u * 1024u)
+    if (!bytes || bytes > 1024u * 1024u * 1024u)
         return 0;
     unsigned pages = (unsigned)((bytes + 4095) / 4096);
     uint64_t memory = lume_pages_alloc_span(pages);
     if (!memory)
         return 0;
     for (unsigned i = 0; i < program_pages; ++i)
+    {
         if (!lume_page_free(program_memory + (uint64_t)i * 4096))
             lume_fail("program staging release");
+        if ((i & 15u) == 15u)
+            lume_worker_checkpoint(65536);
+    }
     program_memory = memory;
     program_pages = pages;
     return (void *)(uintptr_t)memory;

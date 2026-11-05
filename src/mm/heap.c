@@ -5,12 +5,39 @@
 #include "lume/mmu.h"
 #include "lume/gpu_device.h"
 #include "lume/worker.h"
-#define HEAP_BASE LUME_HEAP_BASE
+#include "lume/break.h"
 static uint64_t ends[LUME_TASK_LIMIT];
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+static bool extended[LUME_TASK_LIMIT];
+_Static_assert(LUME_HEAP_EXTENDED_BASE >= LUME_LARGE_ELF_LIMIT,
+               "extended heap overlaps executable images");
+_Static_assert(LUME_HEAP_EXTENDED_LIMIT <= UINT64_C(0x8000000000),
+               "extended heap overlaps thread stacks");
+#endif
+
+static uint64_t heap_base(unsigned task)
+{
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    return extended[task] ? LUME_HEAP_EXTENDED_BASE : LUME_HEAP_BASE;
+#else
+    (void)task;
+    return LUME_HEAP_BASE;
+#endif
+}
+
+static uint64_t heap_limit(unsigned task)
+{
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    return extended[task] ? LUME_HEAP_EXTENDED_LIMIT : LUME_HEAP_LIMIT;
+#else
+    (void)task;
+    return LUME_HEAP_LIMIT;
+#endif
+}
 
 bool lume_heap_contains(unsigned pid, uint64_t address, uint64_t bytes)
 {
-    return pid && pid <= LUME_TASK_LIMIT && bytes && address >= HEAP_BASE &&
+    return pid && pid <= LUME_TASK_LIMIT && bytes && address >= heap_base(pid - 1) &&
            address <= ends[pid - 1] && bytes <= ends[pid - 1] - address;
 }
 
@@ -19,6 +46,11 @@ void lume_heap_swap(unsigned a, unsigned b)
     uint64_t value = ends[a];
     ends[a] = ends[b];
     ends[b] = value;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    bool mode = extended[a];
+    extended[a] = extended[b];
+    extended[b] = mode;
+#endif
 }
 
 struct heap_page_copy
@@ -44,12 +76,18 @@ bool lume_heap_clone(unsigned source, unsigned target)
 {
     if (source >= LUME_TASK_LIMIT || target >= LUME_TASK_LIMIT || source == target || ends[target])
         return false;
-    uint64_t end = ends[source] ? ends[source] : HEAP_BASE;
-    unsigned pages = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    if (extended[target])
+        return false;
+    extended[target] = extended[source];
+#endif
+    uint64_t base = heap_base(source);
+    uint64_t end = ends[source] ? ends[source] : base;
+    unsigned pages = (unsigned)((end - base + 4095) / 4096);
     struct heap_page_copy copy = {0};
     for (unsigned i = 0; i < pages; ++i)
     {
-        uint64_t address = HEAP_BASE + (uint64_t)i * 4096, physical;
+        uint64_t address = base + (uint64_t)i * 4096, physical;
         if (!lume_mmu_translate(lume_mmu_task_root(source), address, true, true, false, &physical))
             goto fail;
         uint64_t page = lume_page_alloc(0);
@@ -87,7 +125,7 @@ static void release_pages(unsigned task, unsigned first, unsigned count)
         unsigned batch = count < LUME_MMU_BATCH_PAGES ? count : LUME_MMU_BATCH_PAGES;
         for (unsigned i = 0; i < batch; ++i)
         {
-            addresses[i] = HEAP_BASE + (uint64_t)(first + i) * 4096;
+            addresses[i] = heap_base(task) + (uint64_t)(first + i) * 4096;
             if (!lume_mmu_translate(lume_mmu_task_root(task), addresses[i], true, true, false,
                                     physical + i))
                 lume_fail("heap mapping release");
@@ -109,15 +147,16 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
     if (!pid || pid > LUME_TASK_LIMIT)
         return -LUME_EINVAL;
     unsigned task = pid - 1;
-    uint64_t old = ends[task] ? ends[task] : HEAP_BASE;
+    uint64_t base = heap_base(task);
+    uint64_t old = ends[task] ? ends[task] : base;
     if (!end)
         return (int64_t)old;
-    if (end < HEAP_BASE || end > LUME_HEAP_LIMIT)
+    if (end < base || end > heap_limit(task))
         return -LUME_ENOMEM;
     if (!lume_gpu_heap_allowed(pid, end))
         return -LUME_EBUSY;
-    unsigned before = (unsigned)((old - HEAP_BASE + 4095) / 4096);
-    unsigned after = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+    unsigned before = (unsigned)((old - base + 4095) / 4096);
+    unsigned after = (unsigned)((end - base + 4095) / 4096);
     if (before == after)
     {
         ends[task] = end;
@@ -127,12 +166,14 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
     for (; added < after; ++added)
     {
         uint64_t p = lume_page_alloc(0);
-        if (!p || !lume_mmu_map_user(task, HEAP_BASE + added * 4096u, p, true, false))
+        if (!p || !lume_mmu_map_user(task, base + (uint64_t)added * 4096, p, true, false))
         {
             if (p)
                 (void)lume_page_free(p);
             release_pages(task, before, added - before);
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64)
             lume_mmu_switch(lume_mmu_task_root(task));
+#endif
             return -LUME_ENOMEM;
         }
         if ((added & 15u) == 15u)
@@ -141,8 +182,43 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
     if (after < before)
         release_pages(task, after, before - after);
     ends[task] = end;
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64)
     lume_mmu_switch(lume_mmu_task_root(task));
+#endif
     return (int64_t)end;
+}
+
+int64_t lume_heap_brk_flags(unsigned pid, uint64_t end, uint64_t flags)
+{
+    if (!pid || pid > LUME_TASK_LIMIT || (flags & ~(uint64_t)LUME_BRK_EXTENDED))
+        return -LUME_EINVAL;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    unsigned task = pid - 1;
+    uint64_t previous_end = ends[task];
+    bool selected = false;
+    if ((flags & LUME_BRK_EXTENDED) && !extended[task])
+    {
+        if (ends[task] && ends[task] != LUME_HEAP_BASE)
+            return -LUME_EBUSY;
+        if (end && (end < LUME_HEAP_EXTENDED_BASE || end > LUME_HEAP_EXTENDED_LIMIT))
+            return -LUME_ENOMEM;
+        extended[task] = true;
+        ends[task] = 0;
+        selected = true;
+    }
+#else
+    if (flags)
+        return -LUME_ENOSYS;
+#endif
+    int64_t result = lume_heap_brk(pid, end);
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    if (result < 0 && selected)
+    {
+        extended[task] = false;
+        ends[task] = previous_end;
+    }
+#endif
+    return result;
 }
 
 void lume_heap_release(unsigned pid)
@@ -150,21 +226,27 @@ void lume_heap_release(unsigned pid)
     if (!pid || pid > LUME_TASK_LIMIT)
         return;
     unsigned task = pid - 1;
-    uint64_t end = ends[task] ? ends[task] : HEAP_BASE;
-    unsigned count = (unsigned)((end - HEAP_BASE + 4095) / 4096);
+    uint64_t base = heap_base(task);
+    uint64_t end = ends[task] ? ends[task] : base;
+    unsigned count = (unsigned)((end - base + 4095) / 4096);
     release_pages(task, 0, count);
     ends[task] = 0;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    extended[task] = false;
+#endif
 }
 
 void lume_heap_snapshot(unsigned pid, struct lume_memory_snapshot *s)
 {
     *s = (struct lume_memory_snapshot){.total_pages = lume_pages_total(),
                                        .free_pages = lume_pages_free(),
-                                       .heap_base = HEAP_BASE,
+                                       .heap_base = LUME_HEAP_BASE,
                                        .heap_limit = LUME_HEAP_LIMIT};
     if (pid && pid <= LUME_TASK_LIMIT)
     {
-        s->heap_end = ends[pid - 1] ? ends[pid - 1] : HEAP_BASE;
-        s->process_pages = (s->heap_end - HEAP_BASE + 4095) / 4096;
+        s->heap_base = heap_base(pid - 1);
+        s->heap_limit = heap_limit(pid - 1);
+        s->heap_end = ends[pid - 1] ? ends[pid - 1] : s->heap_base;
+        s->process_pages = (s->heap_end - s->heap_base + 4095) / 4096;
     }
 }

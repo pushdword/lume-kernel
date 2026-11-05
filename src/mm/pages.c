@@ -8,6 +8,12 @@
 #define IMAGE_BLOCK UINT64_C(0x200000)
 #endif
 #define MAX_PAGES (PHYSICAL_LIMIT / 4096)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#define MAX_SPAN_PAGES 262144u
+#else
+#define MAX_SPAN_PAGES 32768u
+#endif
+_Static_assert(MAX_SPAN_PAGES <= SIZE_MAX / 4096u, "page span exceeds addressable memory");
 static uint64_t used[MAX_PAGES / 64], managed[MAX_PAGES / 64], free_count;
 static uint64_t cursor;
 static uint64_t total_count;
@@ -83,7 +89,7 @@ static void zero_pages(void *context)
 
 uint64_t lume_pages_alloc_span(unsigned count)
 {
-    if (!count || count > 32768 || free_count < count)
+    if (!count || count > MAX_SPAN_PAGES || count > MAX_PAGES || free_count < count)
         return 0;
     unsigned run = 0;
     for (uint64_t p = 1; p < MAX_PAGES; ++p)
