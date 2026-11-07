@@ -47,10 +47,14 @@ static size_t allocation_bytes[64];
 
 void *lume_kernel_allocate(size_t bytes)
 {
+#ifdef LUME_VFS_HOST_MAX_ALLOCATION
+    assert(bytes && bytes <= LUME_VFS_HOST_MAX_ALLOCATION);
+#else
     size_t table_bytes = LUME_FD_MAX * sizeof(struct lume_fd);
     size_t link_bytes = sizeof(void *) + sizeof(uint64_t);
     assert(bytes == table_bytes ||
            (bytes && bytes % (2 * link_bytes) == 0 && bytes <= LUME_FD_LIMIT * 2 * link_bytes));
+#endif
     for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); ++i)
         if (!tables[i])
         {

@@ -295,6 +295,21 @@ static void *program_buffer = default_program_buffer;
 static size_t program_capacity = sizeof(default_program_buffer);
 static void *(*program_allocate)(size_t);
 
+static struct
+{
+    const struct lume_storage_ops *owner;
+    void *handle;
+    struct lume_storage_snapshot snapshot;
+} program_cache;
+
+static int program_cache_clear(void)
+{
+    const struct lume_storage_ops *owner = program_cache.owner;
+    void *handle = program_cache.handle;
+    memset(&program_cache, 0, sizeof(program_cache));
+    return handle ? owner->close(handle) : 0;
+}
+
 bool lume_vfs_node_buffer(void *buffer, size_t bytes)
 {
     if (!buffer || count || (uintptr_t)buffer % _Alignof(struct node) ||
@@ -322,11 +337,13 @@ bool lume_vfs_node_buffer(void *buffer, size_t bytes)
 
 void lume_vfs_program_allocator(void *(*allocate)(size_t))
 {
+    (void)program_cache_clear();
     program_allocate = allocate;
 }
 
 void lume_vfs_program_buffer(void *buffer, size_t bytes)
 {
+    (void)program_cache_clear();
     program_buffer = buffer;
     program_capacity = bytes;
 }
@@ -712,6 +729,9 @@ int lume_devfs_unregister_block(struct lume_block *b)
 
 void lume_vfs_init(const void *shell, size_t bytes)
 {
+    (void)program_cache_clear();
+    if (storage && storage->program_cache_owner)
+        storage->program_cache_owner(NULL);
     if (storage_handles())
         for (unsigned i = 0; i < OPEN_FILES; ++i)
             if ((open_files[i].references || open_files[i].deferred_close) &&
@@ -1609,6 +1629,12 @@ static int64_t block_io(struct open_file *d, struct node *n, void *data, uint64_
         return writing ? -LUME_ENOSPC : 0;
     if (bytes > n->bytes - d->offset)
         bytes = n->bytes - d->offset;
+    if (writing)
+    {
+        int error = program_cache_clear();
+        if (error)
+            return error;
+    }
     unsigned char sector[4096];
     unsigned char *p = data;
     uint64_t done = 0;
@@ -3238,7 +3264,89 @@ bool lume_vfs_mount_storage(const struct lume_storage_ops *ops)
         }
         storage = NULL;
     }
+    if (success && storage->program_cache_owner)
+        storage->program_cache_owner(program_cache_clear);
     return success;
+}
+
+static int program_reserve(size_t bytes)
+{
+    if (bytes <= program_capacity)
+        return 0;
+    int error = program_cache_clear();
+    if (error)
+        return error;
+    void *replacement = program_allocate ? program_allocate(bytes) : NULL;
+    if (!replacement)
+        return -LUME_E2BIG;
+    program_buffer = replacement;
+    program_capacity = bytes;
+    return 0;
+}
+
+static bool program_snapshot_equal(const struct lume_storage_snapshot *a,
+                                   const struct lume_storage_snapshot *b)
+{
+    return a->mount == b->mount && a->object == b->object && a->generation == b->generation &&
+           a->bytes == b->bytes;
+}
+
+static bool program_cached_image(struct node *node, const void **data, size_t *bytes, int *result)
+{
+    if (!storage_handles() || !storage->snapshot_handle || !storage->program_cache_owner)
+        return false;
+    void *handle;
+    int error = storage->open(node->path, LUME_O_RDONLY, &handle);
+    if (error == -LUME_EMFILE && program_cache.owner == storage && program_cache.handle)
+    {
+        error = program_cache_clear();
+        if (!error)
+            error = storage->open(node->path, LUME_O_RDONLY, &handle);
+    }
+    if (error)
+    {
+        *result = error;
+        return true;
+    }
+    struct lume_storage_snapshot before, after;
+    if (storage->snapshot_handle(handle, &before) || before.bytes > SIZE_MAX)
+    {
+        (void)storage->close(handle);
+        return false;
+    }
+    *bytes = (size_t)before.bytes;
+    if (program_cache.owner == storage && program_cache.handle &&
+        program_snapshot_equal(&program_cache.snapshot, &before))
+    {
+        *result = storage->close(handle);
+        *data = program_buffer;
+        return true;
+    }
+    error = program_cache_clear();
+    if (!error)
+        error = program_reserve(*bytes);
+    if (!error)
+    {
+        int count = storage->read_handle(handle, 0, program_buffer, *bytes);
+        if (count < 0 || (size_t)count != *bytes)
+            error = -LUME_EIO;
+    }
+    if (!error && !storage->snapshot_handle(handle, &after) &&
+        program_snapshot_equal(&before, &after))
+    {
+        program_cache.owner = storage;
+        program_cache.handle = handle;
+        program_cache.snapshot = after;
+    }
+    else
+    {
+        int closed = storage->close(handle);
+        if (!error)
+            error = closed;
+    }
+    *data = program_buffer;
+    *result = error;
+    return true;
 }
 
 static int program_image(unsigned i, const void **data, size_t *bytes)
@@ -3246,14 +3354,15 @@ static int program_image(unsigned i, const void **data, size_t *bytes)
     struct node *n = &nodes[i];
     if (n->kind != LUME_NODE_FILE)
         return -LUME_ENOEXEC;
-    if (n->bytes > program_capacity)
-    {
-        void *replacement = program_allocate ? program_allocate((size_t)n->bytes) : 0;
-        if (!replacement)
-            return -LUME_E2BIG;
-        program_buffer = replacement;
-        program_capacity = (size_t)n->bytes;
-    }
+    int error;
+    if (n->persistent && program_cached_image(n, data, bytes, &error))
+        return error;
+    error = program_cache_clear();
+    if (error)
+        return error;
+    error = program_reserve((size_t)n->bytes);
+    if (error)
+        return error;
     *bytes = (size_t)n->bytes;
     if (n->persistent)
     {

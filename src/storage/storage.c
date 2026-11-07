@@ -19,6 +19,7 @@ static struct storage_file
 {
     FIL file;
     unsigned references;
+    uint64_t identity, generation;
     uint64_t dirty_at;
     size_t dirty_bytes;
     int write_error;
@@ -41,6 +42,9 @@ static bool replacing, replacement_io_failed;
 static struct lume_volume boot_volume;
 static FATFS boot_filesystem;
 static bool boot_mounted;
+static uint64_t mount_epoch, file_sequence;
+static bool snapshot_exhausted;
+static int (*program_cache_release)(void);
 static void *read_cache;
 static char read_path[LUME_FILES_PATH_MAX];
 static uint64_t next_flush_at = UINT64_MAX;
@@ -308,6 +312,19 @@ static const char *name(const char *path)
     return lume_path_equal_folded(result, result) ? result : NULL;
 }
 
+static void content_changed(struct storage_file *file)
+{
+    if (file && file->generation)
+        ++file->generation;
+}
+
+static int snapshot_handle(void *handle, struct lume_storage_snapshot *snapshot);
+
+static void program_cache_owner(int (*release)(void))
+{
+    program_cache_release = release;
+}
+
 static struct storage_file *find_file(const FIL *file)
 {
     for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
@@ -381,11 +398,35 @@ static int open_handle(const char *path, unsigned flags, void **handle)
             (void)f_close(&candidate);
             return -LUME_EMFILE;
         }
-        *file = (struct storage_file){.file = candidate};
+        uint64_t identity = 0;
+        if (!snapshot_exhausted)
+        {
+            if (file_sequence == UINT64_MAX)
+                snapshot_exhausted = true;
+            else
+                identity = ++file_sequence;
+        }
+        *file = (struct storage_file){.file = candidate, .identity = identity, .generation = 1};
     }
     ++file->references;
     *description = (struct storage_handle){file, flags};
     *handle = description;
+    return 0;
+}
+
+static int snapshot_handle(void *handle, struct lume_storage_snapshot *snapshot)
+{
+    struct storage_handle *description = find_handle(handle);
+    if (!snapshot || !description)
+        return -LUME_EBADF;
+    struct storage_file *file = description->file;
+    if (data_faulted)
+        return -LUME_EIO;
+    if (!mounted || snapshot_exhausted || !mount_epoch || !file->identity || !file->generation ||
+        file->file.detached)
+        return -LUME_ENOSYS;
+    *snapshot = (struct lume_storage_snapshot){mount_epoch, file->identity, file->generation,
+                                               f_size(&file->file)};
     return 0;
 }
 
@@ -441,6 +482,7 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
         return description->file->write_error;
     if (!bytes)
         return 0;
+    content_changed(description->file);
     dirty_file(description->file, bytes);
     FIL *file = &description->file->file;
     FSIZE_t previous = f_size(file);
@@ -501,6 +543,8 @@ static int resize_handle(void *handle, uint64_t bytes)
     if (bytes > UINT32_MAX)
         return -LUME_EINVAL;
     FSIZE_t previous = f_size(file);
+    if (bytes != previous)
+        content_changed(description->file);
     if (bytes > previous)
     {
         static const unsigned char zero[4096] = {0};
@@ -668,6 +712,7 @@ static int remove_state(const char *path, unsigned *state)
     BYTE progress;
     replacing = true;
     replacement_io_failed = false;
+    content_changed(file);
     FRESULT removed = f_unlink_live(p, file ? &file->file : 0, &progress);
     return namespace_result(removed, progress, state);
 }
@@ -711,6 +756,7 @@ static int rename_state(const char *from, const char *to, unsigned *state)
     BYTE progress;
     replacing = true;
     replacement_io_failed = false;
+    content_changed(file);
     FRESULT renamed = f_rename_live(a, b, file ? &file->file : 0, &progress);
     return namespace_result(renamed, progress, state);
 }
@@ -743,6 +789,8 @@ static int replace_file(const char *from, const char *to, unsigned *state)
     BYTE progress;
     replacing = true;
     replacement_io_failed = false;
+    content_changed(source);
+    content_changed(target);
     FRESULT result =
         f_replace_live(a, b, source ? &source->file : 0, target ? &target->file : 0, &progress);
     _Static_assert(FF_REPLACE_UNCHANGED == LUME_STORAGE_REPLACE_UNCHANGED &&
@@ -851,6 +899,8 @@ static bool walk(lume_storage_visit visit, void *context)
 
 const struct lume_storage_ops *lume_storage_start(void)
 {
+    if (program_cache_release && program_cache_release())
+        return 0;
     if (data_faulted)
         return 0;
     for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
@@ -859,6 +909,10 @@ const struct lume_storage_ops *lume_storage_start(void)
     if (close_read_cache())
         return 0;
     mounted = false;
+    if (mount_epoch == UINT64_MAX)
+        snapshot_exhausted = true;
+    else
+        ++mount_epoch;
     volume = (struct lume_volume){0};
     unsigned char block[512];
     if (!lume_sd_read(0, block) || !lume_volume_select(block, lume_sd_sectors(), &volume))
@@ -901,7 +955,9 @@ const struct lume_storage_ops *lume_storage_start(void)
                                                 .remove_state = remove_state,
                                                 .rename_state = rename_state,
                                                 .path_hash = lume_path_hash_folded,
-                                                .volume_info = volume_info};
+                                                .volume_info = volume_info,
+                                                .snapshot_handle = snapshot_handle,
+                                                .program_cache_owner = program_cache_owner};
     return &ops;
 }
 

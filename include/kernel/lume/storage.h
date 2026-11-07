@@ -18,6 +18,11 @@ enum
 #define LUME_STORAGE_NAMESPACE_UNCERTAIN LUME_STORAGE_REPLACE_UNCERTAIN
 #define LUME_STORAGE_NAMESPACE_COMMITTED LUME_STORAGE_REPLACE_COMMITTED
 
+struct lume_storage_snapshot
+{
+    uint64_t mount, object, generation, bytes;
+};
+
 struct lume_storage_ops
 {
     bool (*walk)(lume_storage_visit, void *);
@@ -47,6 +52,11 @@ struct lume_storage_ops
     /* Equal paths must have equal hashes. Providers may omit the hash callback. */
     uint32_t (*path_hash)(const char *);
     int (*volume_info)(struct lume_files_volume *);
+    /* A retained backing has one identity and content generation across all aliases.
+     * Content mutation advances the generation before changing any bytes. */
+    int (*snapshot_handle)(void *, struct lume_storage_snapshot *);
+    /* Release cached handles before resetting or remounting the backend. */
+    void (*program_cache_owner)(int (*release)(void));
 };
 
 struct lume_volume

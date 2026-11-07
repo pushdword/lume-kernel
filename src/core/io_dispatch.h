@@ -10,9 +10,12 @@ enum kernel_block_reason
     KERNEL_BLOCK_OTHER = 2
 };
 
-static bool kernel_child_ipc_call(const struct lume_context *frame)
+static bool kernel_child_snapshot_call(const struct lume_context *frame)
 {
-    if (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) != LUME_SYS_SOCKET)
+    uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+    if (number == LUME_SYS_BRK)
+        return true;
+    if (number != LUME_SYS_SOCKET)
         return false;
     uint64_t action = LUME_CONTEXT_REG(frame, 0);
     return action == LUME_SOCKET_SEND_MESSAGE || action == LUME_SOCKET_RECEIVE_MESSAGE ||
@@ -82,7 +85,8 @@ static bool kernel_request_ready(unsigned domain, unsigned task, const struct lu
                                  bool admitted)
 {
     unsigned blocked = kernel_resource_blocks(domain, task, kernel_call_mutates(frame));
-    return (!blocked || (blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_ipc_call(frame))) &&
+    return (!blocked ||
+            (blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_snapshot_call(frame))) &&
            (admitted || domain == KERNEL_IO_EXCLUSIVE || !kernel_regular_draining()) &&
            (admitted || !kernel_domain_queue(domain)->count);
 }
@@ -275,11 +279,11 @@ static bool kernel_admit_queue(unsigned domain)
         unsigned process_word = process / 64u;
         uint64_t process_bit = UINT64_C(1) << (process % 64u);
         unsigned blocked = kernel_resource_blocks(domain, task, mutation);
-        bool snapshot_ipc =
-            blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_ipc_call(&tasks[task].context);
+        bool snapshot_call =
+            blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_snapshot_call(&tasks[task].context);
         if ((blocked_processes[process_word] & process_bit) ||
-            ((snapshot_blocked_processes[process_word] & process_bit) && !snapshot_ipc) ||
-            (blocked && !snapshot_ipc))
+            ((snapshot_blocked_processes[process_word] & process_bit) && !snapshot_call) ||
+            (blocked && !snapshot_call))
         {
             if (blocked == KERNEL_BLOCK_CHILD_LOAD &&
                 kernel_child_pending_vm(&tasks[task].context) &&

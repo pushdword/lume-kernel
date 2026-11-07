@@ -26,6 +26,48 @@ void lume_console_write(const char *data, size_t bytes)
     (void)bytes;
 }
 
+static _Alignas(4096) unsigned char cache_host_pages[128][4096];
+static bool cache_host_page_used[128];
+
+uint64_t lume_page_alloc(uint64_t minimum)
+{
+    assert(!minimum);
+    for (unsigned i = 0; i < 128; ++i)
+        if (!cache_host_page_used[i])
+        {
+            cache_host_page_used[i] = true;
+            memset(cache_host_pages[i], 0, sizeof(cache_host_pages[i]));
+            return (uintptr_t)cache_host_pages[i];
+        }
+    assert(false);
+    return 0;
+}
+
+bool lume_page_free(uint64_t page)
+{
+    for (unsigned i = 0; i < 128; ++i)
+        if (page == (uintptr_t)cache_host_pages[i])
+        {
+            assert(cache_host_page_used[i]);
+            cache_host_page_used[i] = false;
+            return true;
+        }
+    assert(false);
+    return false;
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    if (run)
+        run(context);
+}
+
+_Noreturn void lume_fail(const char *message)
+{
+    fputs(message, stderr);
+    abort();
+}
+
 struct location
 {
     LBA_t sector;
@@ -90,15 +132,21 @@ static bool replacement(unsigned boundary, bool after, bool read_fault)
     T(ops->rename(source, target) == -LUME_EEXIST);
     unsigned state = 99;
     T(ops->replace(source, source, &state) == 0 && state == LUME_STORAGE_REPLACE_COMMITTED);
-    void *handle;
-    T(ops->open(source, LUME_O_RDONLY, &handle) == 0);
-    T(ops->replace(source, target, &state) == -LUME_EBUSY &&
-      state == LUME_STORAGE_REPLACE_UNCHANGED);
-    T(ops->close(handle) == 0);
-    T(ops->open(target, LUME_O_RDONLY, &handle) == 0);
-    T(ops->replace(source, target, &state) == -LUME_EBUSY &&
-      state == LUME_STORAGE_REPLACE_UNCHANGED);
-    T(ops->close(handle) == 0);
+    const char *live_source = "/data/live-source.bin", *live_target = "/data/live-target.bin";
+    T(ops->create(live_source, false) == 0 && ops->create(live_target, false) == 0);
+    T(ops->write(live_source, 0, "incoming", 8) == 8);
+    T(ops->write(live_target, 0, "previous", 8) == 8);
+    void *handle, *live_incoming, *live_previous;
+    T(ops->open(live_source, LUME_O_RDONLY, &live_incoming) == 0);
+    T(ops->open(live_target, LUME_O_RDONLY, &live_previous) == 0);
+    T(ops->replace(live_source, live_target, &state) == 0 &&
+      state == LUME_STORAGE_REPLACE_COMMITTED);
+    T(ops->read_handle(live_incoming, 0, data, 8) == 8 && !memcmp(data, "incoming", 8));
+    T(ops->read_handle(live_previous, 0, data, 8) == 8 && !memcmp(data, "previous", 8));
+    T(ops->read(live_target, 0, data, 8) == 8 && !memcmp(data, "incoming", 8));
+    T(ops->read(live_source, 0, data, 8) == -LUME_ENOENT);
+    T(ops->close(live_incoming) == 0 && ops->close(live_previous) == 0);
+    T(ops->remove(live_target) == 0);
     T(ops->replace(source, "/data/saída", &state) == -LUME_EACCES &&
       state == LUME_STORAGE_REPLACE_UNCHANGED);
     T(ops->replace(source, "/data/missing", &state) == -LUME_ENOENT &&
@@ -249,6 +297,7 @@ static bool vfs_replace(void)
     lume_files_init(&files);
     T(lume_vfs_stat_path(&files, target, &metadata) == 0100644 && metadata.size == 6);
     lume_files_release(&files);
+    lume_vfs_init(NULL, 0);
     return true;
 }
 
@@ -278,6 +327,125 @@ static bool empty_files(void)
     return true;
 }
 
+static const struct lume_storage_ops *cache_backend;
+static unsigned program_reads;
+
+static int observe_program_read(void *handle, uint64_t offset, void *data, size_t bytes)
+{
+    ++program_reads;
+    return cache_backend->read_handle(handle, offset, data, bytes);
+}
+
+static bool vfs_program_cache(void)
+{
+    cache_backend = format(false);
+    T(cache_backend && cache_backend->snapshot_handle && cache_backend->program_cache_owner);
+    struct lume_storage_ops ops = *cache_backend;
+    ops.read_handle = observe_program_read;
+    lume_vfs_init(NULL, 0);
+    T(lume_vfs_mount_storage(&ops));
+    struct lume_files files;
+    T(lume_files_init(&files));
+    char contents[1025];
+    memset(contents, 'a', sizeof(contents) - 1);
+    contents[sizeof(contents) - 1] = 0;
+    T(create_mode(&files, "/data/chrome", contents, 0755));
+    const void *data;
+    size_t bytes;
+    program_reads = 0;
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 1024 &&
+      !memcmp(data, contents, bytes) && program_reads == 1);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && program_reads == 1);
+    T(create_mode(&files, "/data/browser.log", "log", 0644));
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && program_reads == 1);
+    void *writer, *alias;
+    T(cache_backend->open("/data/CHROME", LUME_O_RDWR, &writer) == 0);
+    T(cache_backend->open("/data/chrome", LUME_O_RDONLY, &alias) == 0);
+    struct lume_storage_snapshot before, after;
+    T(cache_backend->snapshot_handle(alias, &before) == 0);
+    T(cache_backend->write_handle(writer, 0, "b", 1) == 1);
+    T(cache_backend->snapshot_handle(alias, &after) == 0 && before.object == after.object &&
+      before.generation != after.generation && after.bytes == 1024);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 1024 &&
+      ((const char *)data)[0] == 'b' && program_reads == 2);
+    T(cache_backend->resize_handle(writer, 512) == 0);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 512 &&
+      program_reads == 3);
+    T(cache_backend->close(alias) == 0 && cache_backend->close(writer) == 0);
+    T(create_mode(&files, "/data/chrome.new", "replacement", 0755));
+    T(lume_vfs_replace(&files, "/data/chrome.new", "/data/chrome") == 0);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 11 &&
+      !memcmp(data, "replacement", bytes) && program_reads == 4);
+    T(lume_vfs_remove(&files, "/data/chrome", false) == 0);
+    T(create_mode(&files, "/data/chrome", "new-object", 0755));
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 10 &&
+      !memcmp(data, "new-object", bytes) && program_reads == 5);
+    static unsigned char replacement_buffer[65536];
+    lume_vfs_program_buffer(replacement_buffer, sizeof(replacement_buffer));
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && program_reads == 6 &&
+      data == replacement_buffer);
+    void *aliases[512];
+    unsigned alias_count = 0;
+    int opened;
+    while (alias_count < 512 && (opened = cache_backend->open("/data/chrome", LUME_O_RDONLY,
+                                                              &aliases[alias_count])) == 0)
+        ++alias_count;
+    T(alias_count > 0 && alias_count < 512 && opened == -LUME_EMFILE);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 10 &&
+      program_reads == 7);
+    for (unsigned i = 0; i < alias_count; ++i)
+        T(cache_backend->close(aliases[i]) == 0);
+    lume_files_release(&files);
+    T(lume_storage_start() == cache_backend);
+    lume_vfs_init(NULL, 0);
+    T(lume_vfs_mount_storage(&ops));
+    T(lume_files_init(&files));
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 10 &&
+      !memcmp(data, "new-object", bytes) && program_reads == 8);
+    lume_files_release(&files);
+    lume_vfs_init(NULL, 0);
+    return true;
+}
+
+static bool program_write_failure(bool after)
+{
+    cache_backend = format(false);
+    T(cache_backend);
+    struct lume_storage_ops ops = *cache_backend;
+    ops.read_handle = observe_program_read;
+    lume_vfs_init(NULL, 0);
+    T(lume_vfs_mount_storage(&ops));
+    struct lume_files files;
+    T(lume_files_init(&files));
+    char contents[1025];
+    memset(contents, 'a', sizeof(contents) - 1);
+    contents[sizeof(contents) - 1] = 0;
+    T(create_mode(&files, "/data/chrome", contents, 0755));
+    const void *data;
+    size_t bytes;
+    program_reads = 0;
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && program_reads == 1);
+    void *writer;
+    T(cache_backend->open("/data/CHROME", LUME_O_RDWR, &writer) == 0);
+    struct lume_storage_snapshot before, current;
+    T(cache_backend->snapshot_handle(writer, &before) == 0);
+    unsigned failed = failed_writes;
+    memset(contents, 'z', 1024);
+    fail_write_at = write_attempts + 1;
+    fail_after_write = after;
+    T(cache_backend->write_handle(writer, 0, contents, 1024) == -LUME_EIO);
+    fail_write_at = 0;
+    fail_after_write = false;
+    T(failed_writes == failed + 1);
+    T(cache_backend->snapshot_handle(writer, &current) == 0 && before.object == current.object &&
+      before.generation != current.generation);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) < 0);
+    T(cache_backend->close(writer) == -LUME_EIO);
+    lume_files_release(&files);
+    lume_vfs_init(NULL, 0);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 1 || argc == 3 || argc == 4);
@@ -289,6 +457,9 @@ int main(int argc, char **argv)
     if (!boundary && !vfs_replace())
         return 1;
     if (!boundary && !empty_files())
+        return 1;
+    if (!boundary &&
+        (!vfs_program_cache() || !program_write_failure(false) || !program_write_failure(true)))
         return 1;
     printf("PASS_STORAGE_REPLACE checks=%u\n", checks);
     return 0;

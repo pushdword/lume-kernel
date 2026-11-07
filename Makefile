@@ -243,7 +243,8 @@ check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
 	env "$<"
 check: check-storage-handles
 .PHONY: check-storage-replace
-$(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/storage-replace$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_MAX_ALLOCATION=131072
+$(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c $(FILE_IO_HOST_FIXTURE)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
 check-storage-replace: $(OUT)/tests/storage-replace$(HOSTEXE)

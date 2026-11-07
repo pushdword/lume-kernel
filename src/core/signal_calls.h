@@ -176,9 +176,11 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     struct signal_state *s = &signals[owner];
     if (thread_slots[current_task].thread)
     {
-        if (operation != LUME_SIGNAL_MASK && operation != LUME_SIGNAL_TRY_WAIT)
+        if (operation != LUME_SIGNAL_MASK && operation != LUME_SIGNAL_TRY_WAIT &&
+            operation != LUME_SIGNAL_SEND)
             return -LUME_ENOSYS;
-        s = &signals[current_task];
+        if (operation != LUME_SIGNAL_SEND)
+            s = &signals[current_task];
     }
     if (operation == LUME_SIGNAL_RETURN)
     {
