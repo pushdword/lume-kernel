@@ -25,31 +25,34 @@ static void thread_drop(unsigned task)
     service_bus_release(task);
     unsigned owner = process_slot(task);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-    lume_vm_thread_release(owner, task);
-#else
-    uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
-    for (unsigned first = 0; first < thread_pages[task];)
-    {
-        uint64_t addresses[LUME_MMU_BATCH_PAGES];
-        unsigned count = thread_pages[task] - first, mapped = 0;
-        if (count > LUME_MMU_BATCH_PAGES)
-            count = LUME_MMU_BATCH_PAGES;
-        for (unsigned i = first; i < first + count; ++i)
-            if (tasks[task].stack[i])
-                addresses[mapped++] = base + (uint64_t)i * 4096;
-        if (mapped && !lume_mmu_unmap_user_batch(owner, addresses, mapped))
-            lume_fail("thread stack mapping release");
-        for (unsigned i = first; i < first + count; ++i)
-        {
-            if (tasks[task].stack[i] && !lume_page_free(tasks[task].stack[i]))
-                lume_fail("thread stack release");
-            tasks[task].stack[i] = 0;
-        }
-        first += count;
-        if (count == LUME_MMU_BATCH_PAGES)
-            lume_worker_checkpoint(65536);
-    }
+    if (!thread_pages[task])
+        lume_vm_thread_release(owner, task);
+    else
 #endif
+    {
+        uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
+        for (unsigned first = 0; first < thread_pages[task];)
+        {
+            uint64_t addresses[LUME_MMU_BATCH_PAGES];
+            unsigned count = thread_pages[task] - first, mapped = 0;
+            if (count > LUME_MMU_BATCH_PAGES)
+                count = LUME_MMU_BATCH_PAGES;
+            for (unsigned i = first; i < first + count; ++i)
+                if (tasks[task].stack[i])
+                    addresses[mapped++] = base + (uint64_t)i * 4096;
+            if (mapped && !lume_mmu_unmap_user_batch(owner, addresses, mapped))
+                lume_fail("thread stack mapping release");
+            for (unsigned i = first; i < first + count; ++i)
+            {
+                if (tasks[task].stack[i] && !lume_page_free(tasks[task].stack[i]))
+                    lume_fail("thread stack release");
+                tasks[task].stack[i] = 0;
+            }
+            first += count;
+            if (count == LUME_MMU_BATCH_PAGES)
+                lume_worker_checkpoint(65536);
+        }
+    }
     thread_pages[task] = 0;
     signal_thread_reset(task);
     lume_mmu_release_user(task);
@@ -131,14 +134,36 @@ static int64_t thread_create(const struct lume_thread_request *r)
     return -LUME_ENOSYS;
 #else
     unsigned owner = process_slot(current_task), task = LUME_TASK_LIMIT;
-    uint64_t physical;
+    uint64_t physical, allowed = 0;
+    bool native64 = false;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    allowed = LUME_THREAD_CREATE_NATIVE64;
+    native64 = (r->value & allowed) || (images[owner].entry >= LUME_LARGE_ELF_BASE &&
+                                        images[owner].entry < LUME_LARGE_ELF_LIMIT);
+#endif
     if (!r->entry ||
         !lume_mmu_translate(lume_mmu_task_root(owner), r->entry, false, true, true, &physical) ||
-        r->stack_bytes < 32768 || r->stack_bytes > LUME_PTHREAD_STACK_MAX || r->tid || r->value ||
-        r->address || r->timeout_ms)
+        r->stack_bytes < 32768 || r->stack_bytes > LUME_PTHREAD_STACK_MAX || r->tid ||
+        (r->value & ~allowed) || r->address || r->timeout_ms)
+        return -LUME_EINVAL;
+    uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
+    uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
+#if defined(LUME_ARCH_AMD64)
+    tls_size += 16;
+#endif
+    uint64_t stack_bytes = (r->stack_bytes + 4095) & ~UINT64_C(4095);
+    unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
+    unsigned stack_pages = (unsigned)(stack_bytes / 4096);
+    unsigned pages = tls_pages + 1 + stack_pages;
+    if (!native64 &&
+        (pages > LUME_STACK_PAGES || (uint64_t)pages * 4096 > UINT64_C(0x100000) - 4096))
         return -LUME_EINVAL;
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
-        if (i != 2 && !states[i])
+        if (i != 2 && !states[i] &&
+            (native64 ||
+             (LUME_THREAD_BASE + (uint64_t)i * 0x100000 + 4096 <= LUME_USER_STACK &&
+              (uint64_t)pages * 4096 <=
+                  LUME_USER_STACK - (LUME_THREAD_BASE + (uint64_t)i * 0x100000 + 4096))))
         {
             task = i;
             break;
@@ -152,48 +177,39 @@ static int64_t thread_create(const struct lume_thread_request *r)
     tasks[task].context = (struct lume_context){0};
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
         tasks[task].stack[i] = 0;
-    uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
-    uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
-#if defined(LUME_ARCH_AMD64)
-    tls_size += 16;
-#endif
     uint64_t base, stack_base;
-    uint64_t stack_bytes = (r->stack_bytes + 4095) & ~UINT64_C(4095);
     lume_mmu_share_user(task, owner);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-    if (!lume_vm_thread_region(owner, task, tls_size, stack_bytes, &base, &stack_base) ||
-        !lume_user_buffer(base, tls_size, true))
+    if (native64)
     {
-        thread_drop(task);
-        return -LUME_ENOMEM;
-    }
-#else
-    base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
-    unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
-    unsigned stack_pages = (unsigned)(stack_bytes / 4096);
-    unsigned pages = tls_pages + 1 + stack_pages;
-    if (pages > LUME_STACK_PAGES)
-    {
-        thread_drop(task);
-        return -LUME_EINVAL;
-    }
-    thread_pages[task] = pages;
-    stack_base = base + (uint64_t)(tls_pages + 1) * 4096;
-    for (unsigned i = 0; i < thread_pages[task]; ++i)
-    {
-        if (i == tls_pages)
-            continue;
-        uint64_t page = lume_page_alloc(0);
-        if (!page || !lume_mmu_map_user(owner, base + (uint64_t)i * 4096, page, true, false))
+        if (!lume_vm_thread_region(owner, task, tls_size, stack_bytes, &base, &stack_base) ||
+            !lume_user_buffer(base, tls_size, true))
         {
-            if (page)
-                (void)lume_page_free(page);
             thread_drop(task);
             return -LUME_ENOMEM;
         }
-        tasks[task].stack[i] = page;
     }
+    else
 #endif
+    {
+        base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
+        thread_pages[task] = pages;
+        stack_base = base + (uint64_t)(tls_pages + 1) * 4096;
+        for (unsigned i = 0; i < thread_pages[task]; ++i)
+        {
+            if (i == tls_pages)
+                continue;
+            uint64_t page = lume_page_alloc(0);
+            if (!page || !lume_mmu_map_user(owner, base + (uint64_t)i * 4096, page, true, false))
+            {
+                if (page)
+                    (void)lume_page_free(page);
+                thread_drop(task);
+                return -LUME_ENOMEM;
+            }
+            tasks[task].stack[i] = page;
+        }
+    }
     lume_arch_flush_user_tlb();
     uint64_t tid = thread_id(thread_slots, task);
     uint64_t tp = lume_arch_tls_pointer(base, images[owner].tls_size, align);
@@ -350,22 +366,27 @@ static struct lume_context *thread_call(struct lume_context *frame)
             if (thread_slots[target].thread)
             {
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-                if (!lume_vm_thread_bounds(owner, target, &base, &bytes))
+                if (!thread_pages[target])
                 {
-                    LUME_CONTEXT_REG(frame, 0) = (uint64_t)-3;
-                    return frame;
+                    if (!lume_vm_thread_bounds(owner, target, &base, &bytes))
+                    {
+                        LUME_CONTEXT_REG(frame, 0) = (uint64_t)-3;
+                        return frame;
+                    }
                 }
-#else
-                uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
-                uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
+                else
+#endif
+                {
+                    uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
+                    uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
 #if defined(LUME_ARCH_AMD64)
-                tls_size += 16;
+                    tls_size += 16;
 #endif
-                unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
-                base = LUME_THREAD_BASE + (uint64_t)target * 0x100000 +
-                       (uint64_t)(tls_pages + 2) * 4096;
-                bytes = (uint64_t)(thread_pages[target] - tls_pages - 1) * 4096;
-#endif
+                    unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
+                    base = LUME_THREAD_BASE + (uint64_t)target * 0x100000 +
+                           (uint64_t)(tls_pages + 2) * 4096;
+                    bytes = (uint64_t)(thread_pages[target] - tls_pages - 1) * 4096;
+                }
                 guard = 4096;
             }
             user->address = base;

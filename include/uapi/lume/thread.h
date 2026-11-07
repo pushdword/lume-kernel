@@ -16,6 +16,10 @@ enum
     LUME_THREAD_WAIT_REALTIME
 };
 
+#define LUME_THREAD_CREATE_NATIVE64 UINT64_C(1)
+
+/* CREATE.value accepts NATIVE64 for 64-bit thread addresses. A low-entry image with
+ * value zero retains legacy addresses. A large-entry image uses Native64 addresses. */
 struct lume_thread_request
 {
     uint64_t entry, argument, stack_bytes, tid, value, address, timeout_ms;

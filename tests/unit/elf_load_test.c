@@ -1,4 +1,6 @@
 #include "lume/elf.h"
+#include "lume/abi.h"
+#include "lume/memory.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +11,7 @@ static _Alignas(4096) unsigned char memory[FRAMES][4096];
 static bool used[FRAMES];
 static uint64_t virtuals[FRAMES], physicals[FRAMES];
 static unsigned allocated, mappings, syncs, completions, checkpoints, tasks[FRAMES];
-static bool writable[FRAMES], executable[FRAMES];
+static bool readable[FRAMES], writable[FRAMES], executable[FRAMES];
 static int allocation_budget = -1, map_budget = -1;
 
 uint64_t lume_pages_alloc_span(unsigned count)
@@ -64,6 +66,7 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
     assert(mappings < FRAMES);
     virtuals[mappings] = va;
     tasks[mappings] = task;
+    readable[mappings] = true;
     writable[mappings] = write;
     executable[mappings] = execute;
     physicals[mappings++] = pa;
@@ -80,6 +83,7 @@ void lume_mmu_unmap_user(unsigned task, uint64_t va)
             virtuals[i] = virtuals[mappings];
             physicals[i] = physicals[mappings];
             tasks[i] = tasks[mappings];
+            readable[i] = readable[mappings];
             writable[i] = writable[mappings];
             executable[i] = executable[mappings];
             return;
@@ -101,14 +105,43 @@ uint64_t lume_mmu_task_root(unsigned task)
     return task + 1;
 }
 
+uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
+{
+    (void)writer;
+    return lume_mmu_task_root(task);
+}
+
+bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const uint64_t *physical,
+                                 unsigned count, unsigned protection)
+{
+    assert(count && count <= LUME_MMU_BATCH_PAGES);
+    unsigned slots[LUME_MMU_BATCH_PAGES];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned slot = 0;
+        while (slot < mappings && (tasks[slot] != task || virtuals[slot] != addresses[i]))
+            ++slot;
+        if (slot == mappings || physicals[slot] != physical[i])
+            return false;
+        slots[i] = slot;
+    }
+    for (unsigned i = 0; i < count; ++i)
+    {
+        readable[slots[i]] = (protection & LUME_PROT_READ) != 0;
+        writable[slots[i]] = (protection & LUME_PROT_WRITE) != 0;
+        executable[slots[i]] = (protection & LUME_PROT_EXEC) != 0;
+    }
+    return true;
+}
+
 bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool execute,
                         uint64_t *physical)
 {
-    assert(user && (root == 4 || root == 5));
+    assert(root == 4 || root == 5);
     for (unsigned i = 0; i < mappings; ++i)
         if (tasks[i] + 1 == root && virtuals[i] == va)
         {
-            if ((write && !writable[i]) || (execute && !executable[i]))
+            if ((user && !readable[i]) || (write && !writable[i]) || (execute && !executable[i]))
                 return false;
             *physical = physicals[i];
             return true;
@@ -179,7 +212,7 @@ int main(void)
     memset(elf + 4096, 0x5a, 4096);
     struct lume_elf_image image;
     assert(lume_elf_load(3, elf, sizeof(elf), &image));
-    assert(image.count == 1408 && image.metadata_pages == 6 && mappings == 1408 && syncs == 128);
+    assert(image.count == 1408 && image.metadata_pages == 9 && mappings == 1408 && syncs == 128);
     assert(completions == 1 && checkpoints == image.count / 16);
     for (unsigned i = 0; i < mappings; ++i)
     {
@@ -239,8 +272,80 @@ int main(void)
         assert(allocated == 3 && mappings == 2 && !child.pages);
     }
     map_budget = -1;
+    uint64_t text_address = image.pages[0].address, data_address = image.pages[1].address;
+    uint64_t data_physical = image.pages[1].physical, physical;
+    unsigned prior_allocated = allocated, prior_mappings = mappings;
+    const unsigned rw = LUME_PROT_READ | LUME_PROT_WRITE;
+    const unsigned rx = LUME_PROT_READ | LUME_PROT_EXEC;
+    allocation_budget = map_budget = 0;
+
+    assert(!lume_elf_protect(&image, data_address, 4096, LUME_PROT_READ));
+    assert(image.pages[1].maximum == rw && image.pages[1].protection == LUME_PROT_READ);
+    assert(lume_mmu_translate(4, data_address, false, true, false, &physical));
+    assert(physical == data_physical);
+    assert(!lume_mmu_translate(4, data_address, true, true, false, &physical));
+
+    assert(!lume_elf_protect(&image, data_address, 4096, rw));
+    assert(lume_mmu_translate(4, data_address, true, true, false, &physical));
+    assert(allocated == prior_allocated && mappings == prior_mappings);
+
+    assert(lume_elf_protect(&image, text_address, 4096, LUME_PROT_WRITE) == -LUME_EACCES);
+    assert(image.pages[0].maximum == rx && image.pages[0].protection == rx);
+    assert(lume_mmu_translate(4, text_address, false, true, true, &physical));
+    assert(!lume_mmu_translate(4, text_address, true, true, false, &physical));
+
+    assert(lume_elf_protect(&image, data_address, 4096, rw | LUME_PROT_EXEC) == -LUME_EACCES);
+    assert(image.pages[1].protection == rw);
+
+    assert(lume_elf_protect(&image, text_address, 8192, LUME_PROT_READ) == -LUME_ENOMEM);
+    assert(image.pages[0].protection == rx && image.pages[1].protection == rw);
+    assert(lume_mmu_translate(4, text_address, false, true, true, &physical));
+
+    assert(lume_elf_protect(&image, UINT64_MAX - 4095, 8192, LUME_PROT_READ) == -LUME_EINVAL);
+    assert(lume_elf_protect(&image, data_address + 1, 4096, LUME_PROT_READ) == -LUME_EINVAL);
+    assert(lume_elf_protect(&image, 0x200000, 4096, LUME_PROT_READ) == -LUME_EINVAL);
+    image.task = 4;
+    assert(lume_elf_protect(&image, data_address, 4096, LUME_PROT_READ) == -LUME_ENOMEM);
+    image.task = 3;
+    unsigned slot = 0;
+    while (slot < mappings && (tasks[slot] != 3 || virtuals[slot] != data_address))
+        ++slot;
+    assert(slot < mappings);
+    physicals[slot] += 4096;
+    assert(lume_elf_protect(&image, data_address, 4096, LUME_PROT_READ) == -LUME_ENOMEM);
+    physicals[slot] -= 4096;
+    assert(image.pages[1].protection == rw && allocated == prior_allocated &&
+           mappings == prior_mappings);
+
+    assert(!lume_elf_protect(&image, data_address, 4096, LUME_PROT_NONE));
+    assert(!lume_mmu_translate(4, data_address, false, true, false, &physical));
+    assert(lume_mmu_translate(4, data_address, false, false, false, &physical));
+    assert(physical == data_physical && image.pages[1].maximum == rw);
+    assert(!lume_elf_protect(&image, data_address, 4096, rw));
+    assert(lume_mmu_translate(4, data_address, true, true, false, &physical));
+
+    assert(!lume_elf_protect(&image, text_address, 4096, LUME_PROT_READ));
+    assert(!lume_elf_protect(&image, data_address, 4096, LUME_PROT_NONE));
+    allocation_budget = map_budget = -1;
+    assert(lume_elf_clone(4, &image, &child));
+    assert(child.pages[0].maximum == rx && child.pages[0].protection == LUME_PROT_READ);
+    assert(child.pages[1].maximum == rw && child.pages[1].protection == LUME_PROT_NONE);
+    assert(lume_mmu_translate(5, text_address, false, true, false, &physical));
+    assert(!lume_mmu_translate(5, text_address, false, true, true, &physical));
+    assert(!lume_mmu_translate(5, data_address, false, true, false, &physical));
+    assert(child.pages[1].physical != image.pages[1].physical);
+    assert(!memcmp((void *)(uintptr_t)child.pages[1].physical,
+                   (void *)(uintptr_t)image.pages[1].physical, 4096));
+    assert(lume_elf_protect(&child, text_address, 4096, LUME_PROT_WRITE) == -LUME_EACCES);
+    assert(!lume_elf_protect(&child, text_address, 4096, rx));
+    assert(!lume_elf_protect(&child, data_address, 4096, rw));
+    assert(lume_mmu_translate(5, text_address, false, true, true, &physical));
+    assert(lume_mmu_translate(5, data_address, true, true, false, &physical));
+    assert(!lume_mmu_translate(4, data_address, false, true, false, &physical));
+    lume_elf_release(&child);
     lume_elf_release(&image);
     assert(!allocated && !mappings);
+    puts("PASS_ELF_PROTECTION cases=8");
     put(elf + 64 + 56 + 40, 8, 5 * 1024 * 1024);
     struct lume_elf_plan plan;
     unsigned char *tls = elf + 64 + 2 * 56;

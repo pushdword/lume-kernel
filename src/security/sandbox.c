@@ -20,6 +20,16 @@ int64_t lume_sandbox_call(struct lume_files *files, unsigned pid, uint64_t opera
 {
     if (operation == LUME_SANDBOX_QUERY)
         return profile || version ? -LUME_EINVAL : (int64_t)files->identity.sandbox_profile;
+    if (operation == LUME_SANDBOX_X11_AUTHORITY)
+    {
+        if (version)
+            return -LUME_EINVAL;
+        if (files->identity.sandbox_profile != LUME_SANDBOX_NONE)
+            return -LUME_EPERM;
+        if (!lume_task_sandbox_ready(pid))
+            return -LUME_EBUSY;
+        return lume_vfs_x11_authority(files, profile);
+    }
     if (operation >= LUME_SANDBOX_DIRECTORY_MINT && operation <= LUME_SANDBOX_DIRECTORY_RELEASE)
         return version ? -LUME_EINVAL
                        : lume_vfs_directory_authority(files, (unsigned)operation, profile);
@@ -67,6 +77,8 @@ int lume_sandbox_path(struct lume_files *files, const char *canonical)
     if (files->identity.sandbox_profile == LUME_SANDBOX_NETWORK &&
         (within(canonical, "/data/etc/ssl") || within(canonical, "/data/share/lume/ssl") ||
          within(canonical, "/etc/ssl")))
+        return 0;
+    if (lume_vfs_sandbox_x11_authority(files, canonical))
         return 0;
     if (lume_vfs_sandbox_directory(files, canonical, false))
         return 0;

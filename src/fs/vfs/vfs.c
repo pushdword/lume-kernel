@@ -238,6 +238,8 @@ struct directory_authority
 struct lume_directory_authorities
 {
     unsigned generation;
+    int x11_object;
+    bool x11_active;
     struct directory_authority entry[LUME_SANDBOX_DIRECTORY_LIMIT];
 };
 
@@ -976,9 +978,13 @@ bool lume_files_clone(struct lume_files *out, const struct lume_files *in)
             ++open_files[out->fd[i].object].references;
     }
     if (authorities)
+    {
         for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
             if (authorities->entry[i].active)
                 ++open_files[authorities->entry[i].object].references;
+        if (authorities->generation == namespace_generation && authorities->x11_active)
+            ++open_files[authorities->x11_object].references;
+    }
     return true;
 }
 
@@ -1014,9 +1020,13 @@ void lume_files_release(struct lume_files *f)
     if (authorities)
     {
         if (authorities->generation == namespace_generation)
+        {
             for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
                 if (authorities->entry[i].active)
                     lume_vfs_drop(authorities->entry[i].object);
+            if (authorities->x11_active)
+                lume_vfs_drop(authorities->x11_object);
+        }
         lume_kernel_free(authorities);
     }
 #if LUME_FILES_DYNAMIC
@@ -1230,6 +1240,55 @@ int lume_vfs_directory_authority(struct lume_files *files, unsigned operation, u
         return object;
     authorities->entry[slot] = (struct directory_authority){.object = object, .active = true};
     return 0;
+}
+
+int lume_vfs_x11_authority(struct lume_files *files, uint64_t fd)
+{
+    if (files->identity.sandbox_profile != LUME_SANDBOX_NONE)
+        return -LUME_EPERM;
+    if (fd > UINT32_MAX || !files_ready(files))
+        return -LUME_EBADF;
+    struct open_file *file = descriptor(files, fd);
+    if (!file)
+        return -LUME_EBADF;
+    if (file->external || file->pipe >= 0 || file->node < 0 || (file->flags & 3) ||
+        nodes[file->node].kind != LUME_NODE_FILE || !nodes[file->node].linked)
+        return -LUME_EPERM;
+    struct lume_directory_authorities *authorities = files->directory_authorities;
+    if (authorities && authorities->generation != namespace_generation)
+        return -LUME_EINVAL;
+    if (authorities && authorities->x11_active)
+        return open_files[authorities->x11_object].node == file->node ? 0 : -LUME_EBUSY;
+    int object = lume_vfs_hold(files, (unsigned)fd);
+    if (object < 0)
+        return object;
+    if (!authorities)
+    {
+        authorities = lume_kernel_allocate(sizeof(*authorities));
+        if (!authorities)
+        {
+            lume_vfs_drop(object);
+            return -LUME_ENOMEM;
+        }
+        memset(authorities, 0, sizeof(*authorities));
+        authorities->generation = namespace_generation;
+        files->directory_authorities = authorities;
+    }
+    authorities->x11_object = object;
+    authorities->x11_active = true;
+    return 0;
+}
+
+bool lume_vfs_sandbox_x11_authority(struct lume_files *files, const char *canonical)
+{
+    struct lume_directory_authorities *authorities = files->directory_authorities;
+    if (files->identity.sandbox_profile != LUME_SANDBOX_GPU_SOFTWARE || !authorities ||
+        authorities->generation != namespace_generation || !authorities->x11_active ||
+        !files_ready(files))
+        return false;
+    int index = find(canonical);
+    return index >= 0 && nodes[index].linked && nodes[index].kind == LUME_NODE_FILE &&
+           open_files[authorities->x11_object].node == index;
 }
 
 static bool directory_contains(unsigned anchor, unsigned index)

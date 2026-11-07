@@ -12,6 +12,7 @@
 #include LUME_VM_TEST_SOURCE
 
 static unsigned metadata_live, physical_live, mappings_live, syncs, checks;
+static unsigned image_protect_calls;
 static int metadata_budget = -1, physical_budget = -1;
 
 static struct
@@ -39,6 +40,16 @@ static struct
             exit(1);                                                                               \
         }                                                                                          \
     } while (0)
+
+int64_t lume_task_protect_image(unsigned task, uint64_t first, uint64_t length, unsigned protection)
+{
+    (void)task;
+    (void)first;
+    (void)length;
+    (void)protection;
+    ++image_protect_calls;
+    return -LUME_ENOMEM;
+}
 
 void *lume_kernel_allocate(size_t size)
 {
@@ -369,6 +380,9 @@ int main(void)
 {
     const unsigned anonymous = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
     const uint64_t span = UINT64_C(4) * 1024 * 1024 * 1024;
+    CHECK(call(0, LUME_VM_PROTECT, LUME_VM_BASE - 4096, 4096, LUME_PROT_READ, 0, -1) ==
+          -LUME_ENOMEM);
+    CHECK(image_protect_calls == 1);
     uint64_t base = call(0, LUME_VM_MAP, 0, span, 0, anonymous, -1);
     CHECK(base == LUME_VM_BASE && !physical_live && !mappings_live && metadata_live == 2);
     CHECK(call(0, LUME_VM_PROTECT, base + 4096, 12288, 3, 0, -1) == 0);

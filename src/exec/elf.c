@@ -2,6 +2,8 @@
 #include "lume/elf.h"
 #include "lume/mmu.h"
 #include "lume/worker.h"
+#include "lume/abi.h"
+#include "lume/memory.h"
 
 static uint16_t le16(const unsigned char *p)
 {
@@ -144,6 +146,79 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
     return true;
 }
 
+static bool image_page_mapped(const struct lume_elf_image *image, unsigned index)
+{
+    uint64_t physical;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    for (unsigned view = 0; view < 2; ++view)
+        if (!lume_mmu_translate(lume_mmu_task_view_root(image->task, view != 0),
+                                image->pages[index].address, false, false, false, &physical) ||
+            physical != image->pages[index].physical)
+            return false;
+#else
+    if (!lume_mmu_translate(lume_mmu_task_root(image->task), image->pages[index].address, false,
+                            false, false, &physical) ||
+        physical != image->pages[index].physical)
+        return false;
+#endif
+    return true;
+}
+
+static void protect_image_batch(struct lume_elf_image *image, const uint64_t *addresses,
+                                const uint64_t *physical, const unsigned *indices, unsigned count,
+                                unsigned protection)
+{
+    if (!lume_mmu_protect_user_batch(image->task, addresses, physical, count, protection))
+        lume_fail("ELF page protection state");
+    for (unsigned i = 0; i < count; ++i)
+        image->pages[indices[i]].protection = protection;
+}
+
+int64_t lume_elf_protect(struct lume_elf_image *image, uint64_t first, uint64_t length,
+                         unsigned protection)
+{
+    if (!image || image->task >= LUME_TASK_LIMIT || !length || ((first | length) & 4095) ||
+        !image_range(first, length))
+        return -LUME_EINVAL;
+    if ((protection & ~7u) || (protection & 6u) == 6u)
+        return -LUME_EACCES;
+    if (protection)
+        protection |= LUME_PROT_READ;
+    if (!image->pages || length / 4096 > image->count)
+        return -LUME_ENOMEM;
+    uint64_t end = first + length;
+    unsigned found = 0;
+    for (unsigned i = 0; i < image->count; ++i)
+        if (image->pages[i].address >= first && image->pages[i].address < end)
+        {
+            if (protection & ~image->pages[i].maximum)
+                return -LUME_EACCES;
+            if (!image_page_mapped(image, i))
+                return -LUME_ENOMEM;
+            ++found;
+        }
+    if (found != length / 4096)
+        return -LUME_ENOMEM;
+    uint64_t addresses[LUME_MMU_BATCH_PAGES], physical[LUME_MMU_BATCH_PAGES];
+    unsigned indices[LUME_MMU_BATCH_PAGES], count = 0;
+    for (unsigned i = 0; i < image->count; ++i)
+        if (image->pages[i].address >= first && image->pages[i].address < end)
+        {
+            addresses[count] = image->pages[i].address;
+            physical[count] = image->pages[i].physical;
+            indices[count++] = i;
+            if (count == LUME_MMU_BATCH_PAGES)
+            {
+                protect_image_batch(image, addresses, physical, indices, count, protection);
+                count = 0;
+                lume_worker_checkpoint(65536);
+            }
+        }
+    if (count)
+        protect_image_batch(image, addresses, physical, indices, count, protection);
+    return 0;
+}
+
 void lume_elf_release(struct lume_elf_image *image)
 {
     for (unsigned first = 0; first < image->count;)
@@ -229,11 +304,10 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
     struct elf_page_copy copy = {0};
     for (unsigned i = 0; i < source->count; ++i)
     {
-        uint64_t address = source->pages[i].address, ignored;
-        bool write = lume_mmu_translate(lume_mmu_task_root(source->task), address, true, true,
-                                        false, &ignored);
-        bool execute = lume_mmu_translate(lume_mmu_task_root(source->task), address, false, true,
-                                          true, &ignored);
+        uint64_t address = source->pages[i].address;
+        unsigned protection = source->pages[i].protection;
+        bool write = (protection & LUME_PROT_WRITE) != 0;
+        bool execute = (protection & LUME_PROT_EXEC) != 0;
         uint64_t page = lume_page_alloc(0);
         if (!page)
             goto fail;
@@ -242,12 +316,14 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
             (void)lume_page_free(page);
             goto fail;
         }
-        image->pages[image->count].address = address;
+        image->pages[image->count] = source->pages[i];
         image->pages[image->count++].physical = page;
+        if (!protection && !lume_mmu_protect_user_batch(task, &address, &page, 1, 0))
+            goto fail;
         copy.pages[copy.count].target = (void *)(uintptr_t)page;
         copy.pages[copy.count].source = (const void *)(uintptr_t)source->pages[i].physical;
         copy.pages[copy.count].bytes = 4096;
-        copy.pages[copy.count++].executable = execute ? page : 0;
+        copy.pages[copy.count++].executable = source->pages[i].maximum & LUME_PROT_EXEC ? page : 0;
         if (copy.count == LUME_MMU_BATCH_PAGES)
             finish_elf_batch(&copy);
     }
@@ -290,8 +366,12 @@ bool lume_elf_load(unsigned task, const void *data, size_t size, struct lume_elf
                 (void)lume_page_free(page);
                 goto fail;
             }
+            unsigned protection = LUME_PROT_READ | ((s->flags & 2) ? LUME_PROT_WRITE : 0) |
+                                  ((s->flags & 1) ? LUME_PROT_EXEC : 0);
             image->pages[image->count].address = va;
-            image->pages[image->count++].physical = page;
+            image->pages[image->count].physical = page;
+            image->pages[image->count].maximum = protection;
+            image->pages[image->count++].protection = protection;
             uint64_t copy_start = va > s->address ? va : s->address;
             uint64_t file_end = s->address + s->file_size;
             uint64_t copy_end = va + 4096 < file_end ? va + 4096 : file_end;

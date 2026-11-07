@@ -1619,6 +1619,27 @@ bool lume_task_sandbox_ready(unsigned pid)
     return true;
 }
 
+int64_t lume_task_protect_image(unsigned task, uint64_t first, uint64_t length, unsigned protection)
+{
+    if (task >= LUME_TASK_LIMIT || !owned[task] || images[task].task != task)
+        return -LUME_ENOMEM;
+    return lume_elf_protect(&images[task], first, length, protection);
+}
+
+static void report_program_fault(unsigned process, unsigned task, const struct lume_context *frame,
+                                 uint64_t esr, uint64_t far)
+{
+    lume_value("PROGRAM_FAULT_PROCESS", process + 1);
+    lume_value("PROGRAM_FAULT_TASK", task + 1);
+    lume_value("PROGRAM_FAULT_ESR", esr);
+    lume_value("PROGRAM_FAULT_ADDRESS", far);
+    lume_value("PROGRAM_FAULT_PC", LUME_CONTEXT_PC(frame));
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+    lume_value("PROGRAM_FAULT_LINK", LUME_CONTEXT_REG(frame, 30));
+    lume_value("PROGRAM_FAULT_ARG0", LUME_CONTEXT_REG(frame, 0));
+#endif
+}
+
 struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, uint64_t far)
 {
     if (!active || (LUME_CONTEXT_STATUS(frame) & 15) != 0)
@@ -1738,7 +1759,10 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     if (public_mode && process_exiting[process])
         return thread_slots[task].thread ? thread_finish(0) : finish_program(process_status[task]);
     if (public_mode && thread_slots[task].thread && !svc)
+    {
+        report_program_fault(process, task, frame, esr, far);
         return process_terminate(139);
+    }
     if (public_mode && task == 2 && !lume_arch_is_syscall(esr, true))
     {
         service_bus_stop();
@@ -1751,14 +1775,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     if (public_mode && owned[task] && !lume_arch_is_syscall(esr, true))
     {
         ++program_faults;
-        lume_value("PROGRAM_FAULT_PROCESS", process + 1);
-        lume_value("PROGRAM_FAULT_TASK", task + 1);
-        lume_value("PROGRAM_FAULT_ESR", esr);
-        lume_value("PROGRAM_FAULT_ADDRESS", far);
-        lume_value("PROGRAM_FAULT_PC", LUME_CONTEXT_PC(frame));
+        report_program_fault(process, task, frame, esr, far);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
-        lume_value("PROGRAM_FAULT_LINK", LUME_CONTEXT_REG(frame, 30));
-        lume_value("PROGRAM_FAULT_ARG0", LUME_CONTEXT_REG(frame, 0));
         uint64_t pointer = LUME_CONTEXT_REG(frame, 29);
         for (unsigned depth = 0;
              depth < 16 && !(pointer & 15) && lume_user_buffer(pointer, 16, false); ++depth)

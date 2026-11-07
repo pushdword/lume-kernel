@@ -93,6 +93,10 @@ void lume_mmu_secondary(void)
                      : "+r"(mair), "+r"(tcr), "+r"(base), "=r"(sctlr)::"memory");
     sctlr |= 1 | 4 | (UINT64_C(1) << 12) | (UINT64_C(1) << 19);
     __asm__ volatile("msr sctlr_el1, %0; isb" ::"r"(sctlr) : "memory");
+    uint64_t counter_control;
+    __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(counter_control));
+    counter_control |= UINT64_C(1) << 1;
+    __asm__ volatile("msr cntkctl_el1, %0; isb" ::"r"(counter_control) : "memory");
 }
 
 static bool probe(uint64_t va, bool write, bool expected, uint64_t target)

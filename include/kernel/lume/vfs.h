@@ -73,6 +73,8 @@ int64_t lume_vfs_open(struct lume_files *, const char *, uint64_t flags);
 int lume_vfs_sandbox_access(struct lume_files *, uint64_t, bool);
 int lume_vfs_directory_authority(struct lume_files *, unsigned, uint64_t);
 bool lume_vfs_sandbox_directory(struct lume_files *, const char *, bool);
+int lume_vfs_x11_authority(struct lume_files *, uint64_t);
+bool lume_vfs_sandbox_x11_authority(struct lume_files *, const char *);
 void lume_vfs_terminal_open(int (*)(struct lume_files *, const char *, uint64_t));
 int64_t lume_vfs_open_compat(struct lume_files *, const char *, uint64_t flags);
 int64_t lume_vfs_remove_compat(struct lume_files *, const char *, bool);

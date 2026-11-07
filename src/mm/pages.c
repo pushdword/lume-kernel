@@ -8,7 +8,7 @@
 #define IMAGE_BLOCK UINT64_C(0x200000)
 #endif
 #define MAX_PAGES (PHYSICAL_LIMIT / 4096)
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 #define MAX_SPAN_PAGES 262144u
 #else
 #define MAX_SPAN_PAGES 32768u

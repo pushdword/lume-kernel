@@ -1004,6 +1004,8 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
     if (operation == LUME_VM_UNMAP || operation == LUME_VM_PROTECT || operation == LUME_VM_ADVISE)
     {
         uint64_t first = request->address, length = rounded(request->length);
+        if (operation == LUME_VM_PROTECT && (first < LUME_VM_BASE || first >= LUME_VM_LIMIT))
+            return lume_task_protect_image(task, first, length, request->protection);
         if (!length || (first & (PAGE - 1)) || first < LUME_VM_BASE || first >= LUME_VM_LIMIT ||
             length > LUME_VM_LIMIT - first)
             return -LUME_EINVAL;

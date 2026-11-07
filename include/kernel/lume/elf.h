@@ -37,6 +37,7 @@ struct lume_elf_image
     struct
     {
         uint64_t address, physical;
+        unsigned maximum, protection;
     } *pages;
 };
 
@@ -44,11 +45,17 @@ bool lume_elf_plan(const void *, size_t, struct lume_elf_plan *);
 bool lume_elf_load(unsigned task, const void *, size_t, struct lume_elf_image *);
 bool lume_elf_clone(unsigned task, const struct lume_elf_image *, struct lume_elf_image *);
 void lume_elf_release(struct lume_elf_image *);
+int64_t lume_elf_protect(struct lume_elf_image *, uint64_t, uint64_t, unsigned);
+int64_t lume_task_protect_image(unsigned, uint64_t, uint64_t, unsigned);
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 #endif
 #define LUME_MMU_BATCH_PAGES 16u
+/* Protection updates retain physical frames and complete user TLB invalidation.
+ * Callers retain address-space ownership and the scheduler lock. */
+bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const uint64_t *physical,
+                                 unsigned count, unsigned protection);
 /* Callers retain address-space ownership and the scheduler lock. Successful unmaps complete
  * TLB invalidation on every CPU before the physical pages can be reused. */
 bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count);

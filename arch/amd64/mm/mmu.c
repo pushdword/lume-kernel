@@ -486,6 +486,38 @@ bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, 
     return map_user_views(task, va, pa, write, execute, true);
 }
 
+bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const uint64_t *physical,
+                                 unsigned count, unsigned protection)
+{
+    if (task >= LUME_TASK_LIMIT || !addresses || !physical || !count ||
+        count > LUME_MMU_BATCH_PAGES || (protection & ~7u) || (protection & 6u) == 6u ||
+        (protection && !(protection & LUME_PROT_READ)))
+        return false;
+    uint64_t *entries[LUME_MMU_BATCH_PAGES][2], values[LUME_MMU_BATCH_PAGES][2];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        uint64_t va = addresses[i];
+        if (!user_address(va) || (va & 4095) || !physical[i] || (physical[i] & 4095))
+            return false;
+        for (unsigned view = 0; view < 2; ++view)
+        {
+            entries[i][view] = entry(task, view, va, false);
+            if (!entries[i][view] || !(*entries[i][view] & PRESENT) ||
+                (*entries[i][view] & ADDRESS) != physical[i])
+                return false;
+            values[i][view] = (*entries[i][view] & ~(USER | WRITE | NX)) |
+                              ((protection & LUME_PROT_READ) ? USER : 0) |
+                              ((protection & LUME_PROT_WRITE) ? WRITE : 0) |
+                              ((protection & LUME_PROT_EXEC) ? 0 : NX);
+        }
+    }
+    for (unsigned i = 0; i < count; ++i)
+        for (unsigned view = 0; view < 2; ++view)
+            *entries[i][view] = values[i][view];
+    lume_arch_flush_user_tlb();
+    return true;
+}
+
 bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
 {
     if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
