@@ -19,15 +19,17 @@ unsigned lume_cpu_count(void)
 static void kernel_lock_wait(void)
 {
     __asm__ volatile("yield" ::: "memory");
-    lume_pi5_uart_rx_checkpoint();
+    lume_pi5_uart_rx_lock_wait();
 }
 
 static void kernel_lock_acquired(void)
 {
+    lume_pi5_uart_rx_lock_enter();
 }
 
 static void kernel_lock_released(void)
 {
+    lume_pi5_uart_rx_lock_leave();
     __asm__ volatile("dsb ishst; sev" ::: "memory");
 }
 

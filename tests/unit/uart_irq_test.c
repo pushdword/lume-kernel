@@ -7,6 +7,8 @@ static uint32_t index_reg = 7, identity = 0x00011de4, command = 0x406;
 static uint32_t mask = 0x20, level = 0x12, config = 0x8, pending, pin;
 static uint32_t buses;
 static unsigned drained, registered, enabled, unregistered;
+static uint64_t received;
+static bool interrupt_mode;
 static bool available = true, busy, enable_error;
 static lume_irq_handler handler;
 static void *argument;
@@ -73,6 +75,8 @@ int lume_irq_register(unsigned n, unsigned trigger, lume_irq_handler fn, void *c
 int lume_irq_enable(unsigned n, bool on)
 {
     assert(n == 261);
+    if (on)
+        assert(interrupt_mode);
     enabled = on;
     return on && enable_error ? -1 : 0;
 }
@@ -84,9 +88,24 @@ int lume_irq_unregister(unsigned n, void *context)
     return 0;
 }
 
-void lume_pi5_uart_rx_collect(void)
+void lume_pi5_uart_rx_irq_mode(bool on)
 {
-    ++drained;
+    assert(!enabled);
+    interrupt_mode = on;
+}
+
+uint64_t lume_pi5_uart_rx_irq_count(void)
+{
+    return received;
+}
+
+void lume_pi5_uart_rx_irq_drain(void)
+{
+    if (pending & (1u << 25))
+    {
+        ++drained;
+        ++received;
+    }
 }
 
 #include "../../drivers/serial/pl011/rp1_irq.c"
@@ -106,7 +125,7 @@ int main(void)
     assert(!lume_uart_irq_start() && unregistered == 1 && !enabled);
     assert(mask == 0x20 && level == 0x12 && config == 8 && command == 0x406);
     enable_error = false;
-    assert(lume_uart_irq_start() && enabled && config == 9 && command == 6);
+    assert(lume_uart_irq_start() && enabled && interrupt_mode && config == 9 && command == 6);
     assert((mask & RX_MASK) == RX_MASK && !(level & (7u << 3)) && index_reg == 7);
     unsigned before = registered;
     assert(lume_uart_irq_start() && registered == before);
@@ -116,7 +135,7 @@ int main(void)
     handler(261, argument);
     assert(drained == 1 && lume_uart_irq_count() == 1);
     lume_uart_irq_stop();
-    assert(!enabled && unregistered == 2 && mask == 0x20 && level == 0x12);
+    assert(!enabled && !interrupt_mode && unregistered == 2 && mask == 0x20 && level == 0x12);
     assert(config == 8 && command == 0x406 && index_reg == 7 && !pin && !buses);
     lume_uart_irq_stop();
     assert(unregistered == 2);

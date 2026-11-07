@@ -24,8 +24,9 @@ static int configure(unsigned irq, unsigned trigger)
     lume_mmio_write32_sync(group, lume_mmio_read32_relaxed(group) | (1u << (irq % 32)));
     uint64_t priority = GICD + 0x400 + (irq & ~3u);
     unsigned shift = (irq & 3) * 8;
+    /* Subsystem callbacks use the regular priority. Only resident RX may raise its UART line. */
     lume_mmio_write32_sync(priority, (lume_mmio_read32_relaxed(priority) & ~(0xffu << shift)) |
-                                         (0x80u << shift));
+                                         (LUME_BOARD_IRQ_PRIORITY << shift));
     if (irq >= 32)
     {
         uint64_t target = GICD + 0x800 + (irq & ~3u);
@@ -60,8 +61,8 @@ static const struct lume_irq_controller operations = {configure, enable, lume_ir
 void lume_pi5_irq_secondary(void)
 {
     lume_mmio_write32_sync(GICD + 0x80, UINT32_MAX);
-    lume_mmio_write32_sync(GICD + 0x400, 0x80808080);
-    lume_mmio_write32_sync(GICD + 0x41c, 0x80808080);
+    lume_mmio_write32_sync(GICD + 0x400, LUME_BOARD_IRQ_PRIORITY * UINT32_C(0x01010101));
+    lume_mmio_write32_sync(GICD + 0x41c, LUME_BOARD_IRQ_PRIORITY * UINT32_C(0x01010101));
     lume_mmio_write32_sync(GICD + 0x100, 1u << 30 | 1u);
     lume_mmio_write32_sync(GICC + 4, 0xff);
     lume_mmio_write32_sync(GICC + 8, 0);

@@ -374,7 +374,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         bool reclaim = lane->reclaim;
         uint64_t worker_root =
             owner < LUME_TASK_LIMIT && !reclaim ? lume_mmu_task_root(owner) : lume_mmu_root();
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
         bool change_root = !lume_mmu_root_active(worker_root);
 #else
         bool change_root = owner != previous || reclaim;
@@ -407,7 +407,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         uint64_t previous_root = previous < LUME_TASK_LIMIT && !(reclaim && previous == owner)
                                      ? lume_mmu_task_root(previous)
                                      : lume_mmu_root();
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
         change_root = !lume_mmu_root_active(previous_root);
 #endif
         if (change_root)

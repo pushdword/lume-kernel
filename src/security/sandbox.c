@@ -171,7 +171,8 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
                    ? 0
                    : -LUME_EPERM;
     case LUME_SYS_FILE_IO:
-        return action <= LUME_FILE_IO_POSIX_SETLK ? 0 : -LUME_EPERM;
+        return action <= LUME_FILE_IO_POSIX_SETLK || action == LUME_FILE_IO_FLOCK_NB ? 0
+                                                                                     : -LUME_EPERM;
     case LUME_SYS_FD:
         return action >= LUME_FD_INFO && action <= LUME_FD_PATH && action != LUME_FD_SPAWN
                    ? 0

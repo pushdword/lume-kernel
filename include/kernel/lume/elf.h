@@ -3,7 +3,7 @@
 #include "early.h"
 #define LUME_ELF_BASE (LUME_USER_BASE + 0x40000)
 #define LUME_ELF_LIMIT LUME_HEAP_BASE
-#if defined(LUME_ARCH_AARCH64) || defined(__aarch64__)
+#if defined(LUME_ARCH_AARCH64) || defined(__aarch64__) || defined(LUME_ARCH_AMD64)
 #define LUME_LARGE_ELF_BASE UINT64_C(0x4000000000)
 #define LUME_LARGE_ELF_LIMIT UINT64_C(0x4100000000)
 #define LUME_ELF_PAGES ((LUME_LARGE_ELF_LIMIT - LUME_LARGE_ELF_BASE) / 4096u)
@@ -45,7 +45,7 @@ bool lume_elf_load(unsigned task, const void *, size_t, struct lume_elf_image *)
 bool lume_elf_clone(unsigned task, const struct lume_elf_image *, struct lume_elf_image *);
 void lume_elf_release(struct lume_elf_image *);
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 #endif
 #define LUME_MMU_BATCH_PAGES 16u

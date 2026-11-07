@@ -87,6 +87,7 @@ int64_t lume_vfs_sync(struct lume_files *, uint64_t fd);
 int64_t lume_vfs_seek(struct lume_files *, uint64_t fd, int64_t offset, uint64_t whence);
 struct lume_file_lock_request;
 int64_t lume_vfs_ofd_lock(struct lume_files *, bool, struct lume_file_lock_request *);
+int64_t lume_vfs_flock(struct lume_files *, struct lume_file_lock_request *);
 int64_t lume_vfs_posix_lock(struct lume_files *, unsigned, bool, struct lume_file_lock_request *);
 int64_t lume_vfs_process_close(struct lume_files *, uint64_t, unsigned);
 int64_t lume_vfs_process_dup2(struct lume_files *, uint64_t, uint64_t, unsigned);

@@ -13,7 +13,8 @@ enum
     LUME_FILE_IO_OFD_GETLK,
     LUME_FILE_IO_OFD_SETLK,
     LUME_FILE_IO_POSIX_GETLK,
-    LUME_FILE_IO_POSIX_SETLK
+    LUME_FILE_IO_POSIX_SETLK,
+    LUME_FILE_IO_FLOCK_NB
 };
 
 /* FILE_IO takes an operation, a request address and its byte size. PREAD and PWRITE
@@ -25,6 +26,13 @@ enum
  * TRUNCATE uses offset as the new nonnegative length with zero whence, buffer and
  * count. It preserves the shared offset and zero-fills expanded regular files.
  * Unused fields are zero. Storage providers retain their own size limits. */
+/* FLOCK_NB uses lume_file_lock_request with zero whence, start, length, pid and
+ * reserved fields. READ, WRITE and UNLOCK apply to the whole file. This namespace
+ * is independent of OFD and POSIX byte-range locks. Locks follow the open file
+ * description through duplicate, inherited and transferred references until its
+ * final close. Changing a lock releases its old mode before checking conflicts.
+ * A conflict returns EAGAIN without restoring the old mode. Descriptor access
+ * mode does not restrict these advisory locks. Blocking waits are unsupported. */
 struct lume_file_io_request
 {
     uint32_t version, bytes;

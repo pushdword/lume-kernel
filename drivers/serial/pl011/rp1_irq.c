@@ -8,11 +8,10 @@
 #define PCIE LUME_BOARD_PCIE_BASE
 #define INTC (LUME_BOARD_RP1_BASE + 0x108000)
 #define UART_SOURCE 25u
-#define UART_PARENT (32u + 229u)
+#define UART_PARENT LUME_BOARD_UART_IRQ
 #define UART_CONFIG (8u + 4u * UART_SOURCE)
 #define RX_MASK ((1u << 4) | (1u << 6) | (15u << 7))
 static bool started;
-static uint64_t interrupts;
 static uint32_t saved_mask, saved_level, saved_config, saved_command, saved_index, saved_pin,
     saved_bus;
 static uint32_t bus_index;
@@ -21,17 +20,12 @@ static void receive(unsigned irq, void *context)
 {
     (void)irq;
     (void)context;
-    if (!(lume_mmio_read32_relaxed(INTC + 0x108) & (1u << UART_SOURCE)))
-        return;
-    ++interrupts;
-    lume_pi5_uart_rx_collect();
-    lume_mmio_write32_sync(UART + 0x44, RX_MASK);
-    lume_mmio_write32_sync(INTC + 0x800 + UART_CONFIG, 1u << 2);
+    lume_pi5_uart_rx_irq_drain();
 }
 
 uint64_t lume_uart_irq_count(void)
 {
-    return interrupts;
+    return lume_pi5_uart_rx_irq_count();
 }
 
 bool lume_uart_irq_start(void)
@@ -76,6 +70,7 @@ bool lume_uart_irq_start(void)
     lume_mmio_write32_sync(UART + 0x44, RX_MASK);
     lume_mmio_write32_sync(INTC + 0x800 + UART_CONFIG, 9);
     lume_mmio_write32_sync(UART + 0x38, saved_mask | RX_MASK);
+    lume_pi5_uart_rx_irq_mode(true);
     if (lume_irq_enable(UART_PARENT, true))
     {
         started = true;
@@ -91,6 +86,7 @@ void lume_uart_irq_stop(void)
     if (!started)
         return;
     (void)lume_irq_enable(UART_PARENT, false);
+    lume_pi5_uart_rx_irq_mode(false);
     lume_mmio_write32_sync(UART + 0x38, saved_mask);
     lume_mmio_write32_sync(UART + 0x34, saved_level);
     lume_mmio_write32_sync(INTC + 0xc00 + UART_CONFIG, 9);

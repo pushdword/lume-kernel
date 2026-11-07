@@ -6,6 +6,89 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#define lume_sandbox_open lume_test_sandbox_open
+#define lume_sandbox_path lume_test_sandbox_path
+#include "../../src/security/sandbox.c"
+#undef lume_sandbox_open
+#undef lume_sandbox_path
+
+bool lume_task_sandbox_ready(unsigned pid)
+{
+    (void)pid;
+    assert(false);
+    return false;
+}
+
+uint64_t lume_task_capabilities(unsigned pid)
+{
+    (void)pid;
+    assert(false);
+    return 0;
+}
+
+int lume_task_drop_capabilities(unsigned pid, uint64_t capabilities)
+{
+    (void)pid;
+    (void)capabilities;
+    assert(false);
+    return -LUME_EPERM;
+}
+
+static _Alignas(4096) unsigned char host_pages[128][4096];
+static bool host_page_used[128], flock_running;
+
+uint64_t lume_page_alloc(uint64_t minimum)
+{
+    assert(!minimum && !flock_running);
+    for (unsigned i = 0; i < 128; ++i)
+        if (!host_page_used[i])
+        {
+            host_page_used[i] = true;
+            memset(host_pages[i], 0, sizeof(host_pages[i]));
+            return (uintptr_t)host_pages[i];
+        }
+    assert(false);
+    return 0;
+}
+
+bool lume_page_free(uint64_t page)
+{
+    assert(!flock_running);
+    for (unsigned i = 0; i < 128; ++i)
+        if (page == (uintptr_t)host_pages[i])
+        {
+            assert(host_page_used[i]);
+            host_page_used[i] = false;
+            return true;
+        }
+    assert(false);
+    return false;
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    assert(!flock_running);
+    run(context);
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    (void)bytes;
+    assert(!flock_running);
+}
+
+_Noreturn void lume_fail(const char *message)
+{
+    fputs(message, stderr);
+    abort();
+}
+
+uint32_t ff_wtoupper(uint32_t value)
+{
+    assert(value < 128);
+    return value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+}
 
 static struct lume_files first, second, third;
 static int a, b, c;
@@ -421,6 +504,128 @@ static void byte_oracle(void)
     }
 }
 
+static int64_t flock_set(struct lume_files *files, int fd, unsigned type)
+{
+    struct lume_file_lock_request lock = request(fd, type, 0, 0);
+    flock_running = true;
+    int64_t result = lume_vfs_flock(files, &lock);
+    flock_running = false;
+    return result;
+}
+
+static void flock_namespace_and_conversion(void)
+{
+    reset();
+    assert(set(&first, a, LUME_FILE_LOCK_WRITE, 0, 0) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == 0);
+    struct lume_file_lock_request lock = request(c, LUME_FILE_LOCK_WRITE, 0, 0);
+    assert(lume_vfs_posix_lock(&third, 7, false, &lock) == -LUME_EAGAIN);
+    assert(set(&first, a, LUME_FILE_LOCK_UNLOCK, 0, 0) == 0);
+    assert(lume_vfs_posix_lock(&third, 7, false, &lock) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_READ) == -LUME_EAGAIN);
+    lock = request(a, LUME_FILE_LOCK_WRITE, 0, 0);
+    assert(lume_vfs_ofd_lock(&first, true, &lock) == 0 && lock.pid == 7 &&
+           lock.type == LUME_FILE_LOCK_WRITE);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_UNLOCK) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_READ) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_READ) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_READ) == -LUME_EAGAIN);
+    lock = request(a, LUME_FILE_LOCK_WRITE, 0, 0);
+    assert(lume_vfs_ofd_lock(&first, true, &lock) == 0 && lock.pid == 7 &&
+           lock.type == LUME_FILE_LOCK_WRITE);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_UNLOCK) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_WRITE) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_READ) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_READ) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_UNLOCK) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == 0);
+    lume_vfs_process_release(7);
+}
+
+static void flock_reference_lifetime(void)
+{
+    reset();
+    int readonly = (int)lume_vfs_open(&first, "/tmp/locks", LUME_O_RDONLY);
+    assert(readonly >= 0 && flock_set(&first, readonly, LUME_FILE_LOCK_WRITE) == 0);
+    assert(lume_vfs_close(&first, readonly) == 0);
+    assert(flock_set(&first, a, LUME_FILE_LOCK_WRITE) == 0);
+    assert(set(&first, a, LUME_FILE_LOCK_WRITE, 0, 0) == 0);
+    assert(lume_vfs_dup2(&first, a, 9) == 9);
+    struct lume_files child;
+    assert(lume_files_clone(&child, &first));
+    int held = lume_vfs_hold(&first, (unsigned)a);
+    assert(held >= 0);
+    int unrelated = (int)lume_vfs_open(&third, "/tmp/locks", LUME_O_RDWR);
+    assert(unrelated >= 0 && lume_vfs_process_close(&third, unrelated, (unsigned)held) == 0);
+    lume_vfs_process_release((unsigned)held);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
+    assert(lume_vfs_close(&first, a) == 0 && lume_vfs_close(&first, 9) == 0);
+    lume_files_release(&child);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
+    int received = lume_vfs_install(&third, held);
+    assert(received >= 0);
+    assert(flock_set(&third, received, LUME_FILE_LOCK_WRITE) == 0);
+    assert(set(&second, b, LUME_FILE_LOCK_WRITE, 0, 0) == -LUME_EAGAIN);
+    assert(lume_vfs_close(&third, received) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == 0);
+    assert(set(&second, b, LUME_FILE_LOCK_WRITE, 0, 0) == 0);
+    held = lume_vfs_hold(&second, (unsigned)b);
+    assert(held >= 0 && lume_vfs_close(&second, b) == 0);
+    assert(flock_set(&third, c, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
+    lume_vfs_drop(held);
+    assert(flock_set(&third, c, LUME_FILE_LOCK_WRITE) == 0);
+    assert(set(&third, c, LUME_FILE_LOCK_WRITE, 0, 0) == 0);
+}
+
+static void flock_request_and_admission(void)
+{
+    reset();
+    struct lume_context frame = {0};
+    LUME_CONTEXT_REG(&frame, LUME_CONTEXT_SYSCALL_REGISTER) = LUME_SYS_FILE_IO;
+    LUME_CONTEXT_REG(&frame, 0) = LUME_FILE_IO_FLOCK_NB;
+    for (unsigned profile = LUME_SANDBOX_RENDERER; profile <= LUME_SANDBOX_GPU_SOFTWARE; ++profile)
+    {
+        first.identity.sandbox_profile = profile;
+        assert(lume_sandbox_check(&first, 1, &frame) == 0);
+        LUME_CONTEXT_REG(&frame, 0) = LUME_FILE_IO_FLOCK_NB + 1;
+        assert(lume_sandbox_check(&first, 1, &frame) == -LUME_EPERM);
+        LUME_CONTEXT_REG(&frame, 0) = LUME_FILE_IO_FLOCK_NB;
+    }
+    first.identity.sandbox_profile = LUME_SANDBOX_NONE;
+    struct lume_file_lock_request lock = request(a, LUME_FILE_LOCK_WRITE, 0, 0);
+    user_address = (uintptr_t)&lock;
+    user_readable = false;
+    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
+           -LUME_EFAULT);
+    user_readable = true;
+    user_writable = false;
+    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
+    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock) - 1) ==
+           -LUME_EINVAL);
+    lock.start = 1;
+    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
+           -LUME_EINVAL);
+    lock.start = 0;
+    lock.type = LUME_FILE_LOCK_UNLOCK;
+    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
+    user_writable = true;
+    lock.fd = -1;
+    assert(lume_vfs_flock(&first, &lock) == -LUME_EBADF);
+    int directory = (int)lume_vfs_open(&first, "/tmp", LUME_O_RDONLY);
+    assert(directory >= 0 && flock_set(&first, directory, LUME_FILE_LOCK_READ) == -LUME_EISDIR);
+    struct lume_fd_request pipe = {.version = LUME_FD_VERSION, .bytes = sizeof(pipe)};
+    assert(lume_vfs_fd_call(&first, LUME_FD_PIPE, &pipe) == 0);
+    assert(flock_set(&first, pipe.fd, LUME_FILE_LOCK_READ) == -95);
+    for (unsigned i = 0; i < LUME_FILE_LOCK_LIMIT; ++i)
+        assert(set(&first, a, LUME_FILE_LOCK_READ, 2 * (int64_t)i, 1) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == -37);
+    assert(set(&first, a, LUME_FILE_LOCK_UNLOCK, 0, 0) == 0);
+    assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == 0);
+}
+
 int main(void)
 {
     conflicts_and_conversion();
@@ -431,12 +636,14 @@ int main(void)
     request_validation();
     byte_oracle();
     failed_close();
+    flock_namespace_and_conversion();
+    flock_reference_lifetime();
+    flock_request_and_admission();
     release_files();
 #if defined(LUME_FILES_DYNAMIC) && LUME_FILES_DYNAMIC
     extern size_t lume_test_vfs_live_tables(void);
     assert(lume_test_vfs_live_tables() == 0);
 #endif
-    puts(
-        "PASS OFD conflicts, ranges, conversion, lifetime, capacity rollback and capability probe");
+    puts("PASS OFD ranges and FLOCK namespace, conversion, references, validation and admission");
     return 0;
 }

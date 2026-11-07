@@ -9,7 +9,7 @@ int64_t lume_file_lock_call(struct lume_files *files, uint64_t operation, uint64
                             uint64_t bytes)
 {
     bool query = operation == LUME_FILE_IO_OFD_GETLK;
-    if ((!query && operation != LUME_FILE_IO_OFD_SETLK) ||
+    if ((!query && operation != LUME_FILE_IO_OFD_SETLK && operation != LUME_FILE_IO_FLOCK_NB) ||
         bytes != sizeof(struct lume_file_lock_request))
         return -LUME_EINVAL;
     if (address > UINTPTR_MAX || bytes > UINTPTR_MAX - address ||
@@ -18,7 +18,8 @@ int64_t lume_file_lock_call(struct lume_files *files, uint64_t operation, uint64
         return -LUME_EFAULT;
     struct lume_file_lock_request request;
     memcpy(&request, (const void *)(uintptr_t)address, sizeof(request));
-    int64_t result = lume_vfs_ofd_lock(files, query, &request);
+    int64_t result = operation == LUME_FILE_IO_FLOCK_NB ? lume_vfs_flock(files, &request)
+                                                        : lume_vfs_ofd_lock(files, query, &request);
     if (!result && query)
         memcpy((void *)(uintptr_t)address, &request, sizeof(request));
     return result;

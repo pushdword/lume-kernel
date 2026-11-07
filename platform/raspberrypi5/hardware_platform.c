@@ -24,7 +24,7 @@ void *lume_kernel_allocate(size_t bytes)
     if (!bytes || bytes > 16u * 1024u * 1024u)
         return NULL;
     unsigned pages = (unsigned)((bytes + sizeof(struct allocation) + 4095) / 4096);
-    uint64_t memory = lume_pages_alloc_span(pages);
+    uint64_t memory = pages == 1 ? lume_page_alloc(0) : lume_pages_alloc_span(pages);
     if (!memory)
         return NULL;
     struct allocation *header = (void *)(uintptr_t)memory;

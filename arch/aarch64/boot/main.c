@@ -22,6 +22,7 @@
 #include "lume/kernel_memory.h"
 #include "lume/activity.h"
 #include "lume/boot_trial.h"
+#include "lume/uart_rx.h"
 #include <libfdt.h>
 
 #ifndef LUME_BUILD_ID
@@ -78,7 +79,8 @@ _Noreturn void lume_fail(const char *why)
     lume_stop();
 }
 
-static struct lume_context *exception_dispatch(struct lume_context *frame, uint64_t vector)
+static struct lume_context *exception_dispatch(struct lume_context *frame, uint64_t vector,
+                                               unsigned irq_token)
 {
     uint64_t esr, elr, far;
     bool el2 = lume_current_el() == 2;
@@ -94,7 +96,8 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
     }
     if (!el2 && (vector == 5 || vector == 9))
     {
-        unsigned token = lume_irq_ack(), irq = token & 1023;
+        unsigned token = irq_token == UINT32_MAX ? lume_irq_ack() : irq_token;
+        unsigned irq = token & 1023;
         if (irq >= 1020)
             return frame;
         if (!irq)
@@ -134,20 +137,25 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
 
 struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
 {
+    uint64_t control;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(control));
+    bool translated = lume_current_el() == 1 && (control & 1);
+    unsigned irq_token = UINT32_MAX;
+    if (translated && (vector == 5 || vector == 9) && lume_pi5_uart_rx_interrupt(&irq_token))
+        return frame;
     bool user = (frame->spsr & 15) == 0;
     if (user)
         lume_task_trap_enter(lume_counter_read());
-    uint64_t control;
-    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(control));
     /* Translation gives the kernel lock Normal memory attributes. Early
      * exceptions must run before atomic accesses to that storage are valid. */
-    bool acquire = lume_current_el() == 1 && (control & 1) && !lume_smp_owned();
+    bool acquire = translated && !lume_smp_owned();
     if (acquire)
         lume_smp_lock();
     if (user)
         lume_task_account_enter(frame);
-    struct lume_context *result =
-        user && lume_cpu_index() && !lume_tasks_active() ? NULL : exception_dispatch(frame, vector);
+    struct lume_context *result = user && lume_cpu_index() && !lume_tasks_active()
+                                      ? NULL
+                                      : exception_dispatch(frame, vector, irq_token);
     if (user)
     {
         result = lume_tasks_deliver_signals(result);

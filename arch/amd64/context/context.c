@@ -5,6 +5,8 @@
 #include "lume/irq.h"
 #include "lume/activity.h"
 #include "lume/apic.h"
+#include "lume/elf.h"
+#include "lume/vm.h"
 #include <string.h>
 extern unsigned char __trap_top[], __fault_top[];
 extern uintptr_t lume_isr_table[];
@@ -87,12 +89,25 @@ void lume_amd64_context_capture(struct lume_context *c, const uint64_t *r)
     c->tls = lume_rdmsr(0xc0000100);
 }
 
+static bool user_context_address(uint64_t address)
+{
+    return (address >= LUME_USER_BASE && address < LUME_USER_LIMIT) ||
+           (address >= LUME_LARGE_ELF_BASE && address < LUME_LARGE_ELF_LIMIT) ||
+           (address >= LUME_HEAP_EXTENDED_BASE && address < LUME_HEAP_EXTENDED_LIMIT) ||
+           lume_vm_address(address);
+}
+
+static bool user_context_tls(uint64_t address)
+{
+    return address < LUME_USER_LIMIT || user_context_address(address);
+}
+
 struct lume_context *lume_amd64_context_prepare(struct lume_context *c)
 {
     if (!c->status)
     {
-        if (c->pc < LUME_USER_BASE || c->pc >= LUME_USER_LIMIT || c->sp < LUME_USER_BASE ||
-            c->sp >= LUME_USER_LIMIT || c->tls >= LUME_USER_LIMIT)
+        if (!user_context_address(c->pc) || !user_context_address(c->sp) ||
+            !user_context_tls(c->tls))
             lume_fail("invalid application return context");
         c->flags = (c->flags & UINT64_C(0x240dd5)) | 0x202;
     }
@@ -113,9 +128,8 @@ struct lume_context *lume_amd64_exception(struct lume_context *frame, uint64_t v
 {
     bool user = frame->status == 0;
     uint64_t interrupt = vector;
-    bool valid = !user || (frame->pc >= LUME_USER_BASE && frame->pc < LUME_USER_LIMIT &&
-                           frame->sp >= LUME_USER_BASE && frame->sp < LUME_USER_LIMIT &&
-                           frame->tls < LUME_USER_LIMIT);
+    bool valid = !user || (user_context_address(frame->pc) && user_context_address(frame->sp) &&
+                           user_context_tls(frame->tls));
     if (vector == 39 || vector == 47)
     {
         uint16_t command = vector == 39 ? 0x20 : 0xa0;

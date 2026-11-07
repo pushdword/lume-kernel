@@ -4,7 +4,7 @@
 static void process_locks_drop(unsigned pid, int node)
 {
     for (unsigned i = 0; i < file_lock_count;)
-        if (file_locks[i].scope && file_locks[i].owner == (int)pid &&
+        if (file_locks[i].scope == 1 && file_locks[i].owner == (int)pid &&
             (node < 0 || file_locks[i].node == node))
             file_locks[i] = file_locks[--file_lock_count];
         else

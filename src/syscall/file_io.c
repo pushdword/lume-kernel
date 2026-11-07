@@ -7,7 +7,8 @@
 int64_t lume_file_io_call(struct lume_files *files, uint64_t operation, uint64_t address,
                           uint64_t bytes)
 {
-    if (operation == LUME_FILE_IO_OFD_GETLK || operation == LUME_FILE_IO_OFD_SETLK)
+    if (operation == LUME_FILE_IO_OFD_GETLK || operation == LUME_FILE_IO_OFD_SETLK ||
+        operation == LUME_FILE_IO_FLOCK_NB)
         return lume_file_lock_call(files, operation, address, bytes);
     if (operation > LUME_FILE_IO_TRUNCATE || bytes != sizeof(struct lume_file_io_request))
         return -LUME_EINVAL;

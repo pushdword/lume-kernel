@@ -1900,6 +1900,36 @@ int64_t lume_vfs_ofd_lock(struct lume_files *files, bool query,
     return result ? result : file_locks_apply(range, query, request);
 }
 
+int64_t lume_vfs_flock(struct lume_files *files, struct lume_file_lock_request *request)
+{
+    if (request->version != LUME_FILE_LOCK_VERSION || request->bytes != sizeof(*request) ||
+        request->reserved || request->reserved2 || request->pid || request->whence ||
+        request->start || request->length || request->type < LUME_FILE_LOCK_READ ||
+        request->type > LUME_FILE_LOCK_UNLOCK)
+        return -LUME_EINVAL;
+    struct open_file *description = descriptor(files, (uint64_t)request->fd);
+    if (!description)
+        return -LUME_EBADF;
+    if (description->pipe >= 0 || description->external)
+        return -95;
+    if (nodes[description->node].kind == LUME_NODE_DIR)
+        return -LUME_EISDIR;
+    int owner = (int)(description - open_files);
+    /* Conversion releases only this description's whole-file lock. */
+    for (unsigned i = 0; i < file_lock_count;)
+        if (file_locks[i].scope == 2 && file_locks[i].owner == owner)
+            file_locks[i] = file_locks[--file_lock_count];
+        else
+            ++i;
+    struct file_lock_record range = {.first = 0,
+                                     .last = INT64_MAX,
+                                     .owner = owner,
+                                     .node = description->node,
+                                     .type = request->type,
+                                     .scope = 2};
+    return file_locks_apply(range, false, request);
+}
+
 #include "process_locks.h"
 
 int64_t lume_vfs_seek(struct lume_files *f, uint64_t fd, int64_t offset, uint64_t whence)

@@ -18,7 +18,7 @@ static unsigned file_lock_count;
 static void file_locks_drop(int owner)
 {
     for (unsigned i = 0; i < file_lock_count;)
-        if (!file_locks[i].scope && file_locks[i].owner == owner)
+        if (file_locks[i].scope != 1 && file_locks[i].owner == owner)
             file_locks[i] = file_locks[--file_lock_count];
         else
             ++i;
@@ -91,8 +91,8 @@ static int file_locks_apply(struct file_lock_record range, bool query,
     for (unsigned i = 0; i < file_lock_count; ++i)
     {
         const struct file_lock_record *held = file_locks + i;
-        if (held->node != range.node || file_lock_same_owner(held, &range) ||
-            !file_locks_overlap(held, &range) ||
+        if (held->node != range.node || (held->scope == 2) != (range.scope == 2) ||
+            file_lock_same_owner(held, &range) || !file_locks_overlap(held, &range) ||
             (held->type != LUME_FILE_LOCK_WRITE && range.type != LUME_FILE_LOCK_WRITE))
             continue;
         if (!conflict || held->first < conflict->first)

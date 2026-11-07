@@ -53,7 +53,7 @@ void lume_mmu_switch(uint64_t root);
 bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack);
 void lume_mmu_release_user(unsigned task);
 uint64_t lume_mmu_task_root(unsigned task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 uint64_t lume_mmu_task_view_root(unsigned task, bool writer);
 bool lume_mmu_root_matches(unsigned task, uint64_t root);
 bool lume_mmu_root_active(uint64_t root);
@@ -100,14 +100,12 @@ extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_HEAP_BASE UINT64_C(0x48000000)
 #define LUME_THREAD_BASE UINT64_C(0x5a000000)
 #define LUME_HEAP_LIMIT (LUME_THREAD_BASE - 4096)
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 #define LUME_TASK_LIMIT 256u
-#elif defined(LUME_ARCH_AMD64)
-#define LUME_TASK_LIMIT 64u
 #else
 #define LUME_TASK_LIMIT 16u
 #endif
-#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64)
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64)
 _Static_assert(LUME_THREAD_BASE + (uint64_t)LUME_TASK_LIMIT * 0x100000 <= LUME_USER_STACK,
                "thread stacks overlap the main stack");
 #endif

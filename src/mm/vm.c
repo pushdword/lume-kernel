@@ -420,7 +420,7 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     if (!(area->protection & required))
         return 0;
     bool writer = false;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     writer = lume_mmu_jit_active(task);
 #endif
     if (area->jit &&
@@ -433,7 +433,7 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     if (!physical)
         return -1;
     uint64_t existing, root = lume_mmu_task_root(task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     root = lume_mmu_task_view_root(task, writer);
 #endif
     if (lume_mmu_translate(root, address, write, true, execute, &existing))
@@ -441,7 +441,7 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     if (area->protection & LUME_PROT_EXEC)
         lume_sync_code(physical, PAGE);
     bool mapped;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     if (area->jit)
         mapped = lume_mmu_map_user_jit(task, address & ~(PAGE - 1), physical,
                                        (area->protection & LUME_PROT_WRITE) != 0,
@@ -462,7 +462,7 @@ bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
         return false;
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
         if (spaces[task] &&
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
             lume_mmu_root_matches(task, root)
 #else
             lume_mmu_task_root(task) == root
@@ -749,7 +749,7 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                              LUME_MAP_ANONYMOUS | LUME_MAP_NORESERVE | LUME_MAP_FIXED_NOREPLACE |
                              LUME_MAP_JIT;
     bool jit = (flags & LUME_MAP_JIT) != 0;
-#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64)
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64)
     if (jit)
         return -LUME_ENOSYS;
 #endif

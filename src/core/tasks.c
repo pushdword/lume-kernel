@@ -1261,7 +1261,7 @@ static int start_program_with_scratch(struct lume_context *frame,
         lume_gpu_release(owner + 1);
         lume_heap_swap(owner, child);
         lume_vm_swap(owner, child);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
         lume_mmu_jit_copy(owner, child);
 #endif
         memcpy(executable_paths[owner], executable, sizeof(scratch->executable));
@@ -1454,7 +1454,7 @@ static int fork_program(struct lume_context *frame)
     if (!lume_files_clone(&tasks[child].files, &tasks[owner].files))
         goto fail;
     tasks[child].context = *frame;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     lume_mmu_jit_copy(child, current_task);
 #endif
     LUME_CONTEXT_REG(&tasks[child].context, 0) = 0;
@@ -1645,7 +1645,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         int64_t result = -LUME_EINVAL;
         if (!LUME_CONTEXT_REG(frame, 1) && !LUME_CONTEXT_REG(frame, 2))
         {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
             result = lume_mmu_jit_scope(task, LUME_CONTEXT_REG(frame, 0) == LUME_VM_JIT_BEGIN);
 #else
             result = -LUME_ENOSYS;

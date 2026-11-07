@@ -184,9 +184,9 @@ $(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tes
 check: check-file-locks
 check-file-locks: $(OUT)/tests/vfs-file-lock$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/abi/native/lume/file_lock.h
+$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h src/security/sandbox.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out src/security/sandbox.c,$(filter %.c,$^)) -o "$@"
 check: check-file-io
 check-file-io: $(OUT)/tests/file-io-call$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE)
 	env "$(OUT)/tests/file-io-call$(HOSTEXE)"
@@ -528,6 +528,12 @@ check-amd64-context: $(OUT)/tests/amd64-context$(HOSTEXE)
 $(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -DLUME_ARCH_AMD64=1 $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -o "$@"
+.PHONY: check-amd64-mmu-views
+check-amd64-mmu-views: $(OUT)/tests/amd64-mmu-views$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/amd64-mmu-views$(HOSTEXE): tests/arch/amd64/mmu_views_test.c arch/amd64/mm/mmu.c include/kernel/lume/early.h include/kernel/lume/elf.h include/kernel/lume/vm.h include/kernel/lume/heap.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -flto -fwhole-program -ffunction-sections -fdata-sections $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -Wl,--gc-sections -o "$@"
 Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
 $(OUT)/tests/q35-pci$(HOSTEXE): tests/platform/q35/pci_test.c platform/q35/pci.c
 	mkdir -p "$(@D)"

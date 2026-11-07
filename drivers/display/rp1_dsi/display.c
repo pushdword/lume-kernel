@@ -100,8 +100,7 @@ static void delay(unsigned us)
         lume_counter_delay_us(frequency, us);
         return;
     }
-    uint64_t ticks = frequency / 1000000 * us +
-                     (frequency % 1000000 * us + 999999) / 1000000;
+    uint64_t ticks = frequency / 1000000 * us + (frequency % 1000000 * us + 999999) / 1000000;
     uint64_t start = lume_counter_read();
     while (lume_counter_read() - start < ticks)
     {
@@ -113,8 +112,7 @@ static void delay(unsigned us)
 static bool wait(uint64_t address, uint32_t mask, uint32_t value, unsigned us)
 {
     uint64_t start = lume_counter_read();
-    uint64_t ticks = frequency / 1000000 * us +
-                     (frequency % 1000000 * us + 999999) / 1000000;
+    uint64_t ticks = frequency / 1000000 * us + (frequency % 1000000 * us + 999999) / 1000000;
     for (;;)
     {
         if ((lume_mmio_read32(address) & mask) == value)
@@ -138,6 +136,45 @@ static void clean(const void *p, size_t bytes)
 {
     if (!lume_dma_sync_for_device(p, bytes, LUME_DMA_TO_DEVICE))
         lume_fail("display DMA buffer");
+}
+
+struct startup_chunk
+{
+    uint32_t *memory;
+    size_t bytes;
+    bool synchronized;
+};
+
+static void fill_startup_chunk(void *context)
+{
+    struct startup_chunk *chunk = context;
+    for (size_t i = 0; i < chunk->bytes / sizeof(*chunk->memory); ++i)
+        chunk->memory[i] = 0x102030;
+}
+
+static void clean_startup_chunk(void *context)
+{
+    struct startup_chunk *chunk = context;
+    chunk->synchronized = lume_dma_sync_for_device(chunk->memory, chunk->bytes, LUME_DMA_TO_DEVICE);
+}
+
+static void process_startup_framebuffer(void (*run)(void *))
+{
+    uint32_t *memory = fb;
+    size_t bytes = FRAME_BYTES;
+    for (size_t offset = 0; offset < bytes;)
+    {
+        size_t count = bytes - offset;
+        if (count > LUME_WORKER_SLICE_BYTES)
+            count = LUME_WORKER_SLICE_BYTES;
+        struct startup_chunk chunk = {
+            .memory = memory + offset / sizeof(*memory), .bytes = count, .synchronized = true};
+        lume_worker_compute(run, &chunk);
+        if (!chunk.synchronized)
+            lume_fail("display DMA buffer");
+        offset += count;
+        lume_worker_checkpoint((unsigned)count);
+    }
 }
 
 static bool i2c_begin(void)
@@ -392,6 +429,7 @@ static bool dma_start(void)
     if (!lume_pi5_dma_start() ||
         !lume_dma_map(&lume_rp1_dma_domain, (uintptr_t)fb, FRAME_BYTES, &bus))
         return false;
+    process_startup_framebuffer(clean_startup_chunk);
     lume_mmio_write32(DSI + 0x34, 0);
     lume_mmio_write32(DMA + 4, 0);
     lume_mmio_write32(DMA + 8, 0xffffffff);
@@ -407,7 +445,6 @@ static bool dma_start(void)
     lume_mmio_write32(DMA + 0x34, 3u << 16);
     lume_mmio_write32(DMA + 0xc, 0x782b0);
     lume_mmio_write32(DMA, 3 | (448u << 3) | (0x3fu << 17));
-    clean(fb, FRAME_BYTES);
     lume_mmio_write32(DMA + 0x14, WIDTH * 4);
     lume_mmio_write32(DMA + 0x40, (uint32_t)(bus >> 32));
     lume_mmio_write32(DMA + 0x10, (uint32_t)bus);
@@ -565,8 +602,7 @@ bool lume_display_start(uint64_t freq)
     for (unsigned i = 0; i < FRAME_PAGES; ++i)
         framebuffer[i] = memory + (uint64_t)i * 4096;
     fb = (void *)(uintptr_t)framebuffer[0];
-    for (unsigned i = 0; i < WIDTH * HEIGHT; ++i)
-        fb[i] = 0x102030;
+    process_startup_framebuffer(fill_startup_chunk);
     const char title[] = "LUME OS - AARCH64 - RASPBERRY PI 5";
     for (unsigned i = 0; i < sizeof(title) - 1; ++i)
         draw(title[i], 8 + i * 12, 16, 0x66e0bb);

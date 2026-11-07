@@ -24,7 +24,7 @@ static void thread_drop(unsigned task)
     service_wait_cancel(task);
     service_bus_release(task);
     unsigned owner = process_slot(task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     lume_vm_thread_release(owner, task);
 #else
     uint64_t base = LUME_THREAD_BASE + (uint64_t)task * 0x100000 + 4096;
@@ -160,7 +160,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
     uint64_t base, stack_base;
     uint64_t stack_bytes = (r->stack_bytes + 4095) & ~UINT64_C(4095);
     lume_mmu_share_user(task, owner);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     if (!lume_vm_thread_region(owner, task, tls_size, stack_bytes, &base, &stack_base) ||
         !lume_user_buffer(base, tls_size, true))
     {
@@ -349,7 +349,7 @@ static struct lume_context *thread_call(struct lume_context *frame)
             unsigned guard = 0;
             if (thread_slots[target].thread)
             {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
                 if (!lume_vm_thread_bounds(owner, target, &base, &bytes))
                 {
                     LUME_CONTEXT_REG(frame, 0) = (uint64_t)-3;

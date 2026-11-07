@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 /* Workers preserve synchronous call stacks across device waits. Entry, resume, waits and
- * checkpoints require masked IRQs and the scheduler lock. Resource queues own subsystem
+ * checkpoints require the scheduler lock and masked subsystem IRQs. Resident raw RX may remain
+ * enabled. Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
 #define LUME_WORKER_LIMIT 5u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
