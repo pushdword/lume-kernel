@@ -472,6 +472,28 @@ bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
     return false;
 }
 
+bool lume_vm_buffer_ready(unsigned task, uint64_t address, uint64_t bytes)
+{
+    if (task >= LUME_TASK_LIMIT || changing[task] || address > UINT64_MAX - bytes)
+        return false;
+    while (bytes)
+    {
+        uint64_t part = PAGE - address % PAGE;
+        if (part > bytes)
+            part = bytes;
+        if (lume_vm_address(address))
+        {
+            struct vm_area *area = find_area(task, address);
+            if (!area || area->retiring || area->object->changing ||
+                area->offset + address - area->first >= rounded(area->object->bytes))
+                return false;
+        }
+        address += part;
+        bytes -= part;
+    }
+    return true;
+}
+
 static int64_t handle_read_at(void *context, void *data, uint64_t bytes, uint64_t offset)
 {
     struct vm_handle *handle = context;

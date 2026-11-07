@@ -157,7 +157,8 @@ $(OUT)/obj/%.S.o: %.S $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -c "$<" -o "$@"
 $(OUT)/lume.elf: $(PROFILE_FILE) arch/$(ARCH)/config.mk mk/kernel.mk $(OBJECTS) $(DRIVER_OBJECTS) $(SCRIPT) Makefile $(OUT)/configuration
-	$(LD) $(LINK_FLAGS) --gc-sections -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$@"
+	$(file >$@.rsp,$(LINK_FLAGS) --gc-sections -T "$(SCRIPT)" $(OBJECTS) $(DRIVER_OBJECTS) -o "$@")
+	$(LD) @"$@.rsp"
 $(OUT)/lume-amd64.bin: $(OUT)/lume.elf
 	$(OBJCOPY) -O binary "$<" "$@"
 $(OUT)/lume.bin: $(OUT)/lume.elf
@@ -211,6 +212,14 @@ $(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_call
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-poll-wait
+
+.PHONY: check-signal-event-wait
+check-signal-event-wait: $(OUT)/tests/signal-event-wait$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/signal-event-wait$(HOSTEXE): tests/unit/signal_event_wait_test.c tests/unit/poll_wait_test.c src/core/signal_calls.h src/core/signal_wait.h src/core/signal_mask.h src/core/task_wake.h src/core/poll_calls.h include/abi/native/lume/signal.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+check: check-signal-event-wait
 check-memory: $(OUT)/tests/memory$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/memory$(HOSTEXE): tests/unit/memory_test.c src/lib/memory.c
@@ -348,7 +357,11 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h include/kernel/lume/net.h include/kernel/lume/wireless.h
+.PHONY: check-io-calls
+check-io-calls: $(OUT)/tests/io-calls$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/io-calls$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AARCH64=1
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -503,9 +516,9 @@ endif
 .PHONY: check-platform-drivers check-hardware-polling
 check-platform-drivers: $(OUT)/tests/platform-driver$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/device/platform_driver.c
+$(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/device/platform_driver.c src/core/console_output.c tests/fixtures/uart_host/lume/cpu.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Itests/fixtures/uart_host $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 
 .PHONY: check-virtio-block-groups
 check-virtio-block-groups: $(OUT)/tests/virtio-block-groups$(HOSTEXE)
@@ -673,6 +686,14 @@ $(OUT)/tests/uart-rx$(HOSTEXE): tests/unit/uart_rx_test.c platform/raspberrypi5/
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-uart-rx
 
+.PHONY: check-uart-rx-tx
+check-uart-rx-tx: $(OUT)/tests/uart-rx-tx$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/uart-rx-tx$(HOSTEXE): tests/unit/uart_rx_tx_test.c platform/raspberrypi5/uart_rx.c drivers/serial/pl011/uart.c src/core/console_output.c tests/fixtures/uart_host/lume/cpu.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Itests/fixtures/uart_host $(TEST_CPPFLAGS) tests/unit/uart_rx_tx_test.c src/core/console_output.c $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
+check: check-uart-rx-tx
+
 .PHONY: check-realtime
 check-realtime: $(OUT)/tests/realtime$(HOSTEXE)
 	env "$<"
@@ -704,6 +725,35 @@ $(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c include/kerne
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/vm_host -Iinclude/kernel -Iinclude/abi/native "$<" -o "$@"
 check: check-vm-memory
+
+.PHONY: check-user-io-lifetime
+USER_IO_HOST_CPPFLAGS := -Iarch/amd64/include/kernel -Iplatform/q35/include $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
+check-user-io-lifetime: $(OUT)/tests/user-io-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/user-io-lifetime$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1
+$(OUT)/tests/user-io-lifetime$(HOSTEXE): tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
+check: check-user-io-lifetime
+
+SOCKET_LIFETIME_HOST_C := src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c vendor/fatfs/ffunicode.c src/net/socket.c src/net/datagram.c
+.PHONY: check-socket-network-lifetime
+check-socket-network-lifetime: $(OUT)/tests/socket-network-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/socket-network-lifetime$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1
+$(OUT)/tests/socket-network-lifetime$(HOSTEXE): tests/unit/socket_network_lifetime_test.c tests/unit/user_io_lifetime_test.c $(SOCKET_LIFETIME_HOST_C) include/kernel/lume/socket_buffer.h include/kernel/lume/user_buffer.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(USER_IO_HOST_CPPFLAGS) -Ivendor/lwip/src/include $(filter-out tests/unit/user_io_lifetime_test.c,$(filter %.c,$^)) -o "$@"
+check: check-socket-network-lifetime
+
+.PHONY: check-socket-scm-lifetime
+check-socket-scm-lifetime: $(OUT)/tests/socket-scm-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/socket-scm-lifetime$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1
+$(OUT)/tests/socket-scm-lifetime$(HOSTEXE): tests/unit/socket_scm_lifetime_test.c tests/unit/socket_network_lifetime_test.c tests/unit/user_io_lifetime_test.c $(SOCKET_LIFETIME_HOST_C) src/syscall/socket_io.c include/kernel/lume/socket_io.h include/kernel/lume/socket_buffer.h include/kernel/lume/user_buffer.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(USER_IO_HOST_CPPFLAGS) -Ivendor/lwip/src/include $(filter-out src/mm/user_buffer.c tests/unit/user_io_lifetime_test.c tests/unit/socket_network_lifetime_test.c,$(filter %.c,$^)) -o "$@"
+check: check-socket-scm-lifetime
 
 .PHONY: check-vfs-append
 check-vfs-append: $(OUT)/tests/vfs-append$(HOSTEXE)

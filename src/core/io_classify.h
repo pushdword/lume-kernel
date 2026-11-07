@@ -18,7 +18,8 @@ static bool kernel_local_control_call(const struct lume_context *frame)
             (action == LUME_THREAD_WAIT || action == LUME_THREAD_WAKE ||
              action == LUME_THREAD_WAIT_REALTIME)) ||
            (number == LUME_SYS_SIGNAL &&
-            (action == LUME_SIGNAL_MASK || action == LUME_SIGNAL_TRY_WAIT));
+            (action == LUME_SIGNAL_MASK || action == LUME_SIGNAL_TRY_WAIT ||
+             action == LUME_SIGNAL_WAIT));
 }
 
 static bool kernel_call_mutates(const struct lume_context *frame)

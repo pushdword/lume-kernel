@@ -100,11 +100,7 @@ extern unsigned char __user_code_start[], __user_code_end[];
 #define LUME_HEAP_BASE UINT64_C(0x48000000)
 #define LUME_THREAD_BASE UINT64_C(0x5a000000)
 #define LUME_HEAP_LIMIT (LUME_THREAD_BASE - 4096)
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-#define LUME_TASK_LIMIT 256u
-#else
-#define LUME_TASK_LIMIT 16u
-#endif
+#include "lume/task_limits.h"
 #if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64)
 _Static_assert(LUME_THREAD_BASE + (uint64_t)LUME_TASK_LIMIT * 0x100000 <= LUME_USER_STACK,
                "thread stacks overlap the main stack");

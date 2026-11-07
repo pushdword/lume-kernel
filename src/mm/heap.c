@@ -6,6 +6,7 @@
 #include "lume/gpu_device.h"
 #include "lume/worker.h"
 #include "lume/break.h"
+#include "lume/user_buffer.h"
 static uint64_t ends[LUME_TASK_LIMIT];
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 static bool extended[LUME_TASK_LIMIT];
@@ -155,6 +156,8 @@ int64_t lume_heap_brk(unsigned pid, uint64_t end)
         return -LUME_ENOMEM;
     if (!lume_gpu_heap_allowed(pid, end))
         return -LUME_EBUSY;
+    if (end < old)
+        lume_user_buffer_invalidate(task, end, old - end);
     unsigned before = (unsigned)((old - base + 4095) / 4096);
     unsigned after = (unsigned)((end - base + 4095) / 4096);
     if (before == after)

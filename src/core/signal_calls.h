@@ -12,7 +12,7 @@ static struct signal_state
         uint32_t mask, flags;
     } action[LUME_SIGNAL_COUNT];
 
-    uint32_t pending, mask;
+    uint32_t pending, mask, wait_mask;
     uint64_t deadline, interval, epoch;
     unsigned session, group, depth;
     struct lume_context saved[SIGNAL_DEPTH];
@@ -28,6 +28,43 @@ static void signal_thread_initialize(unsigned child, unsigned creator)
 static void signal_thread_reset(unsigned task)
 {
     signals[task] = (struct signal_state){0};
+}
+
+static bool signal_wait_active(unsigned task)
+{
+    return signals[task].wait_mask != 0;
+}
+
+static void signal_wait_cancel(unsigned task)
+{
+    signals[task].wait_mask = 0;
+}
+
+static void signal_wait_cancel_process(unsigned owner)
+{
+    for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
+        if (process_slot(task) == owner)
+            signal_wait_cancel(task);
+}
+
+static bool signal_wake_waiter(unsigned owner)
+{
+    for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
+    {
+        struct signal_state *waiting = signals + task;
+        if (states[task] != 4 || process_slot(task) != owner || !waiting->wait_mask)
+            continue;
+        struct lume_signal_request request = {
+            .version = LUME_SIGNAL_VERSION, .bytes = sizeof(request), .mask = waiting->wait_mask};
+        if (signal_try_wait(&signals[owner].pending, waiting->mask, &request))
+            continue;
+        waiting->wait_mask = 0;
+        LUME_CONTEXT_REG(&tasks[task].context, 0) = request.number;
+        states[task] = 1;
+        sched_wake(&policy, task, unit, 0);
+        return true;
+    }
+    return false;
 }
 
 static bool signal_child_notify(unsigned parent)
@@ -86,6 +123,11 @@ static void signal_queue(unsigned owner, unsigned number)
         exit_signals[owner] = number;
         request_exit(owner, 128 + number);
     }
+    else if (signal_wake_waiter(owner))
+    {
+        lume_smp_wake();
+        return;
+    }
     else if (!(s->mask & (1u << number)) &&
              (stream_interrupt(owner) || netctl_interrupt(owner) || dns_interrupt(owner)))
     {
@@ -106,6 +148,7 @@ static void signal_queue(unsigned owner, unsigned number)
         }
         bool restart = (stopping || (s->action[number].flags & (1u << 3))) &&
                        (pipe_wait[owner] || states[owner] == 3);
+        signal_wait_cancel(owner);
         poll_interrupt(owner, &tasks[owner].context);
         stream_cancel(owner);
         netctl_cancel(owner);
@@ -144,6 +187,7 @@ void lume_tasks_signal_timers(void)
 static void signal_inherit(unsigned child, unsigned parent, bool exec)
 {
     struct signal_state *s = &signals[child], *p = &signals[parent];
+    s->wait_mask = 0;
     if (child != parent)
     {
         process_stopped[child] = false;
@@ -309,6 +353,41 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
         return 0;
     }
     return -LUME_ENOSYS;
+}
+
+static struct lume_context *signal_wait_call(struct lume_context *frame, unsigned owner)
+{
+    uint64_t selected = LUME_CONTEXT_REG(frame, 1);
+    struct signal_state *waiting = signals + current_task;
+    if (LUME_CONTEXT_REG(frame, 2) || selected > UINT32_MAX || !selected ||
+        (selected & (SIGNAL_UNMASKABLE | 1u)) || (selected & ~waiting->mask))
+    {
+        LUME_CONTEXT_REG(frame, 0) = (uint64_t)-LUME_EINVAL;
+        return frame;
+    }
+    struct lume_signal_request request = {
+        .version = LUME_SIGNAL_VERSION, .bytes = sizeof(request), .mask = (uint32_t)selected};
+    int64_t result = signal_try_wait(&signals[owner].pending, waiting->mask, &request);
+    if (result != -LUME_EAGAIN)
+    {
+        LUME_CONTEXT_REG(frame, 0) = result ? (uint64_t)result : request.number;
+        return frame;
+    }
+    /* Pending selection and registration execute under the scheduler lock. */
+    waiting->wait_mask = (uint32_t)selected;
+    tasks[current_task].context = *frame;
+    states[current_task] = 4;
+    wake_at[current_task] = UINT64_MAX;
+    sched_charge(&policy, lume_cpu_index(), now());
+    return wait_ready_task();
+}
+
+static struct lume_context *signal_dispatch_call(struct lume_context *frame, unsigned owner)
+{
+    if (LUME_CONTEXT_REG(frame, 0) == LUME_SIGNAL_WAIT)
+        return signal_wait_call(frame, owner);
+    LUME_CONTEXT_REG(frame, 0) = (uint64_t)signal_call(frame, owner);
+    return frame;
 }
 
 struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)

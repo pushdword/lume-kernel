@@ -2,10 +2,11 @@
 #include "lume/vfs.h"
 #include "lume/file_io.h"
 #include "lume/file_io_call.h"
+#include "lume/user_io.h"
 #include <string.h>
 
-int64_t lume_file_io_call(struct lume_files *files, uint64_t operation, uint64_t address,
-                          uint64_t bytes)
+int64_t lume_file_io_call(struct lume_files *files, unsigned pid, uint64_t operation,
+                          uint64_t address, uint64_t bytes)
 {
     if (operation == LUME_FILE_IO_OFD_GETLK || operation == LUME_FILE_IO_OFD_SETLK ||
         operation == LUME_FILE_IO_FLOCK_NB)
@@ -34,10 +35,6 @@ int64_t lume_file_io_call(struct lume_files *files, uint64_t operation, uint64_t
         (request.count &&
          !lume_user_buffer(request.buffer, request.count, operation == LUME_FILE_IO_PREAD)))
         return -LUME_EFAULT;
-    return operation == LUME_FILE_IO_PREAD
-               ? lume_vfs_pread(files, (uint64_t)request.fd, (void *)(uintptr_t)request.buffer,
-                                request.count, request.offset)
-               : lume_vfs_pwrite(files, (uint64_t)request.fd,
-                                 (const void *)(uintptr_t)request.buffer, request.count,
-                                 request.offset);
+    return lume_user_io_call(files, pid, (uint64_t)request.fd, request.buffer, request.count,
+                             operation == LUME_FILE_IO_PWRITE, true, request.offset);
 }

@@ -11,4 +11,10 @@ void lume_datagram_reap(void);
 int64_t lume_datagram_call(struct lume_files *, unsigned, struct lume_socket_request *);
 int64_t lume_datagram_message(struct lume_files *, unsigned, int, struct lume_socket_message *,
                               struct lume_socket_request *);
+struct lume_socket_buffer;
+int64_t lume_datagram_call_buffer(struct lume_files *, unsigned, struct lume_socket_request *,
+                                  struct lume_socket_buffer *);
+int64_t lume_datagram_message_buffer(struct lume_files *, unsigned, int,
+                                     struct lume_socket_message *, struct lume_socket_request *,
+                                     struct lume_socket_buffer *);
 #endif

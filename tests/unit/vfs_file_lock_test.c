@@ -421,18 +421,18 @@ static void request_validation(void)
     struct lume_file_lock_request lock = request(a, LUME_FILE_LOCK_WRITE, 99, 9);
     user_address = (uintptr_t)&lock;
     user_readable = false;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_OFD_SETLK, user_address, sizeof(lock)) ==
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_OFD_SETLK, user_address, sizeof(lock)) ==
            -LUME_EFAULT);
     assert(query(&second, b, LUME_FILE_LOCK_WRITE, 99, 1).type == LUME_FILE_LOCK_UNLOCK);
     user_readable = true;
     user_writable = false;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_OFD_SETLK, user_address, sizeof(lock)) == 0);
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_OFD_SETLK, user_address, sizeof(lock)) == 0);
     lock = request(b, LUME_FILE_LOCK_READ, 99, 1);
-    assert(lume_file_io_call(&second, LUME_FILE_IO_OFD_GETLK, user_address, sizeof(lock)) ==
+    assert(lume_file_io_call(&second, 2, LUME_FILE_IO_OFD_GETLK, user_address, sizeof(lock)) ==
            -LUME_EFAULT);
     assert(lock.type == LUME_FILE_LOCK_READ && lock.start == 99 && lock.length == 1);
     user_writable = true;
-    assert(lume_file_io_call(&second, LUME_FILE_IO_OFD_GETLK, user_address, sizeof(lock)) == 0);
+    assert(lume_file_io_call(&second, 2, LUME_FILE_IO_OFD_GETLK, user_address, sizeof(lock)) == 0);
     assert(lock.type == LUME_FILE_LOCK_WRITE && lock.pid == -1 && lock.length == 9);
     lock = request(a, LUME_FILE_LOCK_WRITE, 0, 1);
     lock.version++;
@@ -597,20 +597,20 @@ static void flock_request_and_admission(void)
     struct lume_file_lock_request lock = request(a, LUME_FILE_LOCK_WRITE, 0, 0);
     user_address = (uintptr_t)&lock;
     user_readable = false;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
            -LUME_EFAULT);
     user_readable = true;
     user_writable = false;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
     assert(flock_set(&second, b, LUME_FILE_LOCK_WRITE) == -LUME_EAGAIN);
-    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock) - 1) ==
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock) - 1) ==
            -LUME_EINVAL);
     lock.start = 1;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) ==
            -LUME_EINVAL);
     lock.start = 0;
     lock.type = LUME_FILE_LOCK_UNLOCK;
-    assert(lume_file_io_call(&first, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
+    assert(lume_file_io_call(&first, 1, LUME_FILE_IO_FLOCK_NB, user_address, sizeof(lock)) == 0);
     user_writable = true;
     lock.fd = -1;
     assert(lume_vfs_flock(&first, &lock) == -LUME_EBADF);
@@ -646,4 +646,19 @@ int main(void)
 #endif
     puts("PASS OFD ranges and FLOCK namespace, conversion, references, validation and admission");
     return 0;
+}
+
+int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                          uint64_t bytes, bool writing, bool positioned, int64_t offset)
+{
+    (void)files;
+    (void)pid;
+    (void)fd;
+    (void)address;
+    (void)bytes;
+    (void)writing;
+    (void)positioned;
+    (void)offset;
+    assert(!"unexpected user transfer in file lock test");
+    abort();
 }

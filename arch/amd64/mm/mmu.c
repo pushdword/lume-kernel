@@ -1,4 +1,5 @@
 #include "lume/mmu.h"
+#include "lume/user_buffer.h"
 #include "lume/elf.h"
 #include "lume/module_memory.h"
 #include "lume/acpi.h"
@@ -266,6 +267,7 @@ void lume_mmu_share_user(unsigned task, unsigned source)
     source = owner(source);
     if (task == source)
         lume_fail("invalid shared address space");
+    lume_user_buffer_invalidate_root(task);
     shared[task] = source + 1;
     jit_depth[task] = 0;
 }
@@ -280,6 +282,7 @@ void lume_mmu_release_user(unsigned task)
         shared[task] = 0;
         return;
     }
+    lume_user_buffer_invalidate_root(task);
     for (unsigned view = 0; view < 2; ++view)
     {
         task_pdpt[task][view][1] = 0;
@@ -467,6 +470,7 @@ static bool map_user_views(unsigned task, uint64_t va, uint64_t pa, bool write, 
     }
     if (*entries[0] || *entries[1])
         return false;
+    lume_user_buffer_invalidate(owner(task), va, 4096);
     for (unsigned view = 0; view < 2; ++view)
     {
         bool writable = write && (!jit || !execute || view == 1);
@@ -512,6 +516,8 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
         }
     }
     for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(owner(task), addresses[i], 4096);
+    for (unsigned i = 0; i < count; ++i)
         for (unsigned view = 0; view < 2; ++view)
             *entries[i][view] = values[i][view];
     lume_arch_flush_user_tlb();
@@ -535,6 +541,8 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
                 return false;
         }
     }
+    for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(owner(task), addresses[i], 4096);
     for (unsigned i = 0; i < count; ++i)
         for (unsigned view = 0; view < 2; ++view)
             *entries[i][view] = 0;
@@ -584,6 +592,8 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
 {
     if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared[a] || shared[b])
         return false;
+    lume_user_buffer_invalidate_root(a);
+    lume_user_buffer_invalidate_root(b);
     for (unsigned view = 0; view < 2; ++view)
     {
         for (unsigned i = 0; i < 512; ++i)

@@ -69,6 +69,7 @@ static void thread_drop(unsigned task)
 static struct lume_context *thread_finish(uint64_t result)
 {
     unsigned task = current_task, owner = process_slot(task);
+    signal_wait_cancel(task);
     if (!kernel_thread_exit_ready(task))
     {
         sched_charge(&policy, lume_cpu_index(), now());
@@ -116,6 +117,7 @@ static struct lume_context *thread_finish(uint64_t result)
 static struct lume_context *process_terminate(unsigned status)
 {
     unsigned owner = process_slot(current_task);
+    signal_wait_cancel_process(owner);
     process_status[owner] = status;
     process_exiting[owner] = true;
     thread_waiting[owner] = futex_address[owner] = 0;

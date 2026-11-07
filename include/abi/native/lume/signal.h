@@ -10,7 +10,9 @@
  * STOP bits are invalid. Version and bytes identify the request. Fields other
  * than mask, version and bytes are zero on input. The result is zero with the
  * selected number, or EAGAIN when none is pending. Secondary threads support
- * MASK and TRY_WAIT. */
+ * MASK, TRY_WAIT, SEND and WAIT. WAIT takes its mask directly in the second syscall argument
+ * and zero in the third argument. It returns one selected signal number and retains no request
+ * pointer while blocked. LUME_FEATURE_SIGNAL_WAIT identifies kernels supporting WAIT. */
 
 enum
 {
@@ -24,7 +26,8 @@ enum
     LUME_SIGNAL_GROUP,
     LUME_SIGNAL_SET_SESSION,
     LUME_SIGNAL_SET_GROUP,
-    LUME_SIGNAL_TRY_WAIT
+    LUME_SIGNAL_TRY_WAIT,
+    LUME_SIGNAL_WAIT
 };
 
 struct lume_signal_request

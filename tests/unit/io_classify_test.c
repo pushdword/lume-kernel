@@ -18,6 +18,7 @@ static struct
 } tasks[LUME_TASK_LIMIT];
 
 static bool process_exiting[LUME_TASK_LIMIT];
+static bool kernel_socket_network[LUME_TASK_LIMIT];
 
 static unsigned process_slot(unsigned task)
 {
@@ -72,13 +73,22 @@ int main(void)
     check(LUME_SYS_SOCKET, LUME_SOCKET_CREATE, LUME_WORK_NETWORK, true);
     check(LUME_SYS_SOCKET, LUME_SOCKET_SEND_FD, LUME_WORK_GENERAL, true);
     check(LUME_SYS_SOCKET, LUME_SOCKET_RECEIVE_FD, LUME_WORK_GENERAL, true);
-    check(LUME_SYS_SOCKET, LUME_SOCKET_SHUTDOWN, KERNEL_IO_EXCLUSIVE, true);
+    const unsigned messages[] = {LUME_SOCKET_SEND_MESSAGE, LUME_SOCKET_RECEIVE_MESSAGE,
+                                 LUME_SOCKET_SHUTDOWN};
+    for (unsigned i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i)
+    {
+        check(LUME_SYS_SOCKET, messages[i], LUME_WORK_GENERAL, true);
+        kernel_socket_network[1] = true;
+        check(LUME_SYS_SOCKET, messages[i], LUME_WORK_NETWORK, true);
+        kernel_socket_network[1] = false;
+    }
     check(LUME_SYS_THREAD, LUME_THREAD_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_THREAD, LUME_THREAD_WAKE, LUME_WORK_GENERAL, false);
     check(LUME_SYS_THREAD, LUME_THREAD_CREATE, KERNEL_IO_EXCLUSIVE, true);
     check(LUME_SYS_THREAD, LUME_THREAD_EXIT, KERNEL_IO_EXCLUSIVE, true);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_MASK, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_TRY_WAIT, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_SIGNAL, LUME_SIGNAL_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 0, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 4096, LUME_WORK_GENERAL, true);
     check(LUME_SYS_MEMORY, 0, LUME_WORK_GENERAL, false);

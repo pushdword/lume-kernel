@@ -3,7 +3,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 /* CPU0 handles raw receive interrupts without entering subsystem callbacks.
- * Consumers hold the kernel lock. Polling remains available without interrupt mode. */
+ * Consumers hold the kernel lock. Lock requests are idempotent and serial scopes nest.
+ * The final owner restores DAIF and PMR. IRQ stop quiesces handlers without waiting for owners.
+ * Polling remains available when interrupt delivery cannot make progress. */
 void lume_pi5_uart_rx_enable(bool);
 void lume_pi5_uart_rx_collect(void);
 void lume_pi5_uart_rx_checkpoint(void);

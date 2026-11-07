@@ -1,4 +1,5 @@
 #include "lume/mmu.h"
+#include "lume/user_buffer.h"
 #include "lume/elf.h"
 #include "lume/module_memory.h"
 #include "lume/kernel_memory.h"
@@ -206,6 +207,7 @@ void lume_mmu_share_user(unsigned task, unsigned owner)
     owner = user_owner(owner);
     if (task == owner)
         lume_fail("invalid shared address space");
+    lume_user_buffer_invalidate_root(task);
     shared_user[task] = owner + 1;
     jit_depth[task] = 0;
 }
@@ -221,6 +223,8 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
 {
     if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared_user[a] || shared_user[b])
         return false;
+    lume_user_buffer_invalidate_root(a);
+    lume_user_buffer_invalidate_root(b);
     for (unsigned view = 0; view < 2; ++view)
     {
         uint64_t *entries = user_root[a][view];
@@ -244,6 +248,7 @@ void lume_mmu_release_user(unsigned task)
         shared_user[task] = 0;
         return;
     }
+    lume_user_buffer_invalidate_root(task);
     bool detached = false;
     for (unsigned view = 0; view < 2; ++view)
         if (user_root[task][view])
@@ -424,6 +429,7 @@ static bool map_user_views(unsigned task, uint64_t va, uint64_t pa, bool write, 
     }
     if (*entries[0] || *entries[1])
         return false;
+    lume_user_buffer_invalidate(user_owner(task), va, 4096);
     for (unsigned view = 0; view < 2; ++view)
     {
         bool writable = write && (!jit || !execute || view == 1);
@@ -474,6 +480,8 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
     }
     /* Only access permissions change. The frame and memory attributes stay valid. */
     for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(user_owner(task), addresses[i], 4096);
+    for (unsigned i = 0; i < count; ++i)
         for (unsigned view = 0; view < 2; ++view)
             __atomic_store_n(entries[i][view], values[i][view], __ATOMIC_RELAXED);
 #ifdef __aarch64__
@@ -501,6 +509,8 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
                 return false;
         }
     }
+    for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(user_owner(task), addresses[i], 4096);
     for (unsigned i = 0; i < count; ++i)
         for (unsigned view = 0; view < 2; ++view)
             *entries[i][view] = 0;

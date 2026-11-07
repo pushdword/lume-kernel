@@ -1,6 +1,14 @@
 #ifndef LUME_SCHEDULER_CONFIG_H
 #define LUME_SCHEDULER_CONFIG_H
 
+#ifndef SCHED_TASKS
+#define SCHED_TASKS 8u
+#endif
+#ifndef SCHED_CPUS
+#define SCHED_CPUS 2u
+#endif
+#define SCHED_MASK_WORDS ((SCHED_TASKS + 63u) / 64u)
+
 #ifndef LUME_SCHED_FAIR
 #define LUME_SCHED_FAIR 1
 #endif

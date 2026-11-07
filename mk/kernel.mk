@@ -25,6 +25,7 @@ KERNEL_C_aarch64 := \
     platform/raspberrypi5/firmware.c \
     src/mm/heap.c \
     src/mm/vm.c \
+    src/mm/user_buffer.c \
     drivers/input/usb_hid/hid_keyboard.c \
     src/net/icmp.c \
     src/device/irq.c \
@@ -55,6 +56,8 @@ KERNEL_C_aarch64 := \
     src/core/supervision.c \
     src/syscall/syscall.c \
     src/syscall/file_io.c \
+    src/syscall/user_io.c \
+    src/syscall/socket_io.c \
     src/syscall/files.c \
     src/syscall/file_lock.c \
     src/syscall/io.c \

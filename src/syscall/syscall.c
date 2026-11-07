@@ -27,6 +27,8 @@
 #include "lume/vfs_paths.h"
 #include "lume/sandbox_policy.h"
 #include "lume/worker.h"
+#include "lume/user_io.h"
+#include "lume/socket_io.h"
 #include "lume/work.h"
 #include "lume/io_redirect.h"
 #include <string.h>
@@ -156,7 +158,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                         LUME_FEATURE_HARDWARE | LUME_FEATURE_MODULES | LUME_FEATURE_SUPERVISION |
                         LUME_FEATURE_FORK | LUME_FEATURE_EXEC | LUME_FEATURE_RANDOM |
                         LUME_FEATURE_SOCKETS | LUME_FEATURE_CREDENTIALS | LUME_FEATURE_SIGNALS |
-                        LUME_FEATURE_FILE_MODES | LUME_FEATURE_EVENT_WAIT,
+                        LUME_FEATURE_FILE_MODES | LUME_FEATURE_EVENT_WAIT |
+                        LUME_FEATURE_SIGNAL_WAIT,
             .pointer_bits = sizeof(uintptr_t) * 8,
             .compat_pointer_bits = 32,
             .fd_limit = LUME_FD_MAX,
@@ -559,49 +562,12 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         if (a > LUME_SOCKET_RECVFROM || n != sizeof(struct lume_socket_request))
             return -LUME_EINVAL;
+        if (a == LUME_SOCKET_SEND_MESSAGE || a == LUME_SOCKET_RECEIVE_MESSAGE ||
+            a == LUME_SOCKET_SENDTO || a == LUME_SOCKET_RECVFROM)
+            return lume_socket_user_io(files, pid, (unsigned)a, b, n);
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
         struct lume_socket_request request = *(const struct lume_socket_request *)(uintptr_t)b;
-        if (a == LUME_SOCKET_SEND_MESSAGE || a == LUME_SOCKET_RECEIVE_MESSAGE)
-        {
-            int permission = lume_sandbox_socket(files, (unsigned)a, &request, NULL);
-            if (permission)
-                return permission;
-            if (request.version != LUME_SOCKET_VERSION || request.bytes != sizeof(request) ||
-                request.other || request.family || request.type || request.flags || request.port ||
-                request.address[0] || request.address[1] || request.address[2] ||
-                request.address[3] || request.reserved || request.reserved2 ||
-                request.count != sizeof(struct lume_socket_message))
-                return -LUME_EINVAL;
-            if (lume_socket_network_io(files, (unsigned)request.fd) &&
-                lume_worker_current() != LUME_WORK_NETWORK)
-                return LUME_IO_RETRY_NETWORK;
-            if (!lume_user_buffer(request.buffer, sizeof(struct lume_socket_message), false) ||
-                !lume_user_buffer(request.buffer, sizeof(struct lume_socket_message), true))
-                return -LUME_EFAULT;
-            struct lume_socket_message message =
-                *(const struct lume_socket_message *)(uintptr_t)request.buffer;
-            if (message.count > LUME_FILE_IO_MAX)
-                return -LUME_EINVAL;
-            if (message.count &&
-                !lume_user_buffer(message.buffer, message.count, a == LUME_SOCKET_RECEIVE_MESSAGE))
-                return -LUME_EFAULT;
-            int64_t result = lume_socket_message_call_metadata(files, (unsigned)a, request.fd,
-                                                               &message, &request);
-            *(struct lume_socket_message *)(uintptr_t)request.buffer = message;
-            *(struct lume_socket_request *)(uintptr_t)b = request;
-            return result;
-        }
-        if (a == LUME_SOCKET_SENDTO || a == LUME_SOCKET_RECVFROM)
-        {
-            if (a == LUME_SOCKET_SENDTO && request.count > LUME_SOCKET_DATAGRAM_MAX)
-                return -LUME_EMSGSIZE;
-            if (request.count > LUME_SOCKET_DATAGRAM_MAX)
-                request.count = LUME_SOCKET_DATAGRAM_MAX;
-            if (request.count &&
-                !lume_user_buffer(request.buffer, request.count, a == LUME_SOCKET_RECVFROM))
-                return -LUME_EFAULT;
-        }
         if (a != LUME_SOCKET_OPTION && request.count > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
         if (request.family == 1 && (a == LUME_SOCKET_BIND || a == LUME_SOCKET_CONNECT ||
@@ -704,14 +670,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             int access = n ? lume_tty_access(files, pid, (unsigned)a, false) : 0;
             if (access)
                 return access;
-            return lume_vfs_read(files, a, (void *)(uintptr_t)b, n);
+            return lume_user_io_call(files, pid, a, b, n, false, false, 0);
         }
         if (LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WRITE)
         {
             int access = n ? lume_tty_access(files, pid, (unsigned)a, true) : 0;
             if (access)
                 return access;
-            return lume_vfs_write(files, a, (const void *)(uintptr_t)b, n);
+            return lume_user_io_call(files, pid, a, b, n, true, false, 0);
         }
         return lume_vfs_getdents(files, a, (void *)(uintptr_t)b, n);
     default:

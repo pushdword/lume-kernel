@@ -8,13 +8,6 @@
 #define LUME_SCHEDULER_H
 #include <stdint.h>
 #include "scheduler_config.h"
-#ifndef SCHED_TASKS
-#define SCHED_TASKS 8u
-#endif
-#ifndef SCHED_CPUS
-#define SCHED_CPUS 2u
-#endif
-#define SCHED_MASK_WORDS ((SCHED_TASKS + 63u) / 64u)
 #if defined(__clang__)
 #define SCHED_FAST static inline __attribute__((always_inline))
 #else
@@ -119,8 +112,7 @@ static int sched_pick_mask(const struct sched_policy *s, unsigned core, const un
     if (skip < SCHED_TASKS)
     {
         for (unsigned i = 0; i < SCHED_TASKS; i++)
-            if (i != skip && state[i] == 1u &&
-                !(mask[i / 64u] & (UINT64_C(1) << (i % 64u))))
+            if (i != skip && state[i] == 1u && !(mask[i / 64u] & (UINT64_C(1) << (i % 64u))))
             {
                 mask[skip / 64u] |= UINT64_C(1) << (skip % 64u);
                 break;
@@ -147,8 +139,7 @@ static int sched_pick_mask(const struct sched_policy *s, unsigned core, const un
         {
             unsigned i = (s->cursor[core] + n) % SCHED_TASKS;
             if (state[i] == 1u && !(mask[i / 64u] & (UINT64_C(1) << (i % 64u))) &&
-                s->task[i].last_core == core &&
-                s->task[i].service <= ceiling)
+                s->task[i].last_core == core && s->task[i].service <= ceiling)
             {
                 best = (int)i;
                 break;

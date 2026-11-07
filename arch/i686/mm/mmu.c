@@ -1,4 +1,5 @@
 #include "lume/mmu.h"
+#include "lume/user_buffer.h"
 #include "lume/elf.h"
 #include "lume/vm.h"
 #include <string.h>
@@ -128,6 +129,7 @@ void lume_mmu_share_user(unsigned task, unsigned source)
 {
     if (task >= LUME_TASK_LIMIT || source >= LUME_TASK_LIMIT || task == source)
         lume_fail("invalid shared address space");
+    lume_user_buffer_invalidate_root(task);
     shared[task] = owner(source) + 1;
 }
 
@@ -140,6 +142,7 @@ void lume_mmu_release_user(unsigned task)
         shared[task] = 0;
         return;
     }
+    lume_user_buffer_invalidate_root(task);
     bool mapped = false;
     for (unsigned i = 0; i < USER_BLOCKS; ++i)
     {
@@ -181,6 +184,7 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
     uint32_t *p = entry(task, va, true);
     if (!p || *p)
         return false;
+    lume_user_buffer_invalidate(owner(task), va, 4096);
     *p = (uint32_t)pa | PRESENT | USER | (write ? WRITE : 0) | (execute ? EXECUTE : 0);
     return true;
 }
@@ -208,6 +212,8 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
                     ((protection & LUME_PROT_EXEC) ? EXECUTE : 0);
     }
     for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(owner(task), addresses[i], 4096);
+    for (unsigned i = 0; i < count; ++i)
         *entries[i] = values[i];
     lume_arch_flush_user_tlb();
     return true;
@@ -227,6 +233,8 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
         if (!entries[i] || !(*entries[i] & PRESENT))
             return false;
     }
+    for (unsigned i = 0; i < count; ++i)
+        lume_user_buffer_invalidate(owner(task), addresses[i], 4096);
     for (unsigned i = 0; i < count; ++i)
         *entries[i] = 0;
     if (count == 1)
@@ -263,6 +271,8 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
 {
     if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared[a] || shared[b])
         return false;
+    lume_user_buffer_invalidate_root(a);
+    lume_user_buffer_invalidate_root(b);
     for (unsigned i = 0; i < USER_BLOCKS; ++i)
     {
         unsigned slot = (unsigned)(LUME_USER_BASE / BLOCK) + i;

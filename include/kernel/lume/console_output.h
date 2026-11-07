@@ -15,7 +15,8 @@ struct lume_console_output
 };
 
 /* Capture, render and completion require the kernel lock. Transmission requires a
- * copied payload and a pinned provider, with IRQs masked and the kernel lock released. */
+ * copied payload and a pinned provider with the kernel lock released. A platform receive scope
+ * may admit resident raw RX while subsystem interrupts remain masked. */
 void lume_console_output_begin(struct lume_console_output *);
 void lume_console_output_end(struct lume_console_output *);
 void lume_console_output_send(const struct lume_console_output *);
@@ -24,6 +25,9 @@ void lume_console_output_finish(struct lume_console_output *);
 void lume_console_output_start(void);
 /* Raw receive progress is bounded and cannot enter subsystem callbacks. */
 void lume_console_receive_checkpoint(void);
+/* Serial scopes nest and cover the complete ticket wait and transmission. */
+void lume_console_receive_begin(void);
+void lume_console_receive_end(void);
 uint64_t lume_console_serial_reserve(void);
 void lume_console_serial_wait(uint64_t);
 uint64_t lume_console_serial_lock(void);

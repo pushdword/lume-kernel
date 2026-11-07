@@ -6,6 +6,8 @@
 #include "lume/abi.h"
 #include "lume/cpu.h"
 #include "lume/console_output.h"
+#include "lume/early.h"
+#include <limits.h>
 
 #define GICD LUME_BOARD_GIC_DISTRIBUTOR_BASE
 #define GICC LUME_BOARD_GIC_CPU_BASE
@@ -22,14 +24,26 @@ static unsigned head, tail, collecting;
 static bool enabled;
 static uint64_t dropped, checked, interval;
 static bool irq_ready, lock_window;
+static bool lock_requested;
+static unsigned serial_scopes;
 static unsigned irq_active;
 static uint64_t interrupts, window_flags;
 static uint32_t saved_priority, window_priority;
 
-static void enter_window(uint64_t flags)
+static void update_window(uint64_t flags)
 {
-    if (__atomic_load_n(&lock_window, __ATOMIC_ACQUIRE) ||
-        !__atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST))
+    if ((!lock_requested && !serial_scopes) || !__atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST))
+    {
+        if (__atomic_load_n(&lock_window, __ATOMIC_ACQUIRE))
+        {
+            flags = window_flags;
+            __atomic_store_n(&lock_window, false, __ATOMIC_RELEASE);
+            lume_mmio_write32_sync(GICC + 4, window_priority);
+        }
+        lume_arch_irq_restore(flags);
+        return;
+    }
+    if (__atomic_load_n(&lock_window, __ATOMIC_ACQUIRE))
     {
         lume_arch_irq_restore(flags);
         return;
@@ -38,7 +52,7 @@ static void enter_window(uint64_t flags)
     window_priority = lume_mmio_read32_relaxed(GICC + 4);
     uint32_t priority =
         window_priority < LUME_BOARD_IRQ_PRIORITY ? window_priority : LUME_BOARD_IRQ_PRIORITY;
-    /* Subsystem handlers remain masked while raw receive can interrupt the lock owner. */
+    /* Lock and serial owners share this CPU0 window. Subsystem handlers remain masked. */
     lume_mmio_write32_sync(GICC + 4, priority);
     __atomic_store_n(&lock_window, true, __ATOMIC_RELEASE);
     lume_arch_irq_restore(flags & ~UINT64_C(0x80));
@@ -46,34 +60,53 @@ static void enter_window(uint64_t flags)
 
 void lume_pi5_uart_rx_lock_enter(void)
 {
-    if (lume_cpu_index() || !__atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST))
+    if (lume_cpu_index())
         return;
-    enter_window(lume_arch_irq_save());
+    if (lock_requested && __atomic_load_n(&lock_window, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST))
+        return;
+    uint64_t flags = lume_arch_irq_save();
+    lock_requested = true;
+    update_window(flags);
 }
 
 void lume_pi5_uart_rx_lock_leave(void)
 {
-    if (lume_cpu_index() || !__atomic_load_n(&lock_window, __ATOMIC_ACQUIRE))
+    if (lume_cpu_index())
         return;
-    (void)lume_arch_irq_save();
-    uint64_t flags = window_flags;
-    uint32_t priority = window_priority;
-    __atomic_store_n(&lock_window, false, __ATOMIC_RELEASE);
-    lume_mmio_write32_sync(GICC + 4, priority);
-    lume_arch_irq_restore(flags);
+    uint64_t flags = lume_arch_irq_save();
+    lock_requested = false;
+    update_window(flags);
 }
 
 void lume_pi5_uart_rx_lock_wait(void)
 {
     if (lume_cpu_index())
         return;
-    if (__atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST))
-        lume_pi5_uart_rx_lock_enter();
-    else
-    {
-        lume_pi5_uart_rx_lock_leave();
-        lume_pi5_uart_rx_checkpoint();
-    }
+    lume_pi5_uart_rx_lock_enter();
+    lume_pi5_uart_rx_checkpoint();
+}
+
+void lume_console_receive_begin(void)
+{
+    if (lume_cpu_index())
+        return;
+    uint64_t flags = lume_arch_irq_save();
+    if (serial_scopes == UINT_MAX)
+        lume_fail("UART receive scope nesting");
+    ++serial_scopes;
+    update_window(flags);
+}
+
+void lume_console_receive_end(void)
+{
+    if (lume_cpu_index())
+        return;
+    uint64_t flags = lume_arch_irq_save();
+    if (!serial_scopes)
+        lume_fail("UART receive scope ownership");
+    --serial_scopes;
+    update_window(flags);
 }
 
 void lume_pi5_uart_rx_irq_mode(bool on)
@@ -94,9 +127,10 @@ void lume_pi5_uart_rx_irq_mode(bool on)
         lume_mmio_write32_sync(address, (priority & ~(255u << shift)) |
                                             (LUME_BOARD_UART_IRQ_PRIORITY << shift));
         __atomic_store_n(&irq_ready, true, __ATOMIC_SEQ_CST);
-        if (!lume_cpu_index() && lume_smp_owned())
+        if (!lume_cpu_index())
         {
-            enter_window(flags);
+            lock_requested |= lume_smp_owned();
+            update_window(flags);
             return;
         }
     }
@@ -208,9 +242,16 @@ bool lume_pi5_uart_rx_interrupt(unsigned *token)
 
 void lume_pi5_uart_rx_checkpoint(void)
 {
-    if (lume_cpu_index() || !__atomic_load_n(&enabled, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST) ||
-        __atomic_load_n(&lock_window, __ATOMIC_ACQUIRE))
+    if (lume_cpu_index())
+        return;
+    bool ready = __atomic_load_n(&irq_ready, __ATOMIC_SEQ_CST);
+    if (!ready && __atomic_load_n(&lock_window, __ATOMIC_ACQUIRE))
+        update_window(lume_arch_irq_save());
+    if (!__atomic_load_n(&enabled, __ATOMIC_ACQUIRE))
+        return;
+    /* A restrictive caller PMR is preserved and serviced by bounded polling instead. */
+    if (ready && __atomic_load_n(&lock_window, __ATOMIC_ACQUIRE) &&
+        window_priority > LUME_BOARD_UART_IRQ_PRIORITY)
         return;
     uint64_t now = lume_counter_read_relaxed();
     if (now - checked < interval)

@@ -32,6 +32,7 @@ static struct
 static struct
 {
     bool thread;
+    unsigned process;
 } thread_slots[LUME_TASK_LIMIT];
 static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 static unsigned states[LUME_TASK_LIMIT], parents[LUME_TASK_LIMIT], exit_signals[LUME_TASK_LIMIT];
@@ -40,6 +41,7 @@ static unsigned wait_target[LUME_TASK_LIMIT];
 static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
 static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
 static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
+static uint64_t wake_at[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT];
 static struct lume_wait_queue queue;
 static uint32_t watched[LUME_TASK_LIMIT];
@@ -54,6 +56,9 @@ static bool cached_input, subscribe_allowed, graphics_owned;
 static unsigned input_samples;
 static unsigned tty_access_checks;
 static int tty_access_result;
+static unsigned signal_when_waiting, expected_exit_status, exit_requests;
+static void signal_queue(unsigned, unsigned);
+static void signal_wait_cancel_process(unsigned);
 
 int lume_tty_access(struct lume_files *files, unsigned owner, unsigned fd, bool writing)
 {
@@ -69,7 +74,7 @@ bool lume_graphics_input_owned(void)
 
 static unsigned process_slot(unsigned task)
 {
-    return task;
+    return thread_slots[task].thread ? thread_slots[task].process : task;
 }
 
 static void child_state_event(unsigned task, unsigned event)
@@ -163,6 +168,14 @@ static bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user
 static struct lume_context *wait_ready_task(void)
 {
     ++blocked;
+    if (signal_when_waiting)
+    {
+        unsigned number = signal_when_waiting;
+        signal_when_waiting = 0;
+        signal_queue(process_slot(current_task), number);
+        assert(states[current_task] == 1);
+        return &tasks[current_task].context;
+    }
     return &suspended;
 }
 
@@ -175,9 +188,9 @@ static struct lume_context *finish_program(unsigned status)
 
 static void request_exit(unsigned owner, unsigned status)
 {
-    (void)owner;
-    (void)status;
-    assert(0);
+    assert(expected_exit_status && status == expected_exit_status && owner < LUME_TASK_LIMIT);
+    signal_wait_cancel_process(owner);
+    ++exit_requests;
 }
 
 static bool lume_context_signal(struct lume_context *frame, uint64_t handler, uint64_t restorer)
@@ -366,6 +379,7 @@ static void reset(void)
     input_samples = 0;
     tty_access_checks = 0;
     tty_access_result = 0;
+    signal_when_waiting = expected_exit_status = exit_requests = 0;
     generation = 1;
     states[0] = 2;
     signal_inherit(0, 0, false);

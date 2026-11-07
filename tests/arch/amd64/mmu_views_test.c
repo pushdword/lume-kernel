@@ -7,6 +7,16 @@
 
 #include "../../../arch/amd64/mm/mmu.c"
 
+void lume_user_buffer_invalidate(unsigned task, uint64_t first, uint64_t bytes)
+{
+    assert(task < LUME_TASK_LIMIT && !(first & 4095) && bytes == 4096);
+}
+
+void lume_user_buffer_invalidate_root(unsigned task)
+{
+    assert(task < LUME_TASK_LIMIT);
+}
+
 #define MOCK_PAGE_COUNT 128u
 #define MOCK_NODE_COUNT 128u
 

@@ -8,6 +8,7 @@
 #include "lume/early.h"
 #include "lume/net_limits.h"
 #include "lume/datagram.h"
+#include "lume/socket_buffer.h"
 #include <string.h>
 
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
@@ -148,7 +149,8 @@ void lume_socket_reap(void)
     }
 }
 
-static int64_t tcp_read(void *context, void *data, uint64_t bytes)
+static int64_t tcp_read_buffer(void *context, void *data, uint64_t bytes,
+                               struct lume_socket_buffer *transfer)
 {
     struct tcp_file *file = context;
     if (!file->handle || file->listening)
@@ -159,7 +161,9 @@ static int64_t tcp_read(void *context, void *data, uint64_t bytes)
     {
         if (bytes > file->buffered_count)
             bytes = file->buffered_count;
-        memcpy(data, file->buffered + file->buffered_first, (unsigned)bytes);
+        if (!lume_socket_buffer_copy(transfer, (uintptr_t)data, 0,
+                                     file->buffered + file->buffered_first, (size_t)bytes, true))
+            return -LUME_EFAULT;
         file->buffered_first += (unsigned)bytes;
         file->buffered_count -= (unsigned)bytes;
         if (!file->buffered_count)
@@ -169,13 +173,23 @@ static int64_t tcp_read(void *context, void *data, uint64_t bytes)
     }
     struct lume_stream_request request = {.count = bytes < LUME_IO_BYTES ? (unsigned)bytes
                                                                          : LUME_IO_BYTES};
+    unsigned capacity = request.count;
     int result = stream(file, LUME_STREAM_RECEIVE, &request);
-    if (result > 0)
-        memcpy(data, request.data, (unsigned)result);
+    if (result > (int)capacity)
+        return -LUME_EIO;
+    if (result > 0 &&
+        !lume_socket_buffer_copy(transfer, (uintptr_t)data, 0, request.data, (size_t)result, true))
+        return -LUME_EFAULT;
     return result;
 }
 
-static int64_t tcp_peek(struct tcp_file *file, void *data, uint64_t bytes)
+static int64_t tcp_read(void *context, void *data, uint64_t bytes)
+{
+    return tcp_read_buffer(context, data, bytes, NULL);
+}
+
+static int64_t tcp_peek(struct tcp_file *file, void *data, uint64_t bytes,
+                        struct lume_socket_buffer *transfer)
 {
     if (!file->handle || file->listening)
         return -LUME_EINVAL;
@@ -200,19 +214,30 @@ static int64_t tcp_peek(struct tcp_file *file, void *data, uint64_t bytes)
     }
     if (bytes > file->buffered_count)
         bytes = file->buffered_count;
-    memcpy(data, file->buffered + file->buffered_first, (unsigned)bytes);
+    if (!lume_socket_buffer_copy(transfer, (uintptr_t)data, 0,
+                                 file->buffered + file->buffered_first, (size_t)bytes, true))
+        return -LUME_EFAULT;
     return (int64_t)bytes;
 }
 
-static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
+static int64_t tcp_write_buffer(void *context, const void *data, uint64_t bytes,
+                                struct lume_socket_buffer *transfer)
 {
     struct tcp_file *file = context;
     if (!file->handle || file->listening || file->shutdown)
         return -LUME_EPIPE;
     struct lume_stream_request request = {.count = bytes < LUME_IO_BYTES ? (unsigned)bytes
                                                                          : LUME_IO_BYTES};
-    memcpy(request.data, data, request.count);
-    return stream(file, LUME_STREAM_SEND, &request);
+    if (!lume_socket_buffer_copy(transfer, (uintptr_t)data, 0, request.data, request.count, false))
+        return -LUME_EFAULT;
+    unsigned capacity = request.count;
+    int result = stream(file, LUME_STREAM_SEND, &request);
+    return result > (int)capacity ? -LUME_EIO : result;
+}
+
+static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
+{
+    return tcp_write_buffer(context, data, bytes, NULL);
 }
 
 static const struct lume_file_ops tcp_ops = {.kind = LUME_NODE_SOCKET,
@@ -406,7 +431,8 @@ static bool rights_cycle(unsigned destination, const struct local_rights *rights
 }
 
 static int64_t local_send_message(struct lume_files *files, struct local_end *end,
-                                  const struct lume_socket_message *message)
+                                  const struct lume_socket_message *message,
+                                  struct lume_socket_buffer *transfer)
 {
     struct local_pair *pair = end->pair;
     struct local_ring *ring = &pair->ring[end->side ^ 1];
@@ -467,9 +493,16 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
         return error;
     }
     uint64_t offset = ring->produced;
-    const unsigned char *data = (const void *)(uintptr_t)message->buffer;
-    for (unsigned i = 0; i < bytes; ++i)
-        ring->data[(ring->first + ring->count + i) % LUME_PIPE_BYTES] = data[i];
+    unsigned start = (ring->first + ring->count) % LUME_PIPE_BYTES;
+    unsigned first = bytes < LUME_PIPE_BYTES - start ? bytes : LUME_PIPE_BYTES - start;
+    if (!lume_socket_buffer_check(transfer, 0, bytes, false) ||
+        !lume_socket_buffer_copy(transfer, message->buffer, 0, ring->data + start, first, false) ||
+        !lume_socket_buffer_copy(transfer, message->buffer, first, ring->data, bytes - first,
+                                 false))
+    {
+        drop_rights(group);
+        return -LUME_EFAULT;
+    }
     ring->count += bytes;
     ring->produced += bytes;
     if (group)
@@ -483,7 +516,8 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
 }
 
 static int64_t local_receive_message(struct lume_files *files, struct local_end *end,
-                                     struct lume_socket_message *message)
+                                     struct lume_socket_message *message,
+                                     struct lume_socket_buffer *transfer)
 {
     struct local_pair *pair = end->pair;
     struct local_ring *ring = &pair->ring[end->side];
@@ -536,9 +570,12 @@ static int64_t local_receive_message(struct lume_files *files, struct local_end 
             --ring->rights_count;
         }
     }
-    unsigned char *data = (void *)(uintptr_t)message->buffer;
-    for (unsigned i = 0; i < bytes; ++i)
-        data[i] = ring->data[(ring->first + i) % LUME_PIPE_BYTES];
+    unsigned first = bytes < LUME_PIPE_BYTES - ring->first ? bytes : LUME_PIPE_BYTES - ring->first;
+    bool copied =
+        lume_socket_buffer_check(transfer, 0, bytes, true) &&
+        lume_socket_buffer_copy(transfer, message->buffer, 0, ring->data + ring->first, first,
+                                true) &&
+        lume_socket_buffer_copy(transfer, message->buffer, first, ring->data, bytes - first, true);
     if (!peek)
     {
         ring->first = (ring->first + bytes) % LUME_PIPE_BYTES;
@@ -547,12 +584,13 @@ static int64_t local_receive_message(struct lume_files *files, struct local_end 
         local_notify(pair);
         drop_rights(group);
     }
-    return bytes;
+    return copied ? (int64_t)bytes : -LUME_EFAULT;
 }
 
-int64_t lume_socket_message_call_metadata(struct lume_files *files, unsigned operation, int fd,
-                                          struct lume_socket_message *message,
-                                          struct lume_socket_request *metadata)
+int64_t lume_socket_message_call_buffer(struct lume_files *files, unsigned operation, int fd,
+                                        struct lume_socket_message *message,
+                                        struct lume_socket_request *metadata,
+                                        struct lume_socket_buffer *transfer)
 {
     int permission =
         lume_vfs_sandbox_access(files, (uint64_t)fd, operation == LUME_SOCKET_SEND_MESSAGE);
@@ -566,11 +604,12 @@ int64_t lume_socket_message_call_metadata(struct lume_files *files, unsigned ope
              : message->flags & ~(LUME_SOCKET_MESSAGE_CLOEXEC | LUME_SOCKET_MESSAGE_PEEK)))
         return -LUME_EINVAL;
     if (lume_datagram_file(files, (unsigned)fd))
-        return lume_datagram_message(files, operation, fd, message, metadata);
+        return lume_datagram_message_buffer(files, operation, fd, message, metadata, transfer);
     struct local_end *end = message_end(files, fd);
     if (end)
-        return operation == LUME_SOCKET_SEND_MESSAGE ? local_send_message(files, end, message)
-                                                     : local_receive_message(files, end, message);
+        return operation == LUME_SOCKET_SEND_MESSAGE
+                   ? local_send_message(files, end, message, transfer)
+                   : local_receive_message(files, end, message, transfer);
     struct tcp_file *tcp = lume_vfs_external(files, (unsigned)fd, &tcp_ops);
     if (!tcp)
         return -LUME_EBADF;
@@ -578,10 +617,18 @@ int64_t lume_socket_message_call_metadata(struct lume_files *files, unsigned ope
         return -LUME_ENOSYS;
     message->rights_count = 0;
     if (message->flags & LUME_SOCKET_MESSAGE_PEEK)
-        return tcp_peek(tcp, (void *)(uintptr_t)message->buffer, message->count);
+        return tcp_peek(tcp, (void *)(uintptr_t)message->buffer, message->count, transfer);
     return operation == LUME_SOCKET_SEND_MESSAGE
-               ? tcp_write(tcp, (const void *)(uintptr_t)message->buffer, message->count)
-               : tcp_read(tcp, (void *)(uintptr_t)message->buffer, message->count);
+               ? tcp_write_buffer(tcp, (const void *)(uintptr_t)message->buffer, message->count,
+                                  transfer)
+               : tcp_read_buffer(tcp, (void *)(uintptr_t)message->buffer, message->count, transfer);
+}
+
+int64_t lume_socket_message_call_metadata(struct lume_files *files, unsigned operation, int fd,
+                                          struct lume_socket_message *message,
+                                          struct lume_socket_request *metadata)
+{
+    return lume_socket_message_call_buffer(files, operation, fd, message, metadata, NULL);
 }
 
 int64_t lume_socket_message_call(struct lume_files *files, unsigned operation, int fd,
@@ -781,13 +828,13 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
                 return -LUME_ENOSYS;
             struct lume_socket_message message = {
                 .buffer = r->buffer, .count = 1, .rights_count = 1, .rights = {r->other}};
-            return local_send_message(files, end, &message);
+            return local_send_message(files, end, &message, NULL);
         }
         if (operation == LUME_SOCKET_RECEIVE_FD)
         {
             struct lume_socket_message message = {
                 .buffer = r->buffer, .count = r->count, .rights_count = 1};
-            int64_t result = local_receive_message(files, end, &message);
+            int64_t result = local_receive_message(files, end, &message, NULL);
             r->other = -1;
             if (message.rights_count)
                 r->other = message.rights[0];

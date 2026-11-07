@@ -7,6 +7,10 @@ int64_t lume_socket_message_call(struct lume_files *, unsigned, int, struct lume
 int64_t lume_socket_message_call_metadata(struct lume_files *, unsigned, int,
                                           struct lume_socket_message *,
                                           struct lume_socket_request *);
+struct lume_socket_buffer;
+int64_t lume_socket_message_call_buffer(struct lume_files *, unsigned, int,
+                                        struct lume_socket_message *, struct lume_socket_request *,
+                                        struct lume_socket_buffer *);
 bool lume_socket_network_io(struct lume_files *, unsigned);
 bool lume_socket_reap_pending(void);
 /* Closed TCP contexts are reclaimed only while owning the NETWORK lane. */

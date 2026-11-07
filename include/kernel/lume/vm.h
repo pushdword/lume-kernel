@@ -29,6 +29,7 @@ void lume_vm_poll_background(void);
  * retry after a mapping transaction, zero denies access, and minus one reports backing failure. */
 int lume_vm_fault(unsigned, uint64_t, bool, bool);
 bool lume_vm_resolve_buffer(uint64_t, uint64_t, bool);
+bool lume_vm_buffer_ready(unsigned, uint64_t, uint64_t);
 bool lume_vm_file_call(unsigned, const struct lume_vm_request *);
 
 static inline bool lume_vm_address(uint64_t address)

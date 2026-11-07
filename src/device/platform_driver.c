@@ -429,13 +429,6 @@ void lume_console_output_end(struct lume_console_output *output)
     console_capture = NULL;
 }
 
-void lume_console_output_send(const struct lume_console_output *output)
-{
-    lume_console_serial_wait(output->ticket);
-    output->transmit(output->data, output->bytes);
-    lume_console_serial_unlock(output->ticket);
-}
-
 void lume_console_output_finish(struct lume_console_output *output)
 {
     struct provider *provider = output->provider;

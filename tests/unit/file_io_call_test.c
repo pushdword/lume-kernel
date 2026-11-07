@@ -2,6 +2,7 @@
 #include "lume/vfs.h"
 #include "lume/file_io.h"
 #include "lume/file_io_call.h"
+#include "lume/user_io.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -73,9 +74,17 @@ int64_t lume_vfs_resize(struct lume_files *files, uint64_t fd, uint64_t length)
     return 0;
 }
 
+int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                          uint64_t bytes, bool writing, bool positioned, int64_t offset)
+{
+    assert(pid == 1 && positioned);
+    return writing ? lume_vfs_pwrite(files, fd, (const void *)(uintptr_t)address, bytes, offset)
+                   : lume_vfs_pread(files, fd, (void *)(uintptr_t)address, bytes, offset);
+}
+
 static int64_t call(unsigned operation)
 {
-    return lume_file_io_call(NULL, operation, (uintptr_t)&request, sizeof(request));
+    return lume_file_io_call(NULL, 1, operation, (uintptr_t)&request, sizeof(request));
 }
 
 static void reset(void)
@@ -154,8 +163,8 @@ int main(void)
     request.count = 0;
     request.offset = -1;
     assert(call(LUME_FILE_IO_TRUNCATE) == -LUME_EINVAL);
-    assert(lume_file_io_call(NULL, 0, UINT64_MAX - 1, sizeof(request)) == -LUME_EFAULT);
-    assert(lume_file_io_call(NULL, 0, (uintptr_t)&request, sizeof(request) - 1) == -LUME_EINVAL);
+    assert(lume_file_io_call(NULL, 1, 0, UINT64_MAX - 1, sizeof(request)) == -LUME_EFAULT);
+    assert(lume_file_io_call(NULL, 1, 0, (uintptr_t)&request, sizeof(request) - 1) == -LUME_EINVAL);
     puts("PASS file I/O request version, widths, permissions, copies and invalid arguments");
     return 0;
 }

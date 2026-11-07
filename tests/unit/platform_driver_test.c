@@ -35,14 +35,13 @@ _Noreturn void lume_fail(const char *why)
     }
 }
 
-void lume_console_serial_wait(uint64_t ticket)
+void lume_cpu_relax_ordered(void)
 {
-    assert(ticket == 17);
+    assert(false);
 }
 
-void lume_console_serial_unlock(uint64_t ticket)
+void lume_memory_complete(void)
 {
-    assert(ticket == 17);
 }
 
 int lume_module_pin(uintptr_t callback, void **out)
@@ -284,7 +283,8 @@ int main(void)
     assert(lume_platform_driver_can_stop(LUME_PLATFORM_UART, &uart) == -LUME_EBUSY);
     assert(lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart) == -LUME_EBUSY);
     unsigned before = received;
-    output.ticket = 17;
+    lume_console_output_start();
+    output.ticket = lume_console_serial_reserve();
     lume_console_output_send(&output);
     assert(received == before + 6 && references == 1);
     lume_console_output_finish(&output);

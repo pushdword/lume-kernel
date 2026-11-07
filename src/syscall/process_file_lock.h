@@ -8,7 +8,7 @@ static int64_t process_file_io_call(struct lume_files *files, unsigned pid, uint
 {
     bool query = operation == LUME_FILE_IO_POSIX_GETLK;
     if (!query && operation != LUME_FILE_IO_POSIX_SETLK)
-        return lume_file_io_call(files, operation, address, bytes);
+        return lume_file_io_call(files, pid, operation, address, bytes);
     if (bytes != sizeof(struct lume_file_lock_request))
         return -LUME_EINVAL;
     if (address > UINTPTR_MAX || bytes > UINTPTR_MAX - address ||

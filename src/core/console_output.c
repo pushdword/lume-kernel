@@ -10,6 +10,23 @@ __attribute__((weak)) void lume_console_receive_checkpoint(void)
 {
 }
 
+__attribute__((weak)) void lume_console_receive_begin(void)
+{
+}
+
+__attribute__((weak)) void lume_console_receive_end(void)
+{
+}
+
+void lume_console_output_send(const struct lume_console_output *output)
+{
+    lume_console_receive_begin();
+    lume_console_serial_wait(output->ticket);
+    output->transmit(output->data, output->bytes);
+    lume_console_serial_unlock(output->ticket);
+    lume_console_receive_end();
+}
+
 void lume_console_output_start(void)
 {
     initialized = true;

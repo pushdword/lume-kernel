@@ -3,6 +3,7 @@
 #include "lume/abi.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #define LUME_MMIO_H
 #define LUME_COUNTER_H
 #define LUME_SMP_H
@@ -13,6 +14,12 @@ static uint64_t daif = 0x80;
 static uint32_t priority_mask = 0xff, priorities = 0x80808080, pending_token = 1023;
 static unsigned device_pending, eois, wakeups, uart_accesses;
 static bool owned, parent_masked, complete_active;
+
+_Noreturn void lume_fail(const char *message)
+{
+    fputs(message, stderr);
+    abort();
+}
 
 static bool lume_smp_owned(void)
 {
@@ -195,6 +202,7 @@ int main(void)
     assert(lume_pi5_uart_rx_read() == (int)expected);
     assert(lume_pi5_uart_rx_read() == (int)((expected + 1) & 0xfff));
 
+    lume_pi5_uart_rx_lock_leave();
     owned = false;
     parent_masked = false;
     priority_mask = 0x20;

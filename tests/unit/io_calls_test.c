@@ -7,11 +7,13 @@
 #include "lume/net.h"
 #include "lume/net_commands.h"
 #include "lume/process.h"
+#include "lume/task_limits.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define LUME_TASK_LIMIT LUME_WORK_DOMAINS
+#define SCHED_TASKS LUME_TASK_LIMIT
+#include "scheduler_config.h"
 #define LUME_CONTEXT_SYSCALL_REGISTER 8u
 #define LUME_SYSCALL_INSTRUCTION_BYTES 4u
 #define LUME_CONTEXT_REG(c, n) ((c)->x[n])
@@ -56,6 +58,8 @@ static bool block_pipe, nonblock_pipe, filesystem_scope;
 static bool expect_writing, override_result;
 static int64_t inline_result;
 static unsigned pipe_process, charges, selections, progress, submissions, resumes;
+static unsigned sandbox_checks;
+static int sandbox_result;
 static struct lume_context *inline_frame, selected_frame;
 static bool kernel_console_scope;
 static bool memory_descriptor;
@@ -68,6 +72,7 @@ static bool task_mutation[LUME_TASK_LIMIT];
 #define suspended_once worker_suspended[0]
 #define pending_work work_pending[0]
 static unsigned files_released[LUME_TASK_LIMIT];
+static unsigned poll_releases[LUME_TASK_LIMIT];
 static unsigned counter_step = 1, worker_cost_ms;
 
 bool lume_vfs_reap_pending(void)
@@ -103,6 +108,7 @@ static unsigned stream_attempts, stream_connects, stream_closes;
 static bool stream_ready, stream_event, stream_fault, stop_during_attempt;
 static uint32_t pending_signal;
 static unsigned netctl_attempts, netctl_starts, netctl_cancels;
+static unsigned dns_attempts;
 static bool netctl_ready, netctl_fault, netctl_return_fault, netctl_capable = true;
 static bool signal_during_scan;
 static int cancel_scan_result;
@@ -117,6 +123,17 @@ static bool task_signal_pending(unsigned owner)
 
 bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool writing)
 {
+    if (writing && tasks[current_task].context.x[8] == LUME_SYS_NET &&
+        tasks[current_task].context.x[0] == LUME_NET_DNS)
+    {
+        const struct lume_net_request *request =
+            (const void *)(uintptr_t)tasks[current_task].context.x[1];
+        if (pointer == (uintptr_t)request->output)
+        {
+            assert(bytes && bytes <= sizeof(request->output));
+            return !netctl_fault;
+        }
+    }
     if (bytes == sizeof(struct lume_net_control) || bytes == sizeof(struct lume_net_request) ||
         bytes == sizeof(((struct lume_net_request *)0)->output))
         return pointer && (!writing || !netctl_fault);
@@ -231,10 +248,9 @@ int64_t lume_net_compat_scan(const struct lume_net_control *request, int64_t res
 int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char out[4], bool resumed,
                               bool *pending)
 {
-    (void)owner;
-    (void)name;
+    assert(owner == current_task + 1 && name && !resumed);
+    ++dns_attempts;
     (void)out;
-    (void)resumed;
     *pending = false;
     return -LUME_EIO;
 }
@@ -310,6 +326,11 @@ static uint64_t lume_mmu_task_root(unsigned task)
 static uint64_t lume_mmu_root(void)
 {
     return 0;
+}
+
+static bool lume_mmu_root_active(uint64_t value)
+{
+    return value == root;
 }
 
 static void lume_mmu_switch(uint64_t value)
@@ -463,6 +484,15 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *frame, u
     return override_result ? inline_result : block_pipe ? -LUME_EAGAIN : (int64_t)pid * 10;
 }
 
+int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume_context *frame)
+{
+    assert(current_task < LUME_TASK_LIMIT);
+    assert(files == &tasks[process_slot(current_task)].files);
+    assert(pid == process_slot(current_task) + 1 && frame == &tasks[current_task].context);
+    ++sandbox_checks;
+    return sandbox_result;
+}
+
 bool lume_vfs_pipe_wait(struct lume_files *files, uint64_t fd)
 {
     assert(files == &tasks[pipe_process].files && fd == 3);
@@ -475,7 +505,7 @@ struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *files, uint64_t f
     return &pipe_queue;
 }
 
-static unsigned network_checks, storage_checks;
+static unsigned network_checks, storage_checks, vm_checks;
 
 void lume_net_poll_background(void)
 {
@@ -485,6 +515,17 @@ void lume_net_poll_background(void)
 void lume_storage_poll_background(void)
 {
     ++storage_checks;
+}
+
+void lume_vm_poll_background(void)
+{
+    ++vm_checks;
+}
+
+void lume_vfs_poll_release(unsigned task)
+{
+    assert(task < LUME_TASK_LIMIT && !kernel_task_active(task));
+    ++poll_releases[task];
 }
 
 static bool kernel_enqueue(unsigned, unsigned, bool);
@@ -506,6 +547,7 @@ static void reset(void)
     memset(lock_ticks, 0, sizeof(lock_ticks));
     memset(kernel_files_closed, 0, sizeof(kernel_files_closed));
     memset(files_released, 0, sizeof(files_released));
+    memset(poll_releases, 0, sizeof(poll_releases));
     memset(tasks, 0, sizeof(tasks));
     memset(states, 0, sizeof(states));
     memset(kernel_wait, 0, sizeof(kernel_wait));
@@ -524,6 +566,7 @@ static void reset(void)
     stream_attempts = stream_connects = stream_closes = pending_signal = 0;
     stream_ready = stream_event = stream_fault = stop_during_attempt = false;
     netctl_attempts = netctl_starts = netctl_cancels = 0;
+    dns_attempts = 0;
     netctl_ready = netctl_fault = netctl_return_fault = signal_during_scan = false;
     netctl_capable = true;
     cancel_scan_result = 0;
@@ -555,6 +598,8 @@ static void reset(void)
     memory_descriptor = false;
     inline_frame = NULL;
     pipe_process = charges = selections = progress = submissions = resumes = 0;
+    sandbox_checks = 0;
+    sandbox_result = 0;
     current_task = 3;
     root = 4;
     kernel_owner = LUME_TASK_LIMIT;
@@ -606,7 +651,7 @@ static void cancellation_and_exit(void)
     enqueue(0, false);
     enqueue(1, false);
     kernel_cancel(0);
-    assert(!kernel_wait[0]);
+    assert(!kernel_wait[0] && poll_releases[0] == 1);
     process_exiting[1] = true;
     wake_at[1] = UINT64_MAX;
     kernel_step();
@@ -900,6 +945,39 @@ static void independent_resources(void)
     assert(executed[1] == 1 && !lume_worker_busy());
 }
 
+static void high_process_admission(void)
+{
+    _Static_assert(LUME_TASK_LIMIT > 65, "native admission covers multiple task mask words");
+    reset();
+    counter_step = 0;
+    worker_blocked[LUME_WORK_STORAGE] = true;
+    enqueue_domain(64, LUME_WORK_STORAGE);
+    task_mutation[64] = true;
+    kernel_step();
+    process_owner[65] = 64;
+    enqueue_domain(65, LUME_WORK_GENERAL);
+    enqueue_domain(0, LUME_WORK_GENERAL);
+    kernel_step();
+    assert(!executed[64] && !executed[65] && executed[0] == 1);
+    assert(kernel_wait[65] && kernel_lanes[LUME_WORK_GENERAL].queue.queued[65]);
+    worker_blocked[LUME_WORK_STORAGE] = false;
+    kernel_step();
+    kernel_step();
+    assert(executed[64] == 1 && executed[65] == 1 && !lume_worker_busy());
+}
+
+static void denied_worker_call(void)
+{
+    reset();
+    counter_step = 0;
+    sandbox_result = -LUME_EPERM;
+    enqueue_domain(0, LUME_WORK_STORAGE);
+    kernel_step();
+    assert(sandbox_checks == 1 && !executed[0] && !kernel_wait[0]);
+    assert(states[0] == 1 && (int64_t)tasks[0].context.x[0] == -LUME_EPERM);
+    assert(!lume_worker_busy());
+}
+
 static void local_messages_during_loading(void)
 {
     for (unsigned shared = 0; shared < 2; ++shared)
@@ -1111,7 +1189,7 @@ static void exclusive_background_continuation(void)
     assert(!lume_worker_busy_on(LUME_WORK_NETWORK) && !work_drained[LUME_WORK_STORAGE]);
     worker_blocked[LUME_WORK_STORAGE] = false;
     kernel_step();
-    assert(work_drained[LUME_WORK_STORAGE] == 1 && work_pending[LUME_WORK_STORAGE]);
+    assert(!work_drained[LUME_WORK_STORAGE] && work_pending[LUME_WORK_STORAGE]);
     assert(!work_drained[LUME_WORK_NETWORK] && work_pending[LUME_WORK_NETWORK]);
     assert(states[1] == 1 && kernel_cleanup_ready(1));
     kernel_step();
@@ -1410,7 +1488,12 @@ static void legacy_scan_parking(void)
             continue;
         reset();
         begin_legacy_call(operation, &request, sizeof(request));
-        assert(executed[0] == 1 && !netctl_attempts && !compat_formats && !compat_interfaces);
+        if (operation == LUME_NET_DNS)
+            assert(!executed[0] && dns_attempts == 1 &&
+                   (int64_t)tasks[0].context.x[0] == -LUME_EIO && !request.output[0]);
+        else
+            assert(executed[0] == 1 && !dns_attempts);
+        assert(!netctl_attempts && !compat_formats && !compat_interfaces);
     }
 }
 
@@ -1421,6 +1504,8 @@ int main(void)
     stream_parking();
     bounded_resource_turn();
     independent_resources();
+    high_process_admission();
+    denied_worker_call();
     local_messages_during_loading();
     descriptor_conflicts();
     exclusive_wait_keeps_progress();
@@ -1434,7 +1519,7 @@ int main(void)
     inline_pipe_wait_and_replay();
     final_close_wait();
     queued_memory_io();
-    assert(network_checks && network_checks == storage_checks);
+    assert(network_checks && network_checks == storage_checks && vm_checks == storage_checks);
     puts(
         "PASS_IO_CALLS owner root, completion, cancellation, exit, inline pipe replay and bounded fairness");
     return 0;

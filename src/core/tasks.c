@@ -392,6 +392,8 @@ static void signal_queue(unsigned, unsigned);
 static uint32_t signal_interrupt_pending(unsigned);
 static bool task_signal_pending(unsigned);
 static void signal_inherit(unsigned, unsigned, bool);
+static void signal_wait_cancel(unsigned);
+static void signal_wait_cancel_process(unsigned);
 static void poll_cancel(unsigned);
 static void poll_interrupt(unsigned, struct lume_context *);
 static void service_wait_cancel(unsigned);
@@ -470,6 +472,7 @@ static void detach_program(unsigned);
 
 static void detach_program(unsigned task)
 {
+    signal_wait_cancel(task);
     extern void lume_graphics_release(unsigned);
     lume_graphics_release(task + 1);
     kernel_cancel(task);
@@ -561,6 +564,7 @@ static bool process_busy(unsigned owner)
 
 static void request_exit(unsigned owner, unsigned status)
 {
+    signal_wait_cancel_process(owner);
     process_stopped[owner] = false;
     child_events[owner] = 0;
     if (!process_exiting[owner])
@@ -833,60 +837,7 @@ static struct lume_context *select_task(unsigned next)
     return &tasks[next].context;
 }
 
-static void wake_tasks(void)
-{
-    extern void lume_tasks_signal_timers(void);
-    lume_tasks_signal_timers();
-    poll_console_pump();
-    extern bool lume_console_ready(void);
-    uint64_t at = lume_clock_monotonic();
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (states[i] == 4)
-        {
-            if (kernel_wait[i] || thread_waiting[i])
-                continue;
-            if (stream_wake(i, at))
-                continue;
-            if (netctl_wake(i, at))
-                continue;
-            if (dns_wake(i, at))
-                continue;
-            if (service_wait_wake(i, at))
-                continue;
-            if (poll_wait_active(i))
-            {
-                if (poll_wake(i, at))
-                {
-                    states[i] = 1;
-                    sched_wake(&policy, i, unit, 0);
-                }
-                continue;
-            }
-            bool ready = input_wait[i] && kernel_console_ready();
-            if (pipe_wait[i])
-            {
-                if (!lume_wait_take(pipe_queues[i], i))
-                    continue;
-                pipe_queues[i] = 0;
-                ready = true;
-            }
-            if (!ready && !thread_deadline_expired(i, at))
-                continue;
-            if (futex_address[i])
-            {
-                futex_address[i] = 0;
-                LUME_CONTEXT_REG(&tasks[i].context, 0) = (uint64_t)-110;
-            }
-            else if (!pipe_wait[i])
-                LUME_CONTEXT_REG(&tasks[i].context, 0) =
-                    input_wait[i] && !ready ? (uint64_t)-LUME_EAGAIN : 0;
-            pipe_wait[i] = false;
-            kernel_wait[i] = false;
-            input_wait[i] = false;
-            states[i] = 1;
-            sched_wake(&policy, i, unit, 0);
-        }
-}
+#include "task_wake.h"
 
 static struct lume_context *wait_ready_task(void)
 {
@@ -1862,10 +1813,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         return frame;
     }
     if (public_mode && LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SIGNAL)
-    {
-        LUME_CONTEXT_REG(frame, 0) = (uint64_t)signal_call(frame, process);
-        return frame;
-    }
+        return signal_dispatch_call(frame, process);
     bool terminal_wait =
         public_mode &&
         LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_TERMINAL &&
@@ -2231,6 +2179,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         context_replaced[i] = false;
         lume_supervision_release(i + 1);
         thread_slots[i] = (struct thread_state){.process = i};
+        signal_wait_cancel(i);
         poll_cancel(i);
         stream_waits[i] = (struct stream_wait_state){0};
         service_wait_cancel(i);
