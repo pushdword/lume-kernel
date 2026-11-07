@@ -3,34 +3,69 @@ static struct io_queue *kernel_domain_queue(unsigned domain)
     return domain == KERNEL_IO_EXCLUSIVE ? &kernel_control_queue : &kernel_lanes[domain].queue;
 }
 
-static bool kernel_process_conflict(unsigned task, bool mutation)
+enum kernel_block_reason
 {
-    unsigned process = process_slot(task);
+    KERNEL_BLOCK_NONE = 0,
+    KERNEL_BLOCK_CHILD_LOAD = 1,
+    KERNEL_BLOCK_OTHER = 2
+};
+
+static bool kernel_child_ipc_call(const struct lume_context *frame)
+{
+    if (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) != LUME_SYS_SOCKET)
+        return false;
+    uint64_t action = LUME_CONTEXT_REG(frame, 0);
+    return action == LUME_SOCKET_SEND_MESSAGE || action == LUME_SOCKET_RECEIVE_MESSAGE ||
+           action == LUME_SOCKET_CONNECT;
+}
+
+static bool kernel_child_pending_vm(const struct lume_context *frame)
+{
+    uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+    return kernel_call_mutates(frame) && (number == LUME_SYS_VM || number == LUME_SYS_BRK);
+}
+
+static unsigned kernel_process_blocks(unsigned task, bool mutation)
+{
+    unsigned process = process_slot(task), blocked = KERNEL_BLOCK_NONE;
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
     {
         struct kernel_io_lane *lane = kernel_lanes + i;
         if (lume_worker_busy_on(i) && lane->owner < LUME_TASK_LIMIT &&
             process_slot(lane->owner) == process && (mutation || lane->mutation))
-            return true;
+        {
+            bool snapshot = i == LUME_WORK_STORAGE && lane->child_snapshot_ready && lane->launch &&
+                            lane->mutation && !lane->exclusive && !lane->exclusive_pending &&
+                            !process_exiting[process] &&
+                            LUME_CONTEXT_REG(&tasks[lane->owner].context,
+                                             LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN_ACTIONS;
+            blocked |= snapshot ? KERNEL_BLOCK_CHILD_LOAD : KERNEL_BLOCK_OTHER;
+        }
         if (io_queue_granted(&lane->queue, lume_clock_monotonic()))
         {
             unsigned owner = lane->queue.grant.task;
             if (process_slot(owner) == process &&
                 (mutation || kernel_call_mutates(&tasks[owner].context)))
-                return true;
+                blocked |= KERNEL_BLOCK_OTHER;
         }
     }
-    return false;
+    return blocked;
+}
+
+static unsigned kernel_resource_blocks(unsigned domain, unsigned task, bool mutation)
+{
+    if (domain == KERNEL_IO_EXCLUSIVE)
+        return !lume_worker_busy() && !kernel_any_grant() ? KERNEL_BLOCK_NONE : KERNEL_BLOCK_OTHER;
+    if (kernel_exclusive_active() || lume_worker_busy_on(domain) ||
+        io_queue_granted(&kernel_control_queue, lume_clock_monotonic()) ||
+        io_queue_granted(&kernel_lanes[domain].queue, lume_clock_monotonic()))
+        return KERNEL_BLOCK_OTHER;
+    return task < LUME_TASK_LIMIT ? kernel_process_blocks(task, mutation) : KERNEL_BLOCK_NONE;
 }
 
 static bool kernel_resource_available(unsigned domain, unsigned task, bool mutation)
 {
-    if (domain == KERNEL_IO_EXCLUSIVE)
-        return !lume_worker_busy() && !kernel_any_grant();
-    return !kernel_exclusive_active() && !lume_worker_busy_on(domain) &&
-           !io_queue_granted(&kernel_control_queue, lume_clock_monotonic()) &&
-           !io_queue_granted(&kernel_lanes[domain].queue, lume_clock_monotonic()) &&
-           (task >= LUME_TASK_LIMIT || !kernel_process_conflict(task, mutation));
+    return kernel_resource_blocks(domain, task, mutation) == KERNEL_BLOCK_NONE;
 }
 
 static bool kernel_regular_draining(void)
@@ -46,7 +81,8 @@ static bool kernel_regular_draining(void)
 static bool kernel_request_ready(unsigned domain, unsigned task, const struct lume_context *frame,
                                  bool admitted)
 {
-    return kernel_resource_available(domain, task, kernel_call_mutates(frame)) &&
+    unsigned blocked = kernel_resource_blocks(domain, task, kernel_call_mutates(frame));
+    return (!blocked || (blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_ipc_call(frame))) &&
            (admitted || domain == KERNEL_IO_EXCLUSIVE || !kernel_regular_draining()) &&
            (admitted || !kernel_domain_queue(domain)->count);
 }
@@ -146,7 +182,11 @@ static void kernel_cancel(unsigned task)
     }
     io_queue_cancel(&kernel_control_queue, task);
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+    {
         io_queue_cancel(&kernel_lanes[i].queue, task);
+        if (kernel_lanes[i].owner == task)
+            kernel_lanes[i].child_snapshot_ready = false;
+    }
     if (!kernel_task_active(task))
     {
         stream_cancel(task);
@@ -207,6 +247,7 @@ static bool kernel_admit_queue(unsigned domain)
     if (lume_worker_busy_on(slot) || io_queue_granted(queue, lume_clock_monotonic()))
         return false;
     uint64_t blocked_processes[SCHED_MASK_WORDS] = {0};
+    uint64_t snapshot_blocked_processes[SCHED_MASK_WORDS] = {0};
     for (unsigned i = 0; i < queue->count;)
     {
         struct io_ticket ticket = queue->entries[(queue->head + i) % LUME_TASK_LIMIT];
@@ -233,10 +274,19 @@ static bool kernel_admit_queue(unsigned domain)
         bool mutation = kernel_call_mutates(&tasks[task].context);
         unsigned process_word = process / 64u;
         uint64_t process_bit = UINT64_C(1) << (process % 64u);
+        unsigned blocked = kernel_resource_blocks(domain, task, mutation);
+        bool snapshot_ipc =
+            blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_ipc_call(&tasks[task].context);
         if ((blocked_processes[process_word] & process_bit) ||
-            !kernel_resource_available(domain, task, mutation))
+            ((snapshot_blocked_processes[process_word] & process_bit) && !snapshot_ipc) ||
+            (blocked && !snapshot_ipc))
         {
-            blocked_processes[process_word] |= process_bit;
+            if (blocked == KERNEL_BLOCK_CHILD_LOAD &&
+                kernel_child_pending_vm(&tasks[task].context) &&
+                !(blocked_processes[process_word] & process_bit))
+                snapshot_blocked_processes[process_word] |= process_bit;
+            else
+                blocked_processes[process_word] |= process_bit;
             ++i;
             continue;
         }
@@ -257,6 +307,7 @@ static bool kernel_admit_queue(unsigned domain)
             kernel_retry_launch[task] = false;
             lane->exclusive = domain == KERNEL_IO_EXCLUSIVE;
             lane->mutation = mutation;
+            lane->child_snapshot_ready = false;
             lane->cancel_generation = kernel_lanes[LUME_WORK_NETWORK].queue.generation[task];
             lane->deferred_turn = true;
             if (!lume_worker_submit_on(slot, kernel_call, lane))
@@ -312,6 +363,31 @@ static void kernel_image_commit_end(void)
         kernel_lanes[slot].exclusive = kernel_lanes[slot].exclusive_pending = false;
 }
 
+static bool kernel_child_snapshot_begin(void)
+{
+    unsigned slot = lume_worker_current();
+    if (slot != LUME_WORK_STORAGE)
+        lume_fail("child image phase requires storage worker");
+    struct kernel_io_lane *lane = kernel_lanes + slot;
+    if (lane->owner != current_task || !lane->launch || !lane->mutation || lane->exclusive ||
+        lane->exclusive_pending ||
+        LUME_CONTEXT_REG(&tasks[lane->owner].context, LUME_CONTEXT_SYSCALL_REGISTER) !=
+            LUME_SYS_RUN_ACTIONS)
+        lume_fail("child image phase context");
+    if (process_exiting[process_slot(lane->owner)])
+        return false;
+    lane->child_snapshot_ready = true;
+    return true;
+}
+
+static void kernel_child_snapshot_end(void)
+{
+    unsigned slot = lume_worker_current();
+    if (slot != LUME_WORK_STORAGE)
+        lume_fail("child image phase requires storage worker");
+    kernel_lanes[slot].child_snapshot_ready = false;
+}
+
 /* A selected lane returns with the lock held before the submitter commits its return path. */
 static void kernel_step_selected(bool admit, unsigned selected_domain)
 {
@@ -341,6 +417,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                 lane->deferred_turn = false;
                 lane->owner = LUME_TASK_LIMIT;
                 lane->exclusive = domain == LUME_WORK_GENERAL;
+                lane->child_snapshot_ready = false;
                 (void)lume_worker_submit_on(domain, kernel_work, (void *)(uintptr_t)domain);
                 continue;
             }
@@ -351,6 +428,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                 lane->deferred_turn = false;
                 lane->owner = LUME_TASK_LIMIT;
                 lane->exclusive = domain == LUME_WORK_GENERAL;
+                lane->child_snapshot_ready = false;
                 (void)lume_worker_submit_on(domain, kernel_work, (void *)(uintptr_t)domain);
             }
         }
@@ -417,6 +495,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             struct lume_context *frame = &tasks[owner].context;
             lane->owner = LUME_TASK_LIMIT;
             lane->exclusive = lane->mutation = lane->exclusive_pending = false;
+            lane->child_snapshot_ready = false;
             lane->reclaim = false;
             kernel_wait[owner] = false;
             kernel_socket_network[owner] = false;
@@ -541,6 +620,7 @@ static bool kernel_close_ready(unsigned task)
     lane->owner = task;
     lane->launch = false;
     lane->exclusive = lane->mutation = true;
+    lane->child_snapshot_ready = false;
     lane->deferred_turn = true;
     kernel_wait[task] = true;
     states[task] = 4;

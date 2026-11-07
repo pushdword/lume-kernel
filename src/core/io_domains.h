@@ -13,6 +13,7 @@ struct kernel_io_lane
     int64_t result;
     uint64_t cancel_generation;
     bool launch, deferred_turn, exclusive, mutation, exclusive_pending, reclaim;
+    bool child_snapshot_ready;
 };
 
 static struct kernel_io_lane kernel_lanes[LUME_WORK_DOMAINS];

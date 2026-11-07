@@ -535,6 +535,7 @@ static bool kernel_reclaim_ready(unsigned task)
     struct kernel_io_lane *lane = kernel_lanes + LUME_WORK_GENERAL;
     lane->owner = task;
     lane->launch = lane->exclusive = lane->exclusive_pending = false;
+    lane->child_snapshot_ready = false;
     lane->mutation = lane->reclaim = lane->deferred_turn = true;
     kernel_memory_release[task] = KERNEL_MEMORY_RECLAIMING;
     kernel_wait[task] = true;
@@ -939,6 +940,7 @@ static struct lume_context *kernel_begin(struct lume_context *frame, bool launch
     lane->launch = launch;
     lane->exclusive = domain == KERNEL_IO_EXCLUSIVE;
     lane->mutation = kernel_call_mutates(&tasks[task].context);
+    lane->child_snapshot_ready = false;
     lane->cancel_generation = kernel_lanes[LUME_WORK_NETWORK].queue.generation[task];
     lane->deferred_turn = true;
     kernel_wait[task] = true;
@@ -1199,17 +1201,26 @@ static int start_program_with_scratch(struct lume_context *frame,
             return result;
         }
     }
+    bool child_snapshot = false;
     error = lume_vfs_canonical(&tasks[child].files, path, executable);
     if (!error)
+    {
+        if (actions_call && !replacing)
+            child_snapshot = kernel_child_snapshot_begin();
         error = lume_vfs_program(&tasks[child].files, path, &data, &bytes);
+    }
     if (error)
     {
+        if (child_snapshot)
+            kernel_child_snapshot_end();
         lume_files_release(&tasks[child].files);
         return error;
     }
     struct lume_elf_plan plan;
     if (!lume_elf_plan(data, bytes, &plan))
     {
+        if (child_snapshot)
+            kernel_child_snapshot_end();
         lume_files_release(&tasks[child].files);
         return -LUME_ENOEXEC;
     }
@@ -1232,6 +1243,11 @@ static int start_program_with_scratch(struct lume_context *frame,
     lume_mmu_unmap_user(child, LUME_USER_BASE);
     if (!lume_elf_load(child, data, bytes, &images[child]))
         goto fail;
+    if (child_snapshot)
+    {
+        kernel_child_snapshot_end();
+        child_snapshot = false;
+    }
     for (unsigned i = 0; i < argc; ++i)
         argument_pointers[i] = arguments + offsets[i];
     for (unsigned i = 0; i < request.envc; ++i)
@@ -1350,6 +1366,8 @@ static int start_program_with_scratch(struct lume_context *frame,
     return (int)child + 1;
 
 fail:
+    if (child_snapshot)
+        kernel_child_snapshot_end();
     if (replacing)
         kernel_image_commit_end();
     uint64_t files_pages = files_ready ? lume_files_pages(&tasks[child].files) : 0;
