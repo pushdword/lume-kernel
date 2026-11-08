@@ -116,10 +116,11 @@ static uint64_t lume_counter_frequency(void)
 
 static bool locked = true;
 static uint64_t turn;
+static unsigned cpu_index;
 
 unsigned lume_cpu_index(void)
 {
-    return 0;
+    return cpu_index;
 }
 
 unsigned lume_cpu_count(void)

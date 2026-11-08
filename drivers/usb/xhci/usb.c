@@ -80,8 +80,9 @@ struct host
     bool running, valid;
     unsigned errors, completions;
     uint32_t root_ready, next_scan;
+    uint64_t next_poll;
     unsigned retired_reports, retired_characters, retired_dropped;
-    bool scanning, event_polling;
+    bool scanning, event_polling, poll_scheduled;
     /* The host operation owns command, EP0 and DMA storage across worker waits. */
     enum host_operation operation;
     struct lume_work topology;
@@ -279,11 +280,12 @@ static void arm_input(struct host *h, struct device *d, struct input *input)
     lume_mmio_write32(h->doorbells + d->slot * 4, input->endpoint);
 }
 
-static void events(struct host *h)
+static bool events(struct host *h)
 {
     if (h->event_polling || !h->events)
-        return;
+        return false;
     h->event_polling = true;
+    bool advanced = false;
     unsigned used = 0;
     while (used++ < 256)
     {
@@ -292,6 +294,7 @@ static void events(struct host *h)
         struct lume_xhci_trb e = *entry;
         if ((e.control & 1) != h->event_cycle)
             break;
+        advanced = true;
         lume_dma_read_barrier();
         unsigned type = (e.control >> 10) & 63, cc = e.status >> 24, slot = e.control >> 24,
                  ep = (e.control >> 16) & 31;
@@ -355,9 +358,12 @@ static void events(struct host *h)
             h->event_cycle ^= 1;
         }
     }
-    write64(h->rt + 0x38, dma(&h->events[h->event_head]) | 8);
-    lume_mmio_write32(h->rt + 0x20, 1); /* IP W1C, IE stays clear: no RP1 interrupts. */
+    if (advanced)
+        write64(h->rt + 0x38, dma(&h->events[h->event_head]) | 8);
+    if (advanced || (lume_mmio_read32(h->rt + 0x20) & 1))
+        lume_mmio_write32(h->rt + 0x20, 1); /* IP W1C with interrupt delivery disabled. */
     h->event_polling = false;
+    return advanced;
 }
 
 static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned control,
@@ -1011,8 +1017,14 @@ void lume_usb_poll(void)
         struct host *h = &hosts[i];
         if (!h->running || h->operation == HOST_STOP)
             continue;
-        events(h);
         queue_topology(h);
+        uint64_t now = lume_counter_read();
+        if (h->poll_scheduled && (int64_t)(now - h->next_poll) < 0 && !h->waiting_command &&
+            !h->waiting_transfer)
+            continue;
+        bool advanced = events(h);
+        h->poll_scheduled = !advanced;
+        h->next_poll = now + (h->frequency + 999) / 1000;
         for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
         {
             struct device *d = &h->devices[slot];

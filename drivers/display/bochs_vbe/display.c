@@ -302,8 +302,8 @@ static int64_t video_control(unsigned action, unsigned value, const unsigned cha
     }
 }
 
-static const struct lume_platform_display_ops operations = {start, display_putc, write,
-                                                            clear, stop,         video_control};
+static const struct lume_platform_display_ops operations = {start, display_putc,  write, clear,
+                                                            stop,  video_control, NULL,  NULL};
 
 static int graphics_query(struct lume_graphics_request *request)
 {

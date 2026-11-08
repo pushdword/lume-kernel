@@ -31,6 +31,7 @@ static struct lume_access_point scan_results[LUME_SCAN_MAX];
 static unsigned scan_count, scan_errors;
 static uint32_t scan_started;
 static bool scan_retiring;
+static uint32_t scan_retired_at;
 static unsigned char receive_queue[8][1514];
 static uint16_t receive_size[8];
 static unsigned receive_head, receive_count, receive_drops;
@@ -55,7 +56,53 @@ static unsigned operation_depth;
 static bool reported_link;
 static unsigned char reported_peer[6];
 
-/* The transport buffers and SDPCM/BCDC sequence state remain owned across every wait. */
+/* Firmware replies retain their command identity between bounded poll passes. */
+static struct pending_control
+{
+    bool active, sent, set;
+    uint16_t id;
+    uint32_t command;
+    uint64_t deadline;
+    size_t bytes, capacity, received;
+    int result;
+    unsigned char input[192], output[1024];
+} pending_control;
+
+enum authentication_phase
+{
+    AUTH_IDLE,
+    AUTH_ASSOC_INFO,
+    AUTH_ASSOC_IES,
+    AUTH_INPUT,
+    AUTH_SEND,
+    AUTH_PAIRWISE,
+    AUTH_GROUP,
+    AUTH_AUTHORIZE
+};
+
+static struct
+{
+    enum authentication_phase phase;
+    unsigned char frame[512];
+    size_t bytes, ies_bytes;
+    uint64_t deadline;
+    struct lume_wpa_action action;
+    bool association_ready;
+} authentication;
+
+static bool reset_pending;
+static bool leave_owned(void);
+static void control_received(size_t);
+static void authentication_reset(void);
+
+static void retire_scan(void)
+{
+    if (!scan_retiring)
+        scan_retired_at = lume_clock_millis();
+    scan_retiring = true;
+}
+
+/* Each reservation protects the transport buffers and SDPCM/BCDC sequence state. */
 static bool operation_begin(bool wait)
 {
     while (!lume_wifi_claim())
@@ -343,7 +390,9 @@ static int packet(void)
     network_account(LUME_NET_WIFI_CREDIT,
                     !flow_mask && !hardware_flow && credits <= 64 ? credits : 0);
     network_account(LUME_NET_WIFI_PACKETS, 0);
-    if (h.channel != 0)
+    if (h.channel == 0)
+        control_received(h.length);
+    else
         dispatch(&h);
     return (int)h.length;
 }
@@ -382,9 +431,95 @@ static void settle_data(void)
     data_in_flight = false;
 }
 
+static void control_reset(void)
+{
+    lume_secret_clear(&pending_control, sizeof(pending_control));
+}
+
+static bool control_begin(uint32_t command, bool set, const void *input, size_t bytes,
+                          size_t capacity)
+{
+    if (pending_control.active || reset_pending || request_id == UINT16_MAX ||
+        bytes > sizeof(pending_control.input) || capacity > sizeof(pending_control.output))
+        return false;
+    pending_control = (struct pending_control){.active = true,
+                                               .set = set,
+                                               .id = ++request_id,
+                                               .command = command,
+                                               .deadline = deadline_after(2000000),
+                                               .bytes = bytes,
+                                               .capacity = capacity};
+    if (bytes)
+        memcpy(pending_control.input, input, bytes);
+    return true;
+}
+
+static bool control_get_begin(const char *name, size_t capacity)
+{
+    size_t bytes = strlen(name) + 1;
+    return control_begin(262, false, name, bytes, capacity > bytes ? capacity : bytes);
+}
+
+static void control_received(size_t bytes)
+{
+    if (!pending_control.active || !pending_control.sent || pending_control.result ||
+        !before_deadline(pending_control.deadline))
+        return;
+    int32_t status;
+    int result = lume_wifi_control_reply(rx, bytes, pending_control.id, pending_control.command,
+                                         pending_control.output, pending_control.capacity,
+                                         &pending_control.received, &status);
+    if (result)
+    {
+        pending_control.result = result;
+        if (result == 1 || result == -2)
+            ++responses;
+        if (result == -2)
+            lume_value("WIFI_FW_CONTROL_STATUS", (uint32_t)status);
+    }
+}
+
+static int control_progress(void)
+{
+    if (!pending_control.active)
+        return -1;
+    if (pending_control.result)
+        return pending_control.result;
+    if (!before_deadline(pending_control.deadline))
+    {
+        lume_value("WIFI_FW_TIMEOUT_COMMAND", pending_control.command);
+        return pending_control.result = -1;
+    }
+    if (pending_control.sent)
+        return 0;
+    if (data_in_flight)
+    {
+        if ((uint32_t)(lume_clock_millis() - data_sent_at) < 50)
+            return 0;
+        data_in_flight = false;
+    }
+    if (!lume_wifi_tx_allowed(tx_sequence, tx_credit, flow_mask, hardware_flow))
+        return 0;
+    size_t bytes = lume_wifi_control_request(tx, sizeof(tx), tx_sequence, pending_control.id,
+                                             pending_control.command, pending_control.set,
+                                             pending_control.input, pending_control.bytes,
+                                             pending_control.set ? 0 : pending_control.capacity);
+    if (!bytes || !fifo(true, tx, bytes))
+        return pending_control.result = -1;
+    ++tx_sequence;
+    ++requests;
+    pending_control.sent = true;
+    pending_control.deadline = deadline_after(3000000);
+    lume_secret_clear(pending_control.input, sizeof(pending_control.input));
+    lume_secret_clear(tx, sizeof(tx));
+    return 0;
+}
+
 static int control_attempt(uint32_t op, bool set, const void *input, size_t bytes, void *output,
                            size_t cap, size_t *got, bool *attempted)
 {
+    if (pending_control.active || reset_pending)
+        return -1;
     settle_data();
     if (request_id == UINT16_MAX)
         return -1;
@@ -678,6 +813,8 @@ static bool run(struct lume_files *files)
 
 static bool firmware_owned(void)
 {
+    if (reset_pending || pending_control.active || authentication.phase != AUTH_IDLE)
+        return false;
     bus = lume_wifi_bus();
     if (!bus || !bus->write53)
         return false;
@@ -882,15 +1019,20 @@ static void dispatch(const struct lume_wifi_frame *h)
     {
         carrier = ssid_ok = psk_ok = false;
         joining = false;
+        if (authentication_ready)
+            reset_pending = true;
     }
 }
 
 static bool prepare_owned(const unsigned char mac[6])
 {
-    if (!mac || (mac[0] & 1))
+    if (!mac || (mac[0] & 1) || reset_pending || pending_control.active ||
+        authentication.phase != AUTH_IDLE)
         return false;
     operational = carrier = ssid_ok = psk_ok = joining = scan_running = scan_done = false;
     scan_retiring = false;
+    reset_pending = false;
+    authentication_reset();
     receive_head = receive_count = receive_drops = 0;
     authentication_ready = false;
     auth_head = auth_count = 0;
@@ -924,10 +1066,11 @@ static bool prepare_owned(const unsigned char mac[6])
     return true;
 }
 
-static bool install_key(const unsigned char *key, unsigned index, bool group,
-                        const unsigned char rsc[8])
+static bool key_begin(const unsigned char *key, unsigned index, bool group,
+                      const unsigned char rsc[8])
 {
-    unsigned char wire[164] = {0};
+    unsigned char input[173] = "wsec_key";
+    unsigned char *wire = input + 9;
     put32(wire, index);
     put32(wire + 4, 16);
     put32(wire + 112, 4);
@@ -944,108 +1087,171 @@ static bool install_key(const unsigned char *key, unsigned index, bool group,
     else
         for (unsigned i = 0; i < 6; ++i)
             wire[156 + i] = supplicant.peer[i];
-    bool ok = set_variable("wsec_key", wire, sizeof(wire));
-    lume_secret_clear(wire, sizeof(wire));
+    bool ok = control_begin(263, true, input, sizeof(input), sizeof(pending_control.output));
+    lume_secret_clear(input, sizeof(input));
     return ok;
 }
 
-static bool send_auth(const void *data, size_t bytes)
+static bool association_rsn(const unsigned char *data, size_t count)
 {
-    if (!wait_transmit())
-        return false;
-    size_t count = lume_wifi_data_frame(tx, sizeof(tx), tx_sequence, data, bytes);
-    if (!count || !fifo(true, tx, count))
-        return false;
-    ++tx_sequence;
-    data_in_flight = true;
-    data_sent_at = lume_clock_millis();
-    return true;
-}
-
-static bool association_rsn(void)
-{
-    size_t got;
-    if (get_variable("assoc_info", answer, 64, &got) != 1 || got < 4)
-        return false;
-    size_t count = get32(answer);
-    if (!count || count > sizeof(answer) ||
-        get_variable("assoc_req_ies", answer, count, &got) != 1 || got < count)
-        return false;
     for (size_t pos = 0; pos + 2 <= count;)
     {
-        size_t n = (size_t)answer[pos + 1] + 2;
+        size_t n = (size_t)data[pos + 1] + 2;
         if (n > count - pos)
             return false;
-        if (answer[pos] == 48)
+        if (data[pos] == 48)
         {
             bool same = n == sizeof(lume_wpa_rsn);
             for (size_t j = 0; same && j < n; ++j)
-                same = answer[pos + j] == lume_wpa_rsn[j];
+                same = data[pos + j] == lume_wpa_rsn[j];
             lume_value("WIFI_ASSOC_RSN_MATCH", same);
             lume_value("WIFI_ASSOC_RSN_BYTES", n);
-            return lume_wpa_set_rsn(&supplicant, answer + pos, n);
+            return lume_wpa_set_rsn(&supplicant, data + pos, n);
         }
         pos += n;
     }
     return false;
 }
 
+static void authentication_reset(void)
+{
+    control_reset();
+    lume_secret_clear(&authentication, sizeof(authentication));
+}
+
+static bool authentication_next(void)
+{
+    struct lume_wpa_action *action = &authentication.action;
+    if (action->pairwise)
+    {
+        action->pairwise = false;
+        authentication.phase = AUTH_PAIRWISE;
+        return key_begin(action->tk, 0, false, action->rsc);
+    }
+    if (action->group)
+    {
+        action->group = false;
+        authentication.phase = AUTH_GROUP;
+        return key_begin(action->gtk, action->gtk_id, true, action->rsc);
+    }
+    if (action->authorize)
+    {
+        action->authorize = false;
+        authentication.phase = AUTH_AUTHORIZE;
+        return control_begin(121, true, supplicant.peer, 6, sizeof(pending_control.output));
+    }
+    lume_secret_clear(action, sizeof(*action));
+    authentication.phase = AUTH_IDLE;
+    return true;
+}
+
 static void authenticate(void)
 {
     if (!authentication_ready)
         return;
-    for (unsigned n = 0; n < 4 && auth_count; ++n)
+    if (authentication.phase == AUTH_IDLE)
     {
-        struct lume_wpa_action action;
-        unsigned char frame[512];
-        size_t bytes = auth_size[auth_head];
-        for (size_t i = 0; i < bytes; ++i)
-            frame[i] = auth_queue[auth_head][i];
+        if (!auth_count)
+            return;
+        authentication.bytes = auth_size[auth_head];
+        memcpy(authentication.frame, auth_queue[auth_head], authentication.bytes);
+        lume_secret_clear(auth_queue[auth_head], sizeof(auth_queue[auth_head]));
         auth_head = (auth_head + 1) % 4;
         --auth_count;
-        if (!supplicant.seen && !association_rsn())
-        {
-            joining = false;
-            lume_secret_clear(frame, sizeof(frame));
-            lume_puts("WIFI UNSUPPORTED ASSOCIATION RSN\n");
-            break;
-        }
-        int result = lume_wpa_input(&supplicant, frame, bytes, &action);
-        lume_secret_clear(frame, sizeof(frame));
-        if (result < 0)
-        {
-            lume_puts("WIFI WPA2 INVALID EAPOL DROPPED\n");
-            continue;
-        }
-        if (!result)
-            continue;
-        /* M4 must leave before installing PTK, otherwise firmware encrypts
-         * the handshake completion with the key that it is acknowledging. */
-        bool ok = send_auth(action.frame, action.bytes) &&
-                  (!action.pairwise || install_key(action.tk, 0, false, action.rsc)) &&
-                  (!action.group || install_key(action.gtk, action.gtk_id, true, action.rsc));
-        if (ok && action.authorize)
-        {
-            size_t got;
-            ok = control(121, true, supplicant.peer, 6, answer, sizeof(answer), &got) == 1;
-            if (ok)
-            {
-                psk_ok = true;
-                lume_puts("LUME CHECK WPA2 HOST HANDSHAKE KEYS PASS\n");
-            }
-        }
-        lume_secret_clear(&action, sizeof(action));
-        if (!ok)
-        {
-            psk_ok = joining = false;
-            lume_puts("WIFI WPA2 KEY INSTALL OR TRANSMIT FAILED\n");
-            break;
-        }
+        authentication.phase = AUTH_INPUT;
+        if (authentication.association_ready)
+            return;
+        authentication.phase = AUTH_ASSOC_INFO;
+        if (control_get_begin("assoc_info", 64))
+            return;
+        goto failed;
     }
+    if (authentication.phase == AUTH_INPUT)
+    {
+        int result = lume_wpa_input(&supplicant, authentication.frame, authentication.bytes,
+                                    &authentication.action);
+        lume_secret_clear(authentication.frame, sizeof(authentication.frame));
+        if (result < 0)
+            lume_puts("WIFI WPA2 INVALID EAPOL DROPPED\n");
+        if (result <= 0)
+        {
+            lume_secret_clear(&authentication.action, sizeof(authentication.action));
+            authentication.phase = AUTH_IDLE;
+            return;
+        }
+        authentication.phase = AUTH_SEND;
+        authentication.deadline = deadline_after(2000000);
+        return;
+    }
+    if (authentication.phase == AUTH_SEND)
+    {
+        if (!before_deadline(authentication.deadline))
+            goto failed;
+        if (!lume_wifi_tx_allowed(tx_sequence, tx_credit, flow_mask, hardware_flow))
+            return;
+        size_t count = lume_wifi_data_frame(
+            tx, sizeof(tx), tx_sequence, authentication.action.frame, authentication.action.bytes);
+        bool sent = count && fifo(true, tx, count);
+        lume_secret_clear(tx, sizeof(tx));
+        if (!sent)
+            goto failed;
+        ++tx_sequence;
+        data_in_flight = true;
+        data_sent_at = lume_clock_millis();
+        /* The M4 transmission settles before the pairwise key can encrypt later frames. */
+        if (!authentication_next())
+            goto failed;
+        return;
+    }
+    int result = control_progress();
+    if (!result)
+        return;
+    if (result != 1)
+        goto failed;
+    if (authentication.phase == AUTH_ASSOC_INFO)
+    {
+        if (pending_control.received < 4)
+            goto failed;
+        authentication.ies_bytes = get32(pending_control.output);
+        control_reset();
+        if (!authentication.ies_bytes || authentication.ies_bytes > sizeof(pending_control.output))
+            goto failed;
+        authentication.phase = AUTH_ASSOC_IES;
+        if (!control_get_begin("assoc_req_ies", authentication.ies_bytes))
+            goto failed;
+        return;
+    }
+    if (authentication.phase == AUTH_ASSOC_IES)
+    {
+        if (pending_control.received < authentication.ies_bytes ||
+            !association_rsn(pending_control.output, authentication.ies_bytes))
+            goto failed;
+        control_reset();
+        authentication.association_ready = true;
+        authentication.phase = AUTH_INPUT;
+        return;
+    }
+    if (authentication.phase == AUTH_AUTHORIZE)
+    {
+        psk_ok = true;
+        lume_puts("LUME CHECK WPA2 HOST HANDSHAKE KEYS PASS\n");
+    }
+    control_reset();
+    if (authentication_next())
+        return;
+failed:
+    lume_puts("WIFI WPA2 CONTROL OR TRANSMIT FAILED\n");
+    leave_owned();
 }
 
 static void poll_owned(void)
 {
+    if (reset_pending ||
+        (scan_retiring && (uint32_t)(lume_clock_millis() - scan_retired_at) >= 60000))
+    {
+        leave_owned();
+        return;
+    }
     if (!operational)
         return;
     uint32_t began = lume_clock_millis();
@@ -1055,13 +1261,15 @@ static void poll_owned(void)
         if (r < 0)
         {
             network_account(LUME_NET_WIFI_BUS_ERROR, 0);
-            operational = carrier = false;
             lume_puts("WIFI TRANSPORT FAILED\n");
+            leave_owned();
             break;
         }
         if (!r)
             break;
     }
+    if (reset_pending)
+        leave_owned();
     if (operational)
         authenticate();
     if (joining && lume_wifi_link())
@@ -1070,7 +1278,7 @@ static void poll_owned(void)
         lume_puts("LUME CHECK WIFI WPA2 ASSOCIATION PASS\n");
     }
     else if (joining && (uint32_t)(lume_clock_millis() - join_started) >= 30000)
-        lume_wifi_leave();
+        leave_owned();
     network_account(LUME_NET_WIFI_POLL_MS, (uint32_t)(lume_clock_millis() - began));
 }
 
@@ -1091,7 +1299,8 @@ static int receive_owned(void *out, size_t cap)
 
 static bool send_owned(const void *data, size_t bytes)
 {
-    if (!operational || !lume_wifi_link())
+    if (!operational || pending_control.active || authentication.phase != AUTH_IDLE ||
+        !lume_wifi_link())
         return false;
     if (packet() < 0)
     {
@@ -1124,6 +1333,8 @@ static bool link_owned(void)
 
 static bool start_interface(void)
 {
+    if (reset_pending)
+        return false;
     if (operational)
         return true;
     if (!configured)
@@ -1137,6 +1348,8 @@ static bool start_interface(void)
 
 static int scan_begin_owned(void)
 {
+    if (pending_control.active || authentication.phase != AUTH_IDLE || reset_pending)
+        return -LUME_EBUSY;
     if (scan_running)
         return scan_retiring && (uint32_t)(lume_clock_millis() - scan_started) >= 30000
                    ? -LUME_ETIMEDOUT
@@ -1165,7 +1378,9 @@ static int scan_begin_owned(void)
     if (!ok)
     {
         /* A failed FIFO write may have reached firmware. Earlier failures cannot start a scan. */
-        scan_running = scan_retiring = attempted;
+        scan_running = attempted;
+        if (attempted)
+            retire_scan();
     }
     return ok ? 0 : -LUME_EIO;
 }
@@ -1178,7 +1393,7 @@ static int scan_result_owned(struct lume_access_point *out, size_t capacity)
         return -LUME_EAGAIN;
     if (!scan_done)
     {
-        scan_retiring = true;
+        retire_scan();
         return -LUME_EIO;
     }
     scan_running = false;
@@ -1194,30 +1409,39 @@ static int scan_result_owned(struct lume_access_point *out, size_t capacity)
     return (int)count;
 }
 
-static void leave_owned(void)
+static bool leave_owned(void)
 {
     /* The installed firmware does not reliably acknowledge DOWN/DISASSOC
      * after traffic. WL_ON provides a deterministic, bounded radio stop. */
-    if (operational && (carrier || authentication_ready || scan_running))
-    {
-        settle_data();
+    if (lume_wifi_bus())
         lume_wifi_stop();
-        operational = false;
-    }
+    operational = false;
     carrier = ssid_ok = psk_ok = joining = false;
-    scan_running = scan_done = scan_retiring = false;
     receive_count = 0;
     authentication_ready = false;
     auth_count = 0;
+    data_in_flight = false;
+    authentication_reset();
+    lume_secret_clear(auth_queue, sizeof(auth_queue));
     lume_secret_clear(&supplicant, sizeof(supplicant));
+    reset_pending = lume_wifi_bus() != NULL;
+    if (reset_pending)
+    {
+        if (scan_running)
+            retire_scan();
+        return false;
+    }
+    scan_running = scan_done = scan_retiring = false;
+    return true;
 }
 
 static bool join_begin(const unsigned char *ssid, size_t sn, const unsigned char *key, size_t kn)
 {
     if (!configured || !ssid || !sn || sn > 32 || !key || kn < 8 || kn > 63)
         return false;
-    lume_wifi_leave();
-    if (!start_interface())
+    bool session = reset_pending || carrier || joining || authentication_ready || scan_running ||
+                   pending_control.active || authentication.phase != AUTH_IDLE;
+    if ((session && !leave_owned()) || !start_interface())
         return false;
     joining = true;
     join_started = lume_clock_millis();
@@ -1285,17 +1509,9 @@ static bool cyw_admin(void *ctx, bool up)
     (void)ctx;
     if (!operation_begin(true))
         return false;
-    if (!up)
-    {
-        lume_wifi_leave();
-        if (operational)
-        {
-            lume_wifi_stop();
-            operational = false;
-        }
-    }
+    bool result = up || leave_owned();
     operation_end();
-    return true;
+    return result;
 }
 
 static int cyw_scan(void *ctx, struct lume_wifi_bss_info *out, unsigned cap)
@@ -1359,13 +1575,17 @@ static int cyw_scan_cancel(void *ctx)
         return -LUME_EAGAIN;
     if (scan_running && !scan_done)
     {
-        /* Keep a timed out scan quarantined until its terminal event or a radio stop.
-         * The caller can retire after the deadline without admitting another scan.
-         * An explicit reconnect or administrative stop resets the firmware session. */
-        scan_retiring = true;
-        bool expired = (uint32_t)(lume_clock_millis() - scan_started) >= 30000;
+        /* The client timeout starts retirement. Firmware completion or a verified
+         * radio stop releases the generation after a separate recovery interval. */
+        retire_scan();
+        bool stopped = (uint32_t)(lume_clock_millis() - scan_retired_at) >= 60000 && leave_owned();
         operation_end();
-        return expired ? 0 : -LUME_EAGAIN;
+        return stopped ? 0 : -LUME_EAGAIN;
+    }
+    if (reset_pending && !leave_owned())
+    {
+        operation_end();
+        return -LUME_EAGAIN;
     }
     scan_running = scan_done = scan_retiring = false;
     operation_end();

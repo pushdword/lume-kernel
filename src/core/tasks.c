@@ -24,6 +24,7 @@
 #include "lume/boot.h"
 #include "lume/worker.h"
 #include "lume/console_output.h"
+#include "lume/display.h"
 #include "lume/activity.h"
 #include "lume/thread.h"
 #include "lume/supervision.h"

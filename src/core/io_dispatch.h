@@ -161,6 +161,12 @@ static void kernel_work(void *context)
         stream_reap();
         netctl_reap();
     }
+    if (domain == LUME_WORK_DISPLAY)
+    {
+        lume_display_service();
+        if (kernel_regular_draining())
+            return;
+    }
     for (unsigned n = 0; n < 8; ++n)
     {
         unsigned done = lume_work_drain_on(domain, 1);
@@ -173,6 +179,7 @@ static void kernel_work(void *context)
 static bool kernel_background_pending(unsigned domain)
 {
     return lume_work_pending_on(domain) ||
+           (domain == LUME_WORK_DISPLAY && lume_display_work_pending()) ||
            (domain == LUME_WORK_STORAGE && lume_vfs_reap_pending()) ||
            (domain == LUME_WORK_NETWORK && (stream_retired_pending() || netctl_retired_pending()));
 }

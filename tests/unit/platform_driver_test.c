@@ -219,7 +219,25 @@ static bool allow(uint64_t f, uint64_t n)
 static int64_t video_driver(unsigned action, unsigned value, const unsigned char *font)
 {
     assert(!value && !font);
-    return action == LUME_VIDEO_CELLS ? 100 | 37u << 16 : -LUME_ENOSYS;
+    return action == LUME_VIDEO_CELLS ? 100 | 37 << 16 : -LUME_ENOSYS;
+}
+
+static const void *display_source;
+static bool render_queued;
+static unsigned renders;
+
+static bool display_pending(void)
+{
+    return render_queued;
+}
+
+static void display_service(void)
+{
+    assert(lume_platform_driver_can_stop(LUME_PLATFORM_DISPLAY, display_source) == -LUME_EBUSY);
+    assert(lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, display_source) == -LUME_EBUSY);
+    assert(references == 1);
+    render_queued = false;
+    ++renders;
 }
 
 int main(void)
@@ -310,11 +328,30 @@ int main(void)
     lume_console_output_finish(&guarded.output);
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_UART, &uart));
     assert(!references && !lume_platform_driver_ready(LUME_PLATFORM_UART));
-    struct lume_platform_display_ops display = {start,       putc_driver, write_driver,
-                                                poll_driver, poll_driver, video_driver};
+    struct lume_platform_display_ops display = {
+        start, putc_driver, write_driver, poll_driver, poll_driver, video_driver, NULL, NULL};
     assert(lume_display_video(LUME_VIDEO_CELLS, 0, NULL) == -LUME_ENOSYS);
+    assert(!lume_display_work_pending());
+    lume_display_service();
+    unsigned char legacy[offsetof(struct lume_platform_display_ops, pending)];
+    memcpy(legacy, &display, sizeof(legacy));
+    assert(!lume_platform_driver_register(LUME_PLATFORM_DISPLAY, legacy, sizeof(legacy)));
+    assert(!lume_display_work_pending());
+    lume_display_service();
+    assert(!lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, legacy));
+    display.pending = display_pending;
+    assert(lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &display, sizeof(display)) ==
+           -LUME_EINVAL);
+    display.service = display_service;
     assert(!lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &display, sizeof(display)));
+    display_source = &display;
     assert(references == 1);
+    render_queued = true;
+    assert(lume_display_work_pending());
+    lume_display_service();
+    assert(renders == 1 && !lume_display_work_pending());
+    lume_display_service();
+    assert(renders == 1);
     display.lume_display_video = NULL;
     assert(lume_display_geometry() == (100 | 37u << 16));
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &display));

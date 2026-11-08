@@ -30,7 +30,8 @@ void lume_graphics_input(const struct lume_input_event *event)
 static bool worker_busy;
 static uint64_t ticks = 1000000;
 static uint32_t registers[512], runtime[32], doorbells[16];
-static unsigned second_port_reads, event_reads, allocations, diagnostics;
+static unsigned second_port_reads, port_reads, event_reads, allocations, diagnostics;
+static unsigned mmio_writes, dequeue_writes, acknowledgements;
 
 enum wait_model
 {
@@ -62,9 +63,14 @@ static void lume_dma_read_barrier(void)
 static uint32_t lume_mmio_read32(uintptr_t address)
 {
     uintptr_t first = (uintptr_t)registers;
-    assert(address >= first && address - first < sizeof(registers) && !(address & 3));
+    uintptr_t rt = (uintptr_t)runtime;
+    assert(((address >= first && address - first < sizeof(registers)) ||
+            (address >= rt && address - rt < sizeof(runtime))) &&
+           !(address & 3));
     if (address == first + 0x410)
         ++second_port_reads;
+    if (address == first + 0x400)
+        ++port_reads;
     return *(uint32_t *)address;
 }
 
@@ -74,7 +80,19 @@ static void lume_mmio_write32(uintptr_t address, uint32_t value)
     assert((address >= r && address - r < sizeof(runtime)) ||
            (address >= d && address - d < sizeof(doorbells)));
     assert(!(address & 3));
-    *(uint32_t *)address = value;
+    ++mmio_writes;
+    if (address == r + 0x20)
+    {
+        assert(value == 1);
+        ++acknowledgements;
+        *(uint32_t *)address &= ~value;
+    }
+    else
+    {
+        if (address == r + 0x38 || address == r + 0x3c)
+            ++dequeue_writes;
+        *(uint32_t *)address = value;
+    }
 }
 
 const struct lume_dma_domain lume_rp1_dma_domain = {0};
@@ -229,6 +247,7 @@ static void reset(void)
     memset(keyboard_ring, 0, sizeof(keyboard_ring));
     memset(keyboard_report, 0, sizeof(keyboard_report));
     second_port_reads = event_reads = allocations = diagnostics = 0;
+    port_reads = mmio_writes = dequeue_writes = acknowledgements = 0;
     ticks = 1000000;
     wait_model = WAIT_NONE;
     waits = 0;
@@ -305,6 +324,7 @@ static void reports_and_hotplug(void)
     worker_busy = true;
     registers[0x400 / 4] = 0;
     device->channels[0].hid.repeat_key = 4;
+    ticks += 1000;
     lume_usb_poll();
     assert(device->disconnected && !device->channels[0].hid.repeat_key);
     assert(second_port_reads == 2);
@@ -322,6 +342,39 @@ static void bounded_events(void)
     lume_usb_poll();
     assert(event_reads == 257 && hosts[0].completions == 256);
     assert(!second_port_reads);
+}
+
+static void idle_polling(void)
+{
+    reset();
+    struct host *host = hosts;
+    struct device *device = &host->devices[1];
+    *device = (struct device){.slot = 1, .root = 1, .inputs = 1};
+    device->channels[0] = (struct input){.endpoint = 3,
+                                         .packet = 8,
+                                         .report = keyboard_report,
+                                         .ring = {keyboard_ring, (uintptr_t)keyboard_ring, 0, 1},
+                                         .trb = 0x9000,
+                                         .keyboard = true,
+                                         .pending = true};
+    for (unsigned i = 0; i < 10000; ++i)
+        lume_usb_poll();
+    assert(event_reads == 1 && port_reads == 1 && !mmio_writes);
+    keyboard_event(0, 4, 0);
+    ticks += 999;
+    lume_usb_poll();
+    assert(event_reads == 1 && !host->completions);
+    ++ticks;
+    assert(lume_usb_getc() == 'a');
+    assert(host->completions == 1 && dequeue_writes == 2 && acknowledgements == 1);
+
+    lume_usb_poll();
+    unsigned before = mmio_writes;
+    runtime[0x20 / 4] = 1;
+    ticks += 1000;
+    lume_usb_poll();
+    assert(mmio_writes == before + 1 && acknowledgements == 2 && dequeue_writes == 2);
+    assert(!runtime[0x20 / 4]);
 }
 
 static void composite_reports(void)
@@ -431,8 +484,9 @@ int main(void)
 {
     reports_and_hotplug();
     bounded_events();
+    idle_polling();
     composite_reports();
     final_wait_observation();
-    puts("PASS_USB_POLL bounded HID, deferred hotplug, final completion and absolute deadlines");
+    puts("PASS_USB_POLL idle MMIO, bounded HID, hotplug and absolute deadlines");
     return 0;
 }

@@ -101,6 +101,11 @@ struct lume_platform_display_ops
     void (*lume_display_clear)(void);
     void (*lume_display_stop)(void);
     int64_t (*lume_display_video)(unsigned action, unsigned value, const unsigned char *font);
+    /* The optional pair defers rendering while retaining the provider. The pending
+     * callback reads only RAM state under the kernel lock. The service callback
+     * processes bounded snapshots in the display worker. */
+    bool (*pending)(void);
+    void (*service)(void);
 };
 
 struct lume_platform_entropy_ops

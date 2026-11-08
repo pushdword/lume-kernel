@@ -16,6 +16,7 @@
 _Static_assert(MAX_SPAN_PAGES <= SIZE_MAX / 4096u, "page span exceeds addressable memory");
 static uint64_t used[MAX_PAGES / 64], managed[MAX_PAGES / 64], free_count;
 static uint64_t cursor;
+static uint64_t span_cursor;
 static uint64_t total_count;
 
 static bool overlaps(uint64_t a, uint64_t size, uint64_t b, uint64_t bytes)
@@ -31,6 +32,7 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
     uint64_t image_end = (image_limit + IMAGE_BLOCK - 1) & ~(IMAGE_BLOCK - 1);
     free_count = 0;
     cursor = 0;
+    span_cursor = 1;
     for (unsigned i = 0; i < MAX_PAGES / 64; ++i)
     {
         used[i] = UINT64_MAX;
@@ -87,41 +89,120 @@ static void zero_pages(void *context)
         request->data[i] = 0;
 }
 
+static uint64_t span_mask(uint64_t word, uint64_t first, uint64_t end)
+{
+    uint64_t base = word * 64;
+    unsigned low = first > base ? (unsigned)(first - base) : 0;
+    unsigned high = end - base < 64 ? (unsigned)(end - base) : 64;
+    uint64_t mask = UINT64_MAX << low;
+    return high < 64 ? mask & ((UINT64_C(1) << high) - 1) : mask;
+}
+
+static bool reserve_span(uint64_t first, unsigned count, uint64_t *retry)
+{
+    uint64_t end = first + count;
+    for (uint64_t word = first / 64; word <= (end - 1) / 64; ++word)
+    {
+        uint64_t occupied = used[word] & span_mask(word, first, end);
+        if (occupied)
+        {
+            *retry = word * 64 + (unsigned)__builtin_ctzll(occupied) + 1;
+            return false;
+        }
+    }
+    /* Revalidation and reservation cannot suspend. Search checkpoints retain only
+     * numeric candidates, so another allocator may change a run before this point. */
+    for (uint64_t word = first / 64; word <= (end - 1) / 64; ++word)
+        used[word] |= span_mask(word, first, end);
+    free_count -= count;
+    span_cursor = end < MAX_PAGES ? end : 1;
+    return true;
+}
+
+static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsigned *budget)
+{
+    uint64_t run = 0;
+    uint64_t word = first / 64;
+    while (word <= (end - 1) / 64)
+    {
+        uint64_t available = ~used[word] & span_mask(word, first, end);
+        unsigned prefix = available == UINT64_MAX ? 64 : (unsigned)__builtin_ctzll(~available);
+        uint64_t candidate = 0;
+        if (run && run + prefix >= count)
+            candidate = word * 64 - run;
+        else if (count <= 64)
+        {
+            uint64_t starts = available;
+            for (unsigned length = 1; length < count && starts;)
+            {
+                unsigned step = count - length < length ? count - length : length;
+                starts &= starts >> step;
+                length += step;
+            }
+            if (starts)
+                candidate = word * 64 + (unsigned)__builtin_ctzll(starts);
+        }
+        if (candidate)
+        {
+            uint64_t retry;
+            if (reserve_span(candidate, count, &retry))
+                return candidate;
+            first = retry;
+            word = first / 64;
+            run = 0;
+        }
+        else
+        {
+            run = available == UINT64_MAX ? run + 64 : (unsigned)__builtin_clzll(~available);
+            ++word;
+        }
+        if (++*budget == 256)
+        {
+            *budget = 0;
+            lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+            if (free_count < count)
+                return 0;
+        }
+    }
+    return 0;
+}
+
 uint64_t lume_pages_alloc_span(unsigned count)
 {
     if (!count || count > MAX_SPAN_PAGES || count > MAX_PAGES || free_count < count)
         return 0;
-    unsigned run = 0;
-    for (uint64_t p = 1; p < MAX_PAGES; ++p)
+    unsigned budget = 0;
+    uint64_t start = span_cursor && span_cursor < MAX_PAGES ? span_cursor : 1;
+    uint64_t first = search_span(start, MAX_PAGES, count, &budget);
+    if (!first && start > 1)
     {
-        uint64_t mask = UINT64_C(1) << (p & 63);
-        run = used[p / 64] & mask ? 0 : run + 1;
-        if (run != count)
-            continue;
-        uint64_t first = p + 1 - count;
-        for (uint64_t q = first; q <= p; ++q)
-            used[q / 64] |= UINT64_C(1) << (q & 63);
-        free_count -= count;
-        /* Reserved pages remain unpublished until their complete span is initialized. */
-        size_t bytes = (size_t)count * 4096;
-        for (size_t offset = 0; offset < bytes;)
-        {
-            size_t length =
-                bytes - offset < LUME_WORKER_SLICE_BYTES ? bytes - offset : LUME_WORKER_SLICE_BYTES;
-            struct page_zero request = {
-                .data = (void *)(uintptr_t)(first * 4096 + offset),
-                .bytes = length,
-            };
-            if (length == LUME_WORKER_SLICE_BYTES)
-                lume_worker_compute(zero_pages, &request);
-            else
-                zero_pages(&request);
-            lume_worker_checkpoint((unsigned)length);
-            offset += length;
-        }
-        return first * 4096;
+        /* The second interval includes the tail needed by runs crossing the cursor.
+         * A physical span never wraps from the final page back to page one. */
+        uint64_t end = start + count - 1;
+        if (end > MAX_PAGES)
+            end = MAX_PAGES;
+        first = search_span(1, end, count, &budget);
     }
-    return 0;
+    if (!first)
+        return 0;
+    /* Reserved pages remain unpublished until their complete span is initialized. */
+    size_t bytes = (size_t)count * 4096;
+    for (size_t offset = 0; offset < bytes;)
+    {
+        size_t length =
+            bytes - offset < LUME_WORKER_SLICE_BYTES ? bytes - offset : LUME_WORKER_SLICE_BYTES;
+        struct page_zero request = {
+            .data = (void *)(uintptr_t)(first * 4096 + offset),
+            .bytes = length,
+        };
+        if (length == LUME_WORKER_SLICE_BYTES)
+            lume_worker_compute(zero_pages, &request);
+        else
+            zero_pages(&request);
+        lume_worker_checkpoint((unsigned)length);
+        offset += length;
+    }
+    return first * 4096;
 }
 
 uint64_t lume_page_alloc(uint64_t minimum)

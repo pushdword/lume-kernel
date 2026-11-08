@@ -87,8 +87,17 @@ static size_t operation_bytes(unsigned kind)
 
 int lume_platform_driver_register(unsigned kind, const void *operations, size_t bytes)
 {
-    if (!operations || !operation_bytes(kind) || bytes != operation_bytes(kind))
+    size_t required = operation_bytes(kind);
+    size_t display_base = offsetof(struct lume_platform_display_ops, pending);
+    if (!operations || !required ||
+        (bytes != required && !(kind == LUME_PLATFORM_DISPLAY && bytes == display_base)))
         return -LUME_EINVAL;
+    if (kind == LUME_PLATFORM_DISPLAY && bytes == required)
+    {
+        const struct lume_platform_display_ops *display = operations;
+        if (!!display->pending != !!display->service)
+            return -LUME_EINVAL;
+    }
     struct provider *provider = providers + kind;
     if (provider->source)
     {
@@ -103,6 +112,8 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
         uintptr_t callback;
         void *current = NULL;
         memcpy(&callback, (const unsigned char *)operations + offset, sizeof(callback));
+        if (!callback && kind == LUME_PLATFORM_DISPLAY && offset >= display_base)
+            continue;
         int result = callback ? lume_module_pin(callback, &current) : -LUME_EINVAL;
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
         extern unsigned char __image_start[], __text_end[];
@@ -628,6 +639,24 @@ bool lume_display_start(uint64_t frequency)
     if (!provider->source)
         return false;
     return provider->operations.display.lume_display_start(frequency);
+}
+
+bool lume_display_work_pending(void)
+{
+    struct provider *provider = providers + LUME_PLATFORM_DISPLAY;
+    return provider->source && provider->operations.display.pending &&
+           provider->operations.display.pending();
+}
+
+void lume_display_service(void)
+{
+    struct provider *provider = providers + LUME_PLATFORM_DISPLAY;
+    if (!provider->source || !provider->operations.display.service || provider->active ||
+        !provider->operations.display.pending())
+        return;
+    ++provider->active;
+    provider->operations.display.service();
+    --provider->active;
 }
 
 int lume_platform_graphics_query(struct lume_graphics_request *request)

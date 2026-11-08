@@ -21,7 +21,8 @@ struct lume_v3d_io
     uint64_t frequency;
     int (*power)(void *, bool);
     void (*interrupts)(void *, bool);
-    uint64_t (*allocate)(void *, unsigned);
+    /* Returns a page-aligned span whose complete contents are zero. */
+    uint64_t (*allocate_zeroed)(void *, unsigned);
     void (*release)(void *, uint64_t, unsigned);
     bool (*map)(void *, uint64_t, size_t, uint64_t *);
     bool (*sync)(void *, const void *, size_t, size_t, unsigned, enum lume_dma_direction, bool);
@@ -40,7 +41,7 @@ struct lume_v3d
     uint32_t identity, debug, status, violation;
     unsigned completion;
     volatile uint32_t event;
-    bool powered, bound, failed;
+    bool powered, bound, failed, linear_surface;
     uint64_t jobs, pixels;
 };
 

@@ -553,8 +553,8 @@ int lume_s3_display_register(void)
     if (!video_bytes)
         return -LUME_ENOENT;
     framebuffer = (void *)(uintptr_t)address;
-    static const struct lume_platform_display_ops operations = {start, display_putc, write,
-                                                                clear, stop,         video_control};
+    static const struct lume_platform_display_ops operations = {start, display_putc,  write, clear,
+                                                                stop,  video_control, NULL,  NULL};
     int result =
         lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
     if (!result)

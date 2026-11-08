@@ -81,6 +81,7 @@ void lume_v3d_unbind(struct lume_v3d *gpu)
     gpu->table = gpu->scratch = gpu->guard = 0;
     gpu->scratch_pages = 0;
     gpu->bound = false;
+    gpu->linear_surface = false;
     gpu->surface = (struct lume_gpu_surface){0};
 }
 
@@ -132,22 +133,30 @@ int lume_v3d_bind(struct lume_v3d *gpu, const struct lume_gpu_surface *surface)
     /* Commands use 32-bit addresses. The table covers their complete range
      * even when the MMU advertises a 36-bit virtual address space. */
     gpu->phase = 5;
-    gpu->table = gpu->io.allocate(gpu->io.context, TABLE_PAGES);
+    gpu->table = gpu->io.allocate_zeroed(gpu->io.context, TABLE_PAGES);
     gpu->scratch_pages = surface->pages;
-    gpu->scratch = gpu->io.allocate(gpu->io.context, gpu->scratch_pages);
-    gpu->guard = gpu->io.allocate(gpu->io.context, 1);
+    gpu->scratch = gpu->io.allocate_zeroed(gpu->io.context, gpu->scratch_pages);
+    gpu->guard = gpu->io.allocate_zeroed(gpu->io.context, 1);
     if (!gpu->table || !gpu->scratch || !gpu->guard)
     {
         result = -LUME_ENOMEM;
         goto fail;
     }
-    memset((void *)(uintptr_t)gpu->table, 0, TABLE_PAGES * 4096u);
-    memset((void *)(uintptr_t)gpu->guard, 0, 4096);
     gpu->phase = 6;
     for (unsigned i = 0; i < surface->pages; ++i)
         if (!map_page(gpu, CLIENT_ADDRESS + i * 4096u, surface->physical[i]) ||
             !map_page(gpu, SCRATCH_ADDRESS + i * 4096u, gpu->scratch + (uint64_t)i * 4096))
             goto fail;
+    const uint32_t *table = (const void *)(uintptr_t)gpu->table;
+    uint32_t first = table[CLIENT_ADDRESS >> 12];
+    /* Linear DMA pages exclude aliases between disjoint surface rectangles. */
+    gpu->linear_surface = true;
+    for (unsigned i = 1; i < surface->pages; ++i)
+        if (table[(CLIENT_ADDRESS >> 12) + i] != first + i)
+        {
+            gpu->linear_surface = false;
+            break;
+        }
     uint64_t table_bus, guard_bus;
     if (!gpu->io.map(gpu->io.context, gpu->table, TABLE_PAGES * 4096u, &table_bus) ||
         !gpu->io.map(gpu->io.context, gpu->guard, 4096, &guard_bus) ||
@@ -259,6 +268,25 @@ static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsi
     return 0;
 }
 
+static bool independent(const struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles,
+                        unsigned count)
+{
+    if (!gpu->linear_surface)
+        return false;
+    for (unsigned i = 0; i < count; ++i)
+        for (unsigned j = 0; j < count; ++j)
+        {
+            const struct lume_gpu_rect *target = rectangles + i;
+            const struct lume_gpu_rect *source = rectangles + j;
+            if (target->target_x < source->source_x + source->width &&
+                source->source_x < target->target_x + target->width &&
+                target->target_y < source->source_y + source->height &&
+                source->source_y < target->target_y + target->height)
+                return false;
+        }
+    return true;
+}
+
 int lume_v3d_copy(struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles, unsigned count)
 {
     if (!gpu || !gpu->bound || gpu->failed || !rectangles || !count || count > LUME_GPU_RECTS)
@@ -273,6 +301,7 @@ int lume_v3d_copy(struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles, 
             r->height > s->height - r->source_y || r->height > s->height - r->target_y)
             return -LUME_EINVAL;
     }
+    bool direct = independent(gpu, rectangles, count);
     for (unsigned i = 0; i < count; ++i)
     {
         const struct lume_gpu_rect *r = rectangles + i;
@@ -280,10 +309,13 @@ int lume_v3d_copy(struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles, 
         if (!gpu->io.sync(gpu->io.context, (void *)(uintptr_t)(s->pixels + offset), r->width * 4,
                           s->pitch, r->height, LUME_DMA_TO_DEVICE, false))
             return -LUME_EIO;
-        int result =
-            transfer(gpu, CLIENT_ADDRESS + offset, SCRATCH_ADDRESS + offset, r->width, r->height);
-        if (result)
-            return result;
+        if (!direct)
+        {
+            int result = transfer(gpu, CLIENT_ADDRESS + offset, SCRATCH_ADDRESS + offset, r->width,
+                                  r->height);
+            if (result)
+                return result;
+        }
     }
     for (unsigned i = 0; i < count; ++i)
     {
@@ -293,8 +325,8 @@ int lume_v3d_copy(struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles, 
         if (!gpu->io.sync(gpu->io.context, (void *)(uintptr_t)(s->pixels + target), r->width * 4,
                           s->pitch, r->height, LUME_DMA_FROM_DEVICE, false))
             return -LUME_EIO;
-        int result =
-            transfer(gpu, SCRATCH_ADDRESS + source, CLIENT_ADDRESS + target, r->width, r->height);
+        int result = transfer(gpu, (direct ? CLIENT_ADDRESS : SCRATCH_ADDRESS) + source,
+                              CLIENT_ADDRESS + target, r->width, r->height);
         if (result)
             return result;
         if (!gpu->io.sync(gpu->io.context, (void *)(uintptr_t)(s->pixels + target), r->width * 4,

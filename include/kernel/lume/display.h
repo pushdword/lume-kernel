@@ -11,4 +11,6 @@ void lume_display_clear(void);
 void lume_display_stop(void);
 int64_t lume_display_video(unsigned action, unsigned value, const unsigned char *font);
 unsigned lume_display_geometry(void);
+bool lume_display_work_pending(void);
+void lume_display_service(void);
 #endif

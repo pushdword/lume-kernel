@@ -5,6 +5,8 @@
 #include "lume/early.h"
 #include "lume/process.h"
 #include "lume/gpu_device.h"
+#include "lume/kernel_memory.h"
+#include "lume/user_buffer.h"
 #include <string.h>
 
 #define SESSIONS 4u
@@ -14,9 +16,13 @@ static struct session
 {
     bool used;
     unsigned owner, first, count;
+    uint64_t generation;
     struct lume_poll_source source;
     struct lume_input_event events[EVENTS];
 } sessions[SESSIONS], *active;
+
+static uint64_t session_generation;
+static unsigned present_buffers;
 
 static struct lume_poll_source *input_source(void *context)
 {
@@ -100,8 +106,20 @@ static unsigned input_poll(void *context)
     return session != active ? LUME_POLLIN | LUME_POLLHUP : session->count ? LUME_POLLIN : 0;
 }
 
-static const struct lume_file_ops input_ops = {
-    LUME_NODE_CHAR, input_close, input_read, input_write, input_poll, input_source, true};
+static const struct lume_file_ops input_ops = {.kind = LUME_NODE_CHAR,
+                                               .close = input_close,
+                                               .read = input_read,
+                                               .write = input_write,
+                                               .poll = input_poll,
+                                               .source = input_source,
+                                               .memory_io = true};
+
+static bool session_matches(struct lume_files *files, unsigned owner, unsigned fd,
+                            const struct session *session, uint64_t generation)
+{
+    return active == session && session->generation == generation && session->owner == owner &&
+           lume_vfs_external(files, fd, &input_ops) == session;
+}
 
 int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action,
                        struct lume_graphics_request *r)
@@ -125,7 +143,10 @@ int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action
             struct session *session = sessions + i;
             if (session->used)
                 continue;
-            *session = (struct session){.used = true, .owner = owner};
+            if (!++session_generation)
+                lume_fail("graphics session generation exhausted");
+            *session =
+                (struct session){.used = true, .owner = owner, .generation = session_generation};
             lume_poll_source_reset(&session->source);
             int fd =
                 lume_vfs_attach(files, &input_ops, session, LUME_FD_CLOEXEC | LUME_FD_NONBLOCK);
@@ -149,6 +170,9 @@ int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action
     if (!active || active->owner != owner ||
         lume_vfs_external(files, (unsigned)r->fd, &input_ops) != active)
         return -LUME_EBADF;
+    const struct lume_graphics_request request = *r;
+    struct session *session = active;
+    uint64_t generation = session->generation;
     struct lume_graphics_request screen = {0};
     int result = lume_platform_graphics_query(&screen);
     if (result)
@@ -159,22 +183,97 @@ int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action
         r->pitch > screen.pitch)
         return -LUME_EINVAL;
     uint64_t bytes = (uint64_t)(r->height - 1) * r->pitch + (uint64_t)r->width * 4;
-    if (!lume_user_buffer(r->pixels, bytes, false))
+    if (r->pixels > UINTPTR_MAX || bytes > UINTPTR_MAX - r->pixels)
         return -LUME_EFAULT;
-    unsigned rows = 65536u / (r->width * 4u);
-    if (!rows)
-        rows = 1;
-    for (unsigned row = 0; row < r->height;)
+    if (present_buffers == LUME_TASK_LIMIT)
+        return -LUME_ENOMEM;
+    unsigned width = request.width < LUME_FILE_IO_MAX / 4 ? request.width : LUME_FILE_IO_MAX / 4;
+    unsigned rows = LUME_FILE_IO_MAX / (width * 4);
+    if (rows > 16)
+        rows = 16;
+    if (rows > request.height)
+        rows = request.height;
+    ++present_buffers;
+    unsigned char *buffer = lume_kernel_allocate((size_t)width * 4 * rows);
+    if (!buffer)
     {
-        struct lume_graphics_request part = *r;
-        part.y += row;
-        part.pixels += (uint64_t)row * r->pitch;
-        part.height = r->height - row < rows ? r->height - row : rows;
-        result = lume_platform_graphics_present(&part);
-        if (result)
-            return result;
-        row += part.height;
-        lume_worker_checkpoint(part.width * part.height * 4u);
+        result = -LUME_ENOMEM;
+        goto out;
     }
-    return 0;
+    for (unsigned row = 0; row < request.height; row += rows)
+        for (unsigned column = 0; column < request.width; column += width)
+        {
+            struct lume_graphics_request part = request;
+            part.x += column;
+            part.y += row;
+            part.width = request.width - column < width ? request.width - column : width;
+            part.height = request.height - row < rows ? request.height - row : rows;
+            part.pitch = part.width * 4;
+            part.pixels = (uint64_t)(uintptr_t)buffer;
+            for (unsigned line = 0; line < part.height; ++line)
+            {
+                struct lume_user_buffer_token token = {0};
+                uint64_t address =
+                    request.pixels + (uint64_t)(row + line) * request.pitch + (uint64_t)column * 4;
+                if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+                {
+                    result = -LUME_EBADF;
+                    goto out;
+                }
+                result = lume_user_buffer_acquire(&token, owner, address, part.pitch, false);
+                if (result)
+                    goto out;
+                if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+                    result = -LUME_EBADF;
+                else if (!lume_user_buffer_copy(&token, buffer + (size_t)line * part.pitch,
+                                                part.pitch, false))
+                    result = -LUME_EFAULT;
+                lume_user_buffer_release(&token);
+                if (result)
+                    goto out;
+            }
+            /* Drivers retain only private compact pixels while compute releases the lock. */
+            result = lume_platform_graphics_present(&part);
+            if (!result &&
+                !session_matches(files, owner, (unsigned)request.fd, session, generation))
+                result = -LUME_EBADF;
+            if (result)
+                goto out;
+            lume_worker_checkpoint(part.width * part.height * 4u);
+            if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+            {
+                result = -LUME_EBADF;
+                goto out;
+            }
+        }
+out:
+    lume_kernel_free(buffer);
+    --present_buffers;
+    return result;
+}
+
+int lume_graphics_user_call(struct lume_files *files, unsigned owner, unsigned action,
+                            uint64_t address, uint64_t bytes)
+{
+    if (action > LUME_GRAPHICS_PRESENT || bytes != sizeof(struct lume_graphics_request))
+        return -LUME_EINVAL;
+    struct lume_user_buffer_token token = {0};
+    int result = lume_user_buffer_acquire(&token, owner, address, (size_t)bytes, true);
+    if (result)
+        return result;
+    struct lume_graphics_request request;
+    if (!lume_user_buffer_copy(&token, &request, sizeof(request), false))
+    {
+        lume_user_buffer_release(&token);
+        return -LUME_EFAULT;
+    }
+    result = lume_graphics_call(files, owner, action, &request);
+    if (!lume_user_buffer_copy(&token, &request, sizeof(request), true))
+    {
+        if (!result && action == LUME_GRAPHICS_ACQUIRE)
+            (void)lume_vfs_close(files, (unsigned)request.fd);
+        result = -LUME_EFAULT;
+    }
+    lume_user_buffer_release(&token);
+    return result;
 }

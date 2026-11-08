@@ -298,12 +298,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         if (a > LUME_GRAPHICS_PRESENT || n != sizeof(struct lume_graphics_request))
             return -LUME_EINVAL;
-        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
-            return -LUME_EFAULT;
-        struct lume_graphics_request request = *(const struct lume_graphics_request *)(uintptr_t)b;
-        int result = lume_graphics_call(files, pid, (unsigned)a, &request);
-        *(struct lume_graphics_request *)(uintptr_t)b = request;
-        return result;
+        return lume_graphics_user_call(files, pid, (unsigned)a, b, n);
     }
     case LUME_SYS_GPU:
     {

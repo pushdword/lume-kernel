@@ -4,6 +4,7 @@
 #include "lume/graphics.h"
 struct lume_files;
 int lume_graphics_call(struct lume_files *, unsigned, unsigned, struct lume_graphics_request *);
+int lume_graphics_user_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
 void lume_graphics_release(unsigned);
 bool lume_graphics_input_owned(void);
 void lume_graphics_input(const struct lume_input_event *);

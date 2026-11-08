@@ -106,7 +106,7 @@ static void interrupts(void *context, bool enabled)
         lume_fail("V3D interrupt state");
 }
 
-static uint64_t allocate(void *context, unsigned pages)
+static uint64_t allocate_zeroed(void *context, unsigned pages)
 {
     (void)context;
     return lume_pages_alloc_span(pages);
@@ -252,7 +252,7 @@ static const struct lume_gpu_backend backend = {
 
 static int qualify(struct binding *binding)
 {
-    uint64_t client = allocate(binding, 4), reference = allocate(binding, 4);
+    uint64_t client = allocate_zeroed(binding, 4), reference = allocate_zeroed(binding, 4);
     if (!client || !reference)
     {
         if (client)
@@ -369,8 +369,8 @@ static int start(struct lume_hardware *hardware, void *context)
         return result;
     binding->core_irq_registered = true;
     binding->gpu.io = (struct lume_v3d_io){
-        binding, read_register, write_register, barrier, ticks, lume_counter_frequency(),
-        power,   interrupts,    allocate,       release, map,   sync,
+        binding, read_register, write_register,  barrier, ticks, lume_counter_frequency(),
+        power,   interrupts,    allocate_zeroed, release, map,   sync,
         wait,    checkpoint,    lume_fail};
     result = qualify(binding);
     if (result)

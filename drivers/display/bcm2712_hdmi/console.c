@@ -13,12 +13,24 @@ static struct
     uintptr_t memory;
     size_t bytes;
     unsigned width, height, depth, order, pitch, columns, rows, font;
-    bool enabled, registered, custom_loaded, graphics_owned;
+    bool enabled, registered, custom_loaded, graphics_owned, rendering, pending;
+    unsigned presenting, clear_row, generation, next_row;
     unsigned char custom[256][16];
     struct console_font_bitmap bitmap;
     struct terminal terminal;
     uint32_t cells[TERM_COLUMNS * TERM_ROWS], shown[TERM_COLUMNS * TERM_ROWS];
 } console;
+
+static void schedule_render(void)
+{
+    if (console.enabled && !console.graphics_owned)
+        console.pending = true;
+}
+
+static bool render_pending(void)
+{
+    return console.enabled && !console.graphics_owned && !console.presenting && console.pending;
+}
 
 static unsigned cell_size(unsigned font)
 {
@@ -53,78 +65,165 @@ static uint32_t pixel(unsigned index)
                : ((color >> 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 3) & 0x1f);
 }
 
-static void render_cell(unsigned at, unsigned value)
+struct text_update
 {
-    unsigned size = cell_size(console.font), width = size & 65535, height = size >> 16;
-    unsigned left = at % console.columns * width, top = at / console.columns * height;
-    uint32_t ink = pixel(value >> 8), paper = pixel(value >> 12);
-    for (unsigned y = 0; y < height; ++y)
+    uintptr_t memory;
+    unsigned pitch, depth, left, top, width, first, end, row, rows;
+    bool clear, result;
+    uint32_t values[TERM_COLUMNS], ink[TERM_COLUMNS], paper[TERM_COLUMNS];
+    uint32_t glyphs[TERM_COLUMNS][32];
+};
+
+/* The worker snapshots glyphs and framebuffer geometry before dropping kernel serialization. */
+static void text_compute(void *context)
+{
+    struct text_update *update = context;
+    unsigned bytes = update->depth / 8;
+    unsigned row_bytes = update->width * bytes;
+    uintptr_t first =
+        update->memory + (size_t)(update->top + update->row) * update->pitch + update->left * bytes;
+    for (unsigned y = 0; y < update->rows; ++y)
     {
-        uintptr_t line = console.memory + (size_t)(top + y) * console.pitch;
-        uint32_t bits = console.bitmap.rows[value & 255][y];
-        for (unsigned x = 0; x < width; ++x)
+        uintptr_t line = first + (size_t)y * update->pitch;
+        if (update->clear)
         {
-            bool foreground = !!(bits & (UINT32_C(1) << x)) ^ !!(value & 0x10000);
-            uint32_t color = foreground ? ink : paper;
-            if (console.depth == 16)
-                ((uint16_t *)line)[left + x] = (uint16_t)color;
-            else
-                ((uint32_t *)line)[left + x] = color;
+            memset((void *)line, 0, row_bytes);
+            continue;
+        }
+        unsigned cell_width = update->width / (update->end - update->first);
+        for (unsigned column = update->first; column < update->end; ++column)
+        {
+            uint32_t bits = update->glyphs[column][update->row + y];
+            unsigned left = (column - update->first) * cell_width;
+            for (unsigned x = 0; x < cell_width; ++x)
+            {
+                bool foreground =
+                    !!(bits & (UINT32_C(1) << x)) ^ !!(update->values[column] & 0x10000);
+                uint32_t color = foreground ? update->ink[column] : update->paper[column];
+                if (update->depth == 16)
+                    ((uint16_t *)line)[left + x] = (uint16_t)color;
+                else
+                    ((uint32_t *)line)[left + x] = color;
+            }
         }
     }
+    update->result = lume_dma_sync_rect_for_device((const void *)first, row_bytes, update->pitch,
+                                                   update->rows, LUME_DMA_TO_DEVICE);
 }
 
-static bool render(void)
+static unsigned desired_cell(unsigned at)
 {
-    if (console.graphics_owned)
-        return true;
-    unsigned size = cell_size(console.font), width = size & 65535, height = size >> 16;
     unsigned cursor = console.terminal.row * console.columns + console.terminal.column;
-    for (unsigned row = 0; row < console.rows; ++row)
+    return console.cells[at] | (!console.terminal.cursor_hidden && at == cursor ? 0x10000u : 0);
+}
+
+static bool dirty_row(unsigned row, unsigned *first, unsigned *end)
+{
+    *first = console.columns;
+    *end = 0;
+    for (unsigned column = 0; column < console.columns; ++column)
     {
-        unsigned first = console.columns, end = 0;
-        for (unsigned column = 0; column < console.columns; ++column)
-        {
-            unsigned at = row * console.columns + column;
-            unsigned value = console.cells[at];
-            if (!console.terminal.cursor_hidden && at == cursor)
-                value |= 0x10000;
-            if (value == console.shown[at])
-                continue;
-            console.shown[at] = value;
-            render_cell(at, value);
-            if (first > column)
-                first = column;
-            end = column + 1;
-        }
-        if (end)
-            for (unsigned y = 0; y < height; ++y)
-            {
-                uintptr_t line = console.memory + (size_t)(row * height + y) * console.pitch +
-                                 first * width * (console.depth / 8);
-                size_t bytes = (end - first) * width * (console.depth / 8);
-                if (!lume_dma_sync_for_device((const void *)line, bytes, LUME_DMA_TO_DEVICE))
-                    return false;
-            }
+        unsigned at = row * console.columns + column;
+        if (desired_cell(at) == console.shown[at])
+            continue;
+        if (*first > column)
+            *first = column;
+        *end = column + 1;
     }
-    return true;
+    return *end != 0;
+}
+
+static void render_work(void)
+{
+    if (!console.enabled || console.graphics_owned || console.presenting)
+        return;
+    console.pending = false;
+    console.rendering = true;
+    unsigned generation = console.generation;
+    struct text_update update;
+    memset(&update, 0, offsetof(struct text_update, values));
+    update.memory = console.memory;
+    update.pitch = console.pitch;
+    update.depth = console.depth;
+    unsigned height = 0, row = console.next_row;
+    if (console.clear_row < console.height)
+    {
+        update.clear = true;
+        update.top = console.clear_row;
+        update.width = console.width;
+        height = console.height - console.clear_row;
+    }
+    else
+    {
+        for (unsigned scanned = 0; scanned < console.rows; ++scanned)
+        {
+            row = (console.next_row + scanned) % console.rows;
+            if (dirty_row(row, &update.first, &update.end))
+                break;
+        }
+        if (update.end)
+        {
+            unsigned size = cell_size(console.font), width = size & 65535;
+            height = size >> 16;
+            update.left = update.first * width;
+            update.top = row * height;
+            update.width = (update.end - update.first) * width;
+            for (unsigned column = update.first; column < update.end; ++column)
+            {
+                unsigned value = desired_cell(row * console.columns + column);
+                update.values[column] = value;
+                update.ink[column] = pixel(value >> 8);
+                update.paper[column] = pixel(value >> 12);
+                memcpy(update.glyphs[column], console.bitmap.rows[value & 255],
+                       height * sizeof(uint32_t));
+            }
+        }
+    }
+    if (height)
+    {
+        unsigned row_bytes = update.width * (update.depth / 8);
+        unsigned batch = LUME_WORKER_SLICE_BYTES / row_bytes;
+        if (!batch)
+            batch = 1;
+        do
+        {
+            update.rows = height - update.row < batch ? height - update.row : batch;
+            lume_worker_compute(text_compute, &update);
+            if (!update.result)
+            {
+                console.enabled = false;
+                break;
+            }
+            update.row += update.rows;
+            if (update.clear)
+            {
+                if (generation == console.generation)
+                    console.clear_row += update.rows;
+                break;
+            }
+            lume_worker_checkpoint((size_t)update.rows * row_bytes);
+        } while (update.row < height && console.enabled && !console.graphics_owned &&
+                 generation == console.generation);
+        if (!update.clear && update.row == height && generation == console.generation)
+            for (unsigned column = update.first; column < update.end; ++column)
+                console.shown[row * console.columns + column] = update.values[column];
+        console.next_row = (row + 1) % console.rows;
+    }
+    console.rendering = false;
+    if (height)
+        schedule_render();
 }
 
 static void clear(void)
 {
     if (!console.enabled)
         return;
-    if (!console.graphics_owned)
-        for (unsigned y = 0; y < console.height; ++y)
-            memset((void *)(console.memory + (size_t)y * console.pitch), 0,
-                   console.width * (console.depth / 8));
     terminal_start(&console.terminal, console.cells, console.columns, console.rows);
     for (unsigned i = 0; i < console.columns * console.rows; ++i)
         console.shown[i] = UINT32_MAX;
-    if (!lume_dma_sync_for_device((const void *)console.memory,
-                                  (size_t)console.pitch * console.height, LUME_DMA_TO_DEVICE) ||
-        !render())
-        console.enabled = false;
+    console.clear_row = console.next_row = 0;
+    ++console.generation;
+    schedule_render();
 }
 
 static void write(const char *data, size_t bytes)
@@ -137,14 +236,10 @@ static void write(const char *data, size_t bytes)
         terminal_begin(&console.terminal);
         terminal_write(&console.terminal, (const unsigned char *)data, count);
         terminal_end(&console.terminal);
-        if (!render())
-        {
-            console.enabled = false;
-            return;
-        }
         data += count;
         bytes -= count;
     }
+    schedule_render();
 }
 
 static void console_putc(char c)
@@ -161,13 +256,14 @@ static bool start(uint64_t frequency)
 static void stop(void)
 {
     console.enabled = false;
+    console.pending = false;
 }
 
 static int64_t video(unsigned action, unsigned value, const unsigned char *font)
 {
     if (!console.enabled)
         return -LUME_ENOSYS;
-    if (console.graphics_owned &&
+    if ((console.graphics_owned || console.rendering) &&
         (action == LUME_VIDEO_LEGACY_SELECT || action == LUME_VIDEO_MODE_SELECT ||
          action == LUME_VIDEO_FONT_SELECT || action == LUME_VIDEO_UPLOAD))
         return -LUME_EBUSY;
@@ -227,8 +323,8 @@ static int64_t video(unsigned action, unsigned value, const unsigned char *font)
     }
 }
 
-static const struct lume_platform_display_ops operations = {start, console_putc, write,
-                                                            clear, stop,         video};
+static const struct lume_platform_display_ops operations = {
+    start, console_putc, write, clear, stop, video, render_pending, render_work};
 
 static int graphics_query(struct lume_graphics_request *request)
 {
@@ -245,21 +341,19 @@ static int graphics_claim(bool acquire)
 {
     if (!console.enabled)
         return -LUME_ENOSYS;
-    if (acquire && console.graphics_owned)
+    if (acquire && (console.graphics_owned || console.rendering || console.presenting))
         return -LUME_EBUSY;
     console.graphics_owned = acquire;
     if (!acquire)
     {
-        for (unsigned y = 0; y < console.height; ++y)
-            memset((void *)(console.memory + (size_t)y * console.pitch), 0,
-                   console.width * (console.depth / 8));
-        if (!lume_dma_sync_for_device((void *)console.memory,
-                                      (size_t)console.pitch * console.height, LUME_DMA_TO_DEVICE))
-            return -LUME_EIO;
         for (unsigned i = 0; i < console.columns * console.rows; ++i)
             console.shown[i] = UINT32_MAX;
-        return render() ? 0 : -LUME_EIO;
+        console.clear_row = console.next_row = 0;
+        ++console.generation;
+        schedule_render();
+        return console.enabled ? 0 : -LUME_EIO;
     }
+    console.pending = false;
     return 0;
 }
 
@@ -309,6 +403,8 @@ static int graphics_present(const struct lume_graphics_request *request)
     unsigned batch = LUME_WORKER_SLICE_BYTES / ((uint64_t)full.width * 4);
     if (!batch)
         batch = 1;
+    ++console.presenting;
+    int result = 0;
     for (unsigned row = 0; row < full.height;)
     {
         update.request = full;
@@ -317,10 +413,20 @@ static int graphics_present(const struct lume_graphics_request *request)
         update.request.height = full.height - row < batch ? full.height - row : batch;
         lume_worker_compute(present_compute, &update);
         if (update.result)
-            return update.result;
+        {
+            result = update.result;
+            break;
+        }
+        if (!console.enabled || !console.graphics_owned)
+        {
+            result = -LUME_EBADF;
+            break;
+        }
         row += update.request.height;
+        lume_worker_checkpoint((size_t)update.request.height * full.width * 4);
     }
-    return 0;
+    --console.presenting;
+    return result;
 }
 
 static const struct lume_platform_graphics_ops graphics_operations = {
@@ -358,6 +464,8 @@ int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsig
     console.registered = console.enabled = true;
     console.custom_loaded = false;
     console.graphics_owned = false;
+    console.rendering = false;
+    console.presenting = 0;
     geometry();
     clear();
     if (console.enabled)
@@ -370,16 +478,18 @@ int hdmi_console_detach(void)
 {
     if (!console.registered)
         return 0;
-    if (console.graphics_owned)
+    if (console.graphics_owned || console.rendering || console.presenting)
         return -LUME_EBUSY;
     int result = lume_platform_driver_can_stop(LUME_PLATFORM_DISPLAY, &operations);
-    if (!result)
-        result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
+    if (result)
+        return result;
+    result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
     if (!result)
         result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
     if (result)
         return result;
     console.registered = console.enabled = false;
+    console.pending = false;
     console.memory = 0;
     return 0;
 }

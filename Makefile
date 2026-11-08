@@ -310,6 +310,20 @@ check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_N
 .PHONY: check-scheduler
 .PHONY: check-gem
 .PHONY: check-framebuffer-present
+.PHONY: check-graphics
+.PHONY: check-page-span
+check: check-page-span
+check-page-span: $(OUT)/tests/page-span$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/page-span$(HOSTEXE): tests/unit/page_span_test.c src/mm/pages.c include/kernel/lume/worker.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iinclude/kernel "$<" -o "$@"
+check: check-graphics
+check-graphics: $(OUT)/tests/graphics$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/graphics$(HOSTEXE): tests/unit/graphics_test.c src/device/graphics.c include/kernel/lume/user_buffer.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-framebuffer-present
 check-framebuffer-present: $(OUT)/tests/framebuffer-present$(HOSTEXE)
 	env "$<"
@@ -382,9 +396,9 @@ $(OUT)/tests/sdio-host-wait$(HOSTEXE): tests/unit/sdio_host_wait_test.c drivers/
 check: check-wifi-scan
 check-wifi-scan: $(OUT)/tests/wifi-scan$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/wifi-scan$(HOSTEXE): tests/unit/wifi_scan_test.c drivers/net/cyw43455/firmware.c src/net/wifi/wifi_net.c include/kernel/lume/wifi_protocol.h include/kernel/lume/wireless.h include/kernel/lume/worker.h
+$(OUT)/tests/wifi-scan$(HOSTEXE): tests/unit/wifi_scan_test.c drivers/net/cyw43455/firmware.c src/net/wifi/wifi_net.c src/net/wifi/wifi.c include/kernel/lume/wifi_protocol.h include/kernel/lume/wireless.h include/kernel/lume/worker.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -flto -fwhole-program -ffunction-sections -fdata-sections $(TEST_CPPFLAGS) "$<" src/net/wifi/wifi_net.c -Wl,--gc-sections -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -flto -fwhole-program -ffunction-sections -fdata-sections $(TEST_CPPFLAGS) "$<" src/net/wifi/wifi_net.c src/net/wifi/wifi.c -Wl,--gc-sections -o "$@"
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
@@ -550,6 +564,18 @@ $(OUT)/tests/amd64-mmu-views$(HOSTEXE): tests/arch/amd64/mmu_views_test.c arch/a
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -flto -fwhole-program -ffunction-sections -fdata-sections $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -Wl,--gc-sections -o "$@"
 Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
+.PHONY: check-virtio-net check-v3d
+check: check-virtio-net check-v3d
+check-virtio-net: $(OUT)/tests/virtio-net$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/virtio-net$(HOSTEXE): tests/platform/q35/virtio_net_test.c drivers/net/virtio_net/net.c platform/q35/virtio.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+check-v3d: $(OUT)/tests/v3d$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/v3d$(HOSTEXE): tests/unit/v3d_test.c drivers/gpu/v3d/v3d.c drivers/gpu/v3d/v3d.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Idrivers/gpu/v3d "$<" -o "$@"
 $(OUT)/tests/q35-pci$(HOSTEXE): tests/platform/q35/pci_test.c platform/q35/pci.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
@@ -736,6 +762,14 @@ $(OUT)/tests/user-io-lifetime$(HOSTEXE): tests/unit/user_io_lifetime_test.c src/
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
 check: check-user-io-lifetime
+
+.PHONY: check-graphics-lifetime
+check: check-graphics-lifetime
+check-graphics-lifetime: $(OUT)/tests/graphics-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/graphics-lifetime$(HOSTEXE): tests/unit/graphics_lifetime_test.c tests/unit/user_io_lifetime_test.c src/device/graphics.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/graphics_device.h include/kernel/lume/vm.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out tests/unit/user_io_lifetime_test.c src/device/graphics.c src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
 
 SOCKET_LIFETIME_HOST_C := src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c vendor/fatfs/ffunicode.c src/net/socket.c src/net/datagram.c
 .PHONY: check-socket-network-lifetime
