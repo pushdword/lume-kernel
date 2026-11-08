@@ -2,13 +2,18 @@
 #include "lume/vfs.h"
 #include "lume/file_io.h"
 #include "lume/file_io_call.h"
+#include "lume/user_buffer.h"
 #include "lume/user_io.h"
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static struct lume_file_io_request request;
 static bool request_readable = true, buffer_readable = true, buffer_writable = true;
 static bool mutate_request;
+static bool copy_request = true;
+static int capture_error;
+static unsigned captured_tokens, released_tokens, live_tokens;
 static unsigned calls, operation_seen;
 static uint64_t offset_seen, buffer_seen, count_seen;
 static const uint64_t high = UINT64_C(0x100002000);
@@ -34,6 +39,41 @@ bool lume_user_buffer(uint64_t address, uint64_t count, bool writing)
     if (mutate_request)
         request.offset = 7;
     return writing ? buffer_writable : buffer_readable;
+}
+
+int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid, uint64_t address,
+                             size_t bytes, bool writing)
+{
+    assert(pid == 1 && bytes == sizeof(request) && !writing);
+    *token = (struct lume_user_buffer_token){0};
+    if (capture_error)
+        return capture_error;
+    if (address != (uintptr_t)&request || !request_readable)
+        return -LUME_EFAULT;
+    token->first = address;
+    token->bytes = bytes;
+    token->valid = token->registered = true;
+    ++captured_tokens;
+    ++live_tokens;
+    return 0;
+}
+
+bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *buffer, size_t bytes,
+                           bool output)
+{
+    assert(token->registered && token->valid && !output && bytes == sizeof(request));
+    if (!copy_request)
+        return false;
+    memcpy(buffer, &request, bytes);
+    return true;
+}
+
+void lume_user_buffer_release(struct lume_user_buffer_token *token)
+{
+    assert(token->registered && live_tokens == 1);
+    token->registered = token->valid = false;
+    --live_tokens;
+    ++released_tokens;
 }
 
 int64_t lume_vfs_pread(struct lume_files *files, uint64_t fd, void *buffer, uint64_t count,
@@ -84,7 +124,9 @@ int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, u
 
 static int64_t call(unsigned operation)
 {
-    return lume_file_io_call(NULL, 1, operation, (uintptr_t)&request, sizeof(request));
+    int64_t result = lume_file_io_call(NULL, 1, operation, (uintptr_t)&request, sizeof(request));
+    assert(!live_tokens && captured_tokens == released_tokens);
+    return result;
 }
 
 static void reset(void)
@@ -165,6 +207,16 @@ int main(void)
     assert(call(LUME_FILE_IO_TRUNCATE) == -LUME_EINVAL);
     assert(lume_file_io_call(NULL, 1, 0, UINT64_MAX - 1, sizeof(request)) == -LUME_EFAULT);
     assert(lume_file_io_call(NULL, 1, 0, (uintptr_t)&request, sizeof(request) - 1) == -LUME_EINVAL);
+    reset();
+    unsigned before = calls, released = released_tokens;
+    copy_request = false;
+    assert(call(LUME_FILE_IO_PREAD) == -LUME_EFAULT && calls == before);
+    assert(released_tokens == released + 1);
+    copy_request = true;
+    capture_error = -LUME_ENOMEM;
+    assert(call(LUME_FILE_IO_PREAD) == -LUME_ENOMEM && calls == before);
+    assert(released_tokens == released + 1);
+    capture_error = 0;
     puts("PASS file I/O request version, widths, permissions, copies and invalid arguments");
     return 0;
 }

@@ -25,12 +25,15 @@ struct lume_thread_request
     uint64_t entry, argument, stack_bytes, tid, value, address, timeout_ms;
 };
 
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
+#define LUME_PTHREAD_COMPAT_STACK_DEFAULT (128u * 1024u)
+#define LUME_PTHREAD_COMPAT_STACK_MAX (768u * 1024u)
+
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
 #define LUME_PTHREAD_STACK_DEFAULT (2u * 1024u * 1024u)
 #define LUME_PTHREAD_STACK_MAX (8u * 1024u * 1024u)
 #else
-#define LUME_PTHREAD_STACK_DEFAULT (128u * 1024u)
-#define LUME_PTHREAD_STACK_MAX (768u * 1024u)
+#define LUME_PTHREAD_STACK_DEFAULT LUME_PTHREAD_COMPAT_STACK_DEFAULT
+#define LUME_PTHREAD_STACK_MAX LUME_PTHREAD_COMPAT_STACK_MAX
 #endif
 
 /* WAIT compares a naturally aligned 32-bit word before sleeping. WAKE only addresses

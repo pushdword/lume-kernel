@@ -185,14 +185,14 @@ $(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tes
 check: check-file-locks
 check-file-locks: $(OUT)/tests/vfs-file-lock$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h src/security/sandbox.c
+$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h src/security/sandbox.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out src/security/sandbox.c,$(filter %.c,$^)) -o "$@"
 check: check-file-io
 check-file-io: $(OUT)/tests/file-io-call$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE)
 	env "$(OUT)/tests/file-io-call$(HOSTEXE)"
 	env "$(OUT)/tests/vfs-file-io$(HOSTEXE)"
-$(OUT)/tests/file-io-call$(HOSTEXE): tests/unit/file_io_call_test.c src/syscall/file_io.c include/abi/native/lume/file_io.h
+$(OUT)/tests/file-io-call$(HOSTEXE): tests/unit/file_io_call_test.c src/syscall/file_io.c include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 $(OUT)/tests/vfs-file-io$(HOSTEXE): tests/unit/vfs_file_io_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
@@ -368,6 +368,7 @@ $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 $(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
+$(OUT)/tests/heap$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS := -Itests/fixtures/counter $(TEST_CPPFLAGS) -Ivendor/lwip/src/include
 $(OUT)/tests/sdio$(HOSTEXE): tests/unit/sdio_test.c drivers/storage/sdio/sdio.c
 .PHONY: check-sdio-host-wait
@@ -415,7 +416,7 @@ $(OUT)/tests/user-stack$(HOSTEXE): tests/unit/user_stack_test.c src/mm/user_stac
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 $(OUT)/tests/mmu$(HOSTEXE): tests/arch/aarch64/mmu_test.c arch/aarch64/mm/mmu_tables.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) $^ -o "$@"
 $(OUT)/tests/elf-load$(HOSTEXE): tests/unit/elf_load_test.c src/exec/elf.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"

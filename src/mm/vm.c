@@ -34,7 +34,7 @@ struct vm_object
 
 struct vm_area
 {
-    uint64_t first, end, offset;
+    uint64_t first, end, offset, generation;
     unsigned protection, maximum, thread, saved, owner;
     bool shared, retiring, jit;
     struct vm_object *object;
@@ -50,7 +50,7 @@ struct vm_handle
 
 static struct vm_area *spaces[LUME_TASK_LIMIT];
 static struct vm_object *names, *retired;
-static uint64_t serial;
+static uint64_t serial, area_serial;
 static bool changing[LUME_TASK_LIMIT];
 static void reap(void *);
 static void reap_threads(void *);
@@ -80,12 +80,20 @@ static struct vm_chunk *chunk(struct vm_object *object, uint64_t page, bool crea
         entry = entry->next;
     if (!entry && create)
     {
-        entry = allocate(sizeof(*entry));
-        if (entry)
+        struct vm_chunk *prepared = allocate(sizeof(*prepared));
+        if (prepared)
         {
-            entry->index = index;
-            entry->next = object->chunks[bucket];
-            object->chunks[bucket] = entry;
+            /* Another client can prepare the same chunk while allocation suspends. */
+            entry = chunk(object, page, false);
+            if (entry)
+                lume_kernel_free(prepared);
+            else
+            {
+                prepared->index = index;
+                prepared->next = object->chunks[bucket];
+                object->chunks[bucket] = prepared;
+                entry = prepared;
+            }
         }
     }
     return entry;
@@ -266,6 +274,13 @@ static void trim(struct vm_object *object)
     prune_chunks(object);
 }
 
+static void area_changed(struct vm_area *area)
+{
+    if (!++area_serial)
+        lume_fail("virtual memory area generation exhausted");
+    area->generation = area_serial;
+}
+
 static void insert(unsigned task, struct vm_area *area)
 {
     struct vm_area **position = &spaces[task];
@@ -274,6 +289,7 @@ static void insert(unsigned task, struct vm_area *area)
     area->next = *position;
     *position = area;
     area->owner = task;
+    area_changed(area);
     area->object_next = area->object->areas;
     area->object->areas = area;
 }
@@ -306,6 +322,8 @@ static bool boundaries(unsigned task, uint64_t first, uint64_t end)
         split_a->first = first;
         split_a->offset += first - a->first;
         a->end = first;
+        area_changed(a);
+        area_changed(split_a);
         a->next = split_a;
         ++a->object->references;
         split_a->object_next = a->object->areas;
@@ -319,6 +337,8 @@ static bool boundaries(unsigned task, uint64_t first, uint64_t end)
         split_z->first = end;
         split_z->offset += end - z->first;
         z->end = end;
+        area_changed(z);
+        area_changed(split_z);
         z->next = split_z;
         ++z->object->references;
         split_z->object_next = z->object->areas;
@@ -429,15 +449,78 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     uint64_t offset = area->offset + address - area->first;
     if (offset / PAGE >= (area->object->bytes + PAGE - 1) / PAGE)
         return -1;
-    uint64_t physical = get_page(area->object, offset / PAGE);
-    if (!physical)
-        return -1;
-    uint64_t existing, root = lume_mmu_task_root(task);
+    struct vm_object *object = area->object;
+    uint64_t generation = area->generation, page = offset / PAGE;
+    uint64_t root = lume_mmu_task_root(task);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     root = lume_mmu_task_view_root(task, writer);
 #endif
+    ++object->references;
+    /* Chunk allocation may suspend. Keep its object alive and retain no area or
+     * chunk reference across that allocation. The prepared chunk stays unpublished. */
+    struct vm_chunk *prepared = chunk(object, page, false) ? NULL : allocate(sizeof(*prepared));
+    int result = 0;
+    area = find_area(task, address);
+    if (!area || area->generation != generation || area->object != object || area->retiring ||
+        !(area->protection & required))
+        goto out;
+    if (changing[task] || object->changing)
+    {
+        result = 2;
+        goto out;
+    }
+    uint64_t current_root = lume_mmu_task_root(task);
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    if (lume_mmu_jit_active(task) != writer)
+    {
+        result = 2;
+        goto out;
+    }
+    current_root = lume_mmu_task_view_root(task, writer);
+#endif
+    if (current_root != root)
+    {
+        result = 2;
+        goto out;
+    }
+    if (page >= (object->bytes + PAGE - 1) / PAGE)
+    {
+        result = -1;
+        goto out;
+    }
+    /* Frames and page-table nodes use non-suspending single-page allocation.
+     * Mapping publication stays under the kernel lock after this revalidation. */
+    struct vm_chunk *entry = chunk(object, page, false);
+    bool new_chunk = !entry;
+    if (!entry)
+        entry = prepared;
+    if (!entry)
+    {
+        result = -1;
+        goto out;
+    }
+    unsigned slot = (unsigned)(page % 512), bucket = (unsigned)((page / 512) % HASH);
+    bool new_frame = !entry->pages[slot];
+    uint64_t physical = new_frame ? lume_page_alloc(0) : entry->pages[slot];
+    if (!physical)
+    {
+        result = -1;
+        goto out;
+    }
+    entry->pages[slot] = physical;
+    if (new_chunk)
+    {
+        entry->index = page / 512;
+        entry->next = object->chunks[bucket];
+        object->chunks[bucket] = entry;
+        prepared = NULL;
+    }
+    uint64_t existing;
     if (lume_mmu_translate(root, address, write, true, execute, &existing))
-        return 1;
+    {
+        result = 1;
+        goto out;
+    }
     if (area->protection & LUME_PROT_EXEC)
         lume_sync_code(physical, PAGE);
     bool mapped;
@@ -451,9 +534,22 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         mapped = lume_mmu_map_user(task, address & ~(PAGE - 1), physical,
                                    (area->protection & LUME_PROT_WRITE) != 0,
                                    (area->protection & LUME_PROT_EXEC) != 0);
-    if (!mapped)
-        return -1;
-    return 1;
+    result = mapped ? 1 : -1;
+    if (!mapped && new_frame)
+    {
+        entry->pages[slot] = 0;
+        if (!lume_page_free(physical))
+            lume_fail("virtual memory speculative frame release");
+        if (new_chunk)
+        {
+            object->chunks[bucket] = entry->next;
+            lume_kernel_free(entry);
+        }
+    }
+out:
+    lume_kernel_free(prepared);
+    drop(object);
+    return result;
 }
 
 bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
@@ -1097,6 +1193,7 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
             {
                 area->saved = area->protection;
                 area->protection = 0;
+                area_changed(area);
                 area->object->changing = true;
             }
         unsigned discarded = 0;
@@ -1288,9 +1385,15 @@ void lume_vm_swap(unsigned a, unsigned b)
     spaces[a] = spaces[b];
     spaces[b] = areas;
     for (struct vm_area *area = spaces[a]; area; area = area->next)
+    {
         area->owner = a;
+        area_changed(area);
+    }
     for (struct vm_area *area = spaces[b]; area; area = area->next)
+    {
         area->owner = b;
+        area_changed(area);
+    }
 }
 
 bool lume_vm_clone(unsigned source, unsigned target)
@@ -1337,6 +1440,7 @@ bool lume_vm_clone(unsigned source, unsigned target)
             }
         }
         copy->owner = target;
+        area_changed(copy);
         copy->object_next = copy->object->areas;
         copy->object->areas = copy;
         *tail = copy;
@@ -1398,6 +1502,7 @@ void lume_vm_thread_release(unsigned owner, unsigned task)
         {
             area->retiring = true;
             area->protection = 0;
+            area_changed(area);
             area->retire_next = NULL;
             if (retired_threads_tail)
                 retired_threads_tail->retire_next = area;

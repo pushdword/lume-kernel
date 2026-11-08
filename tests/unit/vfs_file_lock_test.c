@@ -3,6 +3,7 @@
 #include "lume/file_lock.h"
 #include "lume/file_io.h"
 #include "lume/file_io_call.h"
+#include "lume/user_buffer.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -660,5 +661,35 @@ int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, u
     (void)positioned;
     (void)offset;
     assert(!"unexpected user transfer in file lock test");
+    abort();
+}
+
+int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid, uint64_t address,
+                             size_t bytes, bool writing)
+{
+    (void)token;
+    (void)pid;
+    (void)address;
+    (void)bytes;
+    (void)writing;
+    assert(!"unexpected request capture in file lock test");
+    abort();
+}
+
+bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *buffer, size_t bytes,
+                           bool output)
+{
+    (void)token;
+    (void)buffer;
+    (void)bytes;
+    (void)output;
+    assert(!"unexpected request copy in file lock test");
+    abort();
+}
+
+void lume_user_buffer_release(struct lume_user_buffer_token *token)
+{
+    (void)token;
+    assert(!"unexpected request release in file lock test");
     abort();
 }

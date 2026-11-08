@@ -2,8 +2,8 @@
 #include "lume/vfs.h"
 #include "lume/file_io.h"
 #include "lume/file_io_call.h"
+#include "lume/user_buffer.h"
 #include "lume/user_io.h"
-#include <string.h>
 
 int64_t lume_file_io_call(struct lume_files *files, unsigned pid, uint64_t operation,
                           uint64_t address, uint64_t bytes)
@@ -13,11 +13,15 @@ int64_t lume_file_io_call(struct lume_files *files, unsigned pid, uint64_t opera
         return lume_file_lock_call(files, operation, address, bytes);
     if (operation > LUME_FILE_IO_TRUNCATE || bytes != sizeof(struct lume_file_io_request))
         return -LUME_EINVAL;
-    if (address > UINTPTR_MAX || bytes > UINTPTR_MAX - address ||
-        !lume_user_buffer(address, bytes, false))
-        return -LUME_EFAULT;
     struct lume_file_io_request request;
-    memcpy(&request, (const void *)(uintptr_t)address, sizeof(request));
+    struct lume_user_buffer_token token = {0};
+    int captured = lume_user_buffer_acquire(&token, pid, address, sizeof(request), false);
+    if (captured)
+        return captured;
+    bool copied = lume_user_buffer_copy(&token, &request, sizeof(request), false);
+    lume_user_buffer_release(&token);
+    if (!copied)
+        return -LUME_EFAULT;
     if (request.version != LUME_FILE_IO_VERSION || request.bytes != sizeof(request))
         return -LUME_EINVAL;
     if (operation == LUME_FILE_IO_TRUNCATE)

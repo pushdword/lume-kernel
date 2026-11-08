@@ -1,5 +1,8 @@
 extern int lume_clock_realtime_ms(uint64_t, uint64_t *);
 
+_Static_assert(LUME_PTHREAD_STACK_MAX <= LUME_THREAD_STACK_MAX,
+               "Thread stack limit exceeds VM capacity");
+
 static uint64_t thread_realtime_deadline[LUME_TASK_LIMIT];
 static bool thread_realtime_wait[LUME_TASK_LIMIT];
 
@@ -143,10 +146,11 @@ static int64_t thread_create(const struct lume_thread_request *r)
     native64 = (r->value & allowed) || (images[owner].entry >= LUME_LARGE_ELF_BASE &&
                                         images[owner].entry < LUME_LARGE_ELF_LIMIT);
 #endif
+    uint64_t maximum = native64 ? LUME_PTHREAD_STACK_MAX : LUME_PTHREAD_COMPAT_STACK_MAX;
     if (!r->entry ||
         !lume_mmu_translate(lume_mmu_task_root(owner), r->entry, false, true, true, &physical) ||
-        r->stack_bytes < 32768 || r->stack_bytes > LUME_PTHREAD_STACK_MAX || r->tid ||
-        (r->value & ~allowed) || r->address || r->timeout_ms)
+        r->stack_bytes < 32768 || r->stack_bytes > maximum || r->tid || (r->value & ~allowed) ||
+        r->address || r->timeout_ms)
         return -LUME_EINVAL;
     uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
     uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);

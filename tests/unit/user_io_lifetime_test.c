@@ -200,6 +200,7 @@ static struct
 
 static unsigned allocation_live, baseline_metadata;
 static int allocation_budget = -1;
+static struct lume_file_io_request wire;
 
 void *lume_kernel_allocate(size_t bytes)
 {
@@ -343,6 +344,12 @@ bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, 
                         uint64_t *physical)
 {
     CHECK(user);
+    if (root == 2 && !write && !execute && address >= (uintptr_t)&wire &&
+        address - (uintptr_t)&wire < sizeof(wire))
+    {
+        *physical = address;
+        return true;
+    }
     unsigned task = (unsigned)(root / 2) - 1, view = (unsigned)root & 1;
     for (unsigned i = 0; i < 2048; ++i)
         if (mappings[i].live && mappings[i].task == task &&
@@ -430,12 +437,10 @@ int64_t lume_task_protect_image(unsigned task, uint64_t address, uint64_t bytes,
     return -LUME_ENOMEM;
 }
 
-static struct lume_file_io_request wire;
-
 bool lume_user_buffer(uint64_t address, uint64_t bytes, bool write)
 {
     if (address == (uintptr_t)&wire)
-        return bytes == sizeof(wire);
+        return bytes == sizeof(wire) && !write;
     unsigned task = (unsigned)(active_root / 2) - 1;
     while (bytes)
     {
@@ -741,6 +746,43 @@ static void release_and_bounds_cases(void)
         reap(NULL);
 }
 
+static void request_capture_cases(void)
+{
+    active_root = 2;
+    uint64_t base =
+        (uint64_t)vm(0, LUME_VM_MAP, 0, 8192, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(base >= LUME_VM_BASE);
+    uint64_t address = base + 4096 - sizeof(wire) / 2;
+    wire = (struct lume_file_io_request){.version = LUME_FILE_IO_VERSION,
+                                         .bytes = sizeof(wire),
+                                         .fd = image_fd,
+                                         .offset = 31,
+                                         .whence = LUME_SEEK_SET};
+    CHECK(lume_user_buffer(address, sizeof(wire), true));
+    size_t done = 0;
+    while (done < sizeof(wire))
+    {
+        uint64_t physical, next = address + done;
+        CHECK(lume_mmu_translate(2, next, true, true, false, &physical));
+        size_t part = 4096 - (size_t)(next % 4096);
+        if (part > sizeof(wire) - done)
+            part = sizeof(wire) - done;
+        memcpy((void *)(uintptr_t)physical, (unsigned char *)&wire + done, part);
+        done += part;
+    }
+    CHECK(lume_file_io_call(&files[0], 1, LUME_FILE_IO_SEEK, address, sizeof(wire)) == 31);
+    CHECK(vm(0, LUME_VM_PROTECT, base + 4096, 4096, 0, 0, -1) == 0);
+    CHECK(lume_file_io_call(&files[0], 1, LUME_FILE_IO_SEEK, address, sizeof(wire)) ==
+          -LUME_EFAULT);
+    CHECK(lume_vfs_seek(&files[0], image_fd, 0, LUME_SEEK_CUR) == 31);
+    CHECK(vm(0, LUME_VM_PROTECT, base, 8192, 1, 0, -1) == 0);
+    CHECK(lume_file_io_call(&files[0], 1, LUME_FILE_IO_SEEK, address, sizeof(wire)) == 31);
+    CHECK(vm(0, LUME_VM_UNMAP, base, 8192, 0, 0, -1) == 0);
+    while (retired)
+        reap(NULL);
+    CHECK(frame_live == baseline_frames);
+}
+
 static void identity_cases(void)
 {
     unsigned char data[8192] = {0};
@@ -870,6 +912,7 @@ int main(int argc, char **argv)
     replacement_cases();
     result_cases();
     identity_cases();
+    request_capture_cases();
     release_and_bounds_cases();
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);

@@ -14,6 +14,10 @@
 static unsigned metadata_live, physical_live, mappings_live, syncs, checks;
 static unsigned image_protect_calls;
 static int metadata_budget = -1, physical_budget = -1;
+static int mapping_budget = -1;
+static void (*allocation_pause)(void);
+static bool writer_view[LUME_TASK_LIMIT];
+static uint64_t root_offset[LUME_TASK_LIMIT];
 
 static struct
 {
@@ -59,7 +63,15 @@ void *lume_kernel_allocate(size_t size)
         --metadata_budget;
     void *value = malloc(size);
     if (value)
+    {
         ++metadata_live;
+        if (size == sizeof(struct vm_chunk) && allocation_pause)
+        {
+            void (*pause)(void) = allocation_pause;
+            allocation_pause = NULL;
+            pause();
+        }
+    }
     return value;
 }
 
@@ -125,7 +137,7 @@ void lume_fail(const char *message)
 
 uint64_t lume_mmu_task_root(unsigned task)
 {
-    return task + 1;
+    return task + 1 + root_offset[task];
 }
 
 bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, bool execute,
@@ -146,19 +158,18 @@ bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, 
 
 bool lume_mmu_jit_active(unsigned task)
 {
-    (void)task;
-    return false;
+    return writer_view[task];
 }
 
 uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
 {
-    CHECK(!writer);
-    return task + 1;
+    return lume_mmu_task_root(task) + (writer ? 2 * LUME_TASK_LIMIT : 0);
 }
 
 bool lume_mmu_root_matches(unsigned task, uint64_t root)
 {
-    return root == task + 1;
+    return root == lume_mmu_task_view_root(task, false) ||
+           root == lume_mmu_task_view_root(task, true);
 }
 
 bool lume_mmu_map_user_jit(unsigned task, uint64_t address, uint64_t physical, bool write,
@@ -175,6 +186,10 @@ bool lume_mmu_map_user_jit(unsigned task, uint64_t address, uint64_t physical, b
 bool lume_mmu_map_user(unsigned task, uint64_t address, uint64_t physical, bool write, bool execute)
 {
     CHECK(!(write && execute));
+    if (!mapping_budget)
+        return false;
+    if (mapping_budget > 0)
+        --mapping_budget;
     for (unsigned i = 0; i < 4096; ++i)
         if (mappings[i].live && mappings[i].task == task && mappings[i].address == address)
         {
@@ -365,6 +380,10 @@ static void drain(void)
 static void clean(void)
 {
     metadata_budget = physical_budget = -1;
+    mapping_budget = -1;
+    allocation_pause = NULL;
+    memset(writer_view, 0, sizeof(writer_view));
+    memset(root_offset, 0, sizeof(root_offset));
     for (unsigned i = 0; i < 64; ++i)
         lume_vm_release(i);
     for (unsigned fd = 0; fd < 64; ++fd)
@@ -375,6 +394,8 @@ static void clean(void)
 }
 
 static void write_cases(void);
+static void fault_suspend_cases(void);
+static void thread_region_cases(void);
 
 int main(void)
 {
@@ -467,6 +488,8 @@ int main(void)
     CHECK(physical(0, base, true, false) == a);
     clean();
     write_cases();
+    fault_suspend_cases();
+    thread_region_cases();
     printf("PASS_VM_PRODUCT_HOST checks=%u metadata=%u frames=%u ptes=%u\n", checks, metadata_live,
            physical_live, mappings_live);
     return 0;
@@ -611,4 +634,226 @@ static void write_cases(void)
           4096);
     CHECK(!memcmp(output, data, 4096));
     clean();
+}
+
+static int pause_fd;
+static uint64_t pause_base, pause_bytes, pause_other;
+static struct vm_object *pause_object;
+static int64_t pause_result;
+
+static void resize_during_allocation(void)
+{
+    pause_result = call(1, LUME_VM_RESIZE, 0, pause_bytes, 0, 0, pause_fd);
+    CHECK(!pause_result);
+}
+
+static void release_during_allocation(void)
+{
+    lume_vm_release(0);
+    CHECK(!lume_vfs_close(&files, (unsigned)pause_fd));
+    drain();
+    CHECK(pause_object->references == 1);
+}
+
+static void remap_during_allocation(void)
+{
+    CHECK(!call(0, LUME_VM_UNMAP, pause_base, 8192, 0, 0, -1));
+    CHECK(call(0, LUME_VM_MAP, pause_base, 8192, 3, LUME_MAP_SHARED | LUME_MAP_FIXED, pause_fd) ==
+          (int64_t)pause_base);
+}
+
+static void protect_during_allocation(void)
+{
+    CHECK(!call(0, LUME_VM_PROTECT, pause_base, 8192, 0, 0, -1));
+    CHECK(!call(0, LUME_VM_PROTECT, pause_base, 8192, 3, 0, -1));
+}
+
+static void switch_view_during_allocation(void)
+{
+    writer_view[0] = true;
+}
+
+static void switch_root_during_allocation(void)
+{
+    root_offset[0] = 4 * LUME_TASK_LIMIT;
+}
+
+static void change_object_during_allocation(void)
+{
+    pause_object->changing = true;
+}
+
+static void alias_fault_during_allocation(void)
+{
+    CHECK(lume_vm_fault(1, pause_other, false, false) == 1);
+}
+
+static void fault_suspend_cases(void)
+{
+    const uint64_t sizes[] = {0, 4096, 4097, 16384};
+    const uint64_t offsets[] = {0, 4096, 4096, 0};
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i)
+    {
+        pause_fd = memory_file();
+        CHECK(!call(0, LUME_VM_RESIZE, 0, 8192, 0, 0, pause_fd));
+        pause_base = call(0, LUME_VM_MAP, 0, 16384, 3, LUME_MAP_SHARED, pause_fd);
+        pause_bytes = sizes[i];
+        allocation_pause = resize_during_allocation;
+        int result = lume_vm_fault(0, pause_base + offsets[i], true, false);
+        CHECK(!allocation_pause && !pause_result && file_size(pause_fd) == sizes[i]);
+        bool valid = offsets[i] < rounded(sizes[i]);
+        CHECK(result == (valid ? 1 : -1));
+        CHECK(mappings_live == (unsigned)valid && physical_live == (unsigned)valid);
+        uint64_t physical;
+        CHECK(lume_mmu_translate(1, pause_base + offsets[i], false, true, false, &physical) ==
+              valid);
+        if (!valid)
+            CHECK(!((struct vm_handle *)descriptors[pause_fd].context)->object->chunks[0]);
+        else
+        {
+            unsigned char output[8192];
+            uint64_t first = offsets[i], bytes = sizes[i] - first;
+            if (bytes > sizeof(output))
+                bytes = sizeof(output);
+            CHECK(descriptors[pause_fd].ops->pread(descriptors[pause_fd].context, output, bytes,
+                                                   first) == (int64_t)bytes);
+            for (uint64_t j = 0; j < bytes; ++j)
+                CHECK(!output[j]);
+        }
+        if (!i)
+            printf("VM_FAULT_EOF allocation=%zu resize_result=%lld file_bytes=0 fault_result=%d "
+                   "pte_present=0\n",
+                   sizeof(struct vm_chunk), (long long)pause_result, result);
+        clean();
+    }
+
+    pause_fd = memory_file();
+    const uint64_t boundary = 512 * PAGE;
+    CHECK(!call(0, LUME_VM_RESIZE, 0, boundary + 8192, 0, 0, pause_fd));
+    pause_base = call(0, LUME_VM_MAP, 0, boundary + 8192, 3, LUME_MAP_SHARED, pause_fd);
+    uint64_t kept = physical(0, pause_base, true, false);
+    *(unsigned char *)(uintptr_t)kept = 0xa7;
+    unsigned before = metadata_live;
+    pause_bytes = PAGE;
+    allocation_pause = resize_during_allocation;
+    CHECK(lume_vm_fault(0, pause_base + boundary, true, false) == -1);
+    CHECK(!allocation_pause && !pause_result && file_size(pause_fd) == PAGE);
+    CHECK(metadata_live == before && physical_live == 1 && mappings_live == 1);
+    uint64_t translated;
+    CHECK(lume_mmu_translate(1, pause_base, true, true, false, &translated));
+    CHECK(translated == kept && *(unsigned char *)(uintptr_t)translated == 0xa7);
+    CHECK(!lume_mmu_translate(1, pause_base + boundary, false, true, false, &translated));
+    clean();
+
+    void (*mutations[])(void) = {release_during_allocation,     remap_during_allocation,
+                                 protect_during_allocation,     switch_view_during_allocation,
+                                 switch_root_during_allocation, change_object_during_allocation};
+    for (unsigned i = 0; i < sizeof(mutations) / sizeof(*mutations); ++i)
+    {
+        pause_fd = memory_file();
+        CHECK(!call(0, LUME_VM_RESIZE, 0, 8192, 0, 0, pause_fd));
+        pause_base = call(0, LUME_VM_MAP, 0, 8192, 3, LUME_MAP_SHARED, pause_fd);
+        pause_object = ((struct vm_handle *)descriptors[pause_fd].context)->object;
+        allocation_pause = mutations[i];
+        int result = lume_vm_fault(0, pause_base, true, false);
+        CHECK(!allocation_pause && result == (i >= 3 ? 2 : 0));
+        CHECK(!mappings_live && !physical_live);
+        if (i)
+            CHECK(!pause_object->chunks[0]);
+        if (i == 5)
+            pause_object->changing = false;
+        clean();
+    }
+
+    pause_fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 8192, 0, 0, pause_fd));
+    pause_base = call(0, LUME_VM_MAP, 0, 8192, 3, LUME_MAP_SHARED, pause_fd);
+    pause_other = call(1, LUME_VM_MAP, 0, 8192, 1, LUME_MAP_SHARED, pause_fd);
+    allocation_pause = alias_fault_during_allocation;
+    CHECK(lume_vm_fault(0, pause_base, true, false) == 1 && !allocation_pause);
+    struct vm_object *object = ((struct vm_handle *)descriptors[pause_fd].context)->object;
+    CHECK(object->chunks[0] && !object->chunks[0]->next);
+    CHECK(physical_live == 1 && mappings_live == 2);
+    CHECK(physical(0, pause_base, true, false) == physical(1, pause_other, false, false));
+    clean();
+
+    pause_fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 8192, 0, 0, pause_fd));
+    pause_other = call(1, LUME_VM_MAP, 0, 8192, 1, LUME_MAP_SHARED, pause_fd);
+    allocation_pause = alias_fault_during_allocation;
+    unsigned char data[64], output[64];
+    memset(data, 0x7a, sizeof(data));
+    CHECK(descriptors[pause_fd].ops->write(descriptors[pause_fd].context, data, sizeof(data)) ==
+          sizeof(data));
+    object = ((struct vm_handle *)descriptors[pause_fd].context)->object;
+    unsigned chunks = 0;
+    for (struct vm_chunk *entry = object->chunks[0]; entry; entry = entry->next)
+        ++chunks;
+    printf("VM_WRITE_FAULT_SHARED chunks=%u frames=%u ptes=%u\n", chunks, physical_live,
+           mappings_live);
+    CHECK(!allocation_pause && chunks == 1 && physical_live == 1 && mappings_live == 1);
+    uint64_t mapped = physical(1, pause_other, false, false);
+    CHECK(!memcmp((void *)(uintptr_t)mapped, data, sizeof(data)));
+    CHECK(descriptors[pause_fd].ops->pread(descriptors[pause_fd].context, output, sizeof(output),
+                                           0) == sizeof(output));
+    CHECK(!memcmp(output, data, sizeof(data)) && file_size(pause_fd) == 8192);
+    clean();
+
+    for (unsigned failure = 0; failure < 3; ++failure)
+    {
+        pause_base = call(0, LUME_VM_MAP, 0, 8192, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+        unsigned before = metadata_live;
+        if (failure == 0)
+            metadata_budget = 0;
+        else if (failure == 1)
+            physical_budget = 0;
+        else
+            mapping_budget = 0;
+        CHECK(lume_vm_fault(0, pause_base, true, false) == -1);
+        CHECK(metadata_live == before && !physical_live && !mappings_live);
+        CHECK(!spaces[0]->object->chunks[0] && spaces[0]->object->references == 1);
+        clean();
+    }
+}
+
+static void thread_region_cases(void)
+{
+    const uint64_t requests[] = {UINT64_C(2) * 1024 * 1024, UINT64_C(2) * 1024 * 1024 + 1,
+                                 UINT64_C(8) * 1024 * 1024};
+    for (unsigned n = 0; n < sizeof(requests) / sizeof(*requests); ++n)
+    {
+        uint64_t tls, stack, base, bytes, physical;
+        CHECK(lume_vm_thread_region(0, 3, 64, requests[n], &tls, &stack));
+        CHECK(!(tls % PAGE) && !(stack % PAGE) && stack == tls + 2 * PAGE);
+        CHECK(lume_vm_thread_bounds(0, 3, &base, &bytes));
+        CHECK(base == stack && bytes == rounded(requests[n]));
+        CHECK(lume_vm_fault(0, tls - PAGE, true, false) == 0);
+        CHECK(lume_vm_fault(0, stack - PAGE, true, false) == 0);
+        CHECK(lume_vm_fault(0, stack + bytes, true, false) == 0);
+        CHECK(!lume_mmu_translate(1, stack - PAGE, true, true, false, &physical));
+        CHECK(lume_vm_fault(0, tls, true, false) == 1);
+        CHECK(lume_vm_fault(0, stack, true, false) == 1);
+        CHECK(lume_vm_fault(0, stack + bytes - 1, true, false) == 1);
+        lume_vm_thread_release(0, 3);
+        CHECK(!lume_vm_thread_bounds(0, 3, &base, &bytes));
+        CHECK(lume_vm_fault(0, stack, true, false) == 0);
+        unsigned rounds = 0;
+        while (retired_threads)
+        {
+            CHECK(++rounds < 8);
+            reap_threads(NULL);
+        }
+        CHECK(!mappings_live && !physical_live);
+        clean();
+    }
+    uint64_t tls, stack;
+    CHECK(!lume_vm_thread_region(0, 3, 64, UINT64_C(8) * 1024 * 1024 + 1, &tls, &stack));
+    CHECK(!metadata_live && !physical_live && !mappings_live);
+    for (int budget = 0; budget < 4; ++budget)
+    {
+        metadata_budget = budget;
+        CHECK(!lume_vm_thread_region(0, 3, 64, UINT64_C(2) * 1024 * 1024, &tls, &stack));
+        CHECK(!spaces[0] && !physical_live && !mappings_live);
+        clean();
+    }
 }
