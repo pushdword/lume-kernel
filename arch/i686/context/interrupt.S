@@ -24,6 +24,19 @@ lume_trap_common:
     movw $16, %ax
     movw %ax, %ds
     movw %ax, %es
+    cmpl $7, 32(%ebx)
+    jne lume_trap_query_check
+    cmpl $0x1b, 44(%ebx)
+    jne lume_trap_capture
+    andl $-16, %esp
+    subl $12, %esp
+    pushl %ebx
+    call lume_i686_fpu_activate
+    movl %ebx, %esp
+    testb %al, %al
+    jnz lume_trap_fast_return
+    jmp lume_trap_capture
+lume_trap_query_check:
     cmpl $128, 32(%ebx)
     je 1f
     cmpl $129, 32(%ebx)
@@ -38,6 +51,7 @@ lume_trap_common:
     movl %ebx, %esp
     testb %al, %al
     jz lume_trap_capture
+lume_trap_fast_return:
     movw $0x23, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -50,7 +64,6 @@ lume_trap_capture:
     subl $464, %esp
     andl $-16, %esp
     movl %esp, %edi
-    fnsave 336(%edi)
     subl $8, %esp
     pushl %ebx
     pushl %edi

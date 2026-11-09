@@ -93,9 +93,20 @@ static bool kernel_request_ready(unsigned domain, unsigned task, const struct lu
 
 static bool kernel_claim(unsigned task)
 {
-    bool claimed = io_queue_claim(&kernel_control_queue, task, lume_clock_monotonic());
-    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
-        claimed |= io_queue_claim(&kernel_lanes[i].queue, task, lume_clock_monotonic());
+    bool claimed = false, timed = false;
+    uint64_t at = 0;
+    for (unsigned i = 0; i <= LUME_WORK_DOMAINS; ++i)
+    {
+        struct io_queue *queue = i ? &kernel_lanes[i - 1].queue : &kernel_control_queue;
+        if (!queue->granted)
+            continue;
+        if (!timed)
+        {
+            at = lume_clock_monotonic();
+            timed = true;
+        }
+        claimed |= io_queue_claim(queue, task, at);
+    }
     return claimed;
 }
 

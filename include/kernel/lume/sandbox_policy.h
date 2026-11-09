@@ -7,6 +7,7 @@
 
 int64_t lume_sandbox_call(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t);
 int lume_sandbox_check(struct lume_files *, unsigned, const struct lume_context *);
+int lume_sandbox_io(struct lume_files *, uint64_t, bool);
 int lume_sandbox_open(struct lume_files *, const char *, uint64_t);
 int lume_sandbox_path(struct lume_files *, const char *);
 int lume_sandbox_socket(struct lume_files *, unsigned, const struct lume_socket_request *,

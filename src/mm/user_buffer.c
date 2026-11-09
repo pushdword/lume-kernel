@@ -28,6 +28,29 @@ static bool view_matches(const struct lume_user_buffer_token *token)
 #endif
 }
 
+bool lume_user_buffer_resident(unsigned pid, uint64_t first, size_t bytes, bool write,
+                               uint64_t physical[2])
+{
+    if (!lume_smp_owned() || !pid || pid > LUME_TASK_LIMIT || bytes > LUME_USER_RESIDENT_MAX ||
+        first > UINTPTR_MAX || bytes > UINTPTR_MAX - first)
+        return false;
+    unsigned owner = pid - 1;
+    uint64_t root = user_root(owner);
+    if (!root || !lume_vm_buffer_ready(owner, first, bytes))
+        return false;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    if (!lume_mmu_root_active(root))
+        return false;
+#endif
+    if (!bytes)
+        return true;
+    if (!lume_mmu_translate(root, first, write, true, false, physical))
+        return false;
+    size_t part = 4096u - (size_t)(first & 4095u);
+    return bytes <= part ||
+           lume_mmu_translate(root, first + part, write, true, false, physical + 1);
+}
+
 int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid, uint64_t first,
                              size_t bytes, bool write)
 {

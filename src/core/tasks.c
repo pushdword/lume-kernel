@@ -31,6 +31,7 @@
 #include "lume/signal.h"
 #include "lume/process.h"
 #include "lume/tty_device.h"
+#include "lume/user_io.h"
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #include "lume/query.h"
 #endif
@@ -409,12 +410,22 @@ static int pick_task(void)
 {
     uint64_t excluded[SCHED_MASK_WORDS] = {lume_cpu_index() ? (1u | 1u << 2) : 0};
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (process_stopped[thread_slots[i].process] && !process_exiting[thread_slots[i].process])
+        if (states[i] && process_stopped[thread_slots[i].process] &&
+            !process_exiting[thread_slots[i].process])
             excluded[i / 64u] |= UINT64_C(1) << (i % 64u);
+    bool timed = false;
+    uint64_t at = 0;
     for (unsigned i = 0; public_mode && i <= LUME_WORK_DOMAINS; ++i)
     {
         struct io_queue *queue = i == 0 ? &kernel_control_queue : &kernel_lanes[i - 1].queue;
-        if (io_queue_granted(queue, lume_clock_monotonic()))
+        if (!queue->granted)
+            continue;
+        if (!timed)
+        {
+            at = lume_clock_monotonic();
+            timed = true;
+        }
+        if (io_queue_granted(queue, at))
         {
             unsigned task = queue->grant.task;
             if (states[task] == 1 && !(excluded[task / 64u] & (UINT64_C(1) << (task % 64u))))
@@ -784,6 +795,7 @@ static void task_query_publish(const struct lume_context *frame)
                 .reg = {[0] = LUME_THREAD_SELF, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
             pid = process + 1;
             tid = thread_id(thread_slots, task);
+            allowed |= LUME_QUERY_PIPE;
             if (!lume_sandbox_check(&tasks[process].files, pid, &pid_query))
                 allowed |= LUME_QUERY_PID;
             if (!lume_sandbox_check(&tasks[process].files, pid, &tid_query))
@@ -795,6 +807,8 @@ static void task_query_publish(const struct lume_context *frame)
     (void)frame;
 #endif
 }
+
+#include "pipe_fast.h"
 
 static unsigned task_group(unsigned task)
 {
@@ -909,7 +923,6 @@ static struct lume_context *select_task(unsigned next)
     kernel_arm_grants(next, SCHED_TICK_MS);
     sched_enter(&policy, lume_cpu_index(), (int)next, now(), unit, LUME_SCHED_QUANTUM);
     lume_mmu_switch(lume_mmu_task_root(next));
-    task_query_publish(&tasks[next].context);
     return &tasks[next].context;
 }
 
@@ -2132,7 +2145,9 @@ static bool run_tasks(uint64_t frequency, bool elf)
     }
     active = true;
     lume_timer_start(frequency);
-    lume_run_user(select_task(0));
+    struct lume_context *first = select_task(0);
+    task_query_publish(first);
+    lume_run_user(first);
     bool ok = !active && tasks[0].exits && tasks[1].exits && tasks[0].preemptions &&
               tasks[1].preemptions && cpu_switches >= 4 && task_ticks >= 40;
     for (unsigned n = 0; n < 2; ++n)
@@ -2377,6 +2392,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         lume_smp_start();
     lume_timer_start(frequency);
     struct lume_context *first = select_task(service_alive ? 2 : 0);
+    task_query_publish(first);
     lume_smp_unlock();
     lume_run_user(first);
     lume_smp_quiesce();
@@ -2433,6 +2449,7 @@ void lume_tasks_secondary(void)
     struct lume_context *frame = wait_ready_task();
     if (frame)
     {
+        task_query_publish(frame);
         lume_smp_unlock();
         lume_run_user(frame);
         lume_smp_lock();

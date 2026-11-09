@@ -34,7 +34,28 @@ struct __attribute__((packed)) descriptor
     uint32_t address;
 };
 
+static bool fpu_disabled(void)
+{
+    uint32_t control;
+    __asm__ volatile("movl %%cr0, %0" : "=r"(control));
+    return (control & 8u) != 0;
+}
+
+static void fpu_enable(void)
+{
+    __asm__ volatile("clts" : : : "memory");
+}
+
+static void fpu_disable(void)
+{
+    uint32_t control;
+    __asm__ volatile("movl %%cr0, %0" : "=r"(control));
+    if (!(control & 8u))
+        __asm__ volatile("movl %0, %%cr0" : : "r"(control | 8u) : "memory");
+}
+
 #include "query.h"
+#include "fpu.h"
 
 void lume_i686_context_start(void)
 {
@@ -60,10 +81,12 @@ void lume_i686_context_start(void)
     struct descriptor idtr = {sizeof(idt) - 1, (uintptr_t)idt};
     __asm__ volatile("lidt %0" : : "m"(idtr) : "memory");
     lume_i686_query_start();
+    context_fpu_start();
 }
 
 void lume_i686_context_capture(struct lume_context *c, const uint32_t *r)
 {
+    context_fpu_capture(c);
     memcpy(c->raw, r, sizeof(c->raw));
     memset(c->reg, 0, sizeof(c->reg));
     c->pc = r[10];
@@ -72,7 +95,6 @@ void lume_i686_context_capture(struct lume_context *c, const uint32_t *r)
     c->sp = c->status ? (uintptr_t)(r + 13) : r[13];
     c->tls = tls_base;
     c->syscall_pc = 0;
-    c->fpu_valid = 1;
 }
 
 uint32_t *lume_i686_context_prepare(struct lume_context *c)
@@ -98,10 +120,7 @@ uint32_t *lume_i686_context_prepare(struct lume_context *c)
         out[11] = (uint32_t)c->sp;
         out[12] = 0x23;
     }
-    if (c->fpu_valid)
-        __asm__ volatile("frstor %0" : : "m"(c->vector) : "memory");
-    else
-        __asm__ volatile("fninit" : : : "memory");
+    context_fpu_prepare(c);
     return out;
 }
 

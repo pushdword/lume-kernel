@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define LUME_USER_BUFFER_PAGES ((LUME_FILE_IO_MAX + 4095u) / 4096u + 1u)
+#define LUME_USER_RESIDENT_MAX 512u
 
 struct lume_user_buffer_token
 {
@@ -29,4 +30,7 @@ bool lume_user_buffer_copy(struct lume_user_buffer_token *, void *, size_t, bool
 void lume_user_buffer_release(struct lume_user_buffer_token *);
 void lume_user_buffer_invalidate(unsigned, uint64_t, uint64_t);
 void lume_user_buffer_invalidate_root(unsigned);
+/* Resident spans require the scheduler lock through their final copy. They do
+ * not resolve faults or retain mappings across callbacks or suspension. */
+bool lume_user_buffer_resident(unsigned, uint64_t, size_t, bool, uint64_t[2]);
 #endif

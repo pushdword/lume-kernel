@@ -135,6 +135,16 @@ int lume_sandbox_socket(struct lume_files *files, unsigned operation,
     return -LUME_EPERM;
 }
 
+int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
+{
+    unsigned profile = files->identity.sandbox_profile;
+    if (!profile)
+        return 0;
+    if (profile < LUME_SANDBOX_RENDERER || profile > LUME_SANDBOX_GPU_SOFTWARE)
+        return -LUME_EPERM;
+    return lume_vfs_sandbox_access(files, fd, writing);
+}
+
 int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume_context *frame)
 {
     unsigned profile = files->identity.sandbox_profile;
@@ -173,7 +183,7 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
         return !action || action == pid ? 0 : -LUME_EPERM;
     case LUME_SYS_READ:
     case LUME_SYS_WRITE:
-        return lume_vfs_sandbox_access(files, action, number == LUME_SYS_WRITE);
+        return lume_sandbox_io(files, action, number == LUME_SYS_WRITE);
     case LUME_SYS_OPEN:
     case LUME_SYS_CHDIR:
         return 0;

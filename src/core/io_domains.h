@@ -52,7 +52,8 @@ static bool kernel_exclusive_active(void)
 static bool kernel_inline_available(void)
 {
     return !kernel_exclusive_active() &&
-           !io_queue_granted(&kernel_control_queue, lume_clock_monotonic());
+           (!kernel_control_queue.granted ||
+            !io_queue_granted(&kernel_control_queue, lume_clock_monotonic()));
 }
 
 static bool kernel_any_grant(void)
@@ -65,9 +66,21 @@ static bool kernel_any_grant(void)
 
 static void kernel_arm_grants(unsigned task, uint64_t duration)
 {
-    for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
-        io_queue_arm(&kernel_lanes[i].queue, task, lume_clock_monotonic(), duration);
-    io_queue_arm(&kernel_control_queue, task, lume_clock_monotonic(), duration);
+    bool timed = false;
+    uint64_t at = 0;
+    for (unsigned i = 0; i <= LUME_WORK_DOMAINS; ++i)
+    {
+        struct io_queue *queue =
+            i == LUME_WORK_DOMAINS ? &kernel_control_queue : &kernel_lanes[i].queue;
+        if (!queue->granted || queue->grant.task != task || queue->armed)
+            continue;
+        if (!timed)
+        {
+            at = lume_clock_monotonic();
+            timed = true;
+        }
+        io_queue_arm(queue, task, at, duration);
+    }
 }
 
 #endif

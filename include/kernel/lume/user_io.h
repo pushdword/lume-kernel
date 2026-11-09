@@ -10,4 +10,8 @@ struct lume_files;
  * Larger transfers allocate at most LUME_FILE_IO_MAX bytes. */
 int64_t lume_user_io_call(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t, bool, bool,
                           int64_t);
+/* Native pipe operations use resident physical aliases while holding the lock.
+ * A false result leaves the pipe and user buffer untouched. */
+bool lume_user_io_pipe_try(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t, bool,
+                           int64_t *);
 #endif

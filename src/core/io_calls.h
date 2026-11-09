@@ -53,7 +53,13 @@ static struct lume_context *kernel_pipe_result(struct lume_context *frame)
 {
     extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
     unsigned task = current_task, process = process_slot(task);
-    int64_t result = lume_public_call(&tasks[process].files, frame, process + 1);
+    struct lume_files *files = &tasks[process].files;
+    bool writing = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_WRITE;
+    int64_t result = lume_sandbox_io(files, LUME_CONTEXT_REG(frame, 0), writing);
+    if (!result && !lume_user_io_pipe_try(files, process + 1, LUME_CONTEXT_REG(frame, 0),
+                                          LUME_CONTEXT_REG(frame, 1), LUME_CONTEXT_REG(frame, 2),
+                                          writing, &result))
+        result = lume_public_call(files, frame, process + 1);
     if (result > 0)
         kernel_pipe_wake(lume_vfs_pipe_queue(
             &tasks[process].files, LUME_CONTEXT_REG(frame, 0),

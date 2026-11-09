@@ -14,19 +14,42 @@
 #endif
 
 #define BASE UINT32_C(0x41000000)
-static uint64_t raw;
-static unsigned translations;
+static uint64_t raw, raw_step = 2000, frequency = 2000000000;
+static unsigned translations, frequency_reads;
 static bool user_page[3] = {true, true, false};
+static bool writable_page[3] = {true, true, false};
+static bool terminal_handled;
+static unsigned terminal_calls;
+static unsigned pipe_calls;
+static bool pipe_handled;
+static int64_t pipe_result;
+
+bool lume_task_pipe_try(unsigned owner, uint64_t fd, uint64_t address, uint64_t bytes, bool writing,
+                        int64_t *result)
+{
+    assert(owner == 7 && fd == 9 && address == BASE + 64 && bytes == 17 && writing);
+    ++pipe_calls;
+    *result = pipe_result;
+    return pipe_handled;
+}
+
+bool lume_task_pipe_terminal_query(unsigned owner, uint64_t fd)
+{
+    assert(owner == 7 && fd == 9);
+    ++terminal_calls;
+    return terminal_handled;
+}
 
 uint64_t lume_tsc_read(void)
 {
-    raw += 2000;
+    raw += raw_step;
     return raw;
 }
 
 uint64_t lume_q35_tsc_frequency(void)
 {
-    return 2000000000;
+    ++frequency_reads;
+    return frequency;
 }
 
 uint64_t lume_mmu_task_root(unsigned owner)
@@ -39,8 +62,9 @@ bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, 
                         uint64_t *physical)
 {
     ++translations;
-    assert(root == 0x123000 && !write && user && !execute);
-    if (address < BASE || address - BASE >= 12288 || !user_page[(address - BASE) / 4096])
+    assert(root == 0x123000 && user && !execute);
+    if (address < BASE || address - BASE >= 12288 ||
+        (!user_page[(address - BASE) / 4096] || (write && !writable_page[(address - BASE) / 4096])))
         return false;
     *physical = address;
     return true;
@@ -85,6 +109,121 @@ static void accepted(uint32_t registers[15], uint64_t value)
                                 : i == 12 ? ((before[i] & UINT32_C(0x240dd5)) | 0x202)
                                 : i == 14 ? 0x23
                                           : before[i]));
+}
+
+static void terminal_queries(void)
+{
+    uint32_t registers[15];
+    uint64_t *request = (void *)(uintptr_t)BASE;
+    struct lume_tty_request mode = {.version = LUME_TTY_VERSION,
+                                    .bytes = sizeof(mode),
+                                    .fd = 9,
+                                    .other = -1,
+                                    .value = UINT32_MAX,
+                                    .rows = UINT32_MAX};
+    request[0] = LUME_SYS_TTY;
+    request[1] = LUME_TTY_GET;
+    request[2] = BASE + 128;
+    request[3] = sizeof(mode);
+    memcpy((void *)(uintptr_t)request[2], &mode, sizeof(mode));
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PIPE);
+    frame(registers, 128, BASE);
+    denied(registers);
+    terminal_handled = true;
+    frame(registers, 128, BASE);
+    accepted(registers, (uint64_t)-25);
+    assert(!memcmp((void *)(uintptr_t)request[2], &mode, sizeof(mode)));
+    request[3] = sizeof(mode) - 1;
+    frame(registers, 128, BASE);
+    denied(registers);
+    request[3] = UINT64_C(1) << 32 | sizeof(mode);
+    denied(registers);
+    request[3] = sizeof(mode);
+    request[1] = LUME_TTY_SET;
+    denied(registers);
+    request[1] = UINT64_C(1) << 32 | LUME_TTY_GET;
+    denied(registers);
+    request[1] = LUME_TTY_GET;
+    struct lume_tty_request *user = (void *)(uintptr_t)request[2];
+    ++user->version;
+    denied(registers);
+    user->version = LUME_TTY_VERSION;
+    --user->bytes;
+    denied(registers);
+    user->bytes = sizeof(mode);
+    user->reserved = 1;
+    denied(registers);
+    user->reserved = 0;
+    writable_page[0] = false;
+    denied(registers);
+    writable_page[0] = true;
+    unsigned before = terminal_calls;
+    request[2] = BASE + 4096 - 17;
+    memcpy((void *)(uintptr_t)request[2], &mode, sizeof(mode));
+    frame(registers, 128, BASE);
+    accepted(registers, (uint64_t)-25);
+    assert(!memcmp((void *)(uintptr_t)request[2], &mode, sizeof(mode)));
+    writable_page[1] = false;
+    frame(registers, 128, BASE);
+    denied(registers);
+    writable_page[1] = true;
+    user_page[1] = false;
+    denied(registers);
+    user_page[1] = true;
+    request[2] = BASE + 8192 - 16;
+    denied(registers);
+    request[2] = UINT64_C(1) << 32 | BASE;
+    denied(registers);
+    assert(terminal_calls == before + 1);
+    struct lume_query_account account;
+    lume_arch_query_drain(&account);
+    assert(account.calls == 2 && account.mask == (UINT64_C(1) << LUME_SYS_TTY));
+}
+
+static void drain_accounting(void)
+{
+    uint32_t registers[15];
+    struct lume_query_account account;
+    unsigned reads = frequency_reads;
+    lume_arch_query_drain(&account);
+    assert(!account.calls && !account.ticks && !account.mask && frequency_reads == reads);
+    frequency = 1000000;
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    raw_step = 1001;
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        frame(registers, 129, LUME_SYS_GETPID);
+        accepted(registers, 3);
+    }
+    lume_arch_query_drain(&account);
+    assert(account.owner == 7 && account.calls == 3 && account.ticks == 3003);
+    assert(frequency_reads == reads + 1);
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    for (unsigned i = 0; i < 65; ++i)
+    {
+        raw_step = i == 64 ? 4000 : 1001;
+        frame(registers, 129, LUME_SYS_GETPID);
+        accepted(registers, 3);
+    }
+    lume_arch_query_drain(&account);
+    assert(account.calls == 65 && account.ticks == 162532);
+    assert(account.mask == (UINT64_C(1) << LUME_SYS_GETPID));
+    frequency = 0;
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    frame(registers, 129, LUME_SYS_GETPID);
+    accepted(registers, 3);
+    lume_arch_query_drain(&account);
+    assert(account.calls == 1 && !account.ticks);
+    frequency = 123456789;
+    raw_step = 1001;
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    frame(registers, 129, LUME_SYS_GETPID);
+    accepted(registers, 3);
+    lume_arch_query_drain(&account);
+    assert(account.calls == 1 && account.ticks == 8);
+    reads = frequency_reads;
+    lume_arch_query_drain(&account);
+    assert(!account.calls && !account.ticks && !account.mask && frequency_reads == reads);
 }
 
 int main(void)
@@ -151,6 +290,26 @@ int main(void)
     lume_arch_query_drain(&account);
     assert(account.calls == 1);
 
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PIPE);
+    request[0] = LUME_SYS_WRITE;
+    request[1] = 9;
+    request[2] = BASE + 64;
+    request[3] = 17;
+    pipe_result = 17;
+    frame(registers, 128, BASE);
+    denied(registers);
+    pipe_handled = true;
+    accepted(registers, 17);
+    pipe_result = -LUME_EPIPE;
+    frame(registers, 128, BASE);
+    accepted(registers, (uint64_t)-LUME_EPIPE);
+    lume_arch_query_drain(&account);
+    assert(pipe_calls == 3 && account.calls == 2 &&
+           account.mask == (UINT64_C(1) << LUME_SYS_WRITE));
+    request[0] = LUME_SYS_THREAD;
+    request[1] = LUME_THREAD_SELF;
+    request[2] = request[3] = 0;
+
     for (unsigned mask = 0; mask < 4; ++mask)
     {
         lume_arch_query_publish(7, 3, 0x1408, mask);
@@ -215,11 +374,14 @@ int main(void)
     lume_arch_query_publish(LUME_TASK_LIMIT, 0, 0, LUME_QUERY_PID);
     frame(registers, 129, LUME_SYS_GETPID);
     denied(registers);
+    terminal_queries();
+    drain_accounting();
 #ifdef _WIN32
     assert(VirtualFree(allocation, 0, MEM_RELEASE));
 #else
     assert(!munmap(allocation, 12288));
 #endif
-    puts("PASS_I686_QUERY INT80 bounds, page permissions, INT81, revocation, accounting and frame");
+    puts(
+        "PASS_I686_QUERY INT80 bounds, page permissions, INT81, terminal pipe queries, revocation, accounting and frame");
     return 0;
 }

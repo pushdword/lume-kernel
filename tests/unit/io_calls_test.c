@@ -50,6 +50,12 @@ static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue, pipe_peer_queue;
 static bool public_mode = true, account_inside;
+static bool active = true, pipe_locked, resident_ready;
+static bool process_stopped[LUME_TASK_LIMIT], main_thread_done[LUME_TASK_LIMIT];
+static unsigned resident_calls;
+static bool terminal_pipe_descriptor;
+static unsigned clock_reads;
+static int64_t resident_result;
 static bool worker_suspended[LUME_WORK_DOMAINS], work_pending[LUME_WORK_DOMAINS];
 static bool worker_blocked[LUME_WORK_DOMAINS];
 static bool work_requeue[LUME_WORK_DOMAINS];
@@ -279,6 +285,7 @@ bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
 
 static uint64_t lume_clock_monotonic(void)
 {
+    ++clock_reads;
     return clock_ms;
 }
 
@@ -508,6 +515,50 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
     return sandbox_result;
 }
 
+int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
+{
+    assert(files == &tasks[process_slot(current_task)].files && fd == 3);
+    if (pipe_locked)
+        assert(writing == expect_writing);
+    return sandbox_result;
+}
+
+bool lume_smp_owned(void)
+{
+    return pipe_locked;
+}
+
+void lume_smp_lock(void)
+{
+    assert(!pipe_locked);
+    pipe_locked = true;
+}
+
+void lume_smp_unlock(void)
+{
+    assert(pipe_locked);
+    pipe_locked = false;
+}
+
+bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                           uint64_t bytes, bool writing, int64_t *result)
+{
+    if (bytes > 512)
+        return false;
+    assert(pipe_locked && files == &tasks[process_slot(current_task)].files);
+    assert(pid == process_slot(current_task) + 1 && fd == 3 && address == 0x123000 && bytes == 17);
+    assert(writing == expect_writing);
+    ++resident_calls;
+    *result = resident_result;
+    return resident_ready;
+}
+
+bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
+{
+    assert(pipe_locked && files == &tasks[process_slot(current_task)].files);
+    return terminal_pipe_descriptor && fd == 3;
+}
+
 bool lume_vfs_pipe_wait(struct lume_files *files, uint64_t fd)
 {
     assert(files == &tasks[pipe_process].files && fd == 3);
@@ -564,9 +615,17 @@ void *lume_kernel_allocate(size_t bytes)
 #include "netctl_calls.h"
 #include "dns_calls.h"
 #include "io_calls.h"
+#include "pipe_fast.h"
 
 static void reset(void)
 {
+    active = resident_ready = terminal_pipe_descriptor = true;
+    pipe_locked = false;
+    resident_calls = 0;
+    clock_reads = 0;
+    resident_result = 17;
+    memset(process_stopped, 0, sizeof(process_stopped));
+    memset(main_thread_done, 0, sizeof(main_thread_done));
     memset(&local, 0, sizeof(local));
     memset(lock_ticks, 0, sizeof(lock_ticks));
     memset(kernel_files_closed, 0, sizeof(kernel_files_closed));
@@ -934,6 +993,144 @@ static void pipe_ready_handoff(void)
     block_pipe = true;
     assert(kernel_pipe_result(&call) == &selected_frame);
     assert(current_task == 1 && charges == 1 && selections == 1);
+}
+
+static void terminal_pipe_query(void)
+{
+    reset();
+    current_task = pipe_process = 3;
+    states[3] = 2;
+    assert(lume_task_pipe_terminal_query(3, 3));
+    assert(!pipe_locked && !resident_calls && !charges && !selections && !clock_reads);
+    assert(!lume_task_pipe_terminal_query(3, 4));
+    terminal_pipe_descriptor = false;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    terminal_pipe_descriptor = true;
+    for (unsigned profile = 1; profile <= 5; ++profile)
+    {
+        tasks[3].files.identity.sandbox_profile = profile;
+        assert(!lume_task_pipe_terminal_query(3, 3));
+    }
+    tasks[3].files.identity.sandbox_profile = 0;
+    assert(!lume_task_pipe_terminal_query(4, 3));
+    pending_signal = 1;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    pending_signal = 0;
+    process_owner[3] = 1;
+    assert(lume_task_pipe_terminal_query(3, 3));
+    process_exiting[1] = true;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    process_exiting[1] = false;
+    process_stopped[1] = true;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    process_stopped[1] = false;
+    main_thread_done[1] = true;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    main_thread_done[1] = false;
+    active = false;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    active = true;
+    states[3] = 1;
+    assert(!lume_task_pipe_terminal_query(3, 3));
+    assert(!pipe_locked && !resident_calls && !charges && !selections && !clock_reads);
+}
+
+static void resident_pipe_completion(void)
+{
+    reset();
+    current_task = pipe_process = 3;
+    states[3] = 2;
+    expect_writing = true;
+    states[65] = 4;
+    pipe_wait[65] = true;
+    pipe_queues[65] = &pipe_peer_queue;
+    assert(lume_wait_subscribe(&pipe_peer_queue, 65));
+    lume_wait_wake(&pipe_peer_queue);
+    int64_t result = 0;
+    unsigned reads_before = clock_reads;
+    kernel_arm_grants(3, 1000);
+    assert(clock_reads == reads_before);
+    assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    assert(result == 17 && resident_calls == 1 && states[65] == 1 && !pipe_locked);
+    assert(clock_reads == reads_before);
+    assert(!charges && !selections && !submissions && !resumes);
+    resident_result = -LUME_EPIPE;
+    assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && result == -LUME_EPIPE);
+    resident_result = 0;
+    assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && !result);
+    resident_result = -LUME_EAGAIN;
+    block_pipe = true;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    nonblock_pipe = true;
+    assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && result == -LUME_EAGAIN);
+    unsigned before = resident_calls;
+    assert(!lume_task_pipe_try(4, 3, 0x123000, 17, true, &result));
+    pending_signal = 1;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    pending_signal = 0;
+    process_exiting[3] = true;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    process_exiting[3] = false;
+    process_stopped[3] = true;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    process_stopped[3] = false;
+    main_thread_done[3] = true;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    main_thread_done[3] = false;
+    assert(io_queue_push(&kernel_control_queue, 0, false));
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    io_queue_cancel(&kernel_control_queue, 0);
+    sandbox_result = -LUME_EPERM;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    assert(resident_calls == before && !pipe_locked);
+    sandbox_result = 0;
+    resident_ready = false;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    assert(!pipe_locked && !charges && !selections && !submissions && !resumes);
+}
+
+static void captured_resident_pipe(void)
+{
+    reset();
+    current_task = pipe_process = 1;
+    root = 2;
+    states[1] = 2;
+    pipe_locked = true;
+    struct lume_context call = pipe_frame(false);
+    call.x[1] = 0x123000;
+    call.x[2] = 17;
+    inline_frame = &call;
+    resident_result = -LUME_EAGAIN;
+    block_pipe = true;
+    assert(kernel_pipe_result(&call) == &selected_frame);
+    assert(!executed[1] && resident_calls == 1 && states[1] == 4 && pipe_wait[1]);
+    assert(tasks[1].context.pc == call.pc - LUME_SYSCALL_INSTRUCTION_BYTES);
+    assert(charges == 1 && selections == 1 && progress == 1);
+
+    reset();
+    current_task = pipe_process = 1;
+    root = 2;
+    states[1] = 2;
+    pipe_locked = true;
+    call = pipe_frame(false);
+    call.x[1] = 0x123000;
+    call.x[2] = 17;
+    inline_frame = &call;
+    sandbox_result = -LUME_EPERM;
+    assert(kernel_pipe_result(&call) == &call && call.x[0] == (uint64_t)-LUME_EPERM);
+    assert(!resident_calls && !executed[1] && states[1] == 2);
+    sandbox_result = 0;
+    call.x[0] = 3;
+    resident_ready = false;
+    override_result = true;
+    inline_result = 12;
+    assert(kernel_pipe_result(&call) == &call && call.x[0] == 12);
+    assert(resident_calls == 1 && executed[1] == 1);
+    call.x[0] = 3;
+    resident_ready = true;
+    resident_result = 0;
+    assert(kernel_pipe_result(&call) == &call && !call.x[0]);
+    assert(resident_calls == 2 && executed[1] == 1);
 }
 
 static void final_close_wait(void)
@@ -1614,6 +1811,9 @@ int main(void)
     directed_pipe_wake();
     inline_pipe_wait_and_replay();
     pipe_ready_handoff();
+    terminal_pipe_query();
+    resident_pipe_completion();
+    captured_resident_pipe();
     final_close_wait();
     queued_memory_io();
     assert(network_checks && network_checks == storage_checks && vm_checks == storage_checks);

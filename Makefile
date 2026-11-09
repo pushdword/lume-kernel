@@ -375,7 +375,7 @@ $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 check-io-calls: $(OUT)/tests/io-calls$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/io-calls$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AARCH64=1
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/pipe_fast.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -386,10 +386,14 @@ $(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/con
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iplatform/q35/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
 .PHONY: check-i686-query
-check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(HOSTEXE)
+check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(HOSTEXE) $(OUT)/tests/i686-fpu$(HOSTEXE)
 	env "$(OUT)/tests/i686-query$(HOSTEXE)"
 	env "$(OUT)/tests/i686-context$(HOSTEXE)"
-$(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h arch/i686/include/kernel/lume/context.h
+	env "$(OUT)/tests/i686-fpu$(HOSTEXE)"
+$(OUT)/tests/i686-fpu$(HOSTEXE): tests/arch/i686/fpu_test.c arch/i686/context/fpu.h arch/i686/include/kernel/lume/context.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel -Iinclude/kernel "$<" -o "$@"
+$(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/uapi/lume/tty.h arch/i686/include/kernel/lume/context.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 -Iarch/i686/include/kernel -Iplatform/pc/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
 $(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h

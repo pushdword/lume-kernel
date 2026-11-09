@@ -1,6 +1,8 @@
 #define main user_io_lifetime_main
 #include "user_io_lifetime_test.c"
 #undef main
+#include "fd.h"
+#include "lume/wait.h"
 
 static unsigned small_calls;
 static int64_t small_result;
@@ -57,6 +59,65 @@ static const struct lume_file_ops small_ops = {.kind = LUME_NODE_CHAR,
                                                .write = small_write,
                                                .poll = small_poll,
                                                .memory_io = true};
+
+static void resident_pipes(void)
+{
+    shared_setup();
+    struct lume_fd_request request = {.version = LUME_FD_VERSION, .bytes = sizeof(request)};
+    CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &request) == 0);
+    int reading = request.fd, writing = request.other;
+    unsigned before = allocation_live;
+    allocation_budget = 0;
+    int64_t transferred = 123;
+    CHECK(!lume_user_io_pipe_try(&files[0], 1, image_fd, destination, 1, false, &transferred));
+    CHECK(transferred == 123);
+    CHECK(!lume_user_io_pipe_try(&files[0], 1, writing, destination, 513, true, &transferred));
+    CHECK(!lume_user_io_pipe_try(&files[0], 1, writing, destination + 8191, 2, true, &transferred));
+    CHECK(lume_user_io_pipe_try(&files[0], 1, reading, destination, 1, false, &transferred));
+    CHECK(transferred == -LUME_EAGAIN);
+    struct lume_wait_queue *queue = lume_vfs_pipe_queue(&files[0], reading, false);
+    CHECK(lume_wait_subscribe(queue, 7));
+    CHECK(
+        lume_user_io_pipe_try(&files[0], 1, writing, destination + 4080, 512, true, &transferred));
+    CHECK(transferred == 512 && lume_wait_take(queue, 7));
+    fill_destination(0x42);
+    CHECK(
+        !lume_user_io_pipe_try(&files[0], 1, reading, destination + 8191, 2, false, &transferred));
+    CHECK(vm(0, LUME_VM_PROTECT, destination, 8192, LUME_PROT_READ, 0, -1) == 0);
+    uint64_t aliases[2];
+    CHECK(!lume_user_buffer_resident(1, destination + 4080, 512, false, aliases));
+    CHECK(lume_user_buffer(destination, 8192, false));
+    CHECK(lume_user_buffer_resident(1, destination + 4080, 512, false, aliases));
+    CHECK(!lume_user_io_pipe_try(&files[0], 1, reading, destination + 4080, 512, false,
+                                 &transferred));
+    CHECK(vm(0, LUME_VM_PROTECT, destination, 8192, 3, 0, -1) == 0);
+    CHECK(lume_user_buffer(destination, 8192, true));
+    CHECK(
+        lume_user_io_pipe_try(&files[0], 1, reading, destination + 4080, 512, false, &transferred));
+    CHECK(transferred == 512);
+    uint64_t physical;
+    CHECK(lume_mmu_translate(2, destination + 4080, false, true, false, &physical));
+    CHECK(*(const unsigned char *)(uintptr_t)physical == 0xa7);
+    CHECK(lume_mmu_translate(2, destination + 4591, false, true, false, &physical));
+    CHECK(*(const unsigned char *)(uintptr_t)physical == 0xa7);
+    CHECK(lume_user_io_pipe_try(&files[0], 1, reading, destination, 1, false, &transferred));
+    CHECK(transferred == -LUME_EAGAIN);
+    CHECK(lume_vfs_close(&files[0], writing) == 0);
+    CHECK(lume_user_io_pipe_try(&files[0], 1, reading, destination, 1, false, &transferred));
+    CHECK(transferred == 0);
+    CHECK(lume_vfs_close(&files[0], reading) == 0);
+    allocation_budget = -1;
+    request = (struct lume_fd_request){.version = LUME_FD_VERSION, .bytes = sizeof(request)};
+    CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &request) == 0);
+    CHECK(lume_vfs_close(&files[0], request.fd) == 0);
+    CHECK(lume_user_io_pipe_try(&files[0], 1, request.other, destination, 1, true, &transferred));
+    CHECK(transferred == -LUME_EPIPE);
+    CHECK(lume_user_io_pipe_try(&files[0], 1, request.other, 0, 0, true, &transferred));
+    CHECK(transferred == 0);
+    CHECK(lume_vfs_close(&files[0], request.other) == 0);
+    CHECK(allocation_live == before);
+    shared_cleanup();
+}
 
 int main(void)
 {
@@ -139,6 +200,7 @@ int main(void)
     run_transfer(false);
     CHECK(result == 513 && small_calls == calls + 1);
     shared_cleanup();
+    resident_pipes();
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);
     while (retired)

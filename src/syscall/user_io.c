@@ -3,9 +3,49 @@
 #include "lume/early.h"
 #include "lume/kernel_memory.h"
 #include "lume/vfs.h"
+#include <string.h>
 
 static unsigned active_buffers;
 #define SMALL_IO_BYTES 512u
+
+static void resident_copy(const uint64_t physical[2], void *buffer, size_t bytes, bool to_user)
+{
+    size_t part = 4096u - (size_t)(physical[0] & 4095u);
+    if (part > bytes)
+        part = bytes;
+    if (to_user)
+        memcpy((void *)(uintptr_t)physical[0], buffer, part);
+    else
+        memcpy(buffer, (const void *)(uintptr_t)physical[0], part);
+    if (bytes > part)
+    {
+        if (to_user)
+            memcpy((void *)(uintptr_t)physical[1], (unsigned char *)buffer + part, bytes - part);
+        else
+            memcpy((unsigned char *)buffer + part, (const void *)(uintptr_t)physical[1],
+                   bytes - part);
+    }
+}
+
+bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                           uint64_t bytes, bool writing, int64_t *result)
+{
+    if (bytes > LUME_USER_RESIDENT_MAX || !lume_vfs_pipe_io(files, fd))
+        return false;
+    uint64_t physical[2];
+    if (!lume_user_buffer_resident(pid, address, (size_t)bytes, !writing, physical))
+        return false;
+    unsigned char buffer[LUME_USER_RESIDENT_MAX];
+    if (writing && bytes)
+        resident_copy(physical, buffer, (size_t)bytes, false);
+    *result = writing ? lume_vfs_write(files, fd, buffer, bytes)
+                      : lume_vfs_read(files, fd, buffer, bytes);
+    if (*result > (int64_t)bytes)
+        lume_fail("pipe transfer exceeds request");
+    if (!writing && *result > 0)
+        resident_copy(physical, buffer, (size_t)*result, true);
+    return true;
+}
 
 static int64_t transfer(struct lume_files *files, uint64_t fd, void *data, uint64_t bytes,
                         bool writing, bool positioned, int64_t offset)
