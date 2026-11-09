@@ -800,6 +800,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
         "LumeOS AArch64 / Raspberry Pi 5\nNative ABI 1.0. GPIO UART console.\n";
 #endif
     add_required("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
+    add_required("/dev/pts", LUME_NODE_DIR, 0, 0, false);
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (block_devices[i])
             (void)add_block(block_devices[i]);

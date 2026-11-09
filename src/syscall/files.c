@@ -188,8 +188,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                 return -LUME_EINVAL;
         }
         int result = path_at(files, request.path, request.fd, first,
-                             operation == LUME_FILES_MKDIR ||
-                                 (operation == LUME_FILES_OPEN && (flags & LUME_O_CREAT)),
+                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN,
                              false);
         if (result)
             return result;
