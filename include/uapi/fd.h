@@ -10,7 +10,7 @@
 #define LUME_FD_LIMIT 32u
 #endif
 #define LUME_PIPE_BYTES 4096u
-#define LUME_PIPE_ATOMIC 512u
+#define LUME_PIPE_ATOMIC 4096u
 
 enum
 {

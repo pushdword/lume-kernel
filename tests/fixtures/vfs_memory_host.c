@@ -41,10 +41,12 @@ bool lume_page_free(uint64_t page)
     return page != 0;
 }
 
+#ifndef LUME_VFS_HOST_CHECKPOINT_PROVIDED
 void lume_worker_checkpoint(unsigned bytes)
 {
     (void)bytes;
 }
+#endif
 
 void lume_fail(const char *message)
 {

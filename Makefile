@@ -250,6 +250,12 @@ $(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/st
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
 	env "$<"
+.PHONY: check-storage-sync
+check-storage-sync: $(OUT)/tests/storage-sync$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/storage-sync$(HOSTEXE): tests/unit/storage_sync_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
 check: check-storage-handles
 .PHONY: check-storage-replace
 $(OUT)/tests/storage-replace$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_MAX_ALLOCATION=131072
@@ -351,7 +357,7 @@ $(OUT)/tests/volume$(HOSTEXE): tests/unit/volume_test.c src/storage/volume.c
 $(OUT)/tests/watchdog$(HOSTEXE): tests/unit/watchdog_test.c src/watchdog/watchdog.c
 $(OUT)/tests/icmp$(HOSTEXE): tests/unit/icmp_test.c src/net/icmp.c
 $(OUT)/tests/icmp$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/lwip/src/include
-$(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c tests/fixtures/counter/lume/counter.h include/kernel/lume/net.h
+$(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c tests/fixtures/counter/lume/counter.h include/kernel/lume/net.h include/kernel/lume/net_limits.h include/kernel/lwipopts.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 HOST_LWIP_C := $(filter vendor/lwip/%,$(KERNEL_C_aarch64))
@@ -792,6 +798,7 @@ check: check-user-io-lifetime
 
 .PHONY: check-graphics-lifetime
 .PHONY: check-small-io
+$(OUT)/tests/small-io$(HOSTEXE) $(OUT)/tests/user-io-lifetime$(HOSTEXE): include/uapi/fd.h
 check: check-small-io
 check-small-io: $(OUT)/tests/small-io$(HOSTEXE)
 	env "$<"
@@ -854,3 +861,11 @@ check-vfs-mapping: $(OUT)/tests/vfs-mapping$(HOSTEXE)
 $(OUT)/tests/vfs-mapping$(HOSTEXE): tests/unit/vfs_mapping_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-net-tools
+check: check-net-tools
+check-net-tools: $(OUT)/tests/net-tools$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/net-tools$(HOSTEXE): tests/unit/net_tools_test.c src/net/net_tools.c src/net/route.c $(HOST_LWIP_C)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"

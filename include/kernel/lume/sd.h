@@ -12,6 +12,10 @@ bool lume_sd_write(uint64_t sector, const void *data);
 /* Groups complete synchronously. A failed write may have changed earlier sectors. */
 bool lume_sd_read_blocks(uint64_t sector, unsigned count, void *data);
 bool lume_sd_write_blocks(uint64_t sector, unsigned count, const void *data);
+/* Deferred writes require sync at the filesystem's durability boundary.
+ * Providers without a volatile write cache can complete them synchronously. */
+bool lume_sd_write_deferred(uint64_t sector, unsigned count, const void *data);
+bool lume_sd_sync(void);
 uint64_t lume_sd_sectors(void);
 bool lume_sd_allow_volume(uint64_t first, uint64_t count);
 bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count);

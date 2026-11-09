@@ -165,6 +165,12 @@ static bool write_many(uint64_t sector, unsigned count, const void *data)
     return succeed;
 }
 
+static bool sync_many(void)
+{
+    CHECK(entries == leaves + 1);
+    return succeed;
+}
+
 int main(void)
 {
     const struct lume_platform_sd_ops operations = {
@@ -185,7 +191,7 @@ int main(void)
     CHECK(!lume_sd_write_blocks(16, 32, data));
     CHECK(!entries && !pins);
     CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &operations,
-                                        sizeof(operations) - 2 * sizeof(void *)) == -LUME_EINVAL);
+                                        sizeof(operations) - sizeof(void *)) == -LUME_EINVAL);
     CHECK(!pins);
     CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations)) == 0);
     CHECK(pins == 11 && unpins == 10);
@@ -200,6 +206,25 @@ int main(void)
     CHECK(!lume_sd_read_blocks(16, 32, data));
     CHECK(!lume_sd_write_blocks(16, 32, data));
     CHECK(entries == 4 && leaves == 4);
+    succeed = true;
+    CHECK(lume_platform_driver_register(
+              LUME_PLATFORM_SD, &operations,
+              offsetof(struct lume_platform_sd_ops, lume_sd_write_deferred)) == 0);
+    CHECK(lume_sd_write_deferred(16, 32, data));
+    CHECK(lume_sd_sync());
+    CHECK(lume_platform_driver_unregister(LUME_PLATFORM_SD, &operations) == 0);
+    struct lume_platform_sd_ops deferred = operations;
+    deferred.lume_sd_write_deferred = write_many;
+    CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &deferred, sizeof(deferred)) ==
+          -LUME_EINVAL);
+    deferred.lume_sd_sync = sync_many;
+    CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &deferred, sizeof(deferred)) == 0);
+    CHECK(lume_sd_write_deferred(16, 32, data));
+    CHECK(lume_sd_sync());
+    succeed = false;
+    CHECK(!lume_sd_sync());
+    CHECK(lume_platform_driver_unregister(LUME_PLATFORM_SD, &deferred) == 0);
+    CHECK(pins == unpins && entries == leaves);
     printf("PASS SD provider group dispatch: checks=%u\n", checks);
     return 0;
 }

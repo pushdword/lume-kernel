@@ -14,8 +14,25 @@ enum
     LUME_FILE_IO_OFD_SETLK,
     LUME_FILE_IO_POSIX_GETLK,
     LUME_FILE_IO_POSIX_SETLK,
-    LUME_FILE_IO_FLOCK_NB
+    LUME_FILE_IO_FLOCK_NB,
+    LUME_FILE_IO_READV,
+    LUME_FILE_IO_WRITEV
 };
+
+#define LUME_FILE_IO_VECTOR_MAX 1024u
+
+struct lume_io_vector
+{
+    uint64_t buffer, bytes;
+};
+
+_Static_assert(sizeof(struct lume_io_vector) == 16, "vector I/O entry ABI");
+
+/* READV and WRITEV interpret buffer as an array of count vector entries.
+ * Whence and offset are zero. A call transfers at most LUME_FILE_IO_MAX bytes
+ * through one open-description operation. Atomic pipe writes use the combined
+ * vector length. Character devices and sockets return EOPNOTSUPP so their
+ * terminal and networking paths retain the corresponding subsystem admission. */
 
 /* FILE_IO takes an operation, a request address and its byte size. PREAD and PWRITE
  * transfer at most LUME_FILE_IO_MAX bytes without changing the shared file offset.

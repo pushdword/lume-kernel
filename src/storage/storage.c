@@ -122,7 +122,7 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
     for (UINT i = 0; i < count;)
     {
         UINT group = count - i < LUME_SD_MAX_SECTORS ? count - i : LUME_SD_MAX_SECTORS;
-        bool result = lume_sd_write_blocks(v->first + sector + i, group, data + (size_t)i * 512);
+        bool result = lume_sd_write_deferred(v->first + sector + i, group, data + (size_t)i * 512);
         lume_worker_checkpoint(group * 512);
         if (!result)
         {
@@ -145,8 +145,7 @@ DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
     switch (command)
     {
     case CTRL_SYNC:
-        /* Successful writes include card readiness verification. */
-        return lume_sd_sectors() ? RES_OK : RES_ERROR;
+        return lume_sd_sync() ? RES_OK : RES_ERROR;
     case GET_SECTOR_COUNT:
         *(LBA_t *)data = (LBA_t)v->count;
         return RES_OK;

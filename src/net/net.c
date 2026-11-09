@@ -29,9 +29,12 @@ struct adapter
 };
 static struct adapter adapters[LUME_NET_INTERFACES];
 static unsigned adapter_count;
-static bool started, polling;
+static bool started, starting, polling;
 static uint32_t rng;
 static unsigned char ethernet[1514];
+#ifdef LWIP_RAM_HEAP_POINTER
+void *lume_net_heap;
+#endif
 
 u32_t sys_now(void)
 {
@@ -124,23 +127,41 @@ bool lume_net_start(void)
 {
     if (started)
         return true;
-    if (!lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
+    if (starting)
         return false;
+    starting = true;
+    if (!lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
+        goto failed;
     struct lume_netif_info first = {0};
     lume_netif_info(lume_netif_at(0), &first);
     for (unsigned i = 0; i < 6; ++i)
         rng = (rng * 16777619u) ^ first.mac[i];
     if (!rng)
         rng = 1;
+#ifdef LWIP_RAM_HEAP_POINTER
+    if (!lume_net_heap)
+    {
+        /* One trailing page covers allocator headers and alignment padding. */
+        unsigned pages = LUME_NET_HEAP_BYTES / 4096u + 1;
+        uint64_t memory = lume_pages_alloc_span_uninitialized(pages);
+        if (!memory)
+            goto failed;
+        lume_net_heap = (void *)(uintptr_t)memory;
+    }
+#endif
     lwip_init();
     for (unsigned i = 0; i < lume_netif_count(); ++i)
     {
         if (!attach(lume_netif_at(i)))
-            return false;
+            goto failed;
     }
     started = true;
+    starting = false;
     lume_puts("LUME NETWORK INTERFACES READY lwIP 2.2.1 IPv4\n");
     return true;
+failed:
+    starting = false;
+    return false;
 }
 
 static void changed(struct adapter *a)

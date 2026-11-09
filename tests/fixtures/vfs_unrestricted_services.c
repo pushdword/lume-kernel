@@ -27,6 +27,22 @@ int lume_sandbox_path(struct lume_files *files, const char *canonical)
     return 0;
 }
 
+int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
+{
+    unrestricted(files);
+    (void)fd;
+    (void)writing;
+    return 0;
+}
+
+#if LUME_FILES_DYNAMIC && !defined(LUME_VFS_HOST_EXTERNAL_ALLOCATOR)
+uint64_t lume_pages_alloc_span_uninitialized(unsigned pages)
+{
+    (void)pages;
+    return 0;
+}
+#endif
+
 bool lume_tty_slave_output(struct lume_files *files, unsigned fd)
 {
     unrestricted(files);

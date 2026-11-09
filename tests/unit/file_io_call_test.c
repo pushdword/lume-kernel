@@ -18,6 +18,26 @@ static unsigned calls, operation_seen;
 static uint64_t offset_seen, buffer_seen, count_seen;
 static const uint64_t high = UINT64_C(0x100002000);
 
+int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
+{
+    (void)files;
+    (void)fd;
+    (void)writing;
+    return 0;
+}
+
+int64_t lume_user_io_vector_call(struct lume_files *files, unsigned pid, uint64_t fd,
+                                 uint64_t address, unsigned count, bool writing)
+{
+    (void)files;
+    assert(pid == 1);
+    ++calls;
+    operation_seen = writing ? LUME_FILE_IO_WRITEV : LUME_FILE_IO_READV;
+    buffer_seen = address;
+    count_seen = count;
+    return fd == 7 ? 17 : -LUME_EBADF;
+}
+
 int64_t lume_file_lock_call(struct lume_files *files, uint64_t operation, uint64_t address,
                             uint64_t bytes)
 {
@@ -217,6 +237,17 @@ int main(void)
     assert(call(LUME_FILE_IO_PREAD) == -LUME_ENOMEM && calls == before);
     assert(released_tokens == released + 1);
     capture_error = 0;
+    reset();
+    request.fd = 7;
+    request.offset = 0;
+    request.count = 2;
+    assert(call(LUME_FILE_IO_READV) == 17 && operation_seen == LUME_FILE_IO_READV);
+    assert(call(LUME_FILE_IO_WRITEV) == 17 && operation_seen == LUME_FILE_IO_WRITEV);
+    request.count = LUME_FILE_IO_VECTOR_MAX + 1;
+    assert(call(LUME_FILE_IO_WRITEV) == -LUME_EINVAL);
+    request.count = 2;
+    request.whence = 1;
+    assert(call(LUME_FILE_IO_READV) == -LUME_EINVAL);
     puts("PASS file I/O request version, widths, permissions, copies and invalid arguments");
     return 0;
 }

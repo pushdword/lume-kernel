@@ -239,18 +239,61 @@ void lume_kernel_free(void *pointer)
     abort();
 }
 
+static uint64_t frames[2048];
+
 static bool kernel_buffer(const void *pointer, size_t bytes)
 {
+    for (unsigned i = 0; i < 2048; ++i)
+        if (frames[i] && (uintptr_t)pointer < frames[i] + 4096u &&
+            frames[i] < (uintptr_t)pointer + bytes)
+            return false;
     for (unsigned i = 0; i < 1024; ++i)
         if (allocations[i].pointer == pointer && allocations[i].bytes >= bytes)
             return true;
-    return false;
+    return pointer != NULL && bytes <= LUME_FILE_IO_MAX;
 }
 
-static uint64_t frames[2048];
 static unsigned frame_live, baseline_frames;
 static void *reusable_frame;
 static bool reuse_frames;
+
+uint64_t lume_kernel_allocation_pages(const void *pointer)
+{
+    for (unsigned i = 0; i < 1024; ++i)
+        if (allocations[i].pointer == pointer)
+            return (allocations[i].bytes + 4095u) / 4096u;
+    return 0;
+}
+
+uint64_t lume_pages_total(void)
+{
+    return 65536;
+}
+
+uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
+{
+    return lume_page_alloc(minimum);
+}
+
+bool lume_task_storage_context(void)
+{
+    return lume_worker_current() == LUME_WORK_STORAGE;
+}
+
+void lume_task_vm_ready(void)
+{
+}
+
+void lume_task_vm_buffer_wait(void)
+{
+    abort();
+}
+
+static struct
+{
+    uint64_t base, live;
+    unsigned pages;
+} spans[64];
 
 uint64_t lume_page_alloc(uint64_t minimum)
 {
@@ -296,6 +339,24 @@ bool lume_page_free(uint64_t physical)
         {
             frames[i] = 0;
             --frame_live;
+            for (unsigned span = 0; span < 64; ++span)
+                if (spans[span].base && physical >= spans[span].base &&
+                    physical - spans[span].base < (uint64_t)spans[span].pages * 4096u)
+                {
+                    unsigned page = (unsigned)((physical - spans[span].base) / 4096u);
+                    CHECK(spans[span].live & (UINT64_C(1) << page));
+                    spans[span].live &= ~(UINT64_C(1) << page);
+                    if (!spans[span].live)
+                    {
+#ifdef _WIN32
+                        _aligned_free((void *)(uintptr_t)spans[span].base);
+#else
+                        free((void *)(uintptr_t)spans[span].base);
+#endif
+                        spans[span].base = 0;
+                    }
+                    return true;
+                }
             if (reuse_frames && !reusable_frame)
                 reusable_frame = (void *)(uintptr_t)physical;
             else
@@ -313,7 +374,36 @@ bool lume_page_free(uint64_t physical)
 
 uint64_t lume_pages_alloc_span(unsigned count)
 {
+    /* Lifetime worker stacks are released after the final host fiber return. */
     return (uintptr_t)calloc(count, 4096);
+}
+
+uint64_t lume_pages_alloc_span_uninitialized(unsigned count)
+{
+    CHECK(count && count <= 64);
+#ifdef _WIN32
+    void *memory = _aligned_malloc((size_t)count * 4096u, 4096);
+#else
+    void *memory = aligned_alloc(4096, (size_t)count * 4096u);
+#endif
+    if (!memory)
+        return 0;
+    for (unsigned span = 0; span < 64; ++span)
+        if (!spans[span].base)
+        {
+            spans[span].base = (uintptr_t)memory;
+            spans[span].pages = count;
+            spans[span].live = count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1;
+            unsigned page = 0;
+            for (unsigned i = 0; i < 2048 && page < count; ++i)
+                if (!frames[i])
+                    frames[i] = (uintptr_t)memory + (uint64_t)page++ * 4096u;
+            CHECK(page == count);
+            frame_live += count;
+            memset(memory, 0xa5, (size_t)count * 4096u);
+            return (uintptr_t)memory;
+        }
+    abort();
 }
 
 uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
@@ -344,7 +434,7 @@ bool lume_mmu_jit_active(unsigned task)
 bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, bool execute,
                         uint64_t *physical)
 {
-    CHECK(user);
+    (void)user;
     if (root == 2 && !write && !execute && address >= (uintptr_t)&wire &&
         address - (uintptr_t)&wire < sizeof(wire))
     {
@@ -695,9 +785,10 @@ static void result_cases(void)
         CHECK(result == -LUME_EIO && io_calls == before + 2);
         io_error = 0;
         before = io_calls;
+        unsigned allocations_before = allocation_live;
         allocation_budget = 0;
         run_transfer(false);
-        CHECK(result == -LUME_ENOMEM && io_calls == before);
+        CHECK(result == 8192 && io_calls == ++before && allocation_live == allocations_before);
         allocation_budget = -1;
         uint64_t saved = destination;
         destination = 4096;
@@ -715,7 +806,7 @@ static void release_and_bounds_cases(void)
     unsigned before = allocation_live;
     run_transfer(true);
     unsigned retained = allocation_live;
-    CHECK(retained > before);
+    CHECK(retained == before);
     lume_user_buffer_invalidate_root(0);
     CHECK(allocation_live == retained);
     finish_transfer();
@@ -898,7 +989,7 @@ int main(int argc, char **argv)
         CHECK(lume_vfs_seek(&files[0], image_fd, 23, LUME_SEEK_SET) == 23);
         unsigned before = io_calls, allocations_before = allocation_live;
         run_transfer(true);
-        CHECK(allocation_live > allocations_before);
+        CHECK(allocation_live == allocations_before);
         active_root = 4;
         CHECK(lume_worker_submit_on(LUME_WORK_GENERAL, truncate_operation, NULL));
         CHECK(lume_worker_resume_on(LUME_WORK_GENERAL));

@@ -89,9 +89,17 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
 {
     size_t required = operation_bytes(kind);
     size_t display_base = offsetof(struct lume_platform_display_ops, pending);
+    size_t sd_base = offsetof(struct lume_platform_sd_ops, lume_sd_write_deferred);
     if (!operations || !required ||
-        (bytes != required && !(kind == LUME_PLATFORM_DISPLAY && bytes == display_base)))
+        (bytes != required && !(kind == LUME_PLATFORM_DISPLAY && bytes == display_base) &&
+         !(kind == LUME_PLATFORM_SD && bytes == sd_base)))
         return -LUME_EINVAL;
+    if (kind == LUME_PLATFORM_SD && bytes == required)
+    {
+        const struct lume_platform_sd_ops *sd = operations;
+        if (!!sd->lume_sd_write_deferred != !!sd->lume_sd_sync)
+            return -LUME_EINVAL;
+    }
     if (kind == LUME_PLATFORM_DISPLAY && bytes == required)
     {
         const struct lume_platform_display_ops *display = operations;
@@ -113,6 +121,8 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
         void *current = NULL;
         memcpy(&callback, (const unsigned char *)operations + offset, sizeof(callback));
         if (!callback && kind == LUME_PLATFORM_DISPLAY && offset >= display_base)
+            continue;
+        if (!callback && kind == LUME_PLATFORM_SD && offset >= sd_base)
             continue;
         int result = callback ? lume_module_pin(callback, &current) : -LUME_EINVAL;
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
@@ -535,6 +545,32 @@ bool lume_sd_write_blocks(uint64_t sector, unsigned count, const void *data)
         return false;
     unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
     bool result = provider->operations.sd.lume_sd_write_blocks(sector, count, data);
+    lume_activity_leave(activity);
+    return result;
+}
+
+bool lume_sd_write_deferred(uint64_t sector, unsigned count, const void *data)
+{
+    struct provider *provider = providers + LUME_PLATFORM_SD;
+    if (!provider->source)
+        return false;
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_write_deferred
+                      ? provider->operations.sd.lume_sd_write_deferred(sector, count, data)
+                      : provider->operations.sd.lume_sd_write_blocks(sector, count, data);
+    lume_activity_leave(activity);
+    return result;
+}
+
+bool lume_sd_sync(void)
+{
+    struct provider *provider = providers + LUME_PLATFORM_SD;
+    if (!provider->source)
+        return false;
+    unsigned activity = lume_activity_enter(LUME_ACTIVITY_STORAGE);
+    bool result = provider->operations.sd.lume_sd_sync
+                      ? provider->operations.sd.lume_sd_sync()
+                      : provider->operations.sd.lume_sd_sectors() != 0;
     lume_activity_leave(activity);
     return result;
 }

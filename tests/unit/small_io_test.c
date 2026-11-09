@@ -119,6 +119,58 @@ static void resident_pipes(void)
     shared_cleanup();
 }
 
+static void admitted_vectors(void)
+{
+    static unsigned char data[LUME_FILE_IO_MAX];
+    shared_setup();
+    struct lume_fd_request pipe = {.version = LUME_FD_VERSION, .bytes = sizeof(pipe)};
+    CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &pipe) == 0);
+    lume_vfs_pipe_grow(&files[0], pipe.other, sizeof(data));
+    CHECK(lume_vfs_pipe_accept(&files[0], pipe.other, sizeof(data), true) == sizeof(data));
+    memset(data, 0xa7, sizeof(data));
+    CHECK(lume_vfs_write(&files[0], pipe.other, data, sizeof(data)) == sizeof(data));
+    unsigned frames_before = frame_live, allocations_before = allocation_live;
+    allocation_budget = 0;
+    CHECK(lume_user_io_call(&files[0], 1, pipe.other, UINT64_MAX, sizeof(data), true, false, 0) ==
+          -LUME_EAGAIN);
+    CHECK(frame_live == frames_before && allocation_live == allocations_before);
+    CHECK(lume_vfs_read(&files[0], pipe.fd, data, 512) == 512);
+    CHECK(lume_user_io_call(&files[0], 1, pipe.other, UINT64_MAX, 1024, true, false, 0) ==
+          -LUME_EAGAIN);
+    CHECK(lume_user_io_call(&files[0], 1, pipe.other, destination + 8192 - 512, sizeof(data), true,
+                            false, 0) == 512);
+    CHECK(lume_vfs_read(&files[0], pipe.fd, data, sizeof(data)) == sizeof(data));
+    for (unsigned i = 0; i < sizeof(data); ++i)
+        CHECK(data[i] == 0xa7);
+    uint64_t physical;
+    CHECK(lume_mmu_translate(2, destination, true, true, false, &physical));
+    struct lume_io_vector *vectors = (void *)(uintptr_t)(physical + 64);
+    vectors[0] = (struct lume_io_vector){destination + 256, 17};
+    vectors[1] = (struct lume_io_vector){destination + 4096, 31};
+    CHECK(lume_user_io_vector_call(&files[0], 1, pipe.other, destination + 64, 2, true) == 48);
+    memset(data, 0, 48);
+    CHECK(lume_vfs_read(&files[0], pipe.fd, data, 48) == 48);
+    for (unsigned i = 0; i < 48; ++i)
+        CHECK(data[i] == 0xa7);
+    memset(data, 0x3c, 48);
+    CHECK(lume_vfs_write(&files[0], pipe.other, data, 48) == 48);
+    vectors[1].buffer = destination + 8192;
+    CHECK(lume_user_io_vector_call(&files[0], 1, pipe.fd, destination + 64, 2, false) ==
+          -LUME_EFAULT);
+    CHECK(lume_vfs_pipe_accept(&files[0], pipe.fd, sizeof(data), false) == 48);
+    vectors[1].buffer = destination + 4096;
+    CHECK(lume_user_io_vector_call(&files[0], 1, pipe.fd, destination + 64, 2, false) == 48);
+    CHECK(((unsigned char *)(uintptr_t)physical)[256] == 0x3c);
+    CHECK(lume_mmu_translate(2, destination + 4096, true, true, false, &physical));
+    CHECK(*(const unsigned char *)(uintptr_t)physical == 0x3c);
+    CHECK(lume_user_io_vector_call(&files[0], 1, pipe.fd, 0, LUME_FILE_IO_VECTOR_MAX + 1, false) ==
+          -LUME_EINVAL);
+    allocation_budget = -1;
+    CHECK(lume_vfs_close(&files[0], pipe.fd) == 0);
+    CHECK(lume_vfs_close(&files[0], pipe.other) == 0);
+    shared_cleanup();
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -196,11 +248,12 @@ int main(void)
     unsigned calls = small_calls;
     run_transfer(false);
     allocation_budget = -1;
-    CHECK(result == -LUME_ENOMEM && small_calls == calls);
-    run_transfer(false);
     CHECK(result == 513 && small_calls == calls + 1);
+    run_transfer(false);
+    CHECK(result == 513 && small_calls == calls + 2);
     shared_cleanup();
     resident_pipes();
+    admitted_vectors();
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);
     while (retired)

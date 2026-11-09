@@ -478,10 +478,11 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         if ((a == LUME_NET_ADMIN || a == LUME_NET_WIFI_CONNECT || a == LUME_NET_WIFI_DISCONNECT ||
              a == LUME_NET_DHCP_START || a == LUME_NET_WIFI_SCAN || a == LUME_NET_DHCP_BEGIN ||
-             a == LUME_NET_WIFI_CONNECT_BEGIN) &&
+             a == LUME_NET_WIFI_CONNECT_BEGIN || a == LUME_NET_IPV4 || a == LUME_NET_ROUTE_ADD ||
+             a == LUME_NET_ROUTE_DELETE) &&
             !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
             return -LUME_EPERM;
-        if (a > LUME_NET_STATS || n != sizeof(struct lume_net_control))
+        if (a > LUME_NET_ROUTE_DELETE || n != sizeof(struct lume_net_control))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -657,9 +658,6 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     case LUME_SYS_GETDENTS:
         if (n > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
-        if (!lume_user_buffer(b, n,
-                              LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) != LUME_SYS_WRITE))
-            return -LUME_EFAULT;
         if (LUME_CONTEXT_REG(c, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_READ)
         {
             int access = n ? lume_tty_access(files, pid, (unsigned)a, false) : 0;
@@ -674,6 +672,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                 return access;
             return lume_user_io_call(files, pid, a, b, n, true, false, 0);
         }
+        if (!lume_user_buffer(b, n, true))
+            return -LUME_EFAULT;
         return lume_vfs_getdents(files, a, (void *)(uintptr_t)b, n);
     default:
         return -LUME_ENOSYS;

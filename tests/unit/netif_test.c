@@ -6,6 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+int lume_net_tools(unsigned operation, struct lume_net_control *request)
+{
+    (void)operation;
+    (void)request;
+    return -LUME_ENOSYS;
+}
+
 static unsigned checks, polls, releases, dhcps;
 
 unsigned lume_activity_enter(unsigned kind)
@@ -438,7 +446,7 @@ int main(void)
     request.count = 1;
     CHECK(lume_net_control(0, &request) == -LUME_EINVAL);
     init(0);
-    CHECK(lume_net_control(12, &request) == -LUME_EINVAL);
+    CHECK(lume_net_control(LUME_NET_ROUTE_DELETE + 1, &request) == -LUME_EINVAL);
     init(99);
     CHECK(lume_net_control(LUME_NET_GET, &request) == -LUME_ENOENT);
     init(2);

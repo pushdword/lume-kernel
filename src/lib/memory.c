@@ -4,8 +4,13 @@
 
 typedef uintptr_t memory_word __attribute__((__may_alias__));
 
+typedef struct __attribute__((packed, may_alias))
+{
+    memory_word value;
+} memory_unaligned;
+
 /* Volatile accesses keep these RAM primitives independent of runtime builtins.
- * Word transfers require natural alignment for both source and destination.
+ * Native ARM64 and x86 RAM permit unaligned word transfers within the requested range.
  */
 void *memset(void *destination, int value, size_t count)
 {
@@ -47,6 +52,25 @@ void *memcpy(void *destination, const void *source, size_t count)
             count -= sizeof(memory_word);
         }
     }
+#if defined(__aarch64__) || defined(__x86_64__) || defined(__i386__)
+    else
+        while (count >= sizeof(memory_word))
+        {
+#if defined(__aarch64__)
+            memory_word value;
+            __asm__ volatile("ldr %0, [%1]\n\tstr %0, [%2]"
+                             : "=&r"(value)
+                             : "r"(in), "r"(out)
+                             : "memory");
+#else
+            memory_word value = ((const volatile memory_unaligned *)in)->value;
+            ((volatile memory_unaligned *)out)->value = value;
+#endif
+            out += sizeof(memory_word);
+            in += sizeof(memory_word);
+            count -= sizeof(memory_word);
+        }
+#endif
     while (count--)
         *out++ = *in++;
     return destination;

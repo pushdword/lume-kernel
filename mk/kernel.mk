@@ -40,6 +40,7 @@ KERNEL_C_aarch64 := \
     src/net/net.c \
     src/net/net_compat.c \
     src/net/net_control.c \
+    src/net/net_tools.c \
     src/net/netif.c \
     src/net/route.c \
     src/mm/pages.c \

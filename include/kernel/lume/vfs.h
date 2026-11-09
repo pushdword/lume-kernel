@@ -132,6 +132,8 @@ int64_t lume_vfs_dup2(struct lume_files *, uint64_t, uint64_t);
 int64_t lume_vfs_fd_call(struct lume_files *, unsigned, struct lume_fd_request *);
 bool lume_vfs_pipe_wait(struct lume_files *, uint64_t);
 bool lume_vfs_pipe_io(struct lume_files *, uint64_t);
+int64_t lume_vfs_pipe_accept(struct lume_files *, uint64_t, uint64_t, bool);
+void lume_vfs_pipe_grow(struct lume_files *, uint64_t, uint64_t);
 bool lume_vfs_memory_io(struct lume_files *, uint64_t);
 bool lume_vfs_console_io(struct lume_files *, uint64_t);
 bool lume_vfs_storage_io(struct lume_files *, uint64_t);

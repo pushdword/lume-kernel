@@ -1,6 +1,7 @@
 #include "lume/abi.h"
 #include "lume/early.h"
 #include "lume/net.h"
+#include "lume/net_tools.h"
 #include "lume/socket_file.h"
 #include "lume/counter.h"
 #include "lume/worker.h"
@@ -9,8 +10,11 @@
 #include "lwip/udp.h"
 #include <string.h>
 
-#define STREAM_RECEIVE_BYTES 8192u
+#define STREAM_RECEIVE_BYTES LUME_NET_TCP_WINDOW
 #define STREAM_PACKET_COUNT 4u
+
+_Static_assert(STREAM_RECEIVE_BYTES >= TCP_WND && !(STREAM_RECEIVE_BYTES % 4096),
+               "TCP receive storage must cover the advertised window");
 
 static void stream_pause(void)
 {
@@ -35,14 +39,21 @@ struct stream
 };
 static struct stream streams[LUME_NET_STREAM_LIMIT];
 static unsigned sequence;
+static unsigned receive_pages;
 
 static bool receive_buffer(struct stream *stream, unsigned pages)
 {
     if (stream->data)
         return true;
+    if (pages > LUME_NET_RECEIVE_PAGES - receive_pages)
+        return false;
+    receive_pages += pages;
     uint64_t memory = lume_pages_alloc_span(pages);
     if (!memory)
+    {
+        receive_pages -= pages;
         return false;
+    }
     stream->data = (void *)(uintptr_t)memory;
     stream->data_pages = pages;
     return true;
@@ -229,6 +240,7 @@ static void close_stream(struct stream *s)
     for (unsigned i = 0; i < s->data_pages; ++i)
         if (!lume_page_free((uintptr_t)s->data + (uint64_t)i * 4096u))
             lume_fail("stream receive buffer release");
+    receive_pages -= s->data_pages;
     notify(s);
     *s = (struct stream){0};
 }
@@ -635,4 +647,48 @@ int lume_stream_socket_local(unsigned owner, unsigned handle, unsigned char addr
             return 0;
         }
     return -LUME_EBADF;
+}
+
+unsigned lume_stream_connections(struct lume_net_connection *rows, unsigned capacity)
+{
+    static const unsigned states[] = {7, 10, 2, 3, 1, 4, 5, 8, 11, 9, 6};
+    unsigned count = 0;
+    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i)
+    {
+        const struct stream *stream = &streams[i];
+        if (!stream->owner || (!stream->pcb && !stream->udp) || count == capacity)
+            continue;
+        struct lume_net_connection *row = &rows[count++];
+        *row = (struct lume_net_connection){.owner = stream->owner, .handle = stream->handle};
+        if (stream->udp)
+        {
+            const struct udp_pcb *pcb = stream->udp;
+            row->protocol = 17;
+            row->state = pcb->remote_port ? 1 : 7;
+            memcpy(row->local, &ip_2_ip4(&pcb->local_ip)->addr, 4);
+            memcpy(row->remote, &ip_2_ip4(&pcb->remote_ip)->addr, 4);
+            row->local_port = pcb->local_port;
+            row->remote_port = pcb->remote_port;
+            for (unsigned n = 0; n < stream->packets; ++n)
+                row->receive_bytes +=
+                    stream->packet_count[(stream->packet_first + n) % STREAM_PACKET_COUNT];
+        }
+        else
+        {
+            const struct tcp_pcb *pcb = stream->pcb;
+            row->protocol = 6;
+            row->state =
+                (unsigned)pcb->state < sizeof(states) / sizeof(*states) ? states[pcb->state] : 7;
+            memcpy(row->local, &ip_2_ip4(&pcb->local_ip)->addr, 4);
+            row->local_port = pcb->local_port;
+            if (!stream->listening)
+            {
+                memcpy(row->remote, &ip_2_ip4(&pcb->remote_ip)->addr, 4);
+                row->remote_port = pcb->remote_port;
+                row->receive_bytes = stream->count;
+                row->send_bytes = TCP_SND_BUF - tcp_sndbuf(pcb);
+            }
+        }
+    }
+    return count;
 }

@@ -1,10 +1,56 @@
 #include "lume/abi.h"
 #include "lume/net.h"
+#include "lume/net_tools.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include "lume/net_limits.h"
+
+static struct
+{
+    void *memory;
+    unsigned pages, remaining;
+} receive_allocations[64];
+
+uint64_t lume_pages_alloc_span(unsigned pages)
+{
+    for (unsigned i = 0; i < 64; ++i)
+        if (!receive_allocations[i].memory)
+        {
+            void *memory = malloc((size_t)pages * 4096u);
+            assert(memory);
+            receive_allocations[i].memory = memory;
+            receive_allocations[i].pages = receive_allocations[i].remaining = pages;
+            return (uintptr_t)memory;
+        }
+    abort();
+}
+
+bool lume_page_free(uint64_t physical)
+{
+    for (unsigned i = 0; i < 64; ++i)
+        if (receive_allocations[i].memory && physical >= (uintptr_t)receive_allocations[i].memory &&
+            physical - (uintptr_t)receive_allocations[i].memory <
+                (uint64_t)receive_allocations[i].pages * 4096u)
+        {
+            if (!--receive_allocations[i].remaining)
+            {
+                free(receive_allocations[i].memory);
+                receive_allocations[i].memory = NULL;
+            }
+            return true;
+        }
+    return false;
+}
+
+_Noreturn void lume_fail(const char *message)
+{
+    fprintf(stderr, "%s\n", message);
+    abort();
+}
 
 int lume_stream_nowait(unsigned pid, unsigned op, struct lume_stream_request *request);
 
@@ -238,7 +284,7 @@ u8_t pbuf_free(struct pbuf *p)
 static void chained_ring(void)
 {
     notifications = 0;
-    unsigned char initial[8192], extra[1024];
+    unsigned char initial[LUME_NET_TCP_WINDOW], extra[1024];
     for (unsigned i = 0; i < sizeof(initial); ++i)
         initial[i] = (unsigned char)(i * 19u + 3u);
     for (unsigned i = 0; i < sizeof(extra); ++i)
@@ -255,22 +301,32 @@ static void chained_ring(void)
     unsigned previous_freed = freed, previous_ack = acknowledged;
     assert(pcb.recv(pcb.callback_arg, &pcb, &empty, ERR_OK) == ERR_OK);
     assert(freed == previous_freed + 1 && acknowledged == previous_ack);
+    for (unsigned offset = 8192; offset < sizeof(initial); offset += 4096)
+    {
+        struct pbuf chunk = {.payload = initial + offset, .len = 4096, .tot_len = 4096};
+        assert(pcb.recv(pcb.callback_arg, &pcb, &chunk, ERR_OK) == ERR_OK);
+    }
+    unsigned full_freed = freed;
     struct pbuf last = {.payload = extra + 333, .len = 691, .tot_len = 691};
     struct pbuf append = {.payload = extra, .len = 333, .tot_len = 1024, .next = &last};
     assert(pcb.recv(pcb.callback_arg, &pcb, &append, ERR_OK) == ERR_MEM);
-    assert(freed == previous_freed + 1 && acknowledged == previous_ack);
+    assert(freed == full_freed && acknowledged == previous_ack);
     request.count = 1024;
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 1024);
     assert(!memcmp(request.data, initial, 1024) && acknowledged == previous_ack + 1024);
     assert(pcb.recv(pcb.callback_arg, &pcb, &append, ERR_OK) == ERR_OK);
-    assert(freed == previous_freed + 2);
-    request.count = sizeof(request.data);
-    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 4096);
-    assert(!memcmp(request.data, initial + 1024, 4096));
-    request.count = sizeof(request.data);
-    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &request) == 4096);
-    assert(!memcmp(request.data, initial + 5120, 3072));
-    assert(!memcmp(request.data + 3072, extra, 1024));
+    assert(freed == full_freed + 1);
+    for (unsigned offset = 1024; offset < sizeof(initial) + sizeof(extra);)
+    {
+        request.count = sizeof(request.data);
+        int result = lume_stream_call(2, LUME_STREAM_RECEIVE, &request);
+        assert(result > 0);
+        for (int i = 0; i < result; ++i)
+            assert(request.data[i] == (offset + (unsigned)i < sizeof(initial)
+                                           ? initial[offset + (unsigned)i]
+                                           : extra[offset + (unsigned)i - sizeof(initial)]));
+        offset += (unsigned)result;
+    }
     assert(acknowledged == previous_ack + sizeof(initial) + sizeof(extra));
     assert(pcb.recv(pcb.callback_arg, &pcb, NULL, ERR_OK) == ERR_OK);
     request.count = 1;
@@ -331,7 +387,11 @@ int main(void)
     before_notify = notifications;
     assert(pcb.recv(pcb.callback_arg, &pcb, &b, ERR_OK) == ERR_OK && freed == 1 && !acknowledged);
     assert(notifications > before_notify);
-    assert(pcb.recv(pcb.callback_arg, &pcb, &b, ERR_OK) == ERR_MEM && freed == 1);
+    struct lume_net_connection connection;
+    assert(lume_stream_connections(NULL, 0) == 0);
+    assert(lume_stream_connections(&connection, 1) == 1 && connection.protocol == 6 &&
+           connection.owner == 2 && connection.handle == r.handle &&
+           connection.receive_bytes == 6000 && connection.send_bytes == TCP_SND_BUF - pcb.snd_buf);
     r.count = 4096;
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 4096);
     assert(!memcmp(r.data, data, 4096) && acknowledged == 4096);
@@ -365,11 +425,11 @@ int main(void)
     before_notify = notifications;
     pcb.errf(pcb.callback_arg, ERR_RST);
     assert(notifications > before_notify);
-    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EIO);
+    assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_ECONNRESET);
     assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == 0);
     connect_ok = false;
     before_pause = pauses;
-    assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EIO);
+    assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_ETIMEDOUT);
     assert(pauses > before_pause);
     r.count = 0;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT_ASYNC, &r) == 0);
@@ -381,7 +441,7 @@ int main(void)
     assert(lume_stream_call(2, LUME_STREAM_SHUTDOWN_WRITE, &r) == 0 && shutdowns == 1);
     assert(lume_stream_call(2, LUME_STREAM_SHUTDOWN_WRITE, &r) == 0 && shutdowns == 1);
     r.count = 1;
-    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == -LUME_EIO);
+    assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == -LUME_EPIPE);
     pcb.errf(pcb.callback_arg, ERR_CLSD);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) ==
            (LUME_STREAM_READABLE | LUME_STREAM_HANGUP));
@@ -455,6 +515,8 @@ int main(void)
     udp_callback(udp_context, &udp, &b, &peer, 8095);
     peer.addr ^= 0xff;
     udp_callback(udp_context, &udp, &b, &peer, 8095);
+    assert(lume_stream_connections(&connection, 1) == 1 && connection.protocol == 17 &&
+           connection.receive_bytes == 1200);
     r.count = sizeof(r.data);
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 1200);
     r.count = sizeof(r.data);

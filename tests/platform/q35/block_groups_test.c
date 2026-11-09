@@ -6,6 +6,18 @@
 
 #define LUME_Q35_MODULE_H
 #define Q35_MODULE(name, kind, value, resources)
+#define LUME_COUNTER_H
+static uint64_t ticks;
+
+static uint64_t lume_counter_read(void)
+{
+    return ++ticks;
+}
+
+static uint64_t lume_counter_frequency(void)
+{
+    return 1000;
+}
 
 struct q35_binding
 {
@@ -23,29 +35,29 @@ static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint1
 
 #include "../../../drivers/storage/virtio_blk/block.c"
 
-static struct lume_virtio_desc descriptors[3];
-static unsigned char card[256][512];
-static unsigned submits, flushes, checkpoints, fail_at;
-static bool short_read;
-static bool registered;
+static struct lume_virtio_desc descriptors[32];
+static unsigned char card[512][512], durable[sizeof(card)];
+static unsigned pending[32], pending_count, peak, submits, flushes, checkpoints, released;
+static unsigned queue_count = 32;
+static bool registered, short_read, bad_id, hold, fail_flush, reset_ack = true;
 
 uint32_t lume_in32(uint16_t port)
 {
     assert(port == 20 || port == 24);
-    return port == 20 ? 256 : 0;
+    return port == 20 ? 512 : 0;
 }
 
 bool lume_virtio_open(struct lume_virtio *value, uint32_t pci, uint16_t product, uint32_t features)
 {
     assert(value == &device && pci == 0x1800 && product == 0x1001);
-    value->features = features & (1u << 9);
+    *value = (struct lume_virtio){.features = features & (1u << 9)};
     return true;
 }
 
 bool lume_virtio_queue(struct lume_virtio *value, unsigned index, struct lume_virtqueue *q)
 {
     assert(value == &device && !index && q == &queue);
-    q->count = 3;
+    q->count = (uint16_t)queue_count;
     q->descriptors = descriptors;
     return true;
 }
@@ -55,50 +67,82 @@ void lume_virtio_ready(struct lume_virtio *value)
     assert(value == &device);
 }
 
+void lume_virtio_fail(struct lume_virtio *value)
+{
+    assert(value == &device);
+    value->failed = true;
+}
+
 void lume_virtio_submit(struct lume_virtqueue *q, unsigned head)
 {
-    assert(q == &queue && !head);
-    assert(q->descriptors[0].address == (uintptr_t)&header);
-    assert(q->descriptors[2].address == (uintptr_t)&status);
+    assert(q == &queue && head % 3 == 0 && head + 2 < q->count);
+    struct block_request *request = requests + head / 3;
+    assert(q->descriptors[head].address == (uintptr_t)&request->header);
+    assert(q->descriptors[head + 2].address == (uintptr_t)&request->status);
+    assert(q->descriptors[head].next == head + (request->header.type == 4 ? 2 : 1));
+    if (request->header.type == 4)
+        assert(!pending_count);
+    assert(pending_count < 32);
+    pending[pending_count++] = head;
+    if (pending_count > peak)
+        peak = pending_count;
     ++submits;
 }
 
-bool lume_virtio_wait(struct lume_virtio *value, struct lume_virtqueue *q, unsigned *written)
+bool lume_virtio_take(struct lume_virtqueue *q, unsigned *id, unsigned *written)
 {
-    assert(value == &device && q == &queue);
-    if (submits == fail_at)
+    assert(q == &queue);
+    if (!pending_count || hold)
         return false;
-    assert(header.sector < 256);
-    unsigned bytes = q->descriptors[1].bytes;
-    assert(bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
-    if (header.type == 0)
-        memcpy(data, card[header.sector], bytes);
-    else if (header.type == 1)
-        memcpy(card[header.sector], data, bytes);
+    unsigned head = pending[--pending_count];
+    struct block_request *request = requests + head / 3;
+    unsigned bytes = q->descriptors[head + 1].bytes;
+    assert(bytes <= BLOCK_REQUEST_SECTORS * 512 && bytes % 512 == 0);
+    assert(request->header.sector + bytes / 512 <= 512);
+    request->status = 0;
+    if (request->header.type == 0)
+        memcpy(request->data, card[request->header.sector], bytes);
+    else if (request->header.type == 1)
+        memcpy(card[request->header.sector], request->data, bytes);
     else
     {
-        assert(header.type == 4);
-        ++flushes;
+        assert(request->header.type == 4);
+        request->status = fail_flush ? 1 : 0;
+        if (!fail_flush)
+        {
+            memcpy(durable, card, sizeof(card));
+            ++flushes;
+        }
     }
-    status = 0;
-    *written = header.type == 0 ? bytes + (short_read ? 0 : 1) : 1;
+    *written = request->header.type == 0 ? bytes + (short_read ? 0 : 1) : 1;
+    *id = bad_id ? head + 1 : head;
     return true;
 }
 
 bool lume_virtio_reset(struct lume_virtio *value)
 {
     assert(value == &device);
+    if (!reset_ack)
+        return false;
+    pending_count = 0;
     return true;
 }
 
 void lume_virtio_queue_release(struct lume_virtqueue *q)
 {
     assert(q == &queue);
+    ++released;
+}
+
+bool lume_worker_pause(uint64_t until)
+{
+    ticks = until;
+    return true;
 }
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes && bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
+    assert(bytes <= 65536);
     checkpoints += bytes / 512;
 }
 
@@ -110,7 +154,7 @@ void lume_value(const char *name, uint64_t value)
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
     assert(kind == LUME_PLATFORM_SD && ops == &operations && bytes == sizeof(operations));
-    assert(operations.lume_sd_read_blocks && operations.lume_sd_write_blocks);
+    assert(operations.lume_sd_write_deferred && operations.lume_sd_sync);
     registered = true;
     return 0;
 }
@@ -131,62 +175,54 @@ int lume_platform_driver_unregister(unsigned kind, const void *ops)
 int main(void)
 {
     struct q35_binding binding = {0};
-    assert(!module_start(NULL, &binding) && binding.registered && registered);
-    unsigned char bytes[32 * 512 + 1], output[sizeof(bytes)];
-    for (unsigned i = 0; i < sizeof(bytes); ++i)
-        bytes[i] = (unsigned char)(i * 17);
-    assert(allow(16, 32));
-    assert(!write_blocks(15, 2, bytes));
-    assert(!write_blocks(47, 2, bytes));
-    assert(!write_blocks(UINT64_MAX, 1, bytes));
-    assert(!write_blocks(16, 33, bytes));
-    assert(!write_blocks(16, 0, bytes));
-    assert(!write_blocks(16, 1, NULL));
-    assert(!read_blocks(255, 2, bytes));
-    assert(!read_blocks(16, LUME_SD_MAX_SECTORS + 1, bytes));
-    assert(!read_blocks(16, 0, bytes));
-    assert(!read_blocks(16, 1, NULL));
-    assert(!submits);
-    assert(write_blocks(16, 32, bytes + 1));
-    assert(submits == 2 && flushes == 1 && checkpoints == 32);
+    assert(!module_start(NULL, &binding) && registered && request_limit == 4);
+    assert(allow(16, 256));
+    static unsigned char input[65537], output[65537];
+    for (unsigned i = 0; i < sizeof(input); ++i)
+        input[i] = (unsigned char)(i * 17u + 9u);
+    assert(!write_blocks(15, 1, input) && !write_blocks(271, 2, input));
+    assert(!read_blocks(511, 2, output) && !read_blocks(16, 129, output));
+    assert(!read_blocks(16, 0, output) && !write_blocks(16, 1, NULL) && !submits);
+    assert(write_blocks(16, 128, input + 1));
+    assert(peak == 4 && submits == 5 && flushes == 1 && !dirty && !pending_count);
+    assert(!memcmp(durable + 16 * 512, input + 1, 65536));
     memset(output, 0, sizeof(output));
-    assert(read_blocks(16, 32, output + 1));
-    assert(!memcmp(bytes + 1, output + 1, 32 * 512));
-    assert(submits == 3 && flushes == 1 && checkpoints == 64);
-    device.failed = true;
-    assert(!read_blocks(16, 2, output));
-    assert(submits == 3);
-    device.failed = false;
-    fail_at = submits + 1;
-    assert(!write_blocks(16, 4, bytes));
-    assert(submits == fail_at && flushes == 1 && checkpoints == 64);
-    fail_at = submits + 2;
-    assert(!write_blocks(16, 4, bytes));
-    assert(submits == fail_at && flushes == 1 && checkpoints == 64);
-    fail_at = submits + 1;
-    assert(!read_blocks(16, 4, output));
-    fail_at = 0;
+    assert(read_blocks(16, 128, output + 1) && !memcmp(input + 1, output + 1, 65536));
+    unsigned before = flushes;
+    assert(write_deferred(144, 32, input + 1) && dirty && flushes == before);
+    assert(write_deferred(176, 32, input + 1) && flushes == before);
+    assert(operations.lume_sd_sync() && flushes == before + 1 && !dirty);
+    assert(operations.lume_sd_sync() && flushes == before + 1);
+    assert(write_deferred(208, 1, input));
+    fail_flush = true;
+    assert(!operations.lume_sd_sync() && dirty);
+    assert(module_stop(NULL, &binding) == -LUME_EIO && registered && !released);
+    fail_flush = false;
+    assert(operations.lume_sd_sync() && !dirty);
     short_read = true;
     memset(output, 0xa5, sizeof(output));
-    assert(!read_blocks(16, 4, output) && output[0] == 0xa5 && checkpoints == 64);
+    assert(!read_blocks(16, 4, output) && output[0] == 0xa5);
     short_read = false;
-    assert(write_sector(16, bytes) && read_sector(16, output));
-    assert(!memcmp(bytes, output, 512) && flushes == 2);
-    unsigned char group[LUME_SD_MAX_SECTORS * 512 + 1];
-    for (unsigned i = 0; i < sizeof(group); ++i)
-        group[i] = (unsigned char)(i * 13);
-    /* Extend this fixture's volume after checking the smaller original bounds. */
-    allowed_count = 200;
-    assert(write_blocks(16, LUME_SD_MAX_SECTORS, group + 1));
-    memset(group + 1, 0, sizeof(group) - 1);
-    assert(read_blocks(16, LUME_SD_MAX_SECTORS, group + 1));
-    for (unsigned i = 1; i < sizeof(group); ++i)
-        assert(group[i] == (unsigned char)(i * 13));
-    device.features = 0;
-    unsigned before = submits;
-    assert(!write_blocks(16, 4, bytes) && submits == before);
-    assert(!module_stop(NULL, &binding) && !registered && !capacity);
+    assert(write_sector(16, input) && read_sector(16, output));
+    assert(!memcmp(input, output, 512));
+    bad_id = true;
+    assert(!read_blocks(16, 128, output) && device.failed && pending_count);
+    before = submits;
+    assert(!read_blocks(16, 1, output) && submits == before);
+    reset_ack = false;
+    assert(module_stop(NULL, &binding) == -LUME_EIO && !released);
+    reset_ack = true;
+    assert(!module_stop(NULL, &binding) && !registered && released == 1 && !pending_count);
+    bad_id = false;
+    queue_count = 3;
+    peak = 0;
+    assert(!module_start(NULL, &binding) && request_limit == 1 && allow(16, 256));
+    assert(write_blocks(16, 128, input + 1) && peak == 1);
+    hold = true;
+    assert(!read_blocks(16, 1, output) && device.failed && requests[0].active);
+    hold = false;
+    assert(!module_stop(NULL, &binding) && released == 2);
     puts(
-        "VIRTIO_BLOCK_GROUPS_PASS: Bounds, sector order, flushes and provider registration passed.");
+        "VIRTIO_BLOCK_PIPELINE_PASS: Pending requests, reverse completions, bounds, durable flush, timeout and DMA retention");
     return 0;
 }

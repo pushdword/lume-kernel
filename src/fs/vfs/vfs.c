@@ -245,7 +245,8 @@ struct lume_directory_authorities
 
 static struct channel
 {
-    unsigned readers, writers, head, count;
+    unsigned readers, writers, head, count, capacity;
+    bool growing;
     struct lume_wait_queue readable, writable;
     struct lume_poll_source changed;
 #if LUME_FILES_DYNAMIC
@@ -254,6 +255,29 @@ static struct channel
     unsigned char data[LUME_PIPE_BYTES];
 #endif
 } channels[PIPES];
+
+#if LUME_FILES_DYNAMIC
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#define PIPE_MAX_PAGES 16u
+#define PIPE_BUDGET_PAGES 1024u
+#else
+#define PIPE_MAX_PAGES 4u
+#define PIPE_BUDGET_PAGES 256u
+#endif
+static unsigned pipe_pages;
+
+static void pipe_backing_release(struct channel *channel)
+{
+    if (!channel->data)
+        return;
+    unsigned pages = channel->capacity / 4096u;
+    for (unsigned i = 0; i < pages; ++i)
+        if (!lume_page_free((uintptr_t)channel->data + (uint64_t)i * 4096u))
+            lume_fail("pipe backing release");
+    pipe_pages -= pages;
+    channel->data = NULL;
+}
+#endif
 
 static struct node
 {
@@ -826,8 +850,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
     for (unsigned i = 0; i < PIPES; ++i)
     {
 #if LUME_FILES_DYNAMIC
-        if (channels[i].data && !lume_page_free((uintptr_t)channels[i].data))
-            lume_fail("pipe backing release");
+        pipe_backing_release(&channels[i]);
 #endif
         channels[i] = (struct channel){0};
     }
@@ -1182,6 +1205,76 @@ bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
 {
     struct open_file *file = descriptor(files, fd);
     return file && file->references && !file->external && file->pipe >= 0;
+}
+
+/* Admission and the following resident copy require the scheduler lock. */
+int64_t lume_vfs_pipe_accept(struct lume_files *files, uint64_t fd, uint64_t bytes, bool writing)
+{
+    struct open_file *file = descriptor(files, fd);
+    if (!file || !file->references || file->external || file->pipe < 0 ||
+        (writing ? !(file->flags & 3) : (file->flags & 3) == LUME_O_WRONLY))
+        return -LUME_EBADF;
+    struct channel *channel = &channels[file->pipe];
+    if (!bytes)
+        return 0;
+    if (writing)
+    {
+        if (!channel->readers)
+            return -LUME_EPIPE;
+        unsigned space = channel->capacity - channel->count;
+        if (!space || (bytes <= LUME_PIPE_ATOMIC && bytes > space))
+            return -LUME_EAGAIN;
+        return (int64_t)(bytes < space ? bytes : space);
+    }
+    if (!channel->count)
+        return channel->writers ? -LUME_EAGAIN : 0;
+    return (int64_t)(bytes < channel->count ? bytes : channel->count);
+}
+
+void lume_vfs_pipe_grow(struct lume_files *files, uint64_t fd, uint64_t bytes)
+{
+#if LUME_FILES_DYNAMIC
+    struct open_file *file = descriptor(files, fd);
+    if (!file || file->external || file->pipe < 0 || !(file->flags & 3))
+        return;
+    struct channel *channel = channels + file->pipe;
+    if (channel->growing || bytes <= channel->capacity ||
+        channel->capacity >= PIPE_MAX_PAGES * 4096u)
+        return;
+    unsigned pages =
+        (unsigned)((bytes < PIPE_MAX_PAGES * 4096u ? bytes : PIPE_MAX_PAGES * 4096u) + 4095u) /
+        4096u;
+    if (pages > PIPE_BUDGET_PAGES - pipe_pages)
+        return;
+    int held = lume_vfs_hold(files, (unsigned)fd);
+    if (held < 0)
+        return;
+    channel->growing = true;
+    pipe_pages += pages;
+    uint64_t memory = lume_pages_alloc_span_uninitialized(pages);
+    if (memory)
+    {
+        unsigned first = channel->capacity - channel->head;
+        if (first > channel->count)
+            first = channel->count;
+        memcpy((void *)(uintptr_t)memory, channel->data + channel->head, first);
+        memcpy((unsigned char *)(uintptr_t)memory + first, channel->data, channel->count - first);
+        pipe_backing_release(channel);
+        channel->data = (void *)(uintptr_t)memory;
+        channel->capacity = pages * 4096u;
+        channel->head = 0;
+        lume_wait_wake(&channel->writable);
+        lume_poll_source_notify(&channel->changed);
+    }
+    else
+        pipe_pages -= pages;
+    channel->growing = false;
+    lume_vfs_drop(held);
+#else
+    (void)files;
+    (void)fd;
+    (void)bytes;
+#endif
 }
 
 bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
@@ -1586,8 +1679,7 @@ static int finish_object(struct open_file *d)
         if (!c->readers && !c->writers)
         {
 #if LUME_FILES_DYNAMIC
-            if (c->data && !lume_page_free((uintptr_t)c->data))
-                lume_fail("pipe backing release");
+            pipe_backing_release(c);
 #endif
             *c = (struct channel){0};
         }
@@ -1777,9 +1869,12 @@ static int64_t read_description(struct lume_files *f, struct open_file *d, void 
             return c->writers ? -LUME_EAGAIN : 0;
         if (bytes > c->count)
             bytes = c->count;
-        for (unsigned i = 0; i < bytes; ++i)
-            ((unsigned char *)data)[i] = c->data[(c->head + i) % LUME_PIPE_BYTES];
-        c->head = (c->head + (unsigned)bytes) % LUME_PIPE_BYTES;
+        unsigned first = c->capacity - c->head;
+        if (first > bytes)
+            first = (unsigned)bytes;
+        memcpy(data, c->data + c->head, first);
+        memcpy((unsigned char *)data + first, c->data, (size_t)bytes - first);
+        c->head = (c->head + (unsigned)bytes) % c->capacity;
         c->count -= (unsigned)bytes;
         lume_wait_wake(&c->writable);
         lume_poll_source_notify(&c->changed);
@@ -1877,13 +1972,17 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
             return 0;
         if (!c->readers)
             return -LUME_EPIPE;
-        unsigned space = LUME_PIPE_BYTES - c->count;
+        unsigned space = c->capacity - c->count;
         if (!space || (bytes <= LUME_PIPE_ATOMIC && bytes > space))
             return -LUME_EAGAIN;
         if (bytes > space)
             bytes = space;
-        for (unsigned i = 0; i < bytes; ++i)
-            c->data[(c->head + c->count + i) % LUME_PIPE_BYTES] = ((const unsigned char *)data)[i];
+        unsigned end = (c->head + c->count) % c->capacity;
+        unsigned first = c->capacity - end;
+        if (first > bytes)
+            first = (unsigned)bytes;
+        memcpy(c->data + end, data, first);
+        memcpy(c->data, (const unsigned char *)data + first, (size_t)bytes - first);
         c->count += (unsigned)bytes;
         lume_wait_wake(&c->readable);
         lume_poll_source_notify(&c->changed);
@@ -2840,9 +2939,9 @@ static unsigned events(struct lume_files *f, int fd, bool sample_console)
     struct channel *c = &channels[d->pipe];
     if (!(d->flags & 3))
         return (c->count || !c->writers ? LUME_POLLIN : 0) | (!c->writers ? LUME_POLLHUP : 0);
-    return !c->readers                                      ? LUME_POLLERR
-           : LUME_PIPE_BYTES - c->count >= LUME_PIPE_ATOMIC ? LUME_POLLOUT
-                                                            : 0;
+    return !c->readers                                  ? LUME_POLLERR
+           : c->capacity - c->count >= LUME_PIPE_ATOMIC ? LUME_POLLOUT
+                                                        : 0;
 }
 
 void lume_vfs_poll_prepare(struct lume_files *files, struct lume_poll_watch *watch)
@@ -3022,23 +3121,32 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
             ++second;
         if (second >= f->identity.limit[LUME_LIMIT_FILES].soft)
             return -LUME_EMFILE;
-        while (channel < PIPES && (channels[channel].readers || channels[channel].writers))
+        while (channel < PIPES && (channels[channel].readers || channels[channel].writers ||
+                                   channels[channel].growing))
             ++channel;
         if (channel == PIPES)
             return -LUME_ENOMEM;
 #if LUME_FILES_DYNAMIC
+        if (pipe_pages == PIPE_BUDGET_PAGES)
+            return -LUME_ENOMEM;
+        channels[channel].growing = true;
+        ++pipe_pages;
         channels[channel].data = (void *)(uintptr_t)lume_page_alloc(0);
         if (!channels[channel].data)
+        {
+            --pipe_pages;
+            channels[channel].growing = false;
             return -LUME_ENOMEM;
+        }
+        channels[channel].growing = false;
 #endif
+        channels[channel].capacity = LUME_PIPE_BYTES;
         lume_poll_source_reset(&channels[channel].changed);
         int a = new_object(-1, (int)channel, LUME_O_RDONLY);
         if (a < 0)
         {
 #if LUME_FILES_DYNAMIC
-            if (!lume_page_free((uintptr_t)channels[channel].data))
-                lume_fail("pipe backing rollback");
-            channels[channel].data = NULL;
+            pipe_backing_release(&channels[channel]);
 #endif
             return a;
         }

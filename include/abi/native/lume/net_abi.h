@@ -2,6 +2,7 @@
 #define LUME_NET_ABI_H
 /* Native, pointer-free network control ABI. This is not Linux nl80211. */
 #include <stdint.h>
+#include "net_tools.h"
 #define LUME_NET_CONTROL_VERSION 1u
 #define LUME_NET_INTERFACES 4u
 #define LUME_NET_SCAN_MAX 32u
@@ -78,7 +79,13 @@ enum lume_net_control_op
      * for completion. Existing synchronous operations retain their contracts. */
     LUME_NET_DHCP_BEGIN = 10,
     LUME_NET_WIFI_CONNECT_BEGIN = 11,
-    LUME_NET_STATS = 12
+    LUME_NET_STATS = 12,
+    LUME_NET_ROUTES = 13,
+    LUME_NET_NEIGHBORS = 14,
+    LUME_NET_CONNECTIONS = 15,
+    LUME_NET_IPV4 = 16,
+    LUME_NET_ROUTE_ADD = 17,
+    LUME_NET_ROUTE_DELETE = 18
 };
 
 #define LUME_NET_STATS_VERSION 1u
@@ -181,6 +188,10 @@ struct lume_net_control
         struct lume_wifi_connect connect;
         struct lume_net_event events[LUME_NET_EVENTS_MAX];
         struct lume_net_statistics statistics;
+        struct lume_net_route routes[LUME_NET_ROWS];
+        struct lume_net_neighbor neighbors[LUME_NET_ROWS];
+        struct lume_net_connection connections[LUME_NET_ROWS];
+        struct lume_net_ipv4 ipv4;
         uint32_t admin_up;
     } data;
 };

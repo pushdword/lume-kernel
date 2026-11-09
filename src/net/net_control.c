@@ -1,5 +1,6 @@
 #include "lume/net.h"
 #include "lume/wireless.h"
+#include "lume/net_tools.h"
 #include <string.h>
 
 static void wipe(void *p, size_t n)
@@ -45,6 +46,20 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
 {
     if (!r)
         return -LUME_EINVAL;
+    if (op >= LUME_NET_ROUTES && op <= LUME_NET_ROUTE_DELETE)
+    {
+        bool query = op <= LUME_NET_CONNECTIONS;
+        if (r->version != LUME_NET_CONTROL_VERSION || r->cursor || r->reserved || r->count ||
+            r->lost || (!query && !r->ifindex))
+            return -LUME_EINVAL;
+        if (r->ifindex && !lume_netif_find(r->ifindex))
+            return -LUME_ENOENT;
+        lume_net_poll();
+        lume_wireless_sync();
+        if (query)
+            memset(&r->data, 0, sizeof(r->data));
+        return lume_net_tools(op, r);
+    }
     uint32_t version = r->version, index = r->ifindex, admin = r->data.admin_up;
     uint64_t cursor = r->cursor, reserved = r->reserved;
     uint32_t count = r->count, lost = r->lost;
