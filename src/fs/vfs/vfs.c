@@ -2728,7 +2728,7 @@ bool lume_vfs_pipe_wait(struct lume_files *f, uint64_t fd)
 struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *f, uint64_t fd, bool writing)
 {
     struct open_file *d = descriptor(f, fd);
-    if (!d || d->pipe < 0 || (d->status & LUME_FD_NONBLOCK))
+    if (!d || d->pipe < 0)
         return 0;
     return writing ? &channels[d->pipe].writable : &channels[d->pipe].readable;
 }

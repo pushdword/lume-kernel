@@ -1,6 +1,6 @@
 #include "lume/firmware.h"
 
-#define EARLY_LIMIT UINT64_C(0x40000000)
+#define RESERVED_TAIL_MAX UINT64_C(0x1000000)
 
 static uint32_t u32(const unsigned char *p)
 {
@@ -19,8 +19,8 @@ static bool contains(uint64_t base, uint64_t length, uint64_t address, size_t by
 
 bool lume_q35_firmware_range(const void *map, size_t map_bytes, uint64_t address, size_t bytes)
 {
-    if (!map || !map_bytes || map_bytes > 65536 || !address || !bytes || address >= EARLY_LIMIT ||
-        bytes > EARLY_LIMIT - address)
+    if (!map || !map_bytes || map_bytes > 65536 || !address || !bytes ||
+        address >= LUME_Q35_EARLY_LIMIT || bytes > LUME_Q35_EARLY_LIMIT - address)
         return false;
     const unsigned char *records = map;
     unsigned count = 0;
@@ -43,8 +43,10 @@ bool lume_q35_firmware_range(const void *map, size_t map_bytes, uint64_t address
         {
             if (type == 1 || type == 3 || type == 4)
                 allowed = true;
-            /* SeaBIOS keeps its ACPI allocation in the reserved tail of low RAM. */
-            if (type == 2 && base >= 0x100000 && base < EARLY_LIMIT && length <= EARLY_LIMIT - base)
+            /* SeaBIOS keeps ACPI in a small reserved tail of low RAM.
+             * The bound excludes large reserved PCI windows. */
+            if (type == 2 && base >= 0x100000 && base < LUME_Q35_EARLY_LIMIT &&
+                length <= RESERVED_TAIL_MAX && length <= LUME_Q35_EARLY_LIMIT - base)
                 reserved_base = base;
         }
         offset += (size_t)record_bytes;

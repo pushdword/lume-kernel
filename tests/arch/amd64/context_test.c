@@ -115,6 +115,11 @@ uint64_t lume_q35_counter_value(uint64_t raw)
     return raw;
 }
 
+uint64_t lume_q35_tsc_frequency(void)
+{
+    return 1000000;
+}
+
 void lume_value(const char *name, uint64_t value)
 {
     (void)name;

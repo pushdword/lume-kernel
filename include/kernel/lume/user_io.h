@@ -6,6 +6,8 @@ struct lume_files;
 
 /* Each operation invokes VFS once with a bounded kernel buffer. A failed read
  * copyout does not undo consumed input or the cursor advanced by that invocation. */
+/* Transfers up to 512 bytes retain a private stack buffer across suspension.
+ * Larger transfers allocate at most LUME_FILE_IO_MAX bytes. */
 int64_t lume_user_io_call(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t, bool, bool,
                           int64_t);
 #endif

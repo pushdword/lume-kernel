@@ -48,7 +48,7 @@ static uint64_t wake_at[LUME_TASK_LIMIT], clock_ms, root;
 static bool kernel_wait[LUME_TASK_LIMIT], process_exiting[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
-static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue;
+static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue, pipe_peer_queue;
 static bool public_mode = true, account_inside;
 static bool worker_suspended[LUME_WORK_DOMAINS], work_pending[LUME_WORK_DOMAINS];
 static bool worker_blocked[LUME_WORK_DOMAINS];
@@ -61,6 +61,7 @@ static unsigned pipe_process, charges, selections, progress, submissions, resume
 static unsigned sandbox_checks;
 static int sandbox_result;
 static struct lume_context *inline_frame, selected_frame;
+static int handoff_task = -1;
 static bool kernel_console_scope;
 static bool memory_descriptor;
 static void (*worker_functions[LUME_WORK_DOMAINS])(void *);
@@ -456,6 +457,20 @@ static struct lume_context *wait_ready_task(void)
     return &selected_frame;
 }
 
+static int pick_task(void)
+{
+    return handoff_task;
+}
+
+static struct lume_context *select_task(unsigned task)
+{
+    assert(task < LUME_TASK_LIMIT && states[task] == 1);
+    ++selections;
+    current_task = task;
+    root = process_slot(task) + 1;
+    return &tasks[task].context;
+}
+
 static _Noreturn void lume_fail(const char *reason)
 {
     fprintf(stderr, "%s\n", reason);
@@ -501,8 +516,17 @@ bool lume_vfs_pipe_wait(struct lume_files *files, uint64_t fd)
 
 struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *files, uint64_t fd, bool writing)
 {
-    assert(files == &tasks[pipe_process].files && fd == 3 && writing == expect_writing);
-    return &pipe_queue;
+    assert(files == &tasks[pipe_process].files && fd == 3);
+    return writing == expect_writing ? &pipe_queue : &pipe_peer_queue;
+}
+
+bool lume_display_work_pending(void)
+{
+    return false;
+}
+
+void lume_display_service(void)
+{
 }
 
 static unsigned network_checks, storage_checks, vm_checks;
@@ -591,6 +615,7 @@ static void reset(void)
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         kernel_lanes[i].owner = LUME_TASK_LIMIT;
     pipe_queue = (struct lume_wait_queue){0};
+    pipe_peer_queue = (struct lume_wait_queue){0};
     worker_function = NULL;
     block_pipe = suspended_once = pending_work = kernel_deferred_turn = false;
     nonblock_pipe = filesystem_scope = expect_writing = override_result = false;
@@ -598,6 +623,7 @@ static void reset(void)
     memory_descriptor = false;
     inline_frame = NULL;
     pipe_process = charges = selections = progress = submissions = resumes = 0;
+    handoff_task = -1;
     sandbox_checks = 0;
     sandbox_result = 0;
     current_task = 3;
@@ -779,6 +805,41 @@ static void inline_pipe_completion(void)
         }
 }
 
+static void directed_pipe_wake(void)
+{
+    filesystem_pending();
+    struct lume_context call = pipe_frame(true);
+    expect_writing = true;
+    inline_frame = &call;
+    override_result = true;
+    inline_result = 1;
+    const unsigned peers[] = {3, 65, 130, 255};
+    for (unsigned i = 0; i < sizeof(peers) / sizeof(peers[0]); ++i)
+    {
+        unsigned task = peers[i];
+        states[task] = 4;
+        pipe_wait[task] = true;
+        pipe_queues[task] = &pipe_peer_queue;
+        assert(lume_wait_subscribe(&pipe_peer_queue, task));
+    }
+    states[17] = 4;
+    pipe_wait[17] = true;
+    pipe_queues[17] = &pipe_queue;
+    assert(lume_wait_subscribe(&pipe_peer_queue, 17));
+    lume_wait_wake(&pipe_peer_queue);
+    assert(kernel_pipe_result(&call) == &call && call.x[0] == 1);
+    for (unsigned i = 0; i < sizeof(peers) / sizeof(peers[0]); ++i)
+    {
+        unsigned task = peers[i];
+        assert(states[task] == 1 && !pipe_wait[task] && !pipe_queues[task]);
+        assert(wake_count[task] == 1 && !lume_wait_take(&pipe_peer_queue, task));
+    }
+    assert(states[17] == 4 && pipe_wait[17] && !wake_count[17]);
+    assert(pipe_peer_queue.ready & (UINT64_C(1) << 17));
+    call.x[0] = 3;
+    assert(kernel_pipe_result(&call) == &call && wake_count[65] == 1);
+}
+
 static void inline_pipe_wait_and_replay(void)
 {
     for (unsigned writing = 0; writing < 2; ++writing)
@@ -839,6 +900,40 @@ static void inline_pipe_wait_and_replay(void)
     assert(kernel_pipe_result(&call) == &call && call.x[0] == 10);
     assert(executed[1] == 1 && !executed[0]);
     assert_filesystem_pending(&queue, &owner);
+}
+
+static void pipe_ready_handoff(void)
+{
+    reset();
+    current_task = pipe_process = 1;
+    root = 2;
+    states[1] = 2;
+    states[3] = 1;
+    handoff_task = 3;
+    struct lume_context call = pipe_frame(false);
+    inline_frame = &call;
+    block_pipe = true;
+    unsigned network_before = network_checks, storage_before = storage_checks;
+    unsigned vm_before = vm_checks;
+    assert(kernel_pipe_result(&call) == &tasks[3].context);
+    assert(current_task == 3 && root == 4 && states[1] == 4);
+    assert(tasks[1].context.pc == call.pc - LUME_SYSCALL_INSTRUCTION_BYTES);
+    assert(charges == 1 && selections == 1 && executed[1] == 1);
+    assert(network_checks == network_before && storage_checks == storage_before &&
+           vm_checks == vm_before);
+
+    reset();
+    current_task = pipe_process = 1;
+    root = 2;
+    states[1] = 2;
+    states[3] = 1;
+    handoff_task = 3;
+    assert(io_queue_push(&kernel_control_queue, 0, false));
+    call = pipe_frame(false);
+    inline_frame = &call;
+    block_pipe = true;
+    assert(kernel_pipe_result(&call) == &selected_frame);
+    assert(current_task == 1 && charges == 1 && selections == 1);
 }
 
 static void final_close_wait(void)
@@ -1516,7 +1611,9 @@ int main(void)
     cancellation_and_exit();
     pipe_and_fairness();
     inline_pipe_completion();
+    directed_pipe_wake();
     inline_pipe_wait_and_replay();
+    pipe_ready_handoff();
     final_close_wait();
     queued_memory_io();
     assert(network_checks && network_checks == storage_checks && vm_checks == storage_checks);

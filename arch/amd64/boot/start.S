@@ -1,3 +1,5 @@
+#include "lume/firmware.h"
+
 .section .multiboot,"a"
 .balign 4
 lume_multiboot_header:
@@ -38,11 +40,18 @@ lume_boot32:
     orl $3, %eax
     movl %eax, lume_boot_pml4
     movl $lume_boot_pd, %eax
-    orl $3, %eax
-    movl %eax, lume_boot_pdpt
+    movl $lume_boot_pdpt, %edi
+    movl $LUME_Q35_EARLY_GIB, %ecx
+1:
+    movl %eax, %edx
+    orl $3, %edx
+    movl %edx, (%edi)
+    addl $4096, %eax
+    addl $8, %edi
+    loop 1b
     movl $lume_boot_pd, %edi
     xorl %eax, %eax
-    movl $512, %ecx
+    movl $(LUME_Q35_EARLY_GIB * 512), %ecx
 1:
     movl %eax, %edx
     orl $0x83, %edx
@@ -96,7 +105,7 @@ lume_boot_gdtr:
 .global lume_boot_pml4
 lume_boot_pml4: .skip 4096
 lume_boot_pdpt: .skip 4096
-lume_boot_pd: .skip 4096
+lume_boot_pd: .skip 4096 * LUME_Q35_EARLY_GIB
 lume_boot_info: .skip 4
 lume_boot_magic: .skip 4
 .section .note.GNU-stack,"",@progbits

@@ -5,7 +5,6 @@
 #include "lume/apic.h"
 #endif
 #include <string.h>
-#define EARLY_LIMIT UINT64_C(0x40000000)
 static struct lume_acpi acpi;
 
 struct firmware_memory
@@ -31,7 +30,7 @@ static uint64_t wide(uint64_t address)
 
 static bool early(uint64_t address, uint64_t bytes)
 {
-    return address && address < EARLY_LIMIT && bytes <= EARLY_LIMIT - address;
+    return address && address < LUME_Q35_EARLY_LIMIT && bytes <= LUME_Q35_EARLY_LIMIT - address;
 }
 
 static bool firmware_read(void *context, uint64_t address, void *out, size_t bytes)
@@ -104,7 +103,8 @@ bool lume_q35_boot_read(uint64_t info, uint64_t magic, struct lume_fdt *memory)
     for (unsigned i = 0; i < count; ++i)
     {
         uint64_t start = word(modules + i * 16), end = word(modules + i * 16 + 4);
-        if (end <= start || end > EARLY_LIMIT || !contains_ram(memory, start, end - start) ||
+        if (end <= start || end > LUME_Q35_EARLY_LIMIT ||
+            !contains_ram(memory, start, end - start) ||
             (start < (uintptr_t)__image_end && end > (uintptr_t)__image_start))
             return false;
         memory->reserved[memory->reserved_count++] = (struct lume_range){start, end - start};

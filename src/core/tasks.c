@@ -31,6 +31,9 @@
 #include "lume/signal.h"
 #include "lume/process.h"
 #include "lume/tty_device.h"
+#if defined(LUME_ARCH_AMD64)
+#include "lume/amd64_query.h"
+#endif
 #include <string.h>
 #include "thread_state.h"
 #include "poll_state.h"
@@ -161,6 +164,20 @@ static uint64_t lock_ticks[LUME_TASK_LIMIT];
 static unsigned dispatches[LUME_TASK_LIMIT];
 static bool observers[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static unsigned core_masks[LUME_TASK_LIMIT];
+static void task_query_publish(const struct lume_context *);
+
+static void task_query_revoke(unsigned process)
+{
+#if defined(LUME_ARCH_AMD64)
+    if (process == LUME_TASK_LIMIT)
+        for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+            lume_amd64_query_revoke(i);
+    else
+        lume_amd64_query_revoke(process);
+#else
+    (void)process;
+#endif
+}
 
 static uint64_t counter(void)
 {
@@ -174,6 +191,23 @@ void lume_task_trap_enter(uint64_t at)
 
 void lume_task_account_enter(const struct lume_context *frame)
 {
+    uint64_t query_ticks = 0;
+#if defined(LUME_ARCH_AMD64)
+    struct lume_amd64_query_account query;
+    lume_amd64_query_drain(&query);
+    if (query.calls)
+    {
+        if (query.owner != current_task || query.owner >= LUME_TASK_LIMIT)
+            lume_fail("query accounting task mismatch");
+        tasks[query.owner].calls += (uint32_t)query.calls;
+        local.calls += (unsigned)query.calls;
+        if (!query.owner)
+            shell_calls |= query.mask;
+        query_ticks = query.ticks;
+        kernel_ticks[query.owner] += query_ticks;
+        total_kernel_ticks += query_ticks;
+    }
+#endif
     if (!public_mode || !active || (LUME_CONTEXT_STATUS(frame) & 15))
         return;
     uint64_t at = counter();
@@ -181,6 +215,7 @@ void lume_task_account_enter(const struct lume_context *frame)
     if (account_running)
     {
         uint64_t elapsed = entered - account_last;
+        elapsed -= query_ticks < elapsed ? query_ticks : elapsed;
         user_ticks[current_task] += elapsed;
         total_user_ticks += elapsed;
     }
@@ -198,7 +233,10 @@ void lume_task_account_enter(const struct lume_context *frame)
 void lume_task_account_leave(const struct lume_context *frame)
 {
     if (!account_inside)
+    {
+        task_query_publish(frame);
         return;
+    }
     uint64_t at = counter(), elapsed = at - account_start;
     if (account_owner < LUME_TASK_LIMIT)
         kernel_ticks[account_owner] += elapsed;
@@ -206,6 +244,7 @@ void lume_task_account_leave(const struct lume_context *frame)
     account_last = at;
     account_running = frame && public_mode && active;
     account_inside = false;
+    task_query_publish(frame);
 }
 
 static unsigned account_switch(unsigned owner)
@@ -565,6 +604,7 @@ static bool process_busy(unsigned owner)
 
 static void request_exit(unsigned owner, unsigned status)
 {
+    task_query_revoke(owner);
     signal_wait_cancel_process(owner);
     process_stopped[owner] = false;
     child_events[owner] = 0;
@@ -621,6 +661,7 @@ static bool service_drained(unsigned root)
 static struct lume_context *finish_program(unsigned status)
 {
     unsigned task = current_task, parent = parents[task];
+    task_query_revoke(task);
     process_status[task] = status;
     bool running = false;
     process_exiting[task] = true;
@@ -720,6 +761,36 @@ released:
 static bool task_signal_pending(unsigned owner)
 {
     return (signals[owner].pending & ~signals[owner].mask) != 0;
+}
+
+static void task_query_publish(const struct lume_context *frame)
+{
+#if defined(LUME_ARCH_AMD64)
+    unsigned task = current_task, allowed = 0, pid = 0;
+    uint64_t tid = 0;
+    if (frame && !(LUME_CONTEXT_STATUS(frame) & 15) && public_mode && active &&
+        task < LUME_TASK_LIMIT && states[task] == 2)
+    {
+        unsigned process = process_slot(task);
+        if (!process_exiting[process] && !process_stopped[process] && !main_thread_done[process] &&
+            !task_signal_pending(task) && !task_signal_pending(process))
+        {
+            static const struct lume_context pid_query = {
+                .reg = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_GETPID}};
+            static const struct lume_context tid_query = {
+                .reg = {[0] = LUME_THREAD_SELF, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
+            pid = process + 1;
+            tid = thread_id(thread_slots, task);
+            if (!lume_sandbox_check(&tasks[process].files, pid, &pid_query))
+                allowed |= LUME_AMD64_QUERY_PID;
+            if (!lume_sandbox_check(&tasks[process].files, pid, &tid_query))
+                allowed |= LUME_AMD64_QUERY_TID;
+        }
+    }
+    lume_amd64_query_publish(task, pid, tid, allowed);
+#else
+    (void)frame;
+#endif
 }
 
 static unsigned task_group(unsigned task)
@@ -835,6 +906,7 @@ static struct lume_context *select_task(unsigned next)
     kernel_arm_grants(next, SCHED_TICK_MS);
     sched_enter(&policy, lume_cpu_index(), (int)next, now(), unit, LUME_SCHED_QUANTUM);
     lume_mmu_switch(lume_mmu_task_root(next));
+    task_query_publish(&tasks[next].context);
     return &tasks[next].context;
 }
 
@@ -845,6 +917,7 @@ static struct lume_context *wait_ready_task(void)
     extern void lume_net_poll_background(void);
     (void)account_switch(LUME_TASK_LIMIT);
     current_task = LUME_TASK_LIMIT;
+    task_query_publish(NULL);
     lume_mmu_switch(lume_mmu_root());
     for (;;)
     {
@@ -1532,6 +1605,7 @@ static struct lume_context *task_interrupt(struct lume_context *frame, bool time
         lume_puts("LUME SHELL INTERACTIVE TIMEOUT\n");
         tasks[current_task].exits = 1;
         states[current_task] = 0;
+        task_query_revoke(LUME_TASK_LIMIT);
         active = false;
         lume_smp_wake();
         lume_timer_stop();
@@ -1586,6 +1660,7 @@ bool lume_task_sandbox_ready(unsigned pid)
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] && states[i] != 5 && thread_slots[i].thread && process_slot(i) == owner)
             return false;
+    task_query_revoke(owner);
     return true;
 }
 
@@ -1692,7 +1767,11 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
                   LUME_CONTEXT_REG(frame, 0) == LUME_FD_WAIT)) ||
                 (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_TERMINAL &&
                  LUME_CONTEXT_REG(frame, 0) == 5));
-    if (public_mode)
+    if (public_mode && svc && !process_exiting[process] && !kernel_regular_draining())
+        pipe_call = kernel_pipe_call(frame);
+    if (pipe_call)
+        (void)kernel_claim(task);
+    if (public_mode && !pipe_call)
     {
         bool admitted = kernel_claim(task);
         kernel_step_admit(!admitted);
@@ -1973,6 +2052,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
             if (LUME_CONTEXT_REG(frame, 0) && shell_script)
                 lume_fail("public shell exit status");
             service_bus_stop();
+            task_query_revoke(LUME_TASK_LIMIT);
             for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
                 states[i] = 0;
         }
@@ -1987,6 +2067,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         int next = pick_task();
         if (next >= 0)
             return select_task((unsigned)next);
+        task_query_revoke(LUME_TASK_LIMIT);
         active = false;
         lume_smp_wake();
         lume_timer_stop();
@@ -2002,6 +2083,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
 
 static bool run_tasks(uint64_t frequency, bool elf)
 {
+    task_query_revoke(LUME_TASK_LIMIT);
     public_mode = false;
     elf_mode = elf;
     uint64_t before = lume_pages_free() + lume_program_staging_pages();
@@ -2148,6 +2230,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         return false;
     if (!stream_waits_start() || !netctl_waits_start() || !dns_waits_start() || !poll_waits_start())
         return false;
+    task_query_revoke(LUME_TASK_LIMIT);
     public_mode = true;
     for (unsigned i = 0; i < LUME_CPU_LIMIT; ++i)
         cpus[i] = (struct cpu_state){.current = LUME_TASK_LIMIT};

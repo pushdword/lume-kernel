@@ -379,6 +379,12 @@ $(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h 
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
+.PHONY: check-amd64-query
+check-amd64-query: $(OUT)/tests/amd64-query$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/abi/native/lume/abi.h include/uapi/lume/thread.h include/kernel/lume/vm.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iplatform/q35/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
 $(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
@@ -554,7 +560,7 @@ check-q35: $(OUT)/tests/q35-pci$(HOSTEXE) $(OUT)/tests/q35-virtio$(HOSTEXE) $(OU
 check-q35: check-amd64-context
 check-amd64-context: $(OUT)/tests/amd64-context$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
+$(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -DLUME_ARCH_AMD64=1 $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -o "$@"
 .PHONY: check-amd64-mmu-views
@@ -764,6 +770,21 @@ $(OUT)/tests/user-io-lifetime$(HOSTEXE): tests/unit/user_io_lifetime_test.c src/
 check: check-user-io-lifetime
 
 .PHONY: check-graphics-lifetime
+.PHONY: check-small-io
+check: check-small-io
+check-small-io: $(OUT)/tests/small-io$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/small-io$(HOSTEXE): tests/unit/small_io_test.c tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out tests/unit/user_io_lifetime_test.c src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
+
+.PHONY: check-acpi-high-memory
+check: check-acpi-high-memory
+check-acpi-high-memory: $(OUT)/tests/acpi-high-memory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/acpi-high-memory$(HOSTEXE): tests/platform/q35/acpi_high_memory_test.c platform/q35/firmware.c platform/q35/acpi.c platform/q35/include/lume/firmware.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 $(Q35_TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 check: check-graphics-lifetime
 check-graphics-lifetime: $(OUT)/tests/graphics-lifetime$(HOSTEXE)
 	env "$<"

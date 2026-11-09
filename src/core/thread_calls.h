@@ -81,6 +81,7 @@ static struct lume_context *thread_finish(uint64_t result)
     uint64_t tid = thread_id(thread_slots, task);
     if (!thread_slots[task].thread)
     {
+        task_query_revoke(task);
         main_thread_done[task] = true;
         thread_slots[task].result = result;
         thread_slots[task].exited = true;
@@ -120,6 +121,7 @@ static struct lume_context *thread_finish(uint64_t result)
 static struct lume_context *process_terminate(unsigned status)
 {
     unsigned owner = process_slot(current_task);
+    task_query_revoke(owner);
     signal_wait_cancel_process(owner);
     process_status[owner] = status;
     process_exiting[owner] = true;

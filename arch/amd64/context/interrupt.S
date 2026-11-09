@@ -1,3 +1,4 @@
+#include "lume/amd64_query.h"
 .text
 .macro TRAP n, error=0
 .global lume_isr_\n
@@ -35,6 +36,39 @@ lume_trap_common:
     pushq %r14
     pushq %r15
     movq %rsp, %r12
+    cmpq $128, 120(%r12)
+    jne lume_trap_capture
+    cmpq $0x23, 144(%r12)
+    jne lume_trap_capture
+    cmpq $LUME_AMD64_QUERY_SYSCALL_PID, 56(%r12)
+    je lume_trap_query
+    cmpq $LUME_AMD64_QUERY_SYSCALL_THREAD, 56(%r12)
+    jne lume_trap_capture
+lume_trap_query:
+    andq $-16, %rsp
+    movq %r12, %rdi
+    call lume_amd64_query_try
+    movq %r12, %rsp
+    testb %al, %al
+    jz lume_trap_capture
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rdi
+    popq %rsi
+    popq %rbp
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    addq $16, %rsp
+    iretq
+lume_trap_capture:
     subq $704, %rsp
     andq $-16, %rsp
     fxsave64 176(%rsp)

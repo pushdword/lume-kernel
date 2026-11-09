@@ -99,6 +99,7 @@ static void signal_queue(unsigned owner, unsigned number)
 {
     if (owner >= LUME_TASK_LIMIT || !states[owner] || states[owner] == 5)
         return;
+    task_query_revoke(process_slot(owner));
     struct signal_state *s = &signals[owner];
     if (number == 19)
     {
@@ -216,6 +217,7 @@ static void signal_inherit(unsigned child, unsigned parent, bool exec)
 
 static int64_t signal_call(struct lume_context *frame, unsigned owner)
 {
+    task_query_revoke(owner);
     unsigned operation = LUME_CONTEXT_REG(frame, 0);
     struct signal_state *s = &signals[owner];
     if (thread_slots[current_task].thread)
@@ -410,6 +412,7 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
     for (unsigned number = 1; number < LUME_SIGNAL_COUNT; ++number)
         if (pending & (1u << number))
         {
+            task_query_revoke(owner);
             struct signal_action action = s->action[number];
             s->pending &= ~(1u << number);
             if (signal_ignored(owner, number))

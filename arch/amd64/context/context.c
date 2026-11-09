@@ -7,6 +7,9 @@
 #include "lume/apic.h"
 #include "lume/elf.h"
 #include "lume/vm.h"
+#include "lume/amd64_query.h"
+#include "lume/abi.h"
+#include "lume/thread.h"
 #include <string.h>
 extern unsigned char __trap_top[], __fault_top[];
 extern uintptr_t lume_isr_table[];
@@ -32,6 +35,8 @@ struct __attribute__((packed)) descriptor
     uint16_t limit;
     uint64_t address;
 };
+
+#include "query.h"
 
 void lume_amd64_context_start(void)
 {
@@ -74,6 +79,10 @@ void lume_amd64_context_start(void)
         }
     struct descriptor idtr = {sizeof(idt) - 1, (uintptr_t)idt};
     __asm__ volatile("lidt %0" : : "m"(idtr) : "memory");
+    uint64_t cr4;
+    __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+    /* User FS-base writes require the normal capture and validation path. */
+    lume_amd64_query_start(!(cr4 & (UINT64_C(1) << 16)));
 }
 
 void lume_amd64_context_capture(struct lume_context *c, const uint64_t *r)
@@ -87,14 +96,6 @@ void lume_amd64_context_capture(struct lume_context *c, const uint64_t *r)
     c->flags = r[19];
     c->status = (r[18] & 3) == 3 ? 0 : 1;
     c->tls = lume_rdmsr(0xc0000100);
-}
-
-static bool user_context_address(uint64_t address)
-{
-    return (address >= LUME_USER_BASE && address < LUME_USER_LIMIT) ||
-           (address >= LUME_LARGE_ELF_BASE && address < LUME_LARGE_ELF_LIMIT) ||
-           (address >= LUME_HEAP_EXTENDED_BASE && address < LUME_HEAP_EXTENDED_LIMIT) ||
-           lume_vm_address(address);
 }
 
 static bool user_context_tls(uint64_t address)
