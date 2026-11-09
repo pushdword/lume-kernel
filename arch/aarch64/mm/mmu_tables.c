@@ -495,9 +495,9 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
 
 bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
 {
-    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
+    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_UNMAP_PAGES)
         return false;
-    uint64_t *entries[LUME_MMU_BATCH_PAGES][2];
+    uint64_t *entries[LUME_MMU_UNMAP_PAGES][2];
     for (unsigned i = 0; i < count; ++i)
     {
         if (!user_address(addresses[i]) || (addresses[i] & 4095))
@@ -515,9 +515,20 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
         for (unsigned view = 0; view < 2; ++view)
             *entries[i][view] = 0;
     struct user_table *retired = 0;
+    uint64_t tables[LUME_MMU_UNMAP_PAGES];
+    unsigned table_count = 0;
     for (unsigned i = 0; i < count; ++i)
+    {
+        uint64_t table = addresses[i] >> 21;
+        bool seen = false;
+        for (unsigned n = 0; n < table_count; ++n)
+            seen |= tables[n] == table;
+        if (seen)
+            continue;
+        tables[table_count++] = table;
         for (unsigned view = 0; view < 2; ++view)
             detach_empty(task, view, addresses[i], &retired);
+    }
 #ifdef __aarch64__
     __asm__ volatile("dsb ishst" ::: "memory");
     if (retired)

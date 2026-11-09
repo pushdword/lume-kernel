@@ -167,7 +167,7 @@ static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsign
     return 0;
 }
 
-uint64_t lume_pages_alloc_span(unsigned count)
+uint64_t lume_pages_alloc_span_uninitialized(unsigned count)
 {
     if (!count || count > MAX_SPAN_PAGES || count > MAX_PAGES || free_count < count)
         return 0;
@@ -185,6 +185,14 @@ uint64_t lume_pages_alloc_span(unsigned count)
     }
     if (!first)
         return 0;
+    return first * 4096;
+}
+
+uint64_t lume_pages_alloc_span(unsigned count)
+{
+    uint64_t physical = lume_pages_alloc_span_uninitialized(count);
+    if (!physical)
+        return 0;
     /* Reserved pages remain unpublished until their complete span is initialized. */
     size_t bytes = (size_t)count * 4096;
     for (size_t offset = 0; offset < bytes;)
@@ -192,7 +200,7 @@ uint64_t lume_pages_alloc_span(unsigned count)
         size_t length =
             bytes - offset < LUME_WORKER_SLICE_BYTES ? bytes - offset : LUME_WORKER_SLICE_BYTES;
         struct page_zero request = {
-            .data = (void *)(uintptr_t)(first * 4096 + offset),
+            .data = (void *)(uintptr_t)(physical + offset),
             .bytes = length,
         };
         if (length == LUME_WORKER_SLICE_BYTES)
@@ -207,10 +215,10 @@ uint64_t lume_pages_alloc_span(unsigned count)
         }
         offset += length;
     }
-    return first * 4096;
+    return physical;
 }
 
-uint64_t lume_page_alloc(uint64_t minimum)
+uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
 {
     if (!free_count || minimum >= PHYSICAL_LIMIT)
         return 0;
@@ -227,15 +235,24 @@ uint64_t lume_page_alloc(uint64_t minimum)
             used[p / 64] |= mask;
             --free_count;
             cursor = p + 1;
-            volatile uint64_t *data = (void *)(uintptr_t)(p * 4096);
-            for (unsigned i = 0; i < 512; ++i)
-                data[i] = 0;
             return p * 4096;
         }
         if (++p == MAX_PAGES)
             p = first;
     }
     return 0;
+}
+
+uint64_t lume_page_alloc(uint64_t minimum)
+{
+    uint64_t physical = lume_page_alloc_uninitialized(minimum);
+    if (physical)
+    {
+        volatile uint64_t *data = (void *)(uintptr_t)physical;
+        for (unsigned i = 0; i < 512; ++i)
+            data[i] = 0;
+    }
+    return physical;
 }
 
 bool lume_page_free(uint64_t page)

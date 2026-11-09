@@ -38,6 +38,11 @@ struct lume_fd
 
 struct lume_directory_authorities;
 
+struct lume_file_identity
+{
+    uint64_t key, version, bytes;
+};
+
 struct lume_files
 {
     char cwd[LUME_PATH_MAX];
@@ -115,6 +120,13 @@ bool lume_vfs_image(const char *path, const void **data, size_t *bytes);
 bool lume_vfs_mount_fat(const void *, size_t);
 bool lume_vfs_mount_storage(const struct lume_storage_ops *);
 int lume_vfs_program(struct lume_files *, const char *, const void **, size_t *);
+/* A program reference owns an open description without consuming a user descriptor. */
+int lume_vfs_program_hold(struct lume_files *, const char *, size_t *);
+int lume_vfs_object_identity(int, struct lume_file_identity *);
+int lume_vfs_object_retain(int);
+int lume_vfs_exec_pin(int);
+void lume_vfs_exec_unpin(int);
+void lume_vfs_mapping_notify(void (*)(uint64_t, uint64_t, uint64_t));
 int lume_vfs_canonical(struct lume_files *, const char *, char[LUME_PATH_MAX]);
 int64_t lume_vfs_dup2(struct lume_files *, uint64_t, uint64_t);
 int64_t lume_vfs_fd_call(struct lume_files *, unsigned, struct lume_fd_request *);

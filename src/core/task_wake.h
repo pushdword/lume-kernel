@@ -11,6 +11,15 @@ static void wake_tasks(void)
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (states[i] == 4)
         {
+            if (vm_fault_wait[i])
+            {
+                if (!vm_fault_ready[i] && !thread_deadline_expired(i, at))
+                    continue;
+                vm_fault_wait[i] = vm_fault_ready[i] = false;
+                states[i] = 1;
+                sched_wake(&policy, i, unit, 0);
+                continue;
+            }
             if (kernel_wait[i] || thread_waiting[i] || signal_wait_active(i))
                 continue;
             if (stream_wake(i, at))

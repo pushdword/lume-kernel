@@ -67,6 +67,9 @@ void lume_pages_start(const struct lume_fdt *, uint64_t dtb, uint64_t image_star
                       uint64_t image_end);
 uint64_t lume_page_alloc(uint64_t minimum);
 uint64_t lume_pages_alloc_span(unsigned count);
+/* Private kernel buffers must be completely initialized before any user mapping. */
+uint64_t lume_pages_alloc_span_uninitialized(unsigned count);
+uint64_t lume_page_alloc_uninitialized(uint64_t minimum);
 uint64_t lume_pages_total(void);
 bool lume_page_free(uint64_t page);
 uint64_t lume_pages_free(void);
@@ -124,4 +127,7 @@ static inline uint64_t lume_current_el(void)
 uint32_t lume_clock_millis(void);
 uint64_t lume_clock_monotonic(void);
 bool lume_entropy(void *, size_t);
+bool lume_task_storage_context(void);
+void lume_task_vm_ready(void);
+void lume_task_vm_buffer_wait(void);
 #endif

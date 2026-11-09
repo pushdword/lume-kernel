@@ -73,6 +73,8 @@ static struct lume_context *poll_result(struct lume_context *frame, int64_t resu
                            offsetof(struct lume_pollfd, revents),
                        &wait->watch.records[i].revents, sizeof(wait->watch.records[i].revents));
     }
+    if (result == -LUME_EFAULT && kernel_buffer_pending())
+        return kernel_buffer_failure(frame, result);
     poll_cancel(task);
     LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
     lume_watchdog_progress();

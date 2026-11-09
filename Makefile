@@ -775,7 +775,7 @@ $(OUT)/tests/signal-mask$(HOSTEXE): tests/unit/signal_mask_test.c src/core/signa
 .PHONY: check-vm-memory
 check-vm-memory: $(OUT)/tests/vm-memory$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c include/kernel/lume/vm.h include/abi/native/lume/memory.h $(wildcard tests/fixtures/vm_host/lume/*.h)
+$(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c src/mm/vm_file_cache.h include/kernel/lume/vm.h include/abi/native/lume/memory.h $(wildcard tests/fixtures/vm_host/lume/*.h)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/vm_host -Iinclude/kernel -Iinclude/abi/native "$<" -o "$@"
 check: check-vm-memory
@@ -847,3 +847,10 @@ check-signal-wait: $(OUT)/tests/signal-wait$(HOSTEXE)
 $(OUT)/tests/signal-wait$(HOSTEXE): tests/unit/signal_wait_test.c src/core/signal_wait.h src/core/signal_mask.h include/abi/native/lume/signal.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+
+.PHONY: check-vfs-mapping
+check-vfs-mapping: $(OUT)/tests/vfs-mapping$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vfs-mapping$(HOSTEXE): tests/unit/vfs_mapping_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) $^ -o "$@"

@@ -24,7 +24,7 @@ static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint1
 #include "../../../drivers/storage/virtio_blk/block.c"
 
 static struct lume_virtio_desc descriptors[3];
-static unsigned char card[128][512];
+static unsigned char card[256][512];
 static unsigned submits, flushes, checkpoints, fail_at;
 static bool short_read;
 static bool registered;
@@ -32,7 +32,7 @@ static bool registered;
 uint32_t lume_in32(uint16_t port)
 {
     assert(port == 20 || port == 24);
-    return port == 20 ? 128 : 0;
+    return port == 20 ? 256 : 0;
 }
 
 bool lume_virtio_open(struct lume_virtio *value, uint32_t pci, uint16_t product, uint32_t features)
@@ -68,7 +68,7 @@ bool lume_virtio_wait(struct lume_virtio *value, struct lume_virtqueue *q, unsig
     assert(value == &device && q == &queue);
     if (submits == fail_at)
         return false;
-    assert(header.sector < 128);
+    assert(header.sector < 256);
     unsigned bytes = q->descriptors[1].bytes;
     assert(bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
     if (header.type == 0)
@@ -142,8 +142,8 @@ int main(void)
     assert(!write_blocks(16, 33, bytes));
     assert(!write_blocks(16, 0, bytes));
     assert(!write_blocks(16, 1, NULL));
-    assert(!read_blocks(127, 2, bytes));
-    assert(!read_blocks(16, 33, bytes));
+    assert(!read_blocks(255, 2, bytes));
+    assert(!read_blocks(16, LUME_SD_MAX_SECTORS + 1, bytes));
     assert(!read_blocks(16, 0, bytes));
     assert(!read_blocks(16, 1, NULL));
     assert(!submits);
@@ -172,6 +172,16 @@ int main(void)
     short_read = false;
     assert(write_sector(16, bytes) && read_sector(16, output));
     assert(!memcmp(bytes, output, 512) && flushes == 2);
+    unsigned char group[LUME_SD_MAX_SECTORS * 512 + 1];
+    for (unsigned i = 0; i < sizeof(group); ++i)
+        group[i] = (unsigned char)(i * 13);
+    /* Extend this fixture's volume after checking the smaller original bounds. */
+    allowed_count = 200;
+    assert(write_blocks(16, LUME_SD_MAX_SECTORS, group + 1));
+    memset(group + 1, 0, sizeof(group) - 1);
+    assert(read_blocks(16, LUME_SD_MAX_SECTORS, group + 1));
+    for (unsigned i = 1; i < sizeof(group); ++i)
+        assert(group[i] == (unsigned char)(i * 13));
     device.features = 0;
     unsigned before = submits;
     assert(!write_blocks(16, 4, bytes) && submits == before);

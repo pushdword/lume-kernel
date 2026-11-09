@@ -4,6 +4,9 @@
 #include "lume/worker.h"
 #include "lume/abi.h"
 #include "lume/memory.h"
+#include "lume/vm.h"
+#include "lume/vfs.h"
+#include "lume/external_file.h"
 #include <string.h>
 
 static uint16_t le16(const unsigned char *p)
@@ -32,7 +35,8 @@ static bool image_range(uint64_t address, uint64_t bytes)
            (address >= LUME_LARGE_ELF_BASE && bounded(address, bytes, LUME_LARGE_ELF_LIMIT));
 }
 
-bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
+static bool plan_headers(const void *data, size_t size, const unsigned char *headers_data,
+                         struct lume_elf_plan *plan)
 {
     const unsigned char *b = data;
     *plan = (struct lume_elf_plan){0};
@@ -59,7 +63,7 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
     uint64_t tls_offset = 0;
     for (unsigned n = 0; n < headers; ++n)
     {
-        const unsigned char *h = b + phoff + n * phsize;
+        const unsigned char *h = (headers_data ? headers_data : b + phoff) + n * phsize;
 #if defined(LUME_ARCH_I686)
         unsigned type = le32(h), flags = le32(h + 24);
         uint64_t offset = le32(h + 4), address = le32(h + 8), file = le32(h + 16),
@@ -147,6 +151,52 @@ bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
     return true;
 }
 
+bool lume_elf_plan(const void *data, size_t size, struct lume_elf_plan *plan)
+{
+    return plan_headers(data, size, NULL, plan);
+}
+
+bool lume_elf_plan_file(int file, size_t size, struct lume_elf_plan *plan)
+{
+    unsigned char header[64], entries[16 * 56];
+#if defined(LUME_ARCH_I686)
+    const unsigned ehsize = 52, phsize = 32;
+#else
+    const unsigned ehsize = 64, phsize = 56;
+#endif
+    if (size < ehsize || lume_vfs_pread_object(file, 0, header, ehsize) != ehsize)
+        return false;
+#if defined(LUME_ARCH_I686)
+    uint64_t offset = le32(header + 28);
+    unsigned count = le16(header + 44);
+#else
+    uint64_t offset = le64(header + 32);
+    unsigned count = le16(header + 56);
+#endif
+    uint64_t bytes = (uint64_t)count * phsize;
+    if (!count || count > 16 || !bounded(offset, bytes, size) ||
+        lume_vfs_pread_object(file, offset, entries, bytes) != (int64_t)bytes)
+        return false;
+    return plan_headers(header, size, entries, plan);
+}
+
+/* A successful load consumes the held executable description and its write exclusion. */
+bool lume_elf_load_file(unsigned task, int file, const struct lume_elf_plan *plan,
+                        struct lume_elf_image *image)
+{
+    *image = (struct lume_elf_image){0};
+    if (!lume_vm_image_map(task, file, plan))
+        return false;
+    image->task = task;
+    image->entry = plan->entry;
+    image->tls_address = plan->tls_address;
+    image->tls_file = plan->tls_file;
+    image->tls_size = plan->tls_size;
+    image->tls_align = plan->tls_align;
+    image->source_file = file + 1;
+    return true;
+}
+
 static bool image_page_mapped(const struct lume_elf_image *image, unsigned index)
 {
     uint64_t physical;
@@ -185,6 +235,8 @@ int64_t lume_elf_protect(struct lume_elf_image *image, uint64_t first, uint64_t 
         return -LUME_EACCES;
     if (protection)
         protection |= LUME_PROT_READ;
+    if (image->source_file)
+        return lume_vm_image_protect(image->task, first, length, protection);
     if (!image->pages || length / 4096 > image->count)
         return -LUME_ENOMEM;
     uint64_t end = first + length;
@@ -222,6 +274,14 @@ int64_t lume_elf_protect(struct lume_elf_image *image, uint64_t first, uint64_t 
 
 void lume_elf_release(struct lume_elf_image *image)
 {
+    if (image->source_file)
+    {
+        lume_vm_image_release(image->task);
+        lume_vfs_exec_unpin(image->source_file - 1);
+        lume_vfs_drop(image->source_file - 1);
+        *image = (struct lume_elf_image){0};
+        return;
+    }
     for (unsigned first = 0; first < image->count;)
     {
         uint64_t addresses[LUME_MMU_BATCH_PAGES];
@@ -295,6 +355,21 @@ bool lume_elf_clone(unsigned task, const struct lume_elf_image *source,
 {
     *image = *source;
     image->task = task;
+    if (source->source_file)
+    {
+        int file = source->source_file - 1;
+        if (lume_vfs_object_retain(file))
+            goto lazy_fail;
+        if (lume_vfs_exec_pin(file))
+        {
+            lume_vfs_drop(file);
+            goto lazy_fail;
+        }
+        return true;
+    lazy_fail:
+        *image = (struct lume_elf_image){0};
+        return false;
+    }
     image->count = 0;
     image->pages = (void *)(uintptr_t)lume_pages_alloc_span(image->metadata_pages);
     if (!image->pages)

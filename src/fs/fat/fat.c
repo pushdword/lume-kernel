@@ -2,6 +2,7 @@
  * is a firmware-loaded RAM disk. No writes to the Pi OS partitions occur. */
 #include "lume/fat.h"
 #include "lume/files.h"
+#include <string.h>
 
 static uint32_t u16(const unsigned char *p)
 {
@@ -120,8 +121,7 @@ int lume_fat_read_cursor(const struct lume_fat *f, struct lume_fat_file file, ui
         size_t n = f->cluster_bytes - pos;
         if (n > bytes - done)
             n = bytes - done;
-        for (size_t i = 0; i < n; ++i)
-            d[done + i] = s[pos + i];
+        memcpy(d + done, s + pos, n);
         done += n;
         pos = 0;
         if (done < bytes)

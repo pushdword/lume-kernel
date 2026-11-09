@@ -33,6 +33,7 @@ struct lume_elf_image
     uint64_t entry;
     uint64_t tls_address, tls_file, tls_size, tls_align;
     unsigned count, task, metadata_pages;
+    int source_file;
 
     struct
     {
@@ -42,6 +43,8 @@ struct lume_elf_image
 };
 
 bool lume_elf_plan(const void *, size_t, struct lume_elf_plan *);
+bool lume_elf_plan_file(int, size_t, struct lume_elf_plan *);
+bool lume_elf_load_file(unsigned, int, const struct lume_elf_plan *, struct lume_elf_image *);
 bool lume_elf_load(unsigned task, const void *, size_t, struct lume_elf_image *);
 bool lume_elf_clone(unsigned task, const struct lume_elf_image *, struct lume_elf_image *);
 void lume_elf_release(struct lume_elf_image *);
@@ -52,6 +55,7 @@ bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool
 bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 #endif
 #define LUME_MMU_BATCH_PAGES 16u
+#define LUME_MMU_UNMAP_PAGES 64u
 /* Protection updates retain physical frames and complete user TLB invalidation.
  * Callers retain address-space ownership and the scheduler lock. */
 bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const uint64_t *physical,

@@ -23,7 +23,7 @@ static void deliver_irq(void);
 
 static unsigned checks, cases;
 static uint32_t registers[64];
-static unsigned char card[128][512];
+static unsigned char card[256][512];
 static uint64_t ticks, irq_flags;
 static unsigned mmio_calls, data_commands, status_commands, stops, auto_stops, resets;
 static unsigned sectors_done, words, total_blocks, first_sector, checkpoint_calls, watchdog_calls;
@@ -223,7 +223,7 @@ static void model_write(uintptr_t address, uint32_t value)
           ((index == 17 || index == 18 ? 16u : 0u) | (total_blocks > 1 ? 38u : 0u)));
     CHECK((value & 0x003f0000u) == (RESPONSE | CHECKS | (1u << 21)));
     first_sector = registers[8 / 4];
-    CHECK(first_sector + total_blocks <= 128);
+    CHECK(first_sector + total_blocks <= sizeof(card) / sizeof(card[0]));
     words = sectors_done = 0;
     writing = index == 24 || index == 25;
     registers[0x10 / 4] = response_error;
@@ -511,15 +511,19 @@ static void command_counts(void)
 {
     unsigned char data[LUME_SD_MAX_SECTORS * 512] = {0};
     setup(false);
+    capacity = block.sectors = sizeof(card) / sizeof(card[0]);
+    write_count = LUME_SD_MAX_SECTORS;
     for (unsigned i = 0; i < LUME_SD_MAX_SECTORS; ++i)
         CHECK(lume_sd_write(16 + i, data + i * 512));
     unsigned single_commands = data_commands + status_commands;
-    CHECK(single_commands == 64 && writes == 32);
+    CHECK(single_commands == 2 * LUME_SD_MAX_SECTORS && writes == LUME_SD_MAX_SECTORS);
     setup(false);
+    capacity = block.sectors = sizeof(card) / sizeof(card[0]);
+    write_count = LUME_SD_MAX_SECTORS;
     CHECK(lume_sd_write_blocks(16, LUME_SD_MAX_SECTORS, data));
-    CHECK(data_commands + status_commands == 2 && auto_stops == 1 && writes == 32);
-    printf("SDHCI 32-sector write commands: single=%u grouped=%u automatic-stop=%u\n",
-           single_commands, data_commands + status_commands, auto_stops);
+    CHECK(data_commands + status_commands == 2 && auto_stops == 1 && writes == LUME_SD_MAX_SECTORS);
+    printf("SDHCI %u-sector write commands: single=%u grouped=%u automatic-stop=%u\n",
+           LUME_SD_MAX_SECTORS, single_commands, data_commands + status_commands, auto_stops);
 }
 
 static void bus_modes(void)

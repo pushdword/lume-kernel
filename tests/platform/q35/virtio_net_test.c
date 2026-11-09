@@ -32,9 +32,9 @@ static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint1
 
 #include "../../../drivers/net/virtio_net/net.c"
 
-static _Alignas(4096) unsigned char arena[32 * 4096];
-static struct lume_virtio_desc descriptors[2][32];
-static struct lume_virtio_used completions[2][64];
+static _Alignas(4096) unsigned char arena[256 * 4096];
+static struct lume_virtio_desc descriptors[2][256];
+static struct lume_virtio_used completions[2][512];
 static unsigned heads[2], tails[2], submissions[2], allocated, released, allocation_calls;
 static unsigned allocation_failure, queue_size, queue_releases, failures, errors, resets;
 static bool reset_failure, reset_acknowledged;
@@ -104,7 +104,7 @@ bool lume_virtio_take(struct lume_virtqueue *queue, unsigned *id, unsigned *byte
     assert(index < 2);
     if (heads[index] == tails[index])
         return false;
-    struct lume_virtio_used used = completions[index][heads[index]++ % 64];
+    struct lume_virtio_used used = completions[index][heads[index]++ % 512];
     *id = used.id;
     *bytes = used.bytes;
     ++queue->consumed;
@@ -179,8 +179,8 @@ static void reset(unsigned count)
 
 static void complete(unsigned id)
 {
-    assert(tails[1] - heads[1] < 64);
-    completions[1][tails[1]++ % 64] = (struct lume_virtio_used){id, 0};
+    assert(tails[1] - heads[1] < 512);
+    completions[1][tails[1]++ % 512] = (struct lume_virtio_used){id, 0};
 }
 
 static void stop(void)
@@ -192,10 +192,10 @@ static void stop(void)
 
 static void pipeline(void)
 {
-    reset(32);
-    assert(!module_start(NULL, NULL) && submissions[0] == 32);
+    reset(256);
+    assert(!module_start(NULL, NULL) && submissions[0] == 256);
     unsigned char frame[1514];
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < 256; ++i)
     {
         memset(frame, (int)i, sizeof(frame));
         assert(transmit(NULL, frame, sizeof(frame)));
@@ -204,21 +204,21 @@ static void pipeline(void)
             assert(!transmit_buffers[i * FRAME_BYTES + j]);
     }
     memset(frame, 0xa5, sizeof(frame));
-    assert(!transmit(NULL, frame, sizeof(frame)) && submissions[1] == 32);
+    assert(!transmit(NULL, frame, sizeof(frame)) && submissions[1] == 256);
     assert(ticks == 1000000 && !failures && !errors && !released);
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < 256; ++i)
         for (unsigned j = 0; j < sizeof(frame); ++j)
             assert(transmit_buffers[i * FRAME_BYTES + 10 + j] == i);
     complete(17);
-    assert(transmit(NULL, frame, 14) && submissions[1] == 33);
+    assert(transmit(NULL, frame, 14) && submissions[1] == 257);
     assert(transmit_pending[17] && descriptors[1][17].bytes == 24);
     assert(transmit_buffers[17 * FRAME_BYTES + 10] == 0xa5);
     assert(!transmit(NULL, frame, 14));
-    for (unsigned i = 0; i < 32; ++i)
-        complete(31 - i);
+    for (unsigned i = 0; i < 256; ++i)
+        complete(255 - i);
     poll(NULL);
     assert(!failures && !errors);
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < 256; ++i)
         assert(!transmit_pending[i]);
     stop();
 }

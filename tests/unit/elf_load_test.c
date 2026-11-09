@@ -1,10 +1,78 @@
 #include "lume/elf.h"
 #include "lume/abi.h"
 #include "lume/memory.h"
+#include "lume/vm.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const unsigned char *file_image;
+static size_t file_bytes, file_read_bytes;
+
+int64_t lume_vfs_pread_object(int file, uint64_t offset, void *out, uint64_t bytes)
+{
+    if (file != 7 || offset > file_bytes || bytes > file_bytes - offset)
+        return -LUME_EIO;
+    memcpy(out, file_image + offset, (size_t)bytes);
+    file_read_bytes += bytes;
+    return (int64_t)bytes;
+}
+
+int lume_vfs_object_retain(int file)
+{
+    (void)file;
+    return -LUME_EBADF;
+}
+
+int lume_vfs_exec_pin(int file)
+{
+    (void)file;
+    return -LUME_EBADF;
+}
+
+void lume_vfs_exec_unpin(int file)
+{
+    (void)file;
+    abort();
+}
+
+void lume_vfs_drop(int file)
+{
+    (void)file;
+    abort();
+}
+
+bool lume_vm_image_map(unsigned task, int file, const struct lume_elf_plan *plan)
+{
+    (void)task;
+    (void)file;
+    (void)plan;
+    return false;
+}
+
+void lume_vm_image_release(unsigned task)
+{
+    (void)task;
+    abort();
+}
+
+int64_t lume_vm_image_protect(unsigned task, uint64_t a, uint64_t n, unsigned p)
+{
+    (void)task;
+    (void)a;
+    (void)n;
+    (void)p;
+    return -LUME_ENOMEM;
+}
+
+bool lume_vm_resolve_buffer(uint64_t root, uint64_t a, bool w)
+{
+    (void)root;
+    (void)a;
+    (void)w;
+    return false;
+}
 
 #define FRAMES 2048u
 static _Alignas(4096) unsigned char memory[FRAMES][4096];
@@ -351,7 +419,16 @@ int main(void)
     assert(!allocated && !mappings);
     puts("PASS_ELF_PROTECTION cases=8");
     put(elf + 64 + 56 + 40, 8, 5 * 1024 * 1024);
-    struct lume_elf_plan plan;
+    struct lume_elf_plan plan, file_plan;
+    file_image = elf;
+    file_bytes = sizeof(elf);
+    assert(lume_elf_plan(elf, sizeof(elf), &plan));
+    assert(lume_elf_plan_file(7, sizeof(elf), &file_plan));
+    assert(!memcmp(&plan, &file_plan, sizeof(plan)));
+    assert(file_read_bytes == 64 + 2 * 56);
+    file_bytes = 65;
+    assert(!lume_elf_plan_file(7, sizeof(elf), &file_plan));
+    file_bytes = sizeof(elf);
     unsigned char *tls = elf + 64 + 2 * 56;
     put(elf + 56, 2, 3);
     put(tls, 4, 7);

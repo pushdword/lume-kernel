@@ -3,8 +3,8 @@
 #include "lume/netif.h"
 #include "lume/counter.h"
 #include <string.h>
-#define RECEIVE_BUFFERS 32u
-#define TRANSMIT_BUFFERS 32u
+#define RECEIVE_BUFFERS 256u
+#define TRANSMIT_BUFFERS 256u
 #define FRAME_BYTES 1536u
 static struct lume_virtio device;
 static struct lume_virtqueue rx, tx;
@@ -12,7 +12,8 @@ static unsigned char *receive_buffers;
 static unsigned char *transmit_buffers;
 static uint64_t transmit_ticks[TRANSMIT_BUFFERS];
 static bool transmit_pending[TRANSMIT_BUFFERS], transmit_failed;
-static unsigned transmit_count, transmit_next, transmit_pages;
+static unsigned transmit_count, transmit_next, transmit_pages, transmit_inflight;
+static uint64_t transmit_check_started;
 static bool enabled;
 static int interface = -1;
 static unsigned receive_pages;
@@ -49,15 +50,28 @@ static void transmit_reclaim(void)
             return;
         }
         transmit_pending[id] = false;
+        --transmit_inflight;
     }
+    if (!transmit_inflight)
+        return;
     uint64_t now = lume_counter_read();
     uint64_t timeout = lume_counter_frequency() * 5;
+    if (now - transmit_check_started < timeout)
+        return;
+    uint64_t oldest = 0;
     for (unsigned i = 0; i < transmit_count; ++i)
-        if (transmit_pending[i] && now - transmit_ticks[i] >= timeout)
+        if (transmit_pending[i])
         {
-            transmit_fail();
-            return;
+            uint64_t elapsed = now - transmit_ticks[i];
+            if (elapsed >= timeout)
+            {
+                transmit_fail();
+                return;
+            }
+            if (elapsed > oldest)
+                oldest = elapsed;
         }
+    transmit_check_started = now - oldest;
 }
 
 static void poll(void *context)
@@ -123,6 +137,8 @@ static bool transmit(void *context, const void *frame, size_t bytes)
         tx.descriptors[id] =
             (struct lume_virtio_desc){(uintptr_t)buffer, (uint32_t)bytes + 10, 0, 0};
         transmit_ticks[id] = lume_counter_read();
+        if (!transmit_inflight++)
+            transmit_check_started = transmit_ticks[id];
         transmit_pending[id] = true;
         transmit_next = (id + 1) % transmit_count;
         lume_virtio_submit(&tx, id);
@@ -157,7 +173,8 @@ static int module_start(struct lume_hardware *hardware, void *context)
         return -LUME_ENOMEM;
     }
     transmit_buffers = (void *)(uintptr_t)physical;
-    transmit_next = 0;
+    transmit_next = transmit_inflight = 0;
+    transmit_check_started = 0;
     transmit_failed = false;
     memset(transmit_pending, 0, sizeof(transmit_pending));
     enabled = true;
@@ -200,7 +217,7 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     for (unsigned i = 0; i < transmit_pages; ++i)
         (void)lume_page_free((uintptr_t)transmit_buffers + (uint64_t)i * 4096);
     transmit_buffers = NULL;
-    transmit_pages = transmit_count = transmit_next = 0;
+    transmit_pages = transmit_count = transmit_next = transmit_inflight = 0;
     transmit_failed = false;
     memset(transmit_pending, 0, sizeof(transmit_pending));
     lume_virtio_queue_release(&rx);

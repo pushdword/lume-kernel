@@ -45,7 +45,9 @@ static bool kernel_console_ready(void)
 
 static bool kernel_console_call(struct lume_context *frame)
 {
-    if (!kernel_console_available())
+    if (!kernel_console_available() ||
+        lume_vm_buffer_busy(process_slot(current_task), LUME_CONTEXT_REG(frame, 1),
+                            LUME_CONTEXT_REG(frame, 2)))
         return false;
     unsigned number = (unsigned)LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     return ((number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&

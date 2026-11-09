@@ -1,4 +1,5 @@
 #include "lume/vm.h"
+#include "lume/vfs.h"
 #include "lume/early.h"
 #include "lume/elf.h"
 #include "lume/mmu.h"
@@ -15,6 +16,7 @@
 struct vm_chunk
 {
     uint64_t index, pages[512];
+    uint64_t code_ready[8];
     struct vm_chunk *next;
 };
 
@@ -30,13 +32,20 @@ struct vm_object
     struct vm_object *next;
     struct vm_area *areas;
     char name[LUME_VM_NAME_BYTES];
+    struct vm_object *backing, *children, *backing_next, *file_next;
+    uint64_t backing_offset, file_first, file_end;
+    uint64_t file_key, file_version, file_age, io_page, io_error_page;
+    int file, io_error;
+    volatile uint32_t io_ready;
+    bool cached, file_limited, loading, io_running;
+    struct lume_work file_work;
 };
 
 struct vm_area
 {
     uint64_t first, end, offset, generation;
     unsigned protection, maximum, thread, saved, owner;
-    bool shared, retiring, jit;
+    bool shared, retiring, jit, image;
     struct vm_object *object;
     struct vm_area *next, *object_next, *retire_next;
 };
@@ -50,6 +59,9 @@ struct vm_handle
 
 static struct vm_area *spaces[LUME_TASK_LIMIT];
 static struct vm_object *names, *retired;
+static struct vm_object *file_cache;
+static uint64_t cached_pages, file_age;
+static unsigned file_waiters;
 static uint64_t serial, area_serial;
 static bool changing[LUME_TASK_LIMIT];
 static void reap(void *);
@@ -92,6 +104,8 @@ static struct vm_chunk *chunk(struct vm_object *object, uint64_t page, bool crea
                 prepared->index = index;
                 prepared->next = object->chunks[bucket];
                 object->chunks[bucket] = prepared;
+                if (object->cached)
+                    cached_pages += lume_kernel_allocation_pages(prepared);
                 entry = prepared;
             }
         }
@@ -131,6 +145,16 @@ static void drop(struct vm_object *object)
 {
     if (--object->references)
         return;
+    if (object->backing)
+    {
+        struct vm_object **position = &object->backing->children;
+        while (*position && *position != object)
+            position = &(*position)->backing_next;
+        if (!*position)
+            lume_fail("virtual memory backing ownership");
+        *position = object->backing_next;
+        object->backing_next = NULL;
+    }
     object->next = retired;
     retired = object;
     (void)lume_work_submit(&reap_work);
@@ -155,6 +179,8 @@ static void reap(void *unused)
                         if (!lume_page_free(entry->pages[i]))
                             lume_fail("virtual memory frame release");
                         entry->pages[i] = 0;
+                        if (object->cached)
+                            --cached_pages;
                         --budget;
                     }
                 bool live = false;
@@ -172,6 +198,8 @@ static void reap(void *unused)
                     break;
                 }
                 object->chunks[bucket] = entry->next;
+                if (object->cached)
+                    cached_pages -= lume_kernel_allocation_pages(entry);
                 lume_kernel_free(entry);
                 budget -= 2;
             }
@@ -180,7 +208,14 @@ static void reap(void *unused)
         if (!empty || !budget)
             break;
         retired = object->next;
+        struct vm_object *backing = object->backing;
+        if (object->file)
+            lume_vfs_drop(object->file - 1);
+        if (object->cached)
+            cached_pages -= lume_kernel_allocation_pages(object);
         lume_kernel_free(object);
+        if (backing)
+            drop(backing);
         --budget;
     }
     if (retired)
@@ -225,6 +260,8 @@ static bool writable_alias(struct vm_object *object, uint64_t offset, uint64_t e
 
 static bool covered(struct vm_object *object, uint64_t page)
 {
+    if (object->children)
+        return true;
     uint64_t offset = page * PAGE;
     for (struct vm_area *area = object->areas; area; area = area->object_next)
         if (offset >= area->offset && offset - area->offset < area->end - area->first)
@@ -269,7 +306,7 @@ static void trim(struct vm_object *object)
                         lume_fail("virtual memory frame release");
                     entry->pages[i] = 0;
                     if (++count % 16 == 0)
-                        lume_worker_checkpoint(65536);
+                        lume_worker_checkpoint(0);
                 }
     prune_chunks(object);
 }
@@ -347,17 +384,21 @@ static bool boundaries(unsigned task, uint64_t first, uint64_t end)
     return true;
 }
 
-static void revoke(unsigned task, struct vm_area *area, uint64_t offset, uint64_t end)
+static void revoke_object(unsigned task, struct vm_area *area, struct vm_object *object,
+                          uint64_t source_offset, uint64_t offset, uint64_t end)
 {
-    uint64_t addresses[LUME_MMU_BATCH_PAGES];
+    uint64_t addresses[LUME_MMU_UNMAP_PAGES];
     unsigned count = 0, visited = 0;
     for (unsigned bucket = 0; bucket < HASH; ++bucket)
-        for (struct vm_chunk *entry = area->object->chunks[bucket]; entry; entry = entry->next)
+        for (struct vm_chunk *entry = object->chunks[bucket]; entry; entry = entry->next)
             for (unsigned i = 0; i < 512; ++i)
             {
                 if ((++visited & 511) == 0)
                     lume_worker_checkpoint(PAGE);
-                uint64_t position = (entry->index * 512 + i) * PAGE, physical;
+                uint64_t source = (entry->index * 512 + i) * PAGE, physical;
+                if (source < source_offset)
+                    continue;
+                uint64_t position = source - source_offset;
                 if (!entry->pages[i] || position < offset || position >= end ||
                     position < area->offset || position - area->offset >= area->end - area->first)
                     continue;
@@ -366,17 +407,24 @@ static void revoke(unsigned task, struct vm_area *area, uint64_t offset, uint64_
                                         &physical))
                     continue;
                 addresses[count++] = address;
-                if (count == LUME_MMU_BATCH_PAGES)
+                if (count == LUME_MMU_UNMAP_PAGES)
                 {
                     if (!lume_mmu_unmap_user_batch(task, addresses, count))
                         lume_fail("virtual memory mapping release");
                     count = 0;
-                    lume_worker_checkpoint(65536);
+                    lume_worker_checkpoint(0);
                 }
             }
     if (count && !lume_mmu_unmap_user_batch(task, addresses, count))
         lume_fail("virtual memory mapping release");
     lume_worker_checkpoint(PAGE);
+}
+
+static void revoke(unsigned task, struct vm_area *area, uint64_t offset, uint64_t end)
+{
+    revoke_object(task, area, area->object, 0, offset, end);
+    if (area->object->backing)
+        revoke_object(task, area, area->object->backing, area->object->backing_offset, offset, end);
 }
 
 static void forget_retiring(struct vm_area *area)
@@ -427,6 +475,45 @@ static void remove_range(unsigned task, uint64_t first, uint64_t end)
     }
 }
 
+#include "vm_file_cache.h"
+
+static void file_map_around(unsigned task, const struct vm_area *area, uint64_t page)
+{
+    struct vm_object *object = area->object, *source = object->backing;
+    if (!source || !source->cached || area->jit)
+        return;
+    uint64_t first = object->file_limited ? object->file_first : 0;
+    uint64_t end = object->file_limited                     ? object->file_end
+                   : source->bytes > object->backing_offset ? source->bytes - object->backing_offset
+                                                            : 0;
+    uint64_t source_first = object->backing_offset / PAGE;
+    uint64_t group_end = (source_first + page + FILE_READ_PAGES) & ~(uint64_t)(FILE_READ_PAGES - 1);
+    for (uint64_t next = page + 1; source_first + next < group_end; ++next)
+    {
+        uint64_t offset = next * PAGE, existing;
+        if (offset < first || offset + PAGE > end || offset < area->offset ||
+            offset - area->offset >= area->end - area->first)
+            break;
+        uint64_t address = area->first + offset - area->offset;
+        struct vm_chunk *entry = chunk(source, source_first + next, false);
+        unsigned index = (unsigned)((source_first + next) % 512);
+        uint64_t physical = entry ? entry->pages[index] : 0;
+        uint64_t *owned = page_entry(object, next, false);
+        if (!physical || (owned && *owned) ||
+            lume_mmu_translate(lume_mmu_task_root(task), address, false, false, false, &existing))
+            continue;
+        if ((area->protection & LUME_PROT_EXEC) &&
+            !(entry->code_ready[index / 64] & (UINT64_C(1) << (index % 64))))
+        {
+            lume_sync_code(physical, PAGE);
+            entry->code_ready[index / 64] |= UINT64_C(1) << (index % 64);
+        }
+        if (!lume_mmu_map_user(task, address, physical, false,
+                               (area->protection & LUME_PROT_EXEC) != 0))
+            break;
+    }
+}
+
 int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
 {
     if (task >= LUME_TASK_LIMIT)
@@ -435,7 +522,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     unsigned required = execute ? LUME_PROT_EXEC : write ? LUME_PROT_WRITE : LUME_PROT_READ;
     if (!area || area->retiring)
         return 0;
-    if (changing[task] || area->object->changing)
+    struct vm_object *object = area->object;
+    if (changing[task] || object->changing || (object->backing && object->backing->changing))
         return 2;
     if (!(area->protection & required))
         return 0;
@@ -447,24 +535,49 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         ((execute && writer) || (write && !writer && (area->protection & LUME_PROT_EXEC))))
         return 0;
     uint64_t offset = area->offset + address - area->first;
-    if (offset / PAGE >= (area->object->bytes + PAGE - 1) / PAGE)
+    uint64_t page = offset / PAGE, position = page * PAGE;
+    if (page >= (object->bytes + PAGE - 1) / PAGE)
         return -1;
-    struct vm_object *object = area->object;
-    uint64_t generation = area->generation, page = offset / PAGE;
-    uint64_t root = lume_mmu_task_root(task);
+    uint64_t first = 0, end = 0, source_physical = 0, source_version = 0;
+    struct vm_object *source = object->backing;
+    if (source)
+    {
+        first = object->file_limited ? object->file_first : 0;
+        end = object->file_limited                     ? object->file_end
+              : source->bytes > object->backing_offset ? source->bytes - object->backing_offset
+                                                       : 0;
+        if (!object->file_limited && page >= (end + PAGE - 1) / PAGE)
+            return -1;
+    }
+    uint64_t generation = area->generation, root = lume_mmu_task_root(task);
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     root = lume_mmu_task_view_root(task, writer);
 #endif
     ++object->references;
-    /* Chunk allocation may suspend. Keep its object alive and retain no area or
-     * chunk reference across that allocation. The prepared chunk stays unpublished. */
-    struct vm_chunk *prepared = chunk(object, page, false) ? NULL : allocate(sizeof(*prepared));
+    struct vm_chunk *prepared = NULL;
+    struct vm_chunk *entry = chunk(object, page, false);
+    bool owned = entry && entry->pages[page % 512];
+    bool partial = source && (position < first || end < position + PAGE);
+    bool private = owned || !source || write || partial ||
+                   (source && !source->cached && (area->protection & LUME_PROT_EXEC));
     int result = 0;
+    if (!owned && source && position < end && first < position + PAGE)
+    {
+        result = backing_page(object, page, &source_physical);
+        if (result != 1)
+            goto out;
+        source_version = source->file_version;
+    }
+    if (private && !entry)
+        prepared = allocate(sizeof(*prepared));
     area = find_area(task, address);
     if (!area || area->generation != generation || area->object != object || area->retiring ||
         !(area->protection & required))
+    {
+        result = 0;
         goto out;
-    if (changing[task] || object->changing)
+    }
+    if (changing[task] || object->changing || (source && source->changing))
     {
         result = 2;
         goto out;
@@ -488,26 +601,58 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         result = -1;
         goto out;
     }
-    /* Frames and page-table nodes use non-suspending single-page allocation.
-     * Mapping publication stays under the kernel lock after this revalidation. */
-    struct vm_chunk *entry = chunk(object, page, false);
-    bool new_chunk = !entry;
-    if (!entry)
+    if (source && !object->file_limited &&
+        position >= rounded(source->bytes > object->backing_offset
+                                ? source->bytes - object->backing_offset
+                                : 0))
+    {
+        result = -1;
+        goto out;
+    }
+    if (source_physical)
+    {
+        uint64_t source_page = object->backing_offset / PAGE + page;
+        struct vm_chunk *backing = chunk(source, source_page, false);
+        if (!backing || backing->pages[source_page % 512] != source_physical ||
+            source_version != source->file_version)
+        {
+            result = 2;
+            goto out;
+        }
+    }
+    entry = chunk(object, page, false);
+    if (entry && entry->pages[page % 512])
+        private = true;
+    bool new_chunk = private && !entry;
+    if (new_chunk)
         entry = prepared;
-    if (!entry)
+    if (private && !entry)
     {
         result = -1;
         goto out;
     }
     unsigned slot = (unsigned)(page % 512), bucket = (unsigned)((page / 512) % HASH);
-    bool new_frame = !entry->pages[slot];
-    uint64_t physical = new_frame ? lume_page_alloc(0) : entry->pages[slot];
-    if (!physical)
+    bool new_frame = private && !entry->pages[slot];
+    uint64_t physical = private ? entry->pages[slot] : source_physical;
+    if (new_frame)
     {
-        result = -1;
-        goto out;
+        physical =
+            source_physical && !partial ? lume_page_alloc_uninitialized(0) : lume_page_alloc(0);
+        if (!physical)
+        {
+            result = -1;
+            goto out;
+        }
+        if (source_physical)
+        {
+            uint64_t low = first > position ? first - position : 0;
+            uint64_t high = end - position < PAGE ? end - position : PAGE;
+            if (high > low)
+                memcpy((void *)(uintptr_t)(physical + low),
+                       (const void *)(uintptr_t)(source_physical + low), (size_t)(high - low));
+        }
+        entry->pages[slot] = physical;
     }
-    entry->pages[slot] = physical;
     if (new_chunk)
     {
         entry->index = page / 512;
@@ -515,26 +660,53 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         object->chunks[bucket] = entry;
         prepared = NULL;
     }
+    if (!physical)
+    {
+        result = -1;
+        goto out;
+    }
     uint64_t existing;
-    if (lume_mmu_translate(root, address, write, true, execute, &existing))
+    if (lume_mmu_translate(root, address, write, true, execute, &existing) &&
+        (existing & ~(PAGE - 1)) == physical)
     {
         result = 1;
         goto out;
     }
     if (area->protection & LUME_PROT_EXEC)
-        lume_sync_code(physical, PAGE);
+    {
+        bool clean = false;
+        struct vm_chunk *backing = NULL;
+        unsigned bit = 0;
+        if (!private)
+        {
+            uint64_t source_page = object->backing_offset / PAGE + page;
+            backing = chunk(source, source_page, false);
+            bit = (unsigned)(source_page % 512);
+            clean = backing && (backing->code_ready[bit / 64] & (UINT64_C(1) << (bit % 64)));
+        }
+        if (!clean)
+            lume_sync_code(physical, PAGE);
+        if (backing)
+            backing->code_ready[bit / 64] |= UINT64_C(1) << (bit % 64);
+    }
+    uint64_t aligned = address & ~(PAGE - 1);
+    if (lume_mmu_translate(root, aligned, false, false, false, &existing))
+        if (!lume_mmu_unmap_user_batch(task, &aligned, 1))
+            lume_fail("copy-on-write mapping replacement");
     bool mapped;
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     if (area->jit)
-        mapped = lume_mmu_map_user_jit(task, address & ~(PAGE - 1), physical,
-                                       (area->protection & LUME_PROT_WRITE) != 0,
+        mapped = lume_mmu_map_user_jit(task, aligned, physical,
+                                       private && (area->protection & LUME_PROT_WRITE),
                                        (area->protection & LUME_PROT_EXEC) != 0);
     else
 #endif
-        mapped = lume_mmu_map_user(task, address & ~(PAGE - 1), physical,
-                                   (area->protection & LUME_PROT_WRITE) != 0,
+        mapped = lume_mmu_map_user(task, aligned, physical,
+                                   private && (area->protection & LUME_PROT_WRITE),
                                    (area->protection & LUME_PROT_EXEC) != 0);
     result = mapped ? 1 : -1;
+    if (mapped && !private)
+        file_map_around(task, area, page);
     if (!mapped && new_frame)
     {
         entry->pages[slot] = 0;
@@ -554,8 +726,6 @@ out:
 
 bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
 {
-    if (!lume_vm_address(address))
-        return false;
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
         if (spaces[task] &&
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
@@ -564,8 +734,50 @@ bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
             lume_mmu_task_root(task) == root
 #endif
         )
-            return lume_vm_fault(task, address, write, false) == 1;
+        {
+            for (;;)
+            {
+                int result = lume_vm_fault(task, address, write, false);
+                if (result != 2)
+                    return result == 1;
+                if (lume_worker_current() >= LUME_WORK_DOMAINS)
+                {
+                    lume_task_vm_buffer_wait();
+                    return false;
+                }
+                ++file_waiters;
+                bool paused = lume_worker_pause_ms(1);
+                --file_waiters;
+                if (!paused)
+                    return false;
+            }
+        }
     return false;
+}
+
+bool lume_vm_code_address(unsigned task, uint64_t address)
+{
+    if (task >= LUME_TASK_LIMIT)
+        return false;
+    struct vm_area *area = find_area(task, address);
+    if (area)
+    {
+        if (area->retiring || !(area->protection & LUME_PROT_EXEC))
+            return false;
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+        if (area->jit && lume_mmu_jit_active(task))
+            return false;
+#endif
+        return true;
+    }
+    uint64_t physical;
+    return lume_mmu_translate(lume_mmu_task_root(task), address, false, true, true, &physical);
+}
+
+bool lume_vm_file_pointer(unsigned task, uint64_t address)
+{
+    struct vm_area *area = task < LUME_TASK_LIMIT ? find_area(task, address) : NULL;
+    return area && area->object->backing;
 }
 
 bool lume_vm_buffer_busy(unsigned task, uint64_t address, uint64_t bytes)
@@ -576,8 +788,29 @@ bool lume_vm_buffer_busy(unsigned task, uint64_t address, uint64_t bytes)
         return true;
     uint64_t end = address + bytes;
     for (struct vm_area *area = spaces[task]; area && area->first < end; area = area->next)
-        if (area->end > address && area->object->changing)
-            return true;
+        if (area->end > address)
+        {
+            struct vm_object *object = area->object;
+            if (object->changing || (object->backing && object->backing->changing))
+                return true;
+            if (object->backing && object->backing->cached)
+            {
+                uint64_t first = address > area->first ? address : area->first;
+                uint64_t last = end < area->end ? end : area->end;
+                for (uint64_t at = first & ~(PAGE - 1); at < last; at += PAGE)
+                {
+                    uint64_t page = (area->offset + at - area->first) / PAGE;
+                    uint64_t *owned = page_entry(object, page, false);
+                    uint64_t position = object->backing_offset + page * PAGE;
+                    uint64_t *cached = page_entry(object->backing, position / PAGE, false);
+                    if ((!owned || !*owned) && (!cached || !*cached) &&
+                        position < object->backing->bytes &&
+                        (!object->file_limited || page * PAGE < object->file_end) &&
+                        file_request(object->backing, position / PAGE) == 2)
+                        return true;
+                }
+            }
+        }
     return false;
 }
 
@@ -590,9 +823,9 @@ bool lume_vm_buffer_ready(unsigned task, uint64_t address, uint64_t bytes)
         uint64_t part = PAGE - address % PAGE;
         if (part > bytes)
             part = bytes;
-        if (lume_vm_address(address))
+        struct vm_area *area = find_area(task, address);
+        if (area || lume_vm_address(address))
         {
-            struct vm_area *area = find_area(task, address);
             if (!area || area->retiring || area->object->changing ||
                 area->offset + address - area->first >= rounded(area->object->bytes))
                 return false;
@@ -666,6 +899,8 @@ static int64_t resize_object(struct vm_object *object, uint64_t bytes)
     {
         if (bytes > object->bytes)
             zero_old_tail(object);
+        if (object->bytes != bytes)
+            ++object->file_version;
         object->bytes = bytes;
         return 0;
     }
@@ -673,6 +908,8 @@ static int64_t resize_object(struct vm_object *object, uint64_t bytes)
     uint64_t first = bytes & ~(PAGE - 1);
     /* Publish EOF before yielding. Faults cannot recreate truncated frames. */
     object->bytes = bytes;
+    ++object->file_version;
+    backing_revoke(object);
     for (struct vm_area *area = object->areas; area; area = area->object_next)
         revoke(area->owner, area, first, UINT64_MAX);
     unsigned released = 0;
@@ -692,7 +929,7 @@ static int64_t resize_object(struct vm_object *object, uint64_t bytes)
                         lume_fail("virtual memory resize release");
                     entry->pages[i] = 0;
                     if (++released % 16 == 0)
-                        lume_worker_checkpoint(65536);
+                        lume_worker_checkpoint(0);
                 }
             }
     prune_chunks(object);
@@ -842,7 +1079,10 @@ static bool copy_object(struct vm_object *source, uint64_t offset, uint64_t leng
                 uint64_t position = (entry->index * 512 + i) * PAGE;
                 if (!entry->pages[i] || position < offset || position - offset >= length)
                     continue;
-                uint64_t page = get_page(target, (position - offset) / PAGE);
+                uint64_t *slot = page_entry(target, (position - offset) / PAGE, true);
+                if (slot && !*slot)
+                    *slot = lume_page_alloc_uninitialized(0);
+                uint64_t page = slot ? *slot : 0;
                 if (!page)
                     return false;
                 copy.pages[copy.count].source = entry->pages[i];
@@ -850,7 +1090,7 @@ static bool copy_object(struct vm_object *source, uint64_t offset, uint64_t leng
                 if (copy.count == LUME_MMU_BATCH_PAGES)
                 {
                     lume_worker_compute(copy_pages, &copy);
-                    lume_worker_checkpoint(65536);
+                    lume_worker_checkpoint(0);
                     copy.count = 0;
                 }
             }
@@ -865,6 +1105,9 @@ void lume_vm_poll_background(void)
         (void)lume_work_submit(&reap_work);
     if (retired_threads)
         (void)lume_work_submit(&thread_reap_work);
+    for (struct vm_object *object = file_cache; object; object = object->file_next)
+        if (object->loading && !object->io_running && !object->file_work.queued)
+            (void)lume_work_submit(&object->file_work);
 }
 
 bool lume_vm_file_call(unsigned operation, const struct lume_vm_request *request)
@@ -966,68 +1209,34 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                 lume_kernel_free(area);
                 return result < 0 ? result : -LUME_EINVAL;
             }
-            uint64_t available = offset < stat.size ? stat.size - offset : 0;
-            if (available > length)
-                available = length;
-            object = new_object(available, false);
-            if (object)
-                object->discardable = false;
-            if (!object)
-                goto memory;
-            int held = lume_vfs_hold(files, (unsigned)request->fd);
-            if (held < 0)
+            if (length > INT64_MAX - offset)
+                goto invalid;
+            int error = 0;
+            struct vm_object *source = handle ? handle->object : NULL;
+            int held = -1;
+            if (!source)
             {
-                drop(object);
-                lume_kernel_free(area);
-                return held;
+                held = lume_vfs_hold(files, (unsigned)request->fd);
+                if (held >= 0)
+                    source = file_object(held, &error);
+                else
+                    error = held;
             }
-            bool fragmented = false;
-            for (uint64_t position = 0; position < available;)
+            if (!source || source->changing)
             {
-                unsigned bytes =
-                    available - position > 65536 ? 65536 : (unsigned)(available - position);
-                unsigned count = (unsigned)((bytes + PAGE - 1) / PAGE);
-                struct vm_chunk *entry = chunk(object, position / PAGE, true);
-                uint64_t physical = 0;
-                if (entry)
-                {
-                    if (!fragmented && count > 1)
-                    {
-                        physical = lume_pages_alloc_span(count);
-                        if (!physical)
-                            /* Fragmented memory needs no further span searches. */
-                            fragmented = true;
-                    }
-                    if (!physical)
-                    {
-                        count = 1;
-                        if (bytes > PAGE)
-                            bytes = PAGE;
-                        physical = lume_page_alloc(0);
-                    }
-                }
-                if (physical)
-                {
-                    /* Sixteen-page batches remain within a 512-page chunk. */
-                    unsigned first = (unsigned)((position / PAGE) % 512);
-                    for (unsigned i = 0; i < count; ++i)
-                        entry->pages[first + i] = physical + (uint64_t)i * PAGE;
-                }
-                result = physical
-                             ? lume_vfs_pread_object(held, offset + position,
-                                                     (void *)(uintptr_t)physical, bytes)
-                             : -LUME_ENOMEM;
-                if (result != bytes)
-                {
+                if (held >= 0)
                     lume_vfs_drop(held);
-                    drop(object);
-                    lume_kernel_free(area);
-                    return result < 0 ? result : -LUME_EIO;
-                }
-                lume_worker_checkpoint(bytes);
-                position += bytes;
+                lume_kernel_free(area);
+                return error ? error : -LUME_EBUSY;
             }
-            lume_vfs_drop(held);
+            /* Retain the backing before allocation can suspend. */
+            ++source->references;
+            object = new_object(length, false);
+            if (object)
+                backing_attach(object, source, offset);
+            drop(source);
+            if (held >= 0)
+                lume_vfs_drop(held);
             offset = 0;
         }
     }
@@ -1068,6 +1277,69 @@ invalid:
 memory:
     lume_kernel_free(area);
     return -LUME_ENOMEM;
+}
+
+bool lume_vm_image_map(unsigned task, int file, const struct lume_elf_plan *plan)
+{
+    int error;
+    struct vm_object *source = file_object(file, &error);
+    if (!source || task >= LUME_TASK_LIMIT)
+        return false;
+    ++source->references;
+    for (unsigned i = 0; i < plan->count; ++i)
+    {
+        const struct lume_elf_segment *segment = &plan->segments[i];
+        uint64_t first = segment->address & ~(PAGE - 1);
+        uint64_t length = rounded(segment->address - first + segment->memory_size);
+        struct vm_area *area = allocate(sizeof(*area));
+        struct vm_object *object = new_object(length, false);
+        if (!area || !object || !free_range(task, first, first + length))
+        {
+            lume_kernel_free(area);
+            if (object)
+                drop(object);
+            lume_vm_image_release(task);
+            drop(source);
+            return false;
+        }
+        backing_attach(object, source, segment->offset & ~(PAGE - 1));
+        object->file_limited = true;
+        object->file_first = segment->address - first;
+        object->file_end = object->file_first + segment->file_size;
+        unsigned protection = LUME_PROT_READ | ((segment->flags & 2) ? LUME_PROT_WRITE : 0) |
+                              ((segment->flags & 1) ? LUME_PROT_EXEC : 0);
+        *area = (struct vm_area){.first = first,
+                                 .end = first + length,
+                                 .protection = protection,
+                                 .maximum = protection,
+                                 .image = true,
+                                 .object = object};
+        insert(task, area);
+    }
+    drop(source);
+    return true;
+}
+
+void lume_vm_image_release(unsigned task)
+{
+    if (task >= LUME_TASK_LIMIT)
+        return;
+    for (;;)
+    {
+        struct vm_area *area = spaces[task];
+        while (area && !area->image)
+            area = area->next;
+        if (!area)
+        {
+            while (retired)
+            {
+                reap(NULL);
+                lume_worker_checkpoint(0);
+            }
+            return;
+        }
+        remove_range(task, area->first, area->end);
+    }
 }
 
 struct cache_batch
@@ -1134,14 +1406,14 @@ static int64_t sync_cache(unsigned task, uint64_t first, uint64_t bytes)
         lume_worker_compute(clean_cache, &batch);
         for (unsigned i = 0; i < objects; ++i)
             pinned[i]->changing = false;
-        lume_worker_checkpoint(65536);
+        lume_worker_checkpoint(0);
     }
     lume_sync_code_finish();
     return 0;
 }
 
-int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
-                     struct lume_vm_request *request)
+static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operation,
+                       struct lume_vm_request *request, bool image)
 {
     if (!pid || pid > LUME_TASK_LIMIT || request->version != LUME_VM_VERSION || request->reserved)
         return -LUME_EINVAL;
@@ -1164,10 +1436,12 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
     if (operation == LUME_VM_UNMAP || operation == LUME_VM_PROTECT || operation == LUME_VM_ADVISE)
     {
         uint64_t first = request->address, length = rounded(request->length);
-        if (operation == LUME_VM_PROTECT && (first < LUME_VM_BASE || first >= LUME_VM_LIMIT))
+        if (!image && operation == LUME_VM_PROTECT &&
+            (first < LUME_VM_BASE || first >= LUME_VM_LIMIT))
             return lume_task_protect_image(task, first, length, request->protection);
-        if (!length || (first & (PAGE - 1)) || first < LUME_VM_BASE || first >= LUME_VM_LIMIT ||
-            length > LUME_VM_LIMIT - first)
+        if (!length || (first & (PAGE - 1)) || first > UINT64_MAX - length ||
+            (!image &&
+             (first < LUME_VM_BASE || first >= LUME_VM_LIMIT || length > LUME_VM_LIMIT - first)))
             return -LUME_EINVAL;
         uint64_t end = first + length;
         unsigned protection = request->protection;
@@ -1181,7 +1455,7 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
             while (position < end)
             {
                 struct vm_area *area = find_area(task, position);
-                if (!area)
+                if (!area || (image && !area->image))
                     return -LUME_ENOMEM;
                 if (area->object->changing)
                     return -LUME_EBUSY;
@@ -1257,7 +1531,7 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
                                         lume_fail("virtual memory discard release");
                                     entry->pages[i] = 0;
                                     if (++discarded % 16 == 0)
-                                        lume_worker_checkpoint(65536);
+                                        lume_worker_checkpoint(0);
                                 }
                             }
             }
@@ -1396,6 +1670,19 @@ int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
     return -LUME_EINVAL;
 }
 
+int64_t lume_vm_call(struct lume_files *files, unsigned pid, unsigned operation,
+                     struct lume_vm_request *request)
+{
+    return vm_call(files, pid, operation, request, false);
+}
+
+int64_t lume_vm_image_protect(unsigned task, uint64_t first, uint64_t length, unsigned protection)
+{
+    struct lume_vm_request request = {
+        .version = LUME_VM_VERSION, .address = first, .length = length, .protection = protection};
+    return vm_call(NULL, task + 1, LUME_VM_PROTECT, &request, true);
+}
+
 void lume_vm_release(unsigned task)
 {
     if (task < LUME_TASK_LIMIT)
@@ -1416,7 +1703,7 @@ void lume_vm_release(unsigned task)
         while (retired)
         {
             reap(NULL);
-            lume_worker_checkpoint(65536);
+            lume_worker_checkpoint(0);
         }
     }
 }
@@ -1471,7 +1758,19 @@ bool lume_vm_clone(unsigned source, unsigned target)
                 available = length;
             copy->object = new_object(available, false);
             if (copy->object)
-                copy->object->discardable = area->object->discardable;
+            {
+                struct vm_object *old = area->object;
+                copy->object->discardable = old->discardable;
+                if (old->backing)
+                {
+                    backing_attach(copy->object, old->backing, old->backing_offset + area->offset);
+                    copy->object->file_limited = old->file_limited;
+                    copy->object->file_first =
+                        old->file_first > area->offset ? old->file_first - area->offset : 0;
+                    copy->object->file_end =
+                        old->file_end > area->offset ? old->file_end - area->offset : 0;
+                }
+            }
             copy->offset = 0;
             if (!copy->object || !copy_object(area->object, area->offset, length, copy->object))
             {

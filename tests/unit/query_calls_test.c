@@ -60,6 +60,13 @@ static bool kernel_render_available(void)
     return render_available;
 }
 
+static bool lume_vm_file_pointer(unsigned task, uint64_t address)
+{
+    (void)task;
+    (void)address;
+    return false;
+}
+
 #include "query_calls.h"
 
 int main(void)

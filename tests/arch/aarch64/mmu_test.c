@@ -354,6 +354,16 @@ int main(void)
     CHECK(root_invalidations[3] == alias_invalidations + 1 && buffers[2].valid);
     CHECK(lume_mmu_translate(lume_mmu_task_root(0), LUME_HEAP_BASE + 0x200011, true, true, false,
                              &pa));
+    uint64_t batch[LUME_MMU_UNMAP_PAGES];
+    for (unsigned i = 0; i < LUME_MMU_UNMAP_PAGES; ++i)
+    {
+        /* Interleave two leaf tables to exercise an unordered batch. */
+        batch[i] = LUME_VM_BASE + (i % 2) * UINT64_C(0x200000) + (i / 2) * 4096;
+        CHECK(lume_mmu_map_user(0, batch[i], UINT64_C(0x14000000) + i * 4096, true, false));
+    }
+    CHECK(lume_mmu_unmap_user_batch(0, batch, LUME_MMU_UNMAP_PAGES));
+    for (unsigned i = 0; i < LUME_MMU_UNMAP_PAGES; ++i)
+        CHECK(!lume_mmu_translate(lume_mmu_task_root(0), batch[i], false, true, false, &pa));
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
     {
         releasing_task = i;

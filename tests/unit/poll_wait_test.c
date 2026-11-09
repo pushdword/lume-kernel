@@ -42,6 +42,7 @@ static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
 static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
 static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static uint64_t wake_at[LUME_TASK_LIMIT];
+static bool vm_fault_wait[LUME_TASK_LIMIT], vm_fault_ready[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT];
 static struct lume_wait_queue queue;
 static uint32_t watched[LUME_TASK_LIMIT];
@@ -251,6 +252,28 @@ static struct supervision_bus supervision_test_bus;
 int lume_supervision_ready(unsigned pid, uint64_t sequence)
 {
     return supervision_ready(&supervision_test_bus, pid, sequence, pid == 2);
+}
+
+static void task_query_revoke(unsigned task)
+{
+    (void)task;
+}
+
+static bool kernel_buffer_pending(void)
+{
+    return false;
+}
+
+static struct lume_context *kernel_buffer_failure(struct lume_context *frame, int64_t result)
+{
+    frame->x[0] = (uint64_t)result;
+    return frame;
+}
+
+static bool lume_vm_code_address(unsigned task, uint64_t address)
+{
+    uint64_t physical;
+    return lume_mmu_translate(lume_mmu_task_root(task), address, false, true, true, &physical);
 }
 
 #include "signal_calls.h"

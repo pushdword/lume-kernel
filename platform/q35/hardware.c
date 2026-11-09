@@ -47,6 +47,16 @@ void lume_kernel_free(void *memory)
             lume_fail("kernel allocation release");
 }
 
+uint64_t lume_kernel_allocation_pages(const void *memory)
+{
+    if (!memory)
+        return 0;
+    const struct allocation *header = (const struct allocation *)memory - 1;
+    if (header->magic != ALLOCATION_MAGIC)
+        lume_fail("invalid kernel allocation query");
+    return header->pages;
+}
+
 static int validate_resource(const struct lume_resource *resource)
 {
     if (resource->kind == LUME_RESOURCE_IOPORT)

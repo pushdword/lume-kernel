@@ -17,6 +17,10 @@
 #define LUME_THREAD_STRIDE UINT64_C(0x1000000)
 #define LUME_THREAD_STACK_MAX UINT64_C(0x800000)
 struct lume_files;
+struct lume_elf_plan;
+bool lume_vm_image_map(unsigned, int, const struct lume_elf_plan *);
+void lume_vm_image_release(unsigned);
+int64_t lume_vm_image_protect(unsigned, uint64_t, uint64_t, unsigned);
 bool lume_vm_thread_region(unsigned, unsigned, uint64_t, uint64_t, uint64_t *, uint64_t *);
 void lume_vm_thread_release(unsigned, unsigned);
 bool lume_vm_thread_bounds(unsigned, unsigned, uint64_t *, uint64_t *);
@@ -33,6 +37,11 @@ bool lume_vm_buffer_ready(unsigned, uint64_t, uint64_t);
 /* The scheduler lock protects buffer queries. Busy reports a mapping transaction,
  * while address validity remains the responsibility of the buffer validator. */
 bool lume_vm_buffer_busy(unsigned, uint64_t, uint64_t);
+uint64_t lume_vm_cache_pages(void);
+void lume_vm_cache_reclaim(void);
+bool lume_vm_storage_required(void);
+bool lume_vm_code_address(unsigned, uint64_t);
+bool lume_vm_file_pointer(unsigned, uint64_t);
 bool lume_vm_file_call(unsigned, const struct lume_vm_request *);
 
 static inline bool lume_vm_address(uint64_t address)

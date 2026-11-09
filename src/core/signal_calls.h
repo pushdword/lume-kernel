@@ -257,12 +257,9 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
             return -LUME_EINVAL;
         if (r.operation && r.handler > 1)
         {
-            uint64_t physical;
-            uint64_t root = lume_mmu_task_root(owner);
             if ((r.handler & (LUME_CODE_ALIGNMENT - 1)) ||
                 (r.restorer & (LUME_CODE_ALIGNMENT - 1)) ||
-                !lume_mmu_translate(root, r.handler, false, true, true, &physical) ||
-                !lume_mmu_translate(root, r.restorer, false, true, true, &physical))
+                !lume_vm_code_address(owner, r.handler) || !lume_vm_code_address(owner, r.restorer))
                 return -LUME_EFAULT;
         }
         struct signal_action old = s->action[r.number];
@@ -388,8 +385,7 @@ static struct lume_context *signal_dispatch_call(struct lume_context *frame, uns
 {
     if (LUME_CONTEXT_REG(frame, 0) == LUME_SIGNAL_WAIT)
         return signal_wait_call(frame, owner);
-    LUME_CONTEXT_REG(frame, 0) = (uint64_t)signal_call(frame, owner);
-    return frame;
+    return kernel_buffer_failure(frame, signal_call(frame, owner));
 }
 
 struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)

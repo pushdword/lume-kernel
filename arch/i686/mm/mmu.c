@@ -221,9 +221,9 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
 
 bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigned count)
 {
-    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_BATCH_PAGES)
+    if (task >= LUME_TASK_LIMIT || !addresses || !count || count > LUME_MMU_UNMAP_PAGES)
         return false;
-    uint32_t *entries[LUME_MMU_BATCH_PAGES];
+    uint32_t *entries[LUME_MMU_UNMAP_PAGES];
     for (unsigned i = 0; i < count; ++i)
     {
         uint64_t va = addresses[i];

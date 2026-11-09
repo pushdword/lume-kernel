@@ -1,3 +1,11 @@
+#include "lume/thread.h"
+
+bool lume_task_storage_context(void)
+{
+    unsigned slot = lume_worker_current();
+    return slot < LUME_WORK_DOMAINS && (slot == LUME_WORK_STORAGE || kernel_lanes[slot].exclusive);
+}
+
 static struct io_queue *kernel_domain_queue(unsigned domain)
 {
     return domain == KERNEL_IO_EXCLUSIVE ? &kernel_control_queue : &kernel_lanes[domain].queue;
@@ -146,6 +154,10 @@ static void kernel_call(void *context)
     lane->result =
         LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FORK
             ? fork_program(&tasks[task].context)
+        : LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) ==
+                    LUME_SYS_THREAD &&
+                LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_THREAD_CREATE
+            ? kernel_thread_create(&tasks[task].context)
         : lane->launch ? start_program(&tasks[task].context)
         : LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_STREAM
             ? stream_attempt(task)
@@ -166,7 +178,7 @@ static void kernel_work(void *context)
     if (domain == LUME_WORK_STORAGE)
     {
         (void)lume_vfs_reap(1);
-        if (kernel_regular_draining())
+        if (kernel_regular_draining() && !lume_vm_storage_required())
             return;
     }
     if (domain == LUME_WORK_NETWORK)
@@ -425,6 +437,18 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
     bool draining = kernel_commit_drain();
     if (admit && !lume_worker_busy() && !kernel_any_grant())
         (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
+    /* Existing workers can require storage while an exclusive request drains admission. */
+    if (admit && lume_vm_storage_required() &&
+        kernel_resource_available(LUME_WORK_STORAGE, LUME_TASK_LIMIT, false) &&
+        kernel_background_pending(LUME_WORK_STORAGE))
+    {
+        struct kernel_io_lane *lane = kernel_lanes + LUME_WORK_STORAGE;
+        lane->owner = LUME_TASK_LIMIT;
+        lane->exclusive = lane->mutation = lane->exclusive_pending = false;
+        lane->child_snapshot_ready = false;
+        (void)lume_worker_submit_on(LUME_WORK_STORAGE, kernel_work,
+                                    (void *)(uintptr_t)LUME_WORK_STORAGE);
+    }
     if (admit && !draining)
     {
         for (unsigned n = 0; n < LUME_WORK_DOMAINS; ++n)

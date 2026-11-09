@@ -84,7 +84,7 @@ int main(void)
     }
     check(LUME_SYS_THREAD, LUME_THREAD_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_THREAD, LUME_THREAD_WAKE, LUME_WORK_GENERAL, false);
-    check(LUME_SYS_THREAD, LUME_THREAD_CREATE, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_THREAD, LUME_THREAD_CREATE, LUME_WORK_GENERAL, true);
     check(LUME_SYS_THREAD, LUME_THREAD_EXIT, KERNEL_IO_EXCLUSIVE, true);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_MASK, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_TRY_WAIT, LUME_WORK_GENERAL, false);
@@ -113,8 +113,8 @@ int main(void)
                           LUME_SYS_CHDIR, LUME_SYS_UNLINK, LUME_SYS_FILE_MODE};
     for (unsigned i = 0; i < sizeof(storage) / sizeof(storage[0]); ++i)
         check(storage[i], 0, LUME_WORK_STORAGE, true);
-    unsigned exclusive[] = {LUME_SYS_MODULE, LUME_SYS_HARDWARE, LUME_SYS_BOOT,
-                            LUME_SYS_VIDEO,  LUME_SYS_THREAD,   LUME_SYS_EXIT};
+    unsigned exclusive[] = {LUME_SYS_MODULE, LUME_SYS_HARDWARE, LUME_SYS_BOOT, LUME_SYS_VIDEO,
+                            LUME_SYS_EXIT};
     for (unsigned i = 0; i < sizeof(exclusive) / sizeof(exclusive[0]); ++i)
         check(exclusive[i], 0, KERNEL_IO_EXCLUSIVE, true);
     process_exiting[0] = true;

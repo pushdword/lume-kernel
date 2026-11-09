@@ -2,7 +2,7 @@
 #define LUME_SD_H
 #include <stdbool.h>
 #include <stdint.h>
-#define LUME_SD_MAX_SECTORS 32u
+#define LUME_SD_MAX_SECTORS 128u
 bool lume_sd_start(uint64_t counter_frequency);
 bool lume_sd_configure(uint64_t base, uint64_t size, uint32_t irq);
 bool lume_sd_configure_bus(unsigned width, uint32_t maximum_hz);

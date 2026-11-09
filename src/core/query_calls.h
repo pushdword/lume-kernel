@@ -28,6 +28,8 @@ static bool kernel_query_call(struct lume_context *frame, unsigned process)
     bool self = number == LUME_SYS_THREAD && LUME_CONTEXT_REG(frame, 0) == LUME_THREAD_SELF &&
                 !LUME_CONTEXT_REG(frame, 1) && !LUME_CONTEXT_REG(frame, 2);
     bool terminal = number == LUME_SYS_TTY && LUME_CONTEXT_REG(frame, 0) == LUME_TTY_GET;
+    if (terminal && lume_vm_file_pointer(process, LUME_CONTEXT_REG(frame, 1)))
+        return false;
     if (!self && !terminal && number != LUME_SYS_ABI && number != LUME_SYS_GETPID &&
         number != LUME_SYS_CLOCK && number != LUME_SYS_CPU)
         return false;

@@ -393,6 +393,11 @@ uint64_t lume_worker_lock_wait_on(unsigned slot)
     return 0;
 }
 
+unsigned lume_worker_current(void)
+{
+    return local.worker_running ? local.worker_slot : LUME_WORK_DOMAINS;
+}
+
 bool lume_worker_resume_on(unsigned slot)
 {
     ++resumes;
@@ -601,6 +606,13 @@ void lume_storage_poll_background(void)
     ++storage_checks;
 }
 
+static bool vm_storage_dependency;
+
+bool lume_vm_storage_required(void)
+{
+    return vm_storage_dependency;
+}
+
 void lume_vm_poll_background(void)
 {
     ++vm_checks;
@@ -610,6 +622,12 @@ void lume_vfs_poll_release(unsigned task)
 {
     assert(task < LUME_TASK_LIMIT && !kernel_task_active(task));
     ++poll_releases[task];
+}
+
+static int64_t kernel_thread_create(struct lume_context *frame)
+{
+    (void)frame;
+    return -LUME_ENOSYS;
 }
 
 static bool kernel_enqueue(unsigned, unsigned, bool);
@@ -664,6 +682,7 @@ static void reset(void)
     cancel_scan_result = 0;
     compat_index = 7;
     compat_formats = compat_interfaces = 0;
+    vm_storage_dependency = false;
     memset(kernel_lanes, 0, sizeof(kernel_lanes));
     memset(worker_functions, 0, sizeof(worker_functions));
     memset(worker_arguments, 0, sizeof(worker_arguments));
@@ -1839,8 +1858,30 @@ static void pipe_mapping_transaction(void)
     }
 }
 
+static void page_read_dependency(void)
+{
+    reset();
+    enqueue_domain(0, LUME_WORK_GENERAL);
+    worker_suspended[LUME_WORK_GENERAL] = true;
+    kernel_step();
+    assert(lume_worker_busy_on(LUME_WORK_GENERAL));
+    worker_blocked[LUME_WORK_GENERAL] = true;
+    enqueue_domain(1, KERNEL_IO_EXCLUSIVE);
+    vm_storage_dependency = true;
+    work_pending[LUME_WORK_STORAGE] = true;
+    kernel_step();
+    assert(work_drained[LUME_WORK_STORAGE] == 1 && !executed[1]);
+    assert(lume_worker_busy_on(LUME_WORK_GENERAL) && kernel_control_queue.count);
+    vm_storage_dependency = false;
+    worker_blocked[LUME_WORK_GENERAL] = false;
+    kernel_step();
+    kernel_step();
+    assert(executed[0] == 1 && executed[1] == 1);
+}
+
 int main(void)
 {
+    page_read_dependency();
     pipe_mapping_transaction();
     legacy_scan_parking();
     scan_parking();

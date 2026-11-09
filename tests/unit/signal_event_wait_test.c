@@ -164,8 +164,23 @@ static void ignored_and_interrupting_signals(void)
     assert(signals[0].pending == (UINT32_C(1) << 12));
 }
 
+static void page_fault_registers(void)
+{
+    reset();
+    states[1] = 4;
+    for (unsigned i = 0; i < 31; ++i)
+        tasks[1].context.x[i] = UINT64_C(0x47101234) + i;
+    tasks[1].context.pc = 0x12340;
+    struct lume_context saved = tasks[1].context;
+    vm_fault_wait[1] = vm_fault_ready[1] = true;
+    wake_tasks();
+    assert(states[1] == 1 && !vm_fault_wait[1] && !vm_fault_ready[1]);
+    assert(!memcmp(&saved, &tasks[1].context, sizeof(saved)));
+}
+
 int main(void)
 {
+    page_fault_registers();
     pending_and_registration();
     competing_waiters();
     validation_and_cancellation();

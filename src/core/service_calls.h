@@ -112,8 +112,7 @@ static struct lume_context *service_request(struct lume_context *frame, bool sup
     return wait_ready_task();
 
 done:
-    LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
-    return frame;
+    return kernel_buffer_failure(frame, result);
 }
 
 #endif

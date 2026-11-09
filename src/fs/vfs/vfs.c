@@ -264,10 +264,12 @@ static struct node
     unsigned mode;
     unsigned device;
     unsigned references;
+    unsigned executables;
     uint32_t path_hash, path_next, parent;
     struct lume_fat_file fat_file;
     const unsigned char *image;
     uint64_t bytes;
+    uint64_t version;
     unsigned char *data;
     struct lume_block *block;
 } default_nodes[NODES];
@@ -279,9 +281,78 @@ static unsigned name_bucket_count;
 static unsigned count;
 static unsigned free_nodes;
 static unsigned namespace_generation;
+static void (*mapping_changed)(uint64_t, uint64_t, uint64_t);
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
+
+static uint64_t node_identity(const struct node *node)
+{
+    return ((uint64_t)namespace_generation << 32) | ((unsigned)(node - nodes) + 1u);
+}
+
+void lume_vfs_mapping_notify(void (*notify)(uint64_t, uint64_t, uint64_t))
+{
+    mapping_changed = notify;
+}
+
+static void node_changed(struct node *node)
+{
+    if (!++node->version)
+        lume_fail("file version exhausted");
+    if (mapping_changed)
+        mapping_changed(node_identity(node), node->bytes, node->version);
+}
+
+int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
+{
+    if (!identity || object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
+        return -LUME_EBADF;
+    const struct open_file *file = &open_files[object];
+    if ((file->flags & 3) == LUME_O_WRONLY)
+        return -LUME_EACCES;
+    if (file->external || file->pipe >= 0 || file->node < 0 ||
+        nodes[file->node].kind != LUME_NODE_FILE)
+        return -LUME_EINVAL;
+    const struct node *node = &nodes[file->node];
+    *identity = (struct lume_file_identity){node_identity(node), node->version, node->bytes};
+    return 0;
+}
+
+int lume_vfs_object_retain(int object)
+{
+    if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
+        return -LUME_EBADF;
+    if (open_files[object].references == UINT32_MAX)
+        return -LUME_EOVERFLOW;
+    ++open_files[object].references;
+    return 0;
+}
+
+int lume_vfs_exec_pin(int object)
+{
+    struct lume_file_identity identity;
+    int result = lume_vfs_object_identity(object, &identity);
+    if (result)
+        return result;
+    unsigned index = (unsigned)open_files[object].node;
+    for (unsigned i = 0; i < OPEN_FILES; ++i)
+        if (open_files[i].references && !open_files[i].external && open_files[i].pipe < 0 &&
+            open_files[i].node == (int)index && (open_files[i].flags & 3))
+            return -LUME_ETXTBSY;
+    if (nodes[index].executables == UINT32_MAX)
+        return -LUME_EOVERFLOW;
+    ++nodes[index].executables;
+    return 0;
+}
+
+void lume_vfs_exec_unpin(int object)
+{
+    if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references ||
+        open_files[object].node < 0 || !nodes[open_files[object].node].executables)
+        lume_fail("executable reference release");
+    --nodes[open_files[object].node].executables;
+}
 
 static bool storage_handles(void)
 {
@@ -729,6 +800,8 @@ int lume_devfs_unregister_block(struct lume_block *b)
 
 void lume_vfs_init(const void *shell, size_t bytes)
 {
+    if (mapping_changed)
+        mapping_changed(0, 0, 0);
     (void)program_cache_clear();
     if (storage && storage->program_cache_owner)
         storage->program_cache_owner(NULL);
@@ -1464,6 +1537,8 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         return -LUME_EISDIR;
     if ((flags & 3) && !n->writable)
         return -LUME_EROFS;
+    if ((flags & 3) && n->executables)
+        return -LUME_ETXTBSY;
     if ((flags & LUME_O_TRUNC) && n->kind == LUME_NODE_FILE)
     {
         if (n->persistent)
@@ -1473,6 +1548,7 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
                 return e;
         }
         n->bytes = 0;
+        node_changed(n);
     }
     int object = new_object(index, -1, (uint32_t)flags);
     if (object < 0)
@@ -1826,6 +1902,8 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
     }
     if (!n->writable)
         return -LUME_EROFS;
+    if (n->executables)
+        return -LUME_ETXTBSY;
     if (!bytes)
         return 0;
     uint64_t offset = d->flags & LUME_O_APPEND ? n->bytes : d->offset;
@@ -1844,6 +1922,7 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
             d->offset = offset + (uint64_t)r;
             if (d->offset > n->bytes)
                 n->bytes = d->offset;
+            node_changed(n);
         }
         return r;
     }
@@ -1867,6 +1946,7 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
     d->offset = offset + bytes;
     if (d->offset > n->bytes)
         n->bytes = d->offset;
+    node_changed(n);
     return (int64_t)bytes;
 }
 
@@ -2358,6 +2438,8 @@ int64_t lume_vfs_resize(struct lume_files *f, uint64_t fd, uint64_t length)
         return -LUME_EINVAL;
     if (!n->writable)
         return -LUME_EROFS;
+    if (n->executables)
+        return -LUME_ETXTBSY;
     if (f->identity.euid || f->identity.jailed)
         return -LUME_EACCES;
     if (length > INT64_MAX)
@@ -2393,6 +2475,7 @@ int64_t lume_vfs_resize(struct lume_files *f, uint64_t fd, uint64_t length)
             memset(n->data + n->bytes, 0, (size_t)(length - n->bytes));
     }
     n->bytes = length;
+    node_changed(n);
     return 0;
 }
 
@@ -3401,6 +3484,61 @@ int lume_vfs_program(struct lume_files *f, const char *input, const void **data,
     return i < 0 ? i : program_image((unsigned)i, data, bytes);
 }
 
+static int program_reference(unsigned index)
+{
+    struct node *node = &nodes[index];
+    if (node->kind != LUME_NODE_FILE)
+        return -LUME_ENOEXEC;
+    int object = new_object((int)index, -1, LUME_O_RDONLY);
+    if (object < 0)
+        return object;
+    if (node->persistent && storage_handles())
+    {
+        int result = storage->open(node->path, LUME_O_RDONLY, &open_files[object].storage_handle);
+        if (result)
+        {
+            --node->references;
+            open_files[object] = (struct open_file){0};
+            return result;
+        }
+    }
+    return object;
+}
+
+int lume_vfs_program_hold(struct lume_files *files, const char *input, size_t *bytes)
+{
+    char path[LUME_FILES_PATH_MAX];
+    int index = resolve(files, input, path);
+    if (index < 0)
+        return index;
+    int object = program_reference((unsigned)index);
+    if (object < 0)
+        return object;
+    *bytes = (size_t)nodes[index].bytes;
+    if (*bytes == LUME_BUSYBOX_ALIAS_BYTES)
+    {
+        static const unsigned char alias[] = LUME_BUSYBOX_ALIAS_CONTENT;
+        unsigned char content[LUME_BUSYBOX_ALIAS_BYTES];
+        int64_t result = lume_vfs_pread_object(object, 0, content, sizeof(content));
+        if (result < 0)
+        {
+            lume_vfs_drop(object);
+            return (int)result;
+        }
+        if (result == sizeof(content) && !memcmp(content, alias, sizeof(content)))
+        {
+            lume_vfs_drop(object);
+            index = resolve(files, LUME_BUSYBOX_ALIAS_TARGET, path);
+            if (index < 0)
+                return index;
+            object = program_reference((unsigned)index);
+            if (object >= 0)
+                *bytes = (size_t)nodes[index].bytes;
+        }
+    }
+    return object;
+}
+
 /* The caller owns a held open-file reference for the complete positioned read. */
 int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t bytes)
 {
@@ -3424,10 +3562,11 @@ int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t 
                    ? storage->read_handle(file->storage_handle, offset, data, bytes)
                    : storage->read(node->path, offset, data, bytes);
     if (node->on_fat)
-        return lume_fat_read_cursor(&root_fat, node->fat_file, offset, data, bytes, &file->fat_cursor)
+        return lume_fat_read_cursor(&root_fat, node->fat_file, offset, data, bytes,
+                                    &file->fat_cursor)
                    ? -LUME_EIO
                    : (int64_t)bytes;
-    copy(data, (const unsigned char *)(node->image ? node->image : node->data) + offset, bytes);
+    memcpy(data, (const unsigned char *)(node->image ? node->image : node->data) + offset, bytes);
     return (int64_t)bytes;
 }
 

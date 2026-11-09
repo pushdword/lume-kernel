@@ -128,6 +128,8 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_PROCESS:
     case LUME_SYS_EXEPATH:
         return LUME_WORK_GENERAL;
+    case LUME_SYS_THREAD:
+        return action == LUME_THREAD_CREATE ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
     case LUME_SYS_REALTIME:
         return action == LUME_REALTIME_GET ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
     case LUME_SYS_CREDENTIAL:
