@@ -6,6 +6,12 @@
 
 unsigned char __trap_top[1], __fault_top[1], __secondary_stacks[1];
 uintptr_t lume_isr_table[53];
+
+void lume_syscall_entry(void)
+{
+    abort();
+}
+
 static bool held;
 static unsigned locks, unlocks, flushes, eois, pic, activity_calls, ticks, devices, faults;
 static struct lume_context replacement;

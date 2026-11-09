@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* INT 0x80 passes four 64-bit words through a user buffer addressed by EAX. */
+/* INT 0x80 passes four 64-bit words through a user buffer addressed by EAX.
+ * INT 0x81 accepts GETPID in EAX without a user request buffer. */
 struct lume_context
 {
     uint64_t reg[32], sp, pc, status, tls, flags;

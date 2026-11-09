@@ -18,6 +18,20 @@ TRAP \n,1
 .irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,128,255
 TRAP \n
 .endr
+.global lume_syscall_entry
+lume_syscall_entry:
+    swapgs
+    movq %rsp, %gs:LUME_AMD64_ENTRY_USER_SP
+    movq %gs:LUME_AMD64_ENTRY_STACK, %rsp
+    pushq $0x1b
+    pushq %gs:LUME_AMD64_ENTRY_USER_SP
+    pushq %r11
+    pushq $0x23
+    pushq %rcx
+    pushq %gs:LUME_AMD64_ENTRY_CPU
+    pushq $128
+    swapgs
+    jmp lume_trap_common
 lume_trap_common:
     cld
     pushq %rax
@@ -66,8 +80,15 @@ lume_trap_query:
     popq %rcx
     popq %rbx
     popq %rax
+    cmpq $0, 8(%rsp)
+    jne lume_query_sysret
     addq $16, %rsp
     iretq
+lume_query_sysret:
+    movq 16(%rsp), %rcx
+    movq 32(%rsp), %r11
+    movq 40(%rsp), %rsp
+    sysretq
 lume_trap_capture:
     subq $704, %rsp
     andq $-16, %rsp
@@ -78,6 +99,10 @@ lume_trap_capture:
     movq %rsp, %rdi
     movq 120(%r12), %rsi
     movq 128(%r12), %rdx
+    cmpq $128, %rsi
+    jne 1f
+    xorl %edx, %edx
+1:
     call lume_amd64_exception
     testq %rax, %rax
     jz lume_user_finished

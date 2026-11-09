@@ -10,6 +10,7 @@
 #include "lume/amd64_query.h"
 #include "lume/abi.h"
 #include "lume/thread.h"
+#include <stddef.h>
 #include <string.h>
 extern unsigned char __trap_top[], __fault_top[];
 extern uintptr_t lume_isr_table[];
@@ -35,6 +36,35 @@ struct __attribute__((packed)) descriptor
     uint16_t limit;
     uint64_t address;
 };
+
+static struct amd64_syscall_entry
+{
+    _Alignas(128) uint64_t stack;
+    uint64_t user_sp, cpu;
+} syscall_entries[LUME_CPU_LIMIT];
+
+_Static_assert(offsetof(struct amd64_syscall_entry, stack) == LUME_AMD64_ENTRY_STACK,
+               "syscall stack offset");
+_Static_assert(offsetof(struct amd64_syscall_entry, user_sp) == LUME_AMD64_ENTRY_USER_SP,
+               "syscall user stack offset");
+_Static_assert(offsetof(struct amd64_syscall_entry, cpu) == LUME_AMD64_ENTRY_CPU,
+               "syscall CPU marker offset");
+
+static void syscall_start(unsigned cpu, uint64_t stack)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001u), "c"(0));
+    if (!(d & (1u << 11)))
+        return;
+    extern void lume_syscall_entry(void);
+    syscall_entries[cpu] = (struct amd64_syscall_entry){.stack = stack, .cpu = cpu + 1};
+    lume_wrmsr(0xc0000101, 0);
+    lume_wrmsr(0xc0000102, (uintptr_t)&syscall_entries[cpu]);
+    lume_wrmsr(0xc0000081, UINT64_C(0x0010000800000000));
+    lume_wrmsr(0xc0000082, (uintptr_t)lume_syscall_entry);
+    lume_wrmsr(0xc0000084, UINT64_C(0x47700));
+    lume_wrmsr(0xc0000080, lume_rdmsr(0xc0000080) | 1);
+}
 
 #include "query.h"
 
@@ -69,9 +99,9 @@ void lume_amd64_context_start(void)
             uintptr_t address = lume_isr_table[i <= LUME_APIC_TLB ? i : i == 128 ? 51 : 52];
             idt[i] = (struct gate){(uint16_t)address,
                                    8,
-                                   i == 8   ? 1
-                                   : i == 2 ? 2
-                                            : 0,
+                                   i == 8              ? 1
+                                   : i == 2 || i == 18 ? 2
+                                                       : 0,
                                    i == 128 ? 0xee : 0x8e,
                                    (uint16_t)(address >> 16),
                                    (uint32_t)(address >> 32),
@@ -83,6 +113,7 @@ void lume_amd64_context_start(void)
     __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
     /* User FS-base writes require the normal capture and validation path. */
     lume_amd64_query_start(!(cr4 & (UINT64_C(1) << 16)));
+    syscall_start(cpu, local_tss->rsp[0]);
 }
 
 void lume_amd64_context_capture(struct lume_context *c, const uint64_t *r)

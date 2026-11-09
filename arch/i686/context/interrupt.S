@@ -14,7 +14,7 @@ TRAP \n
 .irp n,8,10,11,12,13,14,17,21,29,30
 TRAP \n,1
 .endr
-.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,255
+.irp n,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,129,255
 TRAP \n
 .endr
 lume_trap_common:
@@ -24,6 +24,29 @@ lume_trap_common:
     movw $16, %ax
     movw %ax, %ds
     movw %ax, %es
+    cmpl $128, 32(%ebx)
+    je 1f
+    cmpl $129, 32(%ebx)
+    jne lume_trap_capture
+1:
+    cmpl $0x1b, 44(%ebx)
+    jne lume_trap_capture
+    andl $-16, %esp
+    subl $12, %esp
+    pushl %ebx
+    call lume_i686_query_try
+    movl %ebx, %esp
+    testb %al, %al
+    jz lume_trap_capture
+    movw $0x23, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw $0x33, %ax
+    movw %ax, %gs
+    popal
+    addl $8, %esp
+    iretl
+lume_trap_capture:
     subl $464, %esp
     andl $-16, %esp
     movl %esp, %edi
@@ -75,7 +98,7 @@ lume_kernel_return_sp: .skip 4
 .section .rodata
 .global lume_isr_table
 lume_isr_table:
-.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,255
+.irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,128,129,255
     .long lume_isr_\n
 .endr
 .section .note.GNU-stack,"",@progbits

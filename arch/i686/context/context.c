@@ -3,6 +3,10 @@
 #include "lume/heap.h"
 #include "lume/counter.h"
 #include "lume/irq.h"
+#include "lume/mmu.h"
+#include "lume/abi.h"
+#include "lume/thread.h"
+#include "lume/i686_query.h"
 #include <string.h>
 extern unsigned char __trap_top[];
 extern uintptr_t lume_isr_table[];
@@ -30,6 +34,8 @@ struct __attribute__((packed)) descriptor
     uint32_t address;
 };
 
+#include "query.h"
+
 void lume_i686_context_start(void)
 {
     gdt[1] = UINT64_C(0x00cf9a000000ffff);
@@ -47,12 +53,13 @@ void lume_i686_context_start(void)
     __asm__ volatile("lgdt %0\nmovw $0x28, %%ax\nltr %%ax" : : "m"(gdtr) : "eax", "memory");
     for (unsigned i = 0; i < 256; ++i)
     {
-        uintptr_t address = lume_isr_table[i < 48 ? i : i == 128 ? 48 : 49];
-        idt[i] = (struct gate){(uint16_t)address, 8, 0, i == 128 ? 0xee : 0x8e,
+        uintptr_t address = lume_isr_table[i < 48 ? i : i == 128 ? 48 : i == 129 ? 49 : 50];
+        idt[i] = (struct gate){(uint16_t)address, 8, 0, i == 128 || i == 129 ? 0xee : 0x8e,
                                (uint16_t)(address >> 16)};
     }
     struct descriptor idtr = {sizeof(idt) - 1, (uintptr_t)idt};
     __asm__ volatile("lidt %0" : : "m"(idtr) : "memory");
+    lume_i686_query_start();
 }
 
 void lume_i686_context_capture(struct lume_context *c, const uint32_t *r)
@@ -132,7 +139,13 @@ struct lume_context *lume_i686_exception(struct lume_context *frame, uint32_t ve
     else if (user && lume_tasks_active())
     {
         uint32_t address = 0;
-        if (vector == 128)
+        if (vector == 129)
+        {
+            if (!query_decode(frame))
+                goto finished;
+            vector = 128;
+        }
+        else if (vector == 128)
         {
             uint32_t pointer = frame->raw[7];
             frame->syscall_pc = (uint32_t)frame->pc;

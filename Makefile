@@ -382,9 +382,19 @@ $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 .PHONY: check-amd64-query
 check-amd64-query: $(OUT)/tests/amd64-query$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/abi/native/lume/abi.h include/uapi/lume/thread.h include/kernel/lume/vm.h
+$(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iplatform/q35/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
+.PHONY: check-i686-query
+check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(HOSTEXE)
+	env "$(OUT)/tests/i686-query$(HOSTEXE)"
+	env "$(OUT)/tests/i686-context$(HOSTEXE)"
+$(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h arch/i686/include/kernel/lume/context.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 -Iarch/i686/include/kernel -Iplatform/pc/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
+$(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel "$<" -o "$@"
 $(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
@@ -560,7 +570,7 @@ check-q35: $(OUT)/tests/q35-pci$(HOSTEXE) $(OUT)/tests/q35-virtio$(HOSTEXE) $(OU
 check-q35: check-amd64-context
 check-amd64-context: $(OUT)/tests/amd64-context$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
+$(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64/context/context.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/syscall_numbers.h arch/amd64/include/kernel/lume/context.h arch/amd64/include/kernel/lume/smp.h arch/amd64/include/kernel/lume/apic.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -DLUME_ARCH_AMD64=1 $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -o "$@"
 .PHONY: check-amd64-mmu-views

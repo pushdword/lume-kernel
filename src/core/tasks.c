@@ -31,8 +31,8 @@
 #include "lume/signal.h"
 #include "lume/process.h"
 #include "lume/tty_device.h"
-#if defined(LUME_ARCH_AMD64)
-#include "lume/amd64_query.h"
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#include "lume/query.h"
 #endif
 #include <string.h>
 #include "thread_state.h"
@@ -168,12 +168,12 @@ static void task_query_publish(const struct lume_context *);
 
 static void task_query_revoke(unsigned process)
 {
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     if (process == LUME_TASK_LIMIT)
         for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-            lume_amd64_query_revoke(i);
+            lume_arch_query_revoke(i);
     else
-        lume_amd64_query_revoke(process);
+        lume_arch_query_revoke(process);
 #else
     (void)process;
 #endif
@@ -192,9 +192,9 @@ void lume_task_trap_enter(uint64_t at)
 void lume_task_account_enter(const struct lume_context *frame)
 {
     uint64_t query_ticks = 0;
-#if defined(LUME_ARCH_AMD64)
-    struct lume_amd64_query_account query;
-    lume_amd64_query_drain(&query);
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+    struct lume_query_account query;
+    lume_arch_query_drain(&query);
     if (query.calls)
     {
         if (query.owner != current_task || query.owner >= LUME_TASK_LIMIT)
@@ -203,7 +203,10 @@ void lume_task_account_enter(const struct lume_context *frame)
         local.calls += (unsigned)query.calls;
         if (!query.owner)
             shell_calls |= query.mask;
-        query_ticks = query.ticks;
+        uint64_t entered = __atomic_load_n(&local.trap_at, __ATOMIC_ACQUIRE);
+        uint64_t available =
+            account_running && entered >= account_last ? entered - account_last : 0;
+        query_ticks = query.ticks < available ? query.ticks : available;
         kernel_ticks[query.owner] += query_ticks;
         total_kernel_ticks += query_ticks;
     }
@@ -765,7 +768,7 @@ static bool task_signal_pending(unsigned owner)
 
 static void task_query_publish(const struct lume_context *frame)
 {
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     unsigned task = current_task, allowed = 0, pid = 0;
     uint64_t tid = 0;
     if (frame && !(LUME_CONTEXT_STATUS(frame) & 15) && public_mode && active &&
@@ -782,12 +785,12 @@ static void task_query_publish(const struct lume_context *frame)
             pid = process + 1;
             tid = thread_id(thread_slots, task);
             if (!lume_sandbox_check(&tasks[process].files, pid, &pid_query))
-                allowed |= LUME_AMD64_QUERY_PID;
+                allowed |= LUME_QUERY_PID;
             if (!lume_sandbox_check(&tasks[process].files, pid, &tid_query))
-                allowed |= LUME_AMD64_QUERY_TID;
+                allowed |= LUME_QUERY_TID;
         }
     }
-    lume_amd64_query_publish(task, pid, tid, allowed);
+    lume_arch_query_publish(task, pid, tid, allowed);
 #else
     (void)frame;
 #endif

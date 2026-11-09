@@ -12,7 +12,7 @@ static bool user_context_address(uint64_t address)
 struct amd64_query_cache
 {
     _Alignas(128) uint64_t epoch;
-    uint64_t pid, tid, calls, raw_ticks, mask;
+    uint64_t pid, tid, calls, raw_ticks, mask, sample_raw;
     unsigned owner, allowed;
     bool enabled;
 };
@@ -33,7 +33,7 @@ static uint64_t query_epoch(unsigned process)
     return __atomic_load_n(&query_epochs[process].value, __ATOMIC_ACQUIRE) + 1;
 }
 
-void lume_amd64_query_revoke(unsigned process)
+void lume_arch_query_revoke(unsigned process)
 {
     if (process >= LUME_TASK_LIMIT)
         lume_fail("query revocation process");
@@ -54,7 +54,7 @@ void lume_amd64_query_start(bool enabled)
     *cache = (struct amd64_query_cache){.owner = LUME_TASK_LIMIT, .enabled = enabled};
 }
 
-void lume_amd64_query_publish(unsigned owner, unsigned pid, uint64_t tid, unsigned allowed)
+void lume_arch_query_publish(unsigned owner, unsigned pid, uint64_t tid, unsigned allowed)
 {
     struct amd64_query_cache *cache = query_cpus + lume_cpu_index();
     cache->epoch = 0;
@@ -68,7 +68,7 @@ void lume_amd64_query_publish(unsigned owner, unsigned pid, uint64_t tid, unsign
         cache->epoch = query_epoch(pid - 1);
 }
 
-void lume_amd64_query_drain(struct lume_amd64_query_account *out)
+void lume_arch_query_drain(struct lume_query_account *out)
 {
     struct amd64_query_cache *cache = query_cpus + lume_cpu_index();
     cache->epoch = 0;
@@ -76,7 +76,7 @@ void lume_amd64_query_drain(struct lume_amd64_query_account *out)
     uint64_t ticks = frequency ? cache->raw_ticks / frequency * UINT64_C(1000000) +
                                      cache->raw_ticks % frequency * UINT64_C(1000000) / frequency
                                : 0;
-    *out = (struct lume_amd64_query_account){cache->owner, cache->calls, ticks, cache->mask};
+    *out = (struct lume_query_account){cache->owner, cache->calls, ticks, cache->mask};
     cache->calls = cache->raw_ticks = cache->mask = 0;
 }
 
@@ -91,12 +91,16 @@ bool lume_amd64_query_try(uint64_t *registers)
                !registers[11];
     if (!pid && !tid)
         return false;
-    uint64_t began = query_stamp();
-    unsigned cpu = lume_cpu_index();
+    uint64_t marker = registers[16];
+    if (marker > LUME_CPU_LIMIT)
+        return false;
+    unsigned cpu = marker ? (unsigned)marker - 1 : lume_cpu_index();
     if (cpu >= LUME_CPU_LIMIT)
         return false;
     struct amd64_query_cache *cache = query_cpus + cpu;
-    unsigned required = pid ? LUME_AMD64_QUERY_PID : LUME_AMD64_QUERY_TID;
+    bool sample = !(cache->calls & 63u);
+    uint64_t began = sample ? query_stamp() : 0;
+    unsigned required = pid ? LUME_QUERY_PID : LUME_QUERY_TID;
     if (!(cache->allowed & required) || !cache->epoch || cache->owner >= LUME_TASK_LIMIT ||
         !cache->pid || cache->pid > LUME_TASK_LIMIT ||
         cache->epoch != query_epoch(cache->pid - 1) || registers[18] != 0x23 ||
@@ -107,7 +111,11 @@ bool lume_amd64_query_try(uint64_t *registers)
     registers[21] = 0x1b;
     ++cache->calls;
     cache->mask |= UINT64_C(1) << number;
-    cache->raw_ticks += query_stamp() - began;
+    /* One measured call estimates each batch of 64 fast queries. The first
+     * call after a drain measures the residual batch for its current owner. */
+    if (sample)
+        cache->sample_raw = query_stamp() - began;
+    cache->raw_ticks += cache->sample_raw;
     return true;
 }
 
