@@ -372,10 +372,17 @@ $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 $(OUT)/tests/io-queue$(HOSTEXE): HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 .PHONY: check-io-calls
+.PHONY: check-io-classify
+check: check-io-classify
+check-io-classify: $(OUT)/tests/io-classify$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_classify.h include/abi/native/lume/realtime_abi.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) "$<" -o "$@"
 check-io-calls: $(OUT)/tests/io-calls$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/io-calls$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AARCH64=1
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/pipe_fast.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/pipe_fast.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core

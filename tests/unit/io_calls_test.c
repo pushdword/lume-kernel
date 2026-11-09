@@ -8,6 +8,7 @@
 #include "lume/net_commands.h"
 #include "lume/process.h"
 #include "lume/task_limits.h"
+#include "lume/vm.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +71,7 @@ static struct lume_context *inline_frame, selected_frame;
 static int handoff_task = -1;
 static bool kernel_console_scope;
 static bool memory_descriptor;
+static bool vm_busy[LUME_TASK_LIMIT];
 static void (*worker_functions[LUME_WORK_DOMAINS])(void *);
 static void *worker_arguments[LUME_WORK_DOMAINS];
 static unsigned task_domain[LUME_TASK_LIMIT];
@@ -281,6 +283,13 @@ static bool kernel_console_storage(unsigned task)
 bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
 {
     return memory_descriptor && files == &tasks[1].files && fd == 3;
+}
+
+bool lume_vm_buffer_busy(unsigned task, uint64_t address, uint64_t bytes)
+{
+    (void)address;
+    assert(task < LUME_TASK_LIMIT);
+    return bytes && vm_busy[task];
 }
 
 static uint64_t lume_clock_monotonic(void)
@@ -680,6 +689,7 @@ static void reset(void)
     nonblock_pipe = filesystem_scope = expect_writing = override_result = false;
     kernel_console_scope = kernel_launch = account_inside = false;
     memory_descriptor = false;
+    memset(vm_busy, 0, sizeof(vm_busy));
     inline_frame = NULL;
     pipe_process = charges = selections = progress = submissions = resumes = 0;
     handoff_task = -1;
@@ -1064,6 +1074,10 @@ static void resident_pipe_completion(void)
     nonblock_pipe = true;
     assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && result == -LUME_EAGAIN);
     unsigned before = resident_calls;
+    vm_busy[3] = true;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    assert(resident_calls == before && !pipe_locked);
+    vm_busy[3] = false;
     assert(!lume_task_pipe_try(4, 3, 0x123000, 17, true, &result));
     pending_signal = 1;
     assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
@@ -1789,8 +1803,45 @@ static void legacy_scan_parking(void)
     }
 }
 
+static void pipe_mapping_transaction(void)
+{
+    for (unsigned replay = 0; replay < 2; ++replay)
+    {
+        reset();
+        memory_descriptor = true;
+        enqueue(1, replay != 0);
+        struct lume_context *frame = &tasks[1].context;
+        frame->x[1] = 0x123000;
+        frame->x[2] = 128;
+        vm_busy[1] = true;
+        assert(kernel_pipe_buffer_busy(1, frame));
+        assert(!kernel_request_ready(LUME_WORK_GENERAL, 1, frame, false));
+        assert(!kernel_request_ready(LUME_WORK_GENERAL, 1, frame, true));
+        assert(!kernel_admit_queue(LUME_WORK_GENERAL));
+        for (unsigned i = 0; i < 3; ++i)
+            kernel_memory_waiters();
+        assert(kernel_queue.queued[1] && kernel_wait[1] && states[1] == 4);
+        assert(frame->pc == 100 && !wake_count[1] && !executed[1] && !submissions);
+        assert(!pipe_wait[1] && !pipe_queue.waiting && !resident_calls);
+        frame->x[8] = LUME_SYS_GETPID;
+        assert(!kernel_pipe_buffer_busy(1, frame));
+        frame->x[8] = LUME_SYS_READ;
+        memory_descriptor = false;
+        assert(!kernel_pipe_buffer_busy(1, frame));
+        memory_descriptor = true;
+        vm_busy[1] = false;
+        vm_busy[0] = true;
+        assert(!kernel_pipe_buffer_busy(1, frame));
+        kernel_memory_waiters();
+        assert(!kernel_queue.queued[1] && !kernel_wait[1] && states[1] == 1);
+        assert(frame->pc == 100 - (replay ? 0 : LUME_SYSCALL_INSTRUCTION_BYTES));
+        assert(wake_count[1] == 1 && !pipe_wait[1] && !executed[1] && !submissions);
+    }
+}
+
 int main(void)
 {
+    pipe_mapping_transaction();
     legacy_scan_parking();
     scan_parking();
     stream_parking();

@@ -3424,8 +3424,9 @@ int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t 
                    ? storage->read_handle(file->storage_handle, offset, data, bytes)
                    : storage->read(node->path, offset, data, bytes);
     if (node->on_fat)
-        return lume_fat_read(&root_fat, node->fat_file, offset, data, bytes) ? -LUME_EIO
-                                                                             : (int64_t)bytes;
+        return lume_fat_read_cursor(&root_fat, node->fat_file, offset, data, bytes, &file->fat_cursor)
+                   ? -LUME_EIO
+                   : (int64_t)bytes;
     copy(data, (const unsigned char *)(node->image ? node->image : node->data) + offset, bytes);
     return (int64_t)bytes;
 }

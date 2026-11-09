@@ -95,6 +95,20 @@ int main(void)
     check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_GET, LUME_WORK_GENERAL, false);
     check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_LIMIT_GET, LUME_WORK_GENERAL, false);
     check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_UID, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_PROCESS, UINT64_MAX, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_EXEPATH, UINT64_MAX, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_REALTIME, LUME_REALTIME_GET, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_REALTIME, LUME_REALTIME_SET, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_REALTIME, UINT64_MAX, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_REALTIME, UINT64_C(1) << 32, KERNEL_IO_EXCLUSIVE, true);
+    const unsigned queries[] = {LUME_SYS_PROCESS, LUME_SYS_EXEPATH, LUME_SYS_REALTIME};
+    for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i)
+    {
+        struct lume_context frame = {.x = {LUME_REALTIME_GET, UINT64_MAX, UINT64_MAX}};
+        frame.x[LUME_CONTEXT_SYSCALL_REGISTER] = queries[i];
+        assert(kernel_call_domain(1, &frame) == LUME_WORK_GENERAL);
+        assert(!kernel_call_mutates(&frame));
+    }
     unsigned storage[] = {LUME_SYS_OPEN,  LUME_SYS_EXEC,   LUME_SYS_FORK,     LUME_SYS_RUN_ACTIONS,
                           LUME_SYS_CHDIR, LUME_SYS_UNLINK, LUME_SYS_FILE_MODE};
     for (unsigned i = 0; i < sizeof(storage) / sizeof(storage[0]); ++i)
@@ -106,6 +120,9 @@ int main(void)
     process_exiting[0] = true;
     check(LUME_SYS_READ, 3, KERNEL_IO_EXCLUSIVE, false);
     check(LUME_SYS_GPU, LUME_GPU_COPY, KERNEL_IO_EXCLUSIVE, false);
+    check(LUME_SYS_PROCESS, 0, KERNEL_IO_EXCLUSIVE, false);
+    check(LUME_SYS_EXEPATH, 0, KERNEL_IO_EXCLUSIVE, false);
+    check(LUME_SYS_REALTIME, LUME_REALTIME_GET, KERNEL_IO_EXCLUSIVE, false);
     puts(
         "PASS resource classification, descriptor domains, mutation conflicts and lifecycle fences");
     return 0;

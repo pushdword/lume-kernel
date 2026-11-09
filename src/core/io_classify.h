@@ -7,6 +7,7 @@
 #include "lume/thread.h"
 #include "lume/signal.h"
 #include "lume/vm.h"
+#include "lume/realtime_abi.h"
 
 #define KERNEL_IO_EXCLUSIVE LUME_WORK_DOMAINS
 
@@ -42,7 +43,11 @@ static bool kernel_call_mutates(const struct lume_context *frame)
     case LUME_SYS_TELEMETRY:
     case LUME_SYS_RANDOM:
     case LUME_SYS_TTY:
+    case LUME_SYS_PROCESS:
+    case LUME_SYS_EXEPATH:
         return false;
+    case LUME_SYS_REALTIME:
+        return LUME_CONTEXT_REG(frame, 0) != LUME_REALTIME_GET;
     case LUME_SYS_BRK:
         return LUME_CONTEXT_REG(frame, 0) != 0 || LUME_CONTEXT_REG(frame, 1) != 0;
     case LUME_SYS_GRAPHICS:
@@ -120,7 +125,11 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_TELEMETRY:
     case LUME_SYS_RANDOM:
     case LUME_SYS_TTY:
+    case LUME_SYS_PROCESS:
+    case LUME_SYS_EXEPATH:
         return LUME_WORK_GENERAL;
+    case LUME_SYS_REALTIME:
+        return action == LUME_REALTIME_GET ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
     case LUME_SYS_CREDENTIAL:
         return kernel_call_mutates(frame) ? KERNEL_IO_EXCLUSIVE : LUME_WORK_GENERAL;
     default:

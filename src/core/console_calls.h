@@ -8,9 +8,11 @@ static bool kernel_console_available(void)
     return kernel_inline_available();
 }
 
+static bool kernel_pipe_buffer_busy(unsigned task, const struct lume_context *frame);
+
 static bool kernel_pipe_call(struct lume_context *frame)
 {
-    if (!kernel_console_available())
+    if (!kernel_console_available() || kernel_pipe_buffer_busy(current_task, frame))
         return false;
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     return (number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&

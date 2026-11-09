@@ -1,5 +1,16 @@
 static bool kernel_regular_draining(void);
 
+static bool kernel_pipe_buffer_busy(unsigned task, const struct lume_context *frame)
+{
+    uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+    if (number != LUME_SYS_READ && number != LUME_SYS_WRITE)
+        return false;
+    unsigned process = process_slot(task);
+    return !process_exiting[process] &&
+           lume_vfs_memory_io(&tasks[process].files, LUME_CONTEXT_REG(frame, 0)) &&
+           lume_vm_buffer_busy(process, LUME_CONTEXT_REG(frame, 1), LUME_CONTEXT_REG(frame, 2));
+}
+
 static void kernel_pipe_wake(struct lume_wait_queue *queue)
 {
     if (!queue)

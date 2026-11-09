@@ -568,6 +568,19 @@ bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
     return false;
 }
 
+bool lume_vm_buffer_busy(unsigned task, uint64_t address, uint64_t bytes)
+{
+    if (task >= LUME_TASK_LIMIT || !bytes || address > UINT64_MAX - bytes)
+        return false;
+    if (changing[task])
+        return true;
+    uint64_t end = address + bytes;
+    for (struct vm_area *area = spaces[task]; area && area->first < end; area = area->next)
+        if (area->end > address && area->object->changing)
+            return true;
+    return false;
+}
+
 bool lume_vm_buffer_ready(unsigned task, uint64_t address, uint64_t bytes)
 {
     if (task >= LUME_TASK_LIMIT || changing[task] || address > UINT64_MAX - bytes)
@@ -968,14 +981,42 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                 lume_kernel_free(area);
                 return held;
             }
-            for (uint64_t position = 0; position < available; position += PAGE)
+            bool fragmented = false;
+            for (uint64_t position = 0; position < available;)
             {
-                uint64_t page = get_page(object, position / PAGE);
                 unsigned bytes =
-                    available - position > PAGE ? PAGE : (unsigned)(available - position);
-                result = page ? lume_vfs_pread_object(held, offset + position,
-                                                      (void *)(uintptr_t)page, bytes)
-                              : -LUME_ENOMEM;
+                    available - position > 65536 ? 65536 : (unsigned)(available - position);
+                unsigned count = (unsigned)((bytes + PAGE - 1) / PAGE);
+                struct vm_chunk *entry = chunk(object, position / PAGE, true);
+                uint64_t physical = 0;
+                if (entry)
+                {
+                    if (!fragmented && count > 1)
+                    {
+                        physical = lume_pages_alloc_span(count);
+                        if (!physical)
+                            /* Fragmented memory needs no further span searches. */
+                            fragmented = true;
+                    }
+                    if (!physical)
+                    {
+                        count = 1;
+                        if (bytes > PAGE)
+                            bytes = PAGE;
+                        physical = lume_page_alloc(0);
+                    }
+                }
+                if (physical)
+                {
+                    /* Sixteen-page batches remain within a 512-page chunk. */
+                    unsigned first = (unsigned)((position / PAGE) % 512);
+                    for (unsigned i = 0; i < count; ++i)
+                        entry->pages[first + i] = physical + (uint64_t)i * PAGE;
+                }
+                result = physical
+                             ? lume_vfs_pread_object(held, offset + position,
+                                                     (void *)(uintptr_t)physical, bytes)
+                             : -LUME_ENOMEM;
                 if (result != bytes)
                 {
                     lume_vfs_drop(held);
@@ -983,7 +1024,8 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                     lume_kernel_free(area);
                     return result < 0 ? result : -LUME_EIO;
                 }
-                lume_worker_checkpoint(PAGE);
+                lume_worker_checkpoint(bytes);
+                position += bytes;
             }
             lume_vfs_drop(held);
             offset = 0;

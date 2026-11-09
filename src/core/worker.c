@@ -120,6 +120,20 @@ bool lume_worker_resume(void)
     return lume_worker_resume_on(0);
 }
 
+bool lume_worker_runnable(void)
+{
+    for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
+    {
+        struct worker_state *state = workers + i;
+        if (!state->function || state->running)
+            continue;
+        if (!state->waiting || (state->condition && (*state->condition & state->wanted)) ||
+            (int64_t)(lume_counter_read() - state->until) >= 0)
+            return true;
+    }
+    return false;
+}
+
 bool lume_worker_busy_on(unsigned slot)
 {
     return slot < LUME_WORKER_LIMIT && (workers[slot].function || workers[slot].running);

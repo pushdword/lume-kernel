@@ -20,6 +20,7 @@ static unsigned checkpoints, search_checkpoints, zero_checkpoints, computations,
 static uint64_t expected_first;
 static unsigned expected_count;
 static size_t zeroed;
+static size_t computed_bytes;
 static unsigned *search_budget;
 static uint64_t collision;
 static bool drain_free;
@@ -41,12 +42,15 @@ static bool expected_reserved(void)
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes && bytes <= LUME_WORKER_SLICE_BYTES);
+    assert(bytes <= LUME_WORKER_SLICE_BYTES);
     ++checkpoints;
     if (expected_reserved())
     {
-        assert(zeroed + bytes <= (size_t)expected_count * 4096);
-        zeroed += bytes;
+        assert(computed_bytes ? !bytes : bytes != 0);
+        size_t completed = computed_bytes ? computed_bytes : bytes;
+        assert(zeroed + completed <= (size_t)expected_count * 4096);
+        zeroed += completed;
+        computed_bytes = 0;
         const unsigned char *data = (void *)(uintptr_t)(expected_first * 4096);
         for (size_t i = 0; i < (size_t)expected_count * 4096; ++i)
             assert(data[i] == (i < zeroed ? 0 : 0xa5));
@@ -77,8 +81,10 @@ void lume_worker_compute(void (*run)(void *), void *context)
     assert(run == zero_pages && expected_reserved());
     assert(request->bytes == LUME_WORKER_SLICE_BYTES);
     assert((uintptr_t)request->data == expected_first * 4096 + zeroed);
+    assert(!computed_bytes);
     ++computations;
     run(context);
+    computed_bytes = request->bytes;
 }
 
 void lume_value(const char *name, uint64_t value)
@@ -95,7 +101,7 @@ static void reset(void)
     free_count = total_count = cursor = 0;
     span_cursor = 1;
     checkpoints = search_checkpoints = zero_checkpoints = computations = 0;
-    expected_first = expected_count = zeroed = 0;
+    expected_first = expected_count = zeroed = computed_bytes = 0;
     search_budget = NULL;
     collision = 0;
     drain_free = false;

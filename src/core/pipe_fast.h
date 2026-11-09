@@ -32,6 +32,7 @@ bool lume_task_pipe_try(unsigned task, uint64_t fd, uint64_t address, uint64_t b
         struct lume_files *files = &tasks[process].files;
         if (!process_exiting[process] && !process_stopped[process] && !main_thread_done[process] &&
             !task_signal_pending(task) && !task_signal_pending(process) &&
+            !lume_vm_buffer_busy(process, address, bytes) &&
             !lume_sandbox_io(files, fd, writing) &&
             lume_user_io_pipe_try(files, process + 1, fd, address, bytes, writing, result))
         {

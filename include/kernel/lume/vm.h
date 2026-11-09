@@ -30,6 +30,9 @@ void lume_vm_poll_background(void);
 int lume_vm_fault(unsigned, uint64_t, bool, bool);
 bool lume_vm_resolve_buffer(uint64_t, uint64_t, bool);
 bool lume_vm_buffer_ready(unsigned, uint64_t, uint64_t);
+/* The scheduler lock protects buffer queries. Busy reports a mapping transaction,
+ * while address validity remains the responsibility of the buffer validator. */
+bool lume_vm_buffer_busy(unsigned, uint64_t, uint64_t);
 bool lume_vm_file_call(unsigned, const struct lume_vm_request *);
 
 static inline bool lume_vm_address(uint64_t address)

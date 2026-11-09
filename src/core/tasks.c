@@ -947,6 +947,19 @@ static struct lume_context *wait_ready_task(void)
             lume_timer_idle(false);
             return select_task((unsigned)next);
         }
+        if (public_mode && lume_worker_runnable())
+        {
+            uint64_t lock_before = lume_smp_wait_total();
+            lume_smp_unlock();
+            lume_arch_poll_irq();
+            lume_smp_lock();
+            uint64_t waited = lume_smp_wait_total() - lock_before;
+            local.lock += waited;
+            if (account_inside)
+                account_start += waited;
+            lume_watchdog_progress();
+            continue;
+        }
         uint64_t began = counter();
         uint64_t lock_before = lume_smp_wait_total();
         sched_enter(&policy, lume_cpu_index(), -1, now(), unit, LUME_SCHED_QUANTUM);

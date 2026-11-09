@@ -65,6 +65,11 @@ static inline void lume_arch_idle_irq(void)
     __asm__ volatile("sti\nhlt\ncli" : : : "memory");
 }
 
+static inline void lume_arch_poll_irq(void)
+{
+    __asm__ volatile("sti\nnop\nnop\ncli" : : : "memory");
+}
+
 static inline void lume_arch_flush_user_tlb(void)
 {
     uint32_t root;

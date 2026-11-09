@@ -84,6 +84,8 @@ static bool kernel_regular_draining(void)
 static bool kernel_request_ready(unsigned domain, unsigned task, const struct lume_context *frame,
                                  bool admitted)
 {
+    if (kernel_pipe_buffer_busy(task, frame))
+        return false;
     unsigned blocked = kernel_resource_blocks(domain, task, kernel_call_mutates(frame));
     return (!blocked ||
             (blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_snapshot_call(frame))) &&
@@ -243,7 +245,7 @@ static void kernel_memory_waiters(void)
                 (number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
                 lume_vfs_memory_io(&tasks[process_slot(task)].files, LUME_CONTEXT_REG(frame, 0));
             if (!kernel_wait[task] || states[task] != 4 || process_exiting[process_slot(task)] ||
-                !memory)
+                !memory || kernel_pipe_buffer_busy(task, frame))
             {
                 ++i;
                 continue;
@@ -297,6 +299,8 @@ static bool kernel_admit_queue(unsigned domain)
         unsigned process_word = process / 64u;
         uint64_t process_bit = UINT64_C(1) << (process % 64u);
         unsigned blocked = kernel_resource_blocks(domain, task, mutation);
+        if (kernel_pipe_buffer_busy(task, &tasks[task].context))
+            blocked |= KERNEL_BLOCK_OTHER;
         bool snapshot_call =
             blocked == KERNEL_BLOCK_CHILD_LOAD && kernel_child_snapshot_call(&tasks[task].context);
         if ((blocked_processes[process_word] & process_bit) ||

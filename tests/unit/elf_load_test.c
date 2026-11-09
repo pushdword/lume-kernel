@@ -12,6 +12,7 @@ static bool used[FRAMES];
 static uint64_t virtuals[FRAMES], physicals[FRAMES];
 static unsigned allocated, mappings, syncs, completions, checkpoints, tasks[FRAMES];
 static bool readable[FRAMES], writable[FRAMES], executable[FRAMES];
+static bool computed;
 static int allocation_budget = -1, map_budget = -1;
 
 uint64_t lume_pages_alloc_span(unsigned count)
@@ -166,13 +167,16 @@ void lume_sync_code_finish(void)
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes == 65536);
+    assert(bytes == (computed ? 0u : 65536u));
+    computed = false;
     ++checkpoints;
 }
 
 void lume_worker_compute(void (*run)(void *), void *context)
 {
+    assert(!computed);
     run(context);
+    computed = true;
 }
 
 _Noreturn void lume_fail(const char *message)

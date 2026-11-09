@@ -196,10 +196,15 @@ uint64_t lume_pages_alloc_span(unsigned count)
             .bytes = length,
         };
         if (length == LUME_WORKER_SLICE_BYTES)
+        {
             lume_worker_compute(zero_pages, &request);
+            lume_worker_checkpoint(0);
+        }
         else
+        {
             zero_pages(&request);
-        lume_worker_checkpoint((unsigned)length);
+            lume_worker_checkpoint((unsigned)length);
+        }
         offset += length;
     }
     return first * 4096;

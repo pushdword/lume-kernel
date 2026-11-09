@@ -66,6 +66,11 @@ static inline void lume_arch_idle_irq(void)
     __asm__ volatile("msr daifclr, #2; dsb sy; wfi; msr daifset, #2" ::: "memory");
 }
 
+static inline void lume_arch_poll_irq(void)
+{
+    __asm__ volatile("msr daifclr, #2; isb; yield; msr daifset, #2" ::: "memory");
+}
+
 static inline void lume_arch_flush_user_tlb(void)
 {
     __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");

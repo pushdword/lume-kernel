@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #define LUME_TASK_LIMIT 64u
 uint64_t lume_page_alloc(unsigned);
+uint64_t lume_pages_alloc_span(unsigned);
 bool lume_page_free(uint64_t);
 void lume_fail(const char *);
 bool lume_user_buffer(uint64_t, uint64_t, bool);

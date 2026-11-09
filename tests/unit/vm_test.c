@@ -27,6 +27,13 @@ static struct
 } mappings[4096];
 
 static uint64_t frames[4096];
+static unsigned frame_span[4096], span_calls, file_holds;
+static bool span_unavailable;
+static struct
+{
+    void *data;
+    unsigned references;
+} frame_spans[4096];
 
 static struct
 {
@@ -109,6 +116,42 @@ uint64_t lume_page_alloc(unsigned unused)
     abort();
 }
 
+uint64_t lume_pages_alloc_span(unsigned count)
+{
+    ++span_calls;
+    if (!count || span_unavailable ||
+        (physical_budget >= 0 && (unsigned)physical_budget < count))
+        return 0;
+    unsigned slots[16], found = 0, span = 0;
+    CHECK(count <= 16);
+    for (unsigned i = 0; i < 4096 && found < count; ++i)
+        if (!frames[i])
+            slots[found++] = i;
+    if (found != count)
+        return 0;
+    while (span < 4096 && frame_spans[span].references)
+        ++span;
+    CHECK(span < 4096);
+#if defined(_WIN32)
+    void *data = _aligned_malloc((size_t)count * 4096, 4096);
+#else
+    void *data = aligned_alloc(4096, (size_t)count * 4096);
+#endif
+    CHECK(data);
+    memset(data, 0, (size_t)count * 4096);
+    frame_spans[span].data = data;
+    frame_spans[span].references = count;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        frames[slots[i]] = (uintptr_t)data + (uint64_t)i * 4096;
+        frame_span[slots[i]] = span + 1;
+    }
+    physical_live += count;
+    if (physical_budget > 0)
+        physical_budget -= (int)count;
+    return (uintptr_t)data;
+}
+
 bool lume_page_free(uint64_t physical)
 {
     for (unsigned i = 0; i < 4096; ++i)
@@ -117,10 +160,20 @@ bool lume_page_free(uint64_t physical)
     for (unsigned i = 0; i < 4096; ++i)
         if (frames[i] == physical)
         {
+            void *allocation = (void *)(uintptr_t)physical;
+            if (frame_span[i])
+            {
+                unsigned span = frame_span[i] - 1;
+                CHECK(frame_spans[span].references);
+                allocation = --frame_spans[span].references ? NULL : frame_spans[span].data;
+                if (!frame_spans[span].references)
+                    frame_spans[span].data = NULL;
+                frame_span[i] = 0;
+            }
 #if defined(_WIN32)
-            _aligned_free((void *)(uintptr_t)physical);
+            _aligned_free(allocation);
 #else
-            free((void *)(uintptr_t)physical);
+            free(allocation);
 #endif
             frames[i] = 0;
             --physical_live;
@@ -315,7 +368,10 @@ void lume_vfs_access_mode(struct lume_files *files, unsigned fd, unsigned mode)
 int lume_vfs_hold(struct lume_files *files, unsigned fd)
 {
     (void)files;
-    return fd < 64 && descriptors[fd].ops ? (int)fd : -LUME_EBADF;
+    if (fd >= 64 || !descriptors[fd].ops)
+        return -LUME_EBADF;
+    ++file_holds;
+    return (int)fd;
 }
 
 int64_t lume_vfs_stat(struct lume_files *files, unsigned fd, struct lume_stat *stat)
@@ -333,6 +389,8 @@ int64_t lume_vfs_pread_object(int fd, uint64_t offset, void *data, uint64_t byte
 void lume_vfs_drop(int fd)
 {
     (void)fd;
+    CHECK(file_holds);
+    --file_holds;
 }
 
 int64_t lume_vfs_close(struct lume_files *files, unsigned fd)
@@ -382,6 +440,7 @@ static void clean(void)
     metadata_budget = physical_budget = -1;
     mapping_budget = -1;
     allocation_pause = NULL;
+    span_unavailable = false;
     memset(writer_view, 0, sizeof(writer_view));
     memset(root_offset, 0, sizeof(root_offset));
     for (unsigned i = 0; i < 64; ++i)
@@ -390,15 +449,51 @@ static void clean(void)
         if (descriptors[fd].ops)
             lume_vfs_close(&files, fd);
     drain();
-    CHECK(!metadata_live && !physical_live && !mappings_live && !retired_threads);
+    CHECK(!metadata_live && !physical_live && !mappings_live && !retired_threads && !file_holds);
 }
 
 static void write_cases(void);
 static void fault_suspend_cases(void);
 static void thread_region_cases(void);
+static void file_mapping_cases(void);
+static int memory_file(void);
+
+static void buffer_transaction_cases(void)
+{
+    int fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd));
+    uint64_t base = call(0, LUME_VM_MAP, 0, 2 * PAGE, 3, LUME_MAP_SHARED, fd);
+    uint64_t other = call(1, LUME_VM_MAP, 0, 2 * PAGE, 3, LUME_MAP_SHARED, fd);
+    CHECK(base == LUME_VM_BASE && other == LUME_VM_BASE);
+    CHECK(!lume_vm_buffer_busy(0, base, 128));
+    CHECK(lume_vm_buffer_ready(0, base, 128));
+    changing[0] = true;
+    CHECK(lume_vm_buffer_busy(0, UINT64_C(0x123000), 128));
+    CHECK(!lume_vm_buffer_ready(0, UINT64_C(0x123000), 128));
+    CHECK(!lume_vm_buffer_busy(1, other, 128));
+    CHECK(!lume_vm_buffer_busy(0, base, 0));
+    CHECK(!lume_vm_buffer_busy(0, UINT64_MAX - 63, 128));
+    CHECK(!lume_vm_buffer_busy(LUME_TASK_LIMIT, base, 128));
+    changing[0] = false;
+    struct vm_object *object = find_area(0, base)->object;
+    object->changing = true;
+    CHECK(lume_vm_buffer_busy(0, base + PAGE - 64, 128));
+    CHECK(lume_vm_buffer_busy(1, other, 128));
+    CHECK(!lume_vm_buffer_ready(1, other, 128));
+    CHECK(!lume_vm_buffer_busy(0, base - 128, 128));
+    CHECK(!lume_vm_buffer_busy(0, base + 2 * PAGE, 128));
+    CHECK(!lume_vm_buffer_busy(0, UINT64_C(0x123000), 128));
+    object->changing = false;
+    CHECK(!lume_vm_buffer_busy(0, base, 128));
+    CHECK(lume_vm_buffer_ready(0, base, 128));
+    CHECK(!lume_vm_buffer_busy(0, base + 2 * PAGE, 128));
+    CHECK(!lume_vm_buffer_ready(0, base + 2 * PAGE, 128));
+    clean();
+}
 
 int main(void)
 {
+    buffer_transaction_cases();
     const unsigned anonymous = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
     const uint64_t span = UINT64_C(4) * 1024 * 1024 * 1024;
     CHECK(call(0, LUME_VM_PROTECT, LUME_VM_BASE - 4096, 4096, LUME_PROT_READ, 0, -1) ==
@@ -490,6 +585,7 @@ int main(void)
     write_cases();
     fault_suspend_cases();
     thread_region_cases();
+    file_mapping_cases();
     printf("PASS_VM_PRODUCT_HOST checks=%u metadata=%u frames=%u ptes=%u\n", checks, metadata_live,
            physical_live, mappings_live);
     return 0;
@@ -854,6 +950,111 @@ static void thread_region_cases(void)
         metadata_budget = budget;
         CHECK(!lume_vm_thread_region(0, 3, 64, UINT64_C(2) * 1024 * 1024, &tls, &stack));
         CHECK(!spaces[0] && !physical_live && !mappings_live);
+        clean();
+    }
+}
+
+static unsigned char file_data[2 * 1024 * 1024 + 12288];
+static struct
+{
+    uint64_t size, next;
+    unsigned calls, maximum, fail_call, short_call;
+} regular_file;
+
+static void regular_close(void *context)
+{
+    CHECK(context == &regular_file);
+}
+
+static int64_t regular_stat(void *context, struct lume_stat *stat)
+{
+    CHECK(context == &regular_file);
+    *stat = (struct lume_stat){.kind = LUME_NODE_FILE, .size = regular_file.size};
+    return 0;
+}
+
+static int64_t regular_pread(void *context, void *data, uint64_t bytes, uint64_t offset)
+{
+    CHECK(context == &regular_file && offset == regular_file.next && bytes <= 65536);
+    ++regular_file.calls;
+    if (bytes > regular_file.maximum)
+        regular_file.maximum = (unsigned)bytes;
+    if (regular_file.calls == regular_file.fail_call)
+        return -LUME_EIO;
+    CHECK(offset <= regular_file.size && bytes <= regular_file.size - offset);
+    memcpy(data, file_data + offset, (size_t)bytes);
+    regular_file.next += bytes;
+    return (int64_t)bytes - (regular_file.calls == regular_file.short_call);
+}
+
+static const struct lume_file_ops regular_ops = {
+    .kind = LUME_NODE_FILE, .close = regular_close, .stat = regular_stat, .pread = regular_pread};
+
+static void regular_open(uint64_t size, uint64_t offset)
+{
+    memset(&regular_file, 0, sizeof(regular_file));
+    regular_file.size = size;
+    regular_file.next = offset;
+    descriptors[63].ops = &regular_ops;
+    descriptors[63].context = &regular_file;
+}
+
+static void file_mapping_cases(void)
+{
+    for (size_t i = 0; i < sizeof(file_data); ++i)
+        file_data[i] = (unsigned char)(i * 37u + i / PAGE);
+    const uint64_t available = 2 * 1024 * 1024 + PAGE + 3;
+    regular_open(available + PAGE, PAGE);
+    unsigned before = span_calls;
+    struct lume_vm_request request = {.version = LUME_VM_VERSION,
+                                      .length = rounded(available) + PAGE,
+                                      .offset = PAGE,
+                                      .protection = LUME_PROT_READ | LUME_PROT_WRITE,
+                                      .flags = LUME_MAP_PRIVATE,
+                                      .fd = 63};
+    int64_t base = lume_vm_call(&files, 1, LUME_VM_MAP, &request);
+    CHECK(base > 0 && !file_holds && regular_file.calls == 33 &&
+          regular_file.maximum == 65536 && span_calls - before == 33);
+    for (uint64_t position = 0; position < available; position += PAGE)
+    {
+        uint64_t bytes = available - position < PAGE ? available - position : PAGE;
+        void *data = (void *)(uintptr_t)physical(0, base + position, false, false);
+        CHECK(!memcmp(data, file_data + PAGE + position, (size_t)bytes));
+        for (uint64_t i = bytes; i < PAGE; ++i)
+            CHECK(!((unsigned char *)data)[i]);
+    }
+    CHECK(lume_vm_fault(0, base + rounded(available), false, false) == -1);
+    clean();
+
+    regular_open(65536 + 17, 0);
+    span_unavailable = true;
+    before = span_calls;
+    base = call(0, LUME_VM_MAP, 0, 73728, LUME_PROT_READ, LUME_MAP_PRIVATE, 63);
+    CHECK(base > 0 && regular_file.calls == 17 && regular_file.maximum == PAGE &&
+          span_calls - before == 1 && !file_holds);
+    CHECK(!memcmp((void *)(uintptr_t)physical(0, base + 65536, false, false),
+                  file_data + 65536, 17));
+    clean();
+
+    for (unsigned failure = 0; failure < 3; ++failure)
+    {
+        base = call(0, LUME_VM_MAP, 0, PAGE, 3,
+                    LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+        unsigned char *original = (void *)(uintptr_t)physical(0, base, true, false);
+        *original = 0x5a;
+        regular_open(131072, 0);
+        if (failure == 0)
+            regular_file.fail_call = 2;
+        else if (failure == 1)
+            regular_file.short_call = 2;
+        else
+            physical_budget = 5;
+        CHECK(call(0, LUME_VM_MAP, base, 131072, 3, LUME_MAP_PRIVATE | LUME_MAP_FIXED, 63) ==
+              (failure == 2 ? -LUME_ENOMEM : -LUME_EIO));
+        CHECK(!file_holds && physical(0, base, true, false) == (uintptr_t)original &&
+              *original == 0x5a);
+        drain();
+        CHECK(physical_live == 1);
         clean();
     }
 }

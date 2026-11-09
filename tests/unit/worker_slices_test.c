@@ -274,7 +274,9 @@ static void byte_slices(void)
     phase = 0;
     lume_worker_start();
     T(lume_worker_submit(byte_job, &phase));
+    T(lume_worker_runnable());
     T(lume_worker_resume() && phase == 2 && lume_worker_busy());
+    T(lume_worker_runnable());
     stats(0, 1, 0, 0, 1);
     unsigned reads_before = counter_reads;
     lume_worker_checkpoint(UINT_MAX);
@@ -291,6 +293,7 @@ static void byte_slices(void)
     T(lume_worker_resume() && phase == 5 && lume_worker_busy());
     T(lume_worker_resume() && phase == 6 && !lume_worker_busy());
     T(!lume_worker_resume());
+    T(!lume_worker_runnable());
     stats(1, 4, 0, 0, 3);
 }
 
@@ -327,6 +330,74 @@ static void time_slices(uint64_t hz, uint64_t start, uint64_t before, uint64_t f
     stats(1, 2, 0, 0, 1);
 }
 
+struct compute_sample
+{
+    uint64_t elapsed;
+    bool pressure;
+};
+
+static void compute_sample(void *context)
+{
+    const struct compute_sample *sample = context;
+    T(!lock_owned);
+    T(!lume_worker_runnable());
+    ticks += sample->elapsed;
+    contended = sample->pressure;
+}
+
+static void timed_compute_job(void *context)
+{
+    (void)context;
+    struct compute_sample sample = {1999, false};
+    phase = 1;
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES - 1);
+    lume_worker_compute(compute_sample, &sample);
+    lume_worker_checkpoint(0);
+    T(active->remaining == 1);
+    phase = 2;
+    sample.elapsed = 1;
+    lume_worker_compute(compute_sample, &sample);
+    lume_worker_checkpoint(0);
+    T(active->remaining == LUME_WORKER_SLICE_BYTES);
+    phase = 3;
+}
+
+static void contended_compute_job(void *context)
+{
+    (void)context;
+    struct compute_sample sample = {1, true};
+    phase = 1;
+    lume_worker_compute(compute_sample, &sample);
+    lume_worker_checkpoint(0);
+    phase = 2;
+}
+
+static void compute_fairness(void)
+{
+    frequency = 1000000;
+    ticks = 100;
+    phase = test_cpu = 0;
+    contended = false;
+    lume_smp_lock();
+    lume_worker_start();
+    T(lume_worker_submit(timed_compute_job, NULL));
+    T(lume_worker_resume() && phase == 2 && lume_worker_busy());
+    stats(0, 1, 0, 0, 1);
+    T(lume_worker_resume() && phase == 3 && !lume_worker_busy());
+    stats(1, 2, 0, 0, 1);
+    lume_worker_start();
+    T(lume_worker_submit(contended_compute_job, NULL));
+    T(lume_worker_resume() && phase == 1 && lume_worker_busy());
+    T(!lume_worker_resume());
+    T(lume_worker_runnable());
+    lume_smp_unlock();
+    lume_smp_lock();
+    contended = false;
+    T(lume_worker_resume() && phase == 2 && !lume_worker_busy());
+    stats(1, 2, 0, 0, 1);
+    lume_smp_unlock();
+}
+
 static void wait_body(void *context)
 {
     T(context == &phase);
@@ -358,17 +429,23 @@ static void waits_and_slices(void)
     lume_worker_start();
     T(lume_worker_submit(wait_job, &phase));
     T(lume_worker_resume() && phase == 1 && lume_worker_busy());
+    T(!lume_worker_runnable());
     T(!lume_worker_resume());
     event = 2;
+    T(lume_worker_runnable());
     T(lume_worker_resume() && phase == 2 && lume_worker_busy());
     ticks += 100000;
     T(lume_worker_resume() && phase == 3 && lume_worker_busy());
+    T(!lume_worker_runnable());
     T(!lume_worker_resume());
     ticks += 4;
+    T(!lume_worker_runnable());
     T(!lume_worker_resume());
     ++ticks;
+    T(lume_worker_runnable());
     T(lume_worker_resume() && phase == 5 && lume_worker_busy());
     T(lume_worker_resume() && phase == 6 && !lume_worker_busy());
+    T(!lume_worker_runnable());
     stats(1, 5, 2, 1, 2);
 }
 
@@ -641,6 +718,7 @@ int main(void)
     T(ConvertThreadToFiber(NULL) != NULL);
 #endif
     T(!lume_worker_busy() && !lume_worker_resume());
+    T(!lume_worker_runnable());
     T(!lume_worker_submit(byte_job, &phase));
     T(!lume_worker_wait_bits(&event, 2, 0) && !lume_worker_pause(0));
     lume_worker_checkpoint(0);
@@ -667,6 +745,7 @@ int main(void)
     T(counter_reads == reads_before && contention_reads == contention_before &&
       !lume_worker_busy());
     profiling_across_suspension();
+    compute_fairness();
     independent_waits();
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
         release_fiber(&workers[i].fiber);

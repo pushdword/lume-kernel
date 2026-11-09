@@ -4,6 +4,7 @@
 #include "lume/worker.h"
 #include "lume/abi.h"
 #include "lume/memory.h"
+#include <string.h>
 
 static uint16_t le16(const unsigned char *p)
 {
@@ -265,8 +266,8 @@ static void copy_elf_pages(void *context)
     bool executable = false;
     for (unsigned n = 0; n < copy->count; ++n)
     {
-        for (size_t i = 0; i < copy->pages[n].bytes; ++i)
-            copy->pages[n].target[i] = copy->pages[n].source[i];
+        if (copy->pages[n].bytes)
+            memcpy(copy->pages[n].target, copy->pages[n].source, copy->pages[n].bytes);
         if (copy->pages[n].executable)
         {
             lume_sync_code_defer(copy->pages[n].executable, 4096);
@@ -282,7 +283,7 @@ static void finish_elf_batch(struct elf_page_copy *copy)
     if (copy->count == LUME_MMU_BATCH_PAGES)
     {
         lume_worker_compute(copy_elf_pages, copy);
-        lume_worker_checkpoint(65536);
+        lume_worker_checkpoint(0);
     }
     else if (copy->count)
         copy_elf_pages(copy);
