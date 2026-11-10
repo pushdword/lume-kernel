@@ -883,3 +883,13 @@ check-net-tools: $(OUT)/tests/net-tools$(HOSTEXE)
 $(OUT)/tests/net-tools$(HOSTEXE): tests/unit/net_tools_test.c src/net/net_tools.c src/net/route.c $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"
+
+$(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
+.PHONY: check-devfs-group
+check-devfs-group: $(OUT)/tests/devfs-group$(HOSTEXE)
+	env "$<"
+
+$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/fatfs

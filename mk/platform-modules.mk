@@ -22,6 +22,10 @@ V3D_MODULE_SOURCE := drivers/gpu/v3d/module.c drivers/gpu/v3d/v3d.c
 PLATFORM_MODULE_SOURCES += $(V3D_MODULE_SOURCE)
 PLATFORM_MODULES += $(OUT)/modules/bcm2712-v3d.lkm
 $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(V3D_MODULE_SOURCE))): CPPFLAGS += -Idrivers/gpu/v3d
+CPUFAN_MODULE_SOURCE := drivers/pwm/rp1/cpufan.c
+CPUFAN_MODULE_HEADERS := drivers/pwm/rp1/hardware.h
+PLATFORM_MODULE_SOURCES += $(CPUFAN_MODULE_SOURCE)
+PLATFORM_MODULES += $(OUT)/modules/rp1-cpufan.lkm
 PLATFORM_MODULE_OBJECTS := $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(PLATFORM_MODULE_SOURCES)))
 .PHONY: platform-modules
 all: platform-modules
@@ -87,3 +91,15 @@ $(OUT)/tests/hdmi-console$(HOSTEXE): tests/unit/hdmi_console_test.c drivers/disp
 .PHONY: check-hdmi-platform
 check-hdmi-platform: check-bcm2712-hdmi-module check-brcm-l2-module check-pi5-firmware check-hdmi-framebuffer check-hdmi-console check-irq-domain check-pi5-fdt-irq $(OUT)/tests/mmu$(HOSTEXE)
 	env "$(OUT)/tests/mmu$(HOSTEXE)"
+
+$(OUT)/modules/rp1-cpufan.lkm: $(OUT)/lkm/obj/$(CPUFAN_MODULE_SOURCE).o
+	mkdir -p "$(@D)"
+	$(LD) -r --build-id=none $^ -o "$@"
+
+.PHONY: check-rp1-cpufan
+check-rp1-cpufan: $(OUT)/tests/rp1-cpufan$(HOSTEXE)
+	env "$<"
+CPUFAN_TEST_SOURCES := src/device/hardware.c src/device/resource.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/rp1-cpufan$(HOSTEXE): tests/unit/rp1_cpufan_test.c $(CPUFAN_MODULE_SOURCE) $(CPUFAN_MODULE_HEADERS) $(CPUFAN_TEST_SOURCES) $(OUT)/ddk/include/lume/module_build.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" $(CPUFAN_TEST_SOURCES) src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c -o "$@"

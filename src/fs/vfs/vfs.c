@@ -224,6 +224,9 @@ static struct open_file
     const struct lume_file_ops *external;
     void *context;
     void *storage_handle;
+    unsigned attribute_bytes;
+    bool attribute_cached;
+    char attribute_data[LUME_DEVFS_ATTRIBUTE_BYTES];
 } open_files[OPEN_FILES];
 
 static unsigned storage_reap_count, storage_reap_cursor;
@@ -296,6 +299,8 @@ static struct node
     uint64_t version;
     unsigned char *data;
     struct lume_block *block;
+    struct lume_devfs_group *group;
+    const struct lume_devfs_attribute *attribute;
 } default_nodes[NODES];
 static struct node *nodes = default_nodes;
 static unsigned node_capacity = NODES;
@@ -307,6 +312,7 @@ static unsigned free_nodes;
 static unsigned namespace_generation;
 static void (*mapping_changed)(uint64_t, uint64_t, uint64_t);
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
+static struct lume_devfs_group *attribute_groups[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
 
@@ -573,8 +579,6 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_
         out[1] = 0;
         return find("/");
     }
-    if (f->identity.euid)
-        return -LUME_EACCES;
     char raw[LUME_FILES_PATH_MAX * 2];
     const char *cwd = lume_files_cwd(f);
     if (*input != '/' && !cwd)
@@ -638,6 +642,8 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_
             copy(out, nodes[index].path, used + 1);
         }
     }
+    if (f->identity.euid && (index < 0 || !nodes[index].group))
+        return -LUME_EACCES;
     if (index >= 0 && bytes && input[bytes - 1] == '/' && nodes[index].kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
     return index;
@@ -784,6 +790,9 @@ int lume_devfs_register_block(struct lume_block *b)
     for (const char *p = name; *p; ++p)
         if (*p == '/')
             return -LUME_EINVAL;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (attribute_groups[i] && equal(attribute_groups[i]->name, name))
+            return -LUME_EEXIST;
     unsigned slot = LUME_DEVICE_LIMIT;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
     {
@@ -820,6 +829,141 @@ int lume_devfs_unregister_block(struct lume_block *b)
             return 0;
         }
     return b ? 0 : -LUME_EINVAL;
+}
+
+static bool attribute_name(const char *name)
+{
+    if (!name || !*name || length(name) > LUME_FILES_NAME_MAX || equal(name, ".") ||
+        equal(name, ".."))
+        return false;
+    for (const char *p = name; *p; ++p)
+        if (*p == '/')
+            return false;
+    return true;
+}
+
+static void group_path(const struct lume_devfs_group *group, const char *name,
+                       char out[LUME_FILES_PATH_MAX])
+{
+    copy(out, "/dev/", 5);
+    size_t used = 5;
+    copy(out + used, group->name, length(group->name) + 1);
+    used += length(group->name);
+    if (name)
+    {
+        out[used++] = '/';
+        copy(out + used, name, length(name) + 1);
+    }
+}
+
+static int add_group(struct lume_devfs_group *group)
+{
+    char path[LUME_FILES_PATH_MAX];
+    group_path(group, NULL, path);
+    if (find(path) >= 0)
+        return -LUME_EEXIST;
+    size_t available = node_capacity - count;
+    for (unsigned entry = free_nodes; entry; entry = nodes[entry - 1].path_next)
+        ++available;
+    if (available < group->count + 1)
+        return -LUME_ENOSPC;
+    char *paths[LUME_DEVFS_ATTRIBUTES + 1] = {0};
+    for (size_t i = 0; i <= group->count; ++i)
+    {
+        group_path(group, i ? group->attributes[i - 1].name : NULL, path);
+        paths[i] = lume_path_duplicate(path);
+        if (!paths[i])
+        {
+            for (size_t j = 0; j < i; ++j)
+                lume_path_release(paths[j]);
+            return -LUME_ENOMEM;
+        }
+    }
+    /* Allocate every path before publishing the directory and its attributes. */
+    for (size_t i = 0; i <= group->count; ++i)
+    {
+        const struct lume_devfs_attribute *attribute = i ? &group->attributes[i - 1] : NULL;
+        unsigned slot = reserve_node(paths[i], attribute ? LUME_NODE_CHAR : LUME_NODE_DIR);
+        nodes[slot].writable = attribute && attribute->write;
+        nodes[slot].group = group;
+        nodes[slot].attribute = attribute;
+        publish_node(slot);
+    }
+    return 0;
+}
+
+int lume_devfs_register_group(struct lume_devfs_group *group)
+{
+    if (!group || !attribute_name(group->name) || !group->attributes || !group->count ||
+        group->count > LUME_DEVFS_ATTRIBUTES)
+        return -LUME_EINVAL;
+    if (equal(group->name, "console") || equal(group->name, "null") || equal(group->name, "zero"))
+        return -LUME_EEXIST;
+    for (size_t i = 0; i < group->count; ++i)
+    {
+        const struct lume_devfs_attribute *attribute = &group->attributes[i];
+        if (!attribute_name(attribute->name) || !attribute->read ||
+            7 + length(group->name) + length(attribute->name) > LUME_FILES_PATH_MAX)
+            return -LUME_EINVAL;
+        for (size_t j = 0; j < i; ++j)
+            if (equal(attribute->name, group->attributes[j].name))
+                return -LUME_EEXIST;
+    }
+    unsigned slot = LUME_DEVICE_LIMIT;
+    size_t initial_nodes = 11 + group->count + 1;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        initial_nodes += block_devices[i] != NULL;
+        if (block_devices[i] && equal(block_devices[i]->device->name, group->name))
+            return -LUME_EEXIST;
+        if (attribute_groups[i])
+        {
+            if (equal(attribute_groups[i]->name, group->name))
+                return -LUME_EEXIST;
+            initial_nodes += attribute_groups[i]->count + 1;
+        }
+        else if (slot == LUME_DEVICE_LIMIT)
+            slot = i;
+    }
+    if (slot == LUME_DEVICE_LIMIT || (!count && initial_nodes > node_capacity))
+        return -LUME_ENOSPC;
+    int result = count ? add_group(group) : 0;
+    if (!result)
+        attribute_groups[slot] = group;
+    return result;
+}
+
+int lume_devfs_can_unregister_group(struct lume_devfs_group *group)
+{
+    if (!group)
+        return -LUME_EINVAL;
+    for (unsigned i = 0; i < count; ++i)
+        if (nodes[i].group == group && nodes[i].references)
+            return -LUME_EBUSY;
+    return 0;
+}
+
+int lume_devfs_unregister_group(struct lume_devfs_group *group)
+{
+    int result = lume_devfs_can_unregister_group(group);
+    if (result)
+        return result;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (attribute_groups[i] == group)
+        {
+            for (unsigned j = 0; j < count; ++j)
+                if (nodes[j].linked && nodes[j].group == group)
+                {
+                    index_remove(j);
+                    nodes[j].linked = false;
+                    release_ram(&nodes[j]);
+                    nodes[j].group = NULL;
+                    nodes[j].attribute = NULL;
+                }
+            attribute_groups[i] = NULL;
+            return 0;
+        }
+    return 0;
 }
 
 void lume_vfs_init(const void *shell, size_t bytes)
@@ -900,6 +1044,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (block_devices[i])
             (void)add_block(block_devices[i]);
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (attribute_groups[i] && add_group(attribute_groups[i]))
+            lume_fail("device attribute namespace allocation");
 }
 
 static int new_object(int node, int pipe, uint32_t flags)
@@ -1198,7 +1345,7 @@ bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
     struct open_file *file = descriptor(files, fd);
     return file && file->references && !file->external && file->pipe < 0 &&
            nodes[file->node].kind == LUME_NODE_CHAR && !nodes[file->node].block &&
-           nodes[file->node].device <= 2;
+           !nodes[file->node].group && nodes[file->node].device <= 2;
 }
 
 bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
@@ -1624,6 +1771,8 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     if (index < 0)
         return index;
     struct node *n = &nodes[index];
+    if (n->group && (flags & 3) && (f->identity.euid || f->identity.jailed))
+        return -LUME_EACCES;
     if (n->block && n->block->device->state != LUME_DEVICE_READY)
         return -LUME_EIO;
     if ((flags & 3) && n->kind == LUME_NODE_DIR)
@@ -1858,7 +2007,8 @@ static int64_t read_description(struct lume_files *f, struct open_file *d, void 
         return -LUME_EBADF;
     if (d->external)
         return d->external->read(d->context, data, bytes);
-    if (d->pipe < 0 && !nodes[d->node].device && (f->identity.euid || f->identity.jailed))
+    if (d->pipe < 0 && !nodes[d->node].device &&
+        (f->identity.jailed || (f->identity.euid && !nodes[d->node].group)))
         return -LUME_EACCES;
     if (d->pipe >= 0)
     {
@@ -1887,6 +2037,27 @@ static int64_t read_description(struct lume_files *f, struct open_file *d, void 
         return -LUME_EISDIR;
     if (!bytes)
         return 0;
+    if (n->attribute)
+    {
+        if (!d->attribute_cached)
+        {
+            int result =
+                n->attribute->read(n->group->context, d->attribute_data, sizeof(d->attribute_data));
+            if (result < 0)
+                return result;
+            if ((unsigned)result > sizeof(d->attribute_data))
+                return -LUME_EIO;
+            d->attribute_bytes = (unsigned)result;
+            d->attribute_cached = true;
+        }
+        uint64_t available = d->offset < d->attribute_bytes ? d->attribute_bytes - d->offset : 0;
+        if (bytes > available)
+            bytes = available;
+        if (bytes)
+            copy(data, d->attribute_data + d->offset, (size_t)bytes);
+        d->offset += bytes;
+        return (int64_t)bytes;
+    }
     if (n->kind == LUME_NODE_CHAR)
     {
         if (n->device)
@@ -1991,6 +2162,21 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
     struct node *n = &nodes[d->node];
     if (n->block)
         return block_io(d, n, (void *)data, bytes, true);
+    if (n->attribute)
+    {
+        if (!n->attribute->write)
+            return -LUME_EROFS;
+        if (!bytes)
+            return 0;
+        if (bytes > LUME_DEVFS_ATTRIBUTE_BYTES)
+            return -LUME_E2BIG;
+        int result = n->attribute->write(n->group->context, data, (size_t)bytes);
+        if (result)
+            return result < 0 ? result : -LUME_EIO;
+        d->attribute_cached = false;
+        d->offset = 0;
+        return (int64_t)bytes;
+    }
     if (n->kind == LUME_NODE_CHAR)
     {
         if (n->device)
@@ -2211,6 +2397,12 @@ int64_t lume_vfs_seek(struct lume_files *f, uint64_t fd, int64_t offset, uint64_
     if (d->pipe >= 0)
         return -LUME_ESPIPE;
     struct node *n = &nodes[d->node];
+    if (n->attribute && !whence && !offset)
+    {
+        d->offset = 0;
+        d->attribute_cached = false;
+        return 0;
+    }
     if (n->kind == LUME_NODE_CHAR)
         return -LUME_ESPIPE;
     uint64_t base = whence == 0 ? 0 : whence == 1 ? d->offset : n->bytes;
@@ -2252,7 +2444,7 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
         return -LUME_EBADF;
     if (f->identity.jailed)
         return 0;
-    if (f->identity.euid)
+    if (f->identity.euid && (d->external || d->pipe >= 0 || !nodes[d->node].group))
         return -LUME_EACCES;
     if (d->pipe >= 0 || d->external)
         return -LUME_ENOTDIR;
@@ -2327,6 +2519,8 @@ int64_t lume_vfs_getdents_long(struct lume_files *files, uint64_t fd, void *out,
 
 static unsigned default_mode_at(const struct node *n, const char *path)
 {
+    if (n->attribute)
+        return 0020444 | (n->attribute->write ? 0200 : 0);
     unsigned mode = (n->kind == LUME_NODE_DIR     ? 0040555
                      : n->kind == LUME_NODE_CHAR  ? 0020444
                      : n->kind == LUME_NODE_BLOCK ? 0060444
@@ -2425,7 +2619,15 @@ int lume_vfs_volume_fd(struct lume_files *files, uint64_t fd, struct lume_files_
 static int64_t file_mode(struct lume_files *files, unsigned operation,
                          struct lume_file_mode_request *request, const char *input, bool compat)
 {
-    if ((files->identity.euid || files->identity.jailed) &&
+    bool public_attribute = false;
+    if (files->identity.euid && !files->identity.jailed && operation == LUME_FILE_MODE_OPEN &&
+        request->flags == LUME_O_RDONLY)
+    {
+        char path[LUME_FILES_PATH_MAX];
+        int index = resolve(files, input, path);
+        public_attribute = index >= 0 && nodes[index].group;
+    }
+    if ((files->identity.euid || files->identity.jailed) && !public_attribute &&
         !(files->identity.jailed && operation == LUME_FILE_MODE_OPEN &&
           request->flags == LUME_O_RDONLY))
         return -LUME_EPERM;
@@ -2931,6 +3133,7 @@ static unsigned events(struct lume_files *f, int fd, bool sample_console)
             return LUME_POLLERR;
         return ((d->flags & 3) != LUME_O_WRONLY &&
                         (nodes[d->node].kind != LUME_NODE_CHAR || nodes[d->node].device ||
+                         nodes[d->node].attribute ||
                          (sample_console ? lume_console_ready() : poll_input_ready))
                     ? LUME_POLLIN
                     : 0) |
@@ -2990,7 +3193,8 @@ bool lume_vfs_poll_subscribe(struct lume_files *files, const struct lume_poll_wa
         else if (!file->external && file->pipe >= 0)
             source = &channels[file->pipe].changed;
         else if (!file->external && nodes[file->node].kind == LUME_NODE_CHAR &&
-                 !nodes[file->node].device && (watch->records[i].events & LUME_POLLIN))
+                 !nodes[file->node].device && !nodes[file->node].group &&
+                 (watch->records[i].events & LUME_POLLIN))
             source = &console_source;
         if (!poll_subscribe_source(task, &files->fd[fd].changed) ||
             !poll_subscribe_source(task, source))
@@ -3037,7 +3241,8 @@ bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_pol
             continue;
         const struct open_file *file = &open_files[files->fd[fd].object];
         if (!file->external && file->pipe < 0 && nodes[file->node].kind == LUME_NODE_CHAR &&
-            !nodes[file->node].device && (file->flags & 3) != LUME_O_WRONLY)
+            !nodes[file->node].device && !nodes[file->node].group &&
+            (file->flags & 3) != LUME_O_WRONLY)
             return true;
     }
     return false;

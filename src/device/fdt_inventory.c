@@ -222,11 +222,12 @@ static int reference_property(const void *tree, int node, const char *name, unsi
                               struct lume_property *out)
 {
     const char *cells_name = !strcmp(name, "clocks")          ? "#clock-cells"
+                             : !strcmp(name, "pwms")          ? "#pwm-cells"
                              : !strcmp(name, "resets")        ? "#reset-cells"
                              : !strcmp(name, "power-domains") ? "#power-domain-cells"
                              : !strcmp(name, "phys")          ? "#phy-cells"
                                                               : NULL;
-    bool single = !strcmp(name, "phy-handle");
+    bool single = !strcmp(name, "phy-handle") || !strcmp(name, "rpm-regmap");
     if (!cells_name && !single)
         return -LUME_ENOSYS;
     int bytes;

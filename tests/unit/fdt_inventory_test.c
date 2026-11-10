@@ -49,6 +49,9 @@ static void registers(const char *name, unsigned address, unsigned irq, unsigned
     assert(!fdt_property(tree, "clocks", clock, sizeof(clock)));
     cell("configuration", 0x1234);
     cell("phy-handle", 11);
+    fdt32_t pwm[] = {cpu_to_fdt32(10), cpu_to_fdt32(3), cpu_to_fdt32(41566), cpu_to_fdt32(1)};
+    assert(!fdt_property(tree, "pwms", pwm, sizeof(pwm)));
+    cell("rpm-regmap", 10);
     static const unsigned char station[6] = {2, 0x12, 0x34, 0x56, 0x78, 0x9a};
     assert(!fdt_property(tree, "local-mac-address", station, sizeof(station)));
     static const char labels[] = "primary\0spare";
@@ -80,6 +83,7 @@ static unsigned fixture(unsigned variant)
     text("compatible", "test,clock");
     cell("phandle", 10);
     cell("#clock-cells", 1);
+    cell("#pwm-cells", 3);
     end();
     node("bus");
     text("compatible", "simple-bus");
@@ -156,6 +160,15 @@ static int probe(struct lume_hardware *device, void *context)
     assert(property.values[0] == 1);
     assert(!lume_hardware_property(device, "clocks", LUME_PROPERTY_REFERENCE, 0, &property));
     assert(property.count == 2 && property.values[0] == clock_id && property.values[1] == 3);
+    assert(!lume_hardware_property(device, "pwms", LUME_PROPERTY_REFERENCE, 0, &property));
+    assert(property.count == 4 && property.values[0] == clock_id && property.values[1] == 3 &&
+           property.values[2] == 41566 && property.values[3] == 1);
+    assert(lume_hardware_property(device, "pwms", LUME_PROPERTY_REFERENCE, 1, &property) ==
+           -LUME_ENOENT);
+    assert(!lume_hardware_property(device, "rpm-regmap", LUME_PROPERTY_REFERENCE, 0, &property));
+    assert(property.count == 1 && property.values[0] == clock_id);
+    assert(lume_hardware_property(device, "rpm-regmap", LUME_PROPERTY_REFERENCE, 1, &property) ==
+           -LUME_EINVAL);
     assert(lume_hardware_property(device, "labels", LUME_PROPERTY_U64, 0, &property) ==
            -LUME_EINVAL);
     assert(lume_hardware_property(device, "missing", LUME_PROPERTY_U32, 0, &property) ==

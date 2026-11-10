@@ -9,6 +9,7 @@ static bool network_busy, repeat;
 static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
 static struct lume_block block;
+static struct lume_devfs_group attribute_group;
 static struct lume_work work;
 
 int lume_module_pin(uintptr_t callback, void **owner)
@@ -163,6 +164,55 @@ int lume_devfs_unregister_block(struct lume_block *b)
     return opens ? -LUME_EBUSY : 0;
 }
 
+int lume_devfs_register_group(struct lume_devfs_group *group)
+{
+    assert(group == &attribute_group && references);
+    return 0;
+}
+
+int lume_devfs_unregister_group(struct lume_devfs_group *group)
+{
+    assert(group == &attribute_group && references);
+    return opens ? -LUME_EBUSY : 0;
+}
+
+static int attribute_read(void *context, char *data, size_t bytes)
+{
+    (void)context;
+    (void)data;
+    (void)bytes;
+    return 0;
+}
+
+static int attribute_write(void *context, const char *data, size_t bytes)
+{
+    (void)context;
+    (void)data;
+    (void)bytes;
+    return 0;
+}
+
+static void group_services(void)
+{
+    static const struct lume_devfs_attribute attributes[] = {
+        {.name = "pct", .read = attribute_read, .write = attribute_write}};
+    attribute_group =
+        (struct lume_devfs_group){.name = "cpufan", .attributes = attributes, .count = 1};
+    rejected_callback = (uintptr_t)attribute_write;
+    assert(lume_module_register_group(&attribute_group) == -LUME_ENOEXEC && !references);
+    rejected_callback = 0;
+    foreign_callback = (uintptr_t)attribute_write;
+    assert(lume_module_register_group(&attribute_group) == -LUME_EINVAL && !references &&
+           !foreign_references);
+    foreign_callback = 0;
+    assert(!lume_module_register_group(&attribute_group) && references == 1);
+    assert(lume_module_register_group(&attribute_group) == -LUME_EBUSY && references == 1);
+    opens = 1;
+    assert(lume_module_unregister_group(&attribute_group) == -LUME_EBUSY && references == 1);
+    opens = 0;
+    assert(!lume_module_unregister_group(&attribute_group) && !references);
+}
+
 static int read_block(struct lume_block *b, uint64_t first, unsigned count, void *data)
 {
     (void)b;
@@ -230,6 +280,7 @@ int lume_netif_unregister(uint32_t index)
 
 int main(void)
 {
+    group_services();
     struct lume_device device = {
         .version = LUME_DDK_VERSION, .class_id = LUME_DEVICE_BLOCK, .name = "ram0", .ops = &ops};
     for (unsigned i = 0; i < 8; ++i)

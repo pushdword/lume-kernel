@@ -20,4 +20,6 @@ int lume_module_work_submit(struct lume_work *);
 bool lume_module_work_cancel(struct lume_work *);
 int lume_module_netif_register(const struct lume_netif_descriptor *);
 int lume_module_netif_unregister(uint32_t index);
+int lume_module_register_group(struct lume_devfs_group *);
+int lume_module_unregister_group(struct lume_devfs_group *);
 #endif

@@ -14,7 +14,8 @@ enum
     NETWORK,
     INTERRUPT_DOMAIN,
     DOMAIN_INTERRUPT,
-    RUNNING_WORK
+    RUNNING_WORK,
+    ATTRIBUTE_GROUP
 };
 
 static struct registration
@@ -157,6 +158,43 @@ static int domain_callback(void *expected, uintptr_t callback)
         return result;
     result = owner == expected ? 0 : -LUME_EINVAL;
     lume_module_unpin(owner);
+    return result;
+}
+
+int lume_module_register_group(struct lume_devfs_group *group)
+{
+    if (!group || !group->attributes || !group->count || group->count > LUME_DEVFS_ATTRIBUTES ||
+        !group->attributes[0].read)
+        return -LUME_EINVAL;
+    struct registration *registration;
+    int result =
+        reserve(ATTRIBUTE_GROUP, group, (uintptr_t)group->attributes[0].read, &registration);
+    if (result)
+        return result;
+    /* Every callback must belong to the same pinned module. */
+    for (size_t i = 0; !result && i < group->count; ++i)
+    {
+        const struct lume_devfs_attribute *attribute = &group->attributes[i];
+        result = attribute->read ? domain_callback(registration->owner, (uintptr_t)attribute->read)
+                                 : -LUME_EINVAL;
+        if (!result && attribute->write)
+            result = domain_callback(registration->owner, (uintptr_t)attribute->write);
+    }
+    if (!result)
+        result = lume_devfs_register_group(group);
+    if (result)
+        release(registration);
+    return result;
+}
+
+int lume_module_unregister_group(struct lume_devfs_group *group)
+{
+    struct registration *registration = find(ATTRIBUTE_GROUP, group);
+    if (!registration)
+        return -LUME_ENOENT;
+    int result = lume_devfs_unregister_group(group);
+    if (!result)
+        release(registration);
     return result;
 }
 
