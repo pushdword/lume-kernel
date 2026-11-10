@@ -21,6 +21,11 @@ bool lume_boot_trial_arm(void)
     return arm_success;
 }
 
+bool lume_boot_partition_select(unsigned partition)
+{
+    return arm_success && partition == 3;
+}
+
 bool lume_boot_trial_matches(unsigned bytes, unsigned crc)
 {
     (void)bytes;

@@ -6,7 +6,8 @@
  * or INT 0x80, the number in R8 and arguments in RDI, RSI and RDX. The result replaces the
  * first argument. SYSCALL clobbers RCX and R11. INT 0x80 preserves them.
  * i686 uses ILP32 C types and INT 0x80. EAX addresses four uint64_t words containing the
- * number and three arguments. INT 0x81 accepts GETPID in EAX without a request buffer.
+ * number and three arguments. INT 0x81 accepts GETPID, READ and WRITE in EAX.
+ * READ and WRITE take 32-bit arguments in EBX, ECX and EDX without a request buffer.
  * EDX:EAX returns the result. Other general-purpose registers
  * are preserved. Negative results encode LUME_E values. */
 #include <stdint.h>

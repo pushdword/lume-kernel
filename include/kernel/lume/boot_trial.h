@@ -8,6 +8,8 @@ void lume_boot_trial_context(const void *, const void *, size_t);
 bool lume_boot_trial_supported(void);
 bool lume_boot_trial_running(void);
 bool lume_boot_trial_arm(void);
+bool lume_boot_partition_select(unsigned);
+bool lume_boot_restart_prepare(void);
 bool lume_boot_trial_progress(void);
 bool lume_boot_trial_matches(unsigned, unsigned);
 void lume_boot_trial_accept(void);
@@ -25,6 +27,17 @@ static inline bool lume_boot_trial_running(void)
 static inline bool lume_boot_trial_arm(void)
 {
     return false;
+}
+
+static inline bool lume_boot_partition_select(unsigned partition)
+{
+    (void)partition;
+    return false;
+}
+
+static inline bool lume_boot_restart_prepare(void)
+{
+    return true;
 }
 
 static inline bool lume_boot_trial_matches(unsigned bytes, unsigned crc)

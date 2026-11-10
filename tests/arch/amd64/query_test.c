@@ -37,6 +37,28 @@ _Noreturn void lume_fail(const char *message)
     abort();
 }
 
+static bool pipe_ready;
+static unsigned pipe_calls;
+static bool expected_writing;
+static int64_t pipe_result;
+
+bool lume_task_pipe_try(unsigned owner, uint64_t fd, uint64_t address, uint64_t bytes, bool writing,
+                        int64_t *result)
+{
+    assert(owner == 7 && fd == 3 && address == LUME_USER_BASE + 8192 && bytes == 17);
+    assert(writing == expected_writing);
+    ++pipe_calls;
+    *result = pipe_result;
+    return pipe_ready;
+}
+
+bool lume_task_pipe_terminal_request(unsigned owner, uint64_t address)
+{
+    assert(owner == 7 && address == LUME_USER_BASE + 8192);
+    ++pipe_calls;
+    return pipe_ready;
+}
+
 #include "../../../arch/amd64/context/query.h"
 
 static void frame(uint64_t registers[22], uint64_t number)
@@ -240,6 +262,59 @@ int main(void)
     assert(account.owner == 13 && account.calls == 1 && account.ticks == 1);
     assert(raw - before_raw == 4000);
     registers[16] = LUME_CPU_LIMIT + 1;
+    denied(registers);
+    cpu = 0;
+    lume_arch_query_drain(&account);
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PIPE);
+    for (unsigned writing = 0; writing < 2; ++writing)
+    {
+        frame(registers, writing ? LUME_SYS_WRITE : LUME_SYS_READ);
+        registers[8] = 3;
+        registers[9] = LUME_USER_BASE + 8192;
+        registers[11] = 17;
+        expected_writing = writing != 0;
+        pipe_ready = true;
+        pipe_result = 17;
+        accepted(registers, 17);
+        frame(registers, writing ? LUME_SYS_WRITE : LUME_SYS_READ);
+        registers[8] = 3;
+        registers[9] = LUME_USER_BASE + 8192;
+        registers[11] = 17;
+        pipe_ready = false;
+        denied(registers);
+        pipe_ready = true;
+        pipe_result = -LUME_EAGAIN;
+        accepted(registers, (uint64_t)-LUME_EAGAIN);
+    }
+    assert(pipe_calls == 6);
+    lume_arch_query_drain(&account);
+    assert(account.owner == 7 && account.calls == 4);
+    assert(account.mask == ((UINT64_C(1) << LUME_SYS_READ) | (UINT64_C(1) << LUME_SYS_WRITE)));
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    frame(registers, LUME_SYS_WRITE);
+    denied(registers);
+    assert(pipe_calls == 6);
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PIPE);
+    frame(registers, LUME_SYS_TTY);
+    registers[8] = LUME_TTY_GET;
+    registers[9] = LUME_USER_BASE + 8192;
+    registers[11] = sizeof(struct lume_tty_request);
+    pipe_ready = false;
+    denied(registers);
+    pipe_ready = true;
+    accepted(registers, (uint64_t)-25);
+    registers[8] = LUME_TTY_SET;
+    denied(registers);
+    registers[8] = LUME_TTY_GET;
+    registers[11]--;
+    denied(registers);
+    lume_arch_query_drain(&account);
+    assert(account.calls == 1 && (account.mask & (UINT64_C(1) << LUME_SYS_TTY)));
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PID);
+    frame(registers, LUME_SYS_TTY);
+    registers[8] = LUME_TTY_GET;
+    registers[9] = LUME_USER_BASE + 8192;
+    registers[11] = sizeof(struct lume_tty_request);
     denied(registers);
     puts(
         "PASS_AMD64_QUERY epochs, CPU ownership, sampled accounting, eligibility, bounds and native frame");

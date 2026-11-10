@@ -23,4 +23,5 @@ void lume_arch_query_publish(unsigned, unsigned, uint64_t, unsigned);
 void lume_arch_query_drain(struct lume_query_account *);
 bool lume_task_pipe_try(unsigned, uint64_t, uint64_t, uint64_t, bool, int64_t *);
 bool lume_task_pipe_terminal_query(unsigned, uint64_t);
+bool lume_task_pipe_terminal_request(unsigned, uint64_t);
 #endif

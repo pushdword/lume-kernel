@@ -147,6 +147,7 @@ headers:
 	mkdir -p "$(OUT)/include"
 	cp -Rp include/uapi/. "$(OUT)/include/"
 	cp -Rp $(UAPI_ABI)/. "$(OUT)/include/"
+$(OUT)/obj/arch/amd64/context/interrupt.S.o: include/kernel/lume/amd64_query.h
 $(OUT)/obj/arch/aarch64/context/query.c.o: CFLAGS += -mgeneral-regs-only
 $(OUT)/obj/%.c.o: %.c $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"
@@ -234,15 +235,15 @@ $(OUT)/tests/io-call$(HOSTEXE): tests/unit/io_call_test.c src/syscall/io.c
 check-io-call: $(OUT)/tests/io-call$(HOSTEXE)
 	env "$<"
 
-$(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+$(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 check-boot-storage: $(OUT)/tests/boot-storage$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
 .PHONY: check-boot-trial
-$(OUT)/tests/boot-trial$(HOSTEXE): tests/unit/boot_trial_test.c tests/unit/boot_storage_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+$(OUT)/tests/boot-trial$(HOSTEXE): tests/unit/boot_trial_test.c tests/unit/boot_storage_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/boot_storage_test.c,$(filter %.c,$^)) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/boot_storage_test.c,$(filter %.c,$^)) -o "$@"
 check-boot-trial: $(OUT)/tests/boot-trial$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
 .PHONY: check-storage-handles

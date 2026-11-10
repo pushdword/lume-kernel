@@ -267,6 +267,62 @@ int main(int argc, char **argv)
     assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
     assert(lume_boot_call(3, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
     check_configuration(true);
+#ifdef LUME_BOOT_STORAGE_TRIAL_TEST
+    unsigned char saved_mbr[512];
+    memcpy(saved_mbr, mbr, sizeof(mbr));
+    const uint32_t starts[] = {84936704, 85985280};
+    const uint32_t counts[] = {1048576, 36182016};
+    uint32_t data_count = 83886080;
+    for (unsigned i = 0; i < 4; ++i)
+        mbr[474 + i] = (unsigned char)(data_count >> (8 * i));
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        unsigned char *p = mbr + 478 + 16 * i;
+        memset(p, 0, 16);
+        p[1] = p[5] = 0xfe;
+        p[2] = p[3] = p[6] = p[7] = 0xff;
+        p[4] = i ? 0x83 : 0x0c;
+        for (unsigned byte = 0; byte < 4; ++byte)
+        {
+            p[8 + byte] = (unsigned char)(starts[i] >> (8 * byte));
+            p[12 + byte] = (unsigned char)(counts[i] >> (8 * byte));
+        }
+    }
+    owner = phase = 0;
+    selection_attempted = false;
+    memset(&request, 0, sizeof(request));
+    request.version = LUME_IO_VERSION;
+    assert(lume_boot_call(2, LUME_BOOT_CAPABILITIES, &request) == 0 && request.active == 3 &&
+           (request.total & LUME_BOOT_CAP_PARTITION));
+    assert(f_unlink("1:/tryboot.txt") == FR_OK);
+    assert(lume_boot_call(2, LUME_BOOT_CAPABILITIES, &request) == 0 && request.active == 3 &&
+           (request.total & LUME_BOOT_CAP_PARTITION) && !(request.total & LUME_BOOT_CAP_TRIAL));
+    request.total = 0;
+    trial_running = true;
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EBUSY);
+    trial_running = false;
+    owner = 3;
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EBUSY);
+    owner = 0;
+    request.active = 1;
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EINVAL);
+    request.active = 3;
+    uint32_t *fields[] = {&request.count, &request.total, &request.offset, &request.crc};
+    for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+    {
+        *fields[i] = 1;
+        assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EINVAL);
+        *fields[i] = 0;
+    }
+    arm_success = false;
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EOPNOTSUPP);
+    arm_success = true;
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == 0);
+    assert(lume_boot_call(2, LUME_BOOT_SELECT_PARTITION, &request) == -LUME_EBUSY);
+    request.total = 1048576;
+    assert(lume_boot_call(2, LUME_BOOT_BEGIN, &request) == -LUME_EBUSY);
+    memcpy(mbr, saved_mbr, sizeof(mbr));
+#endif
     fclose(volumes[0]);
     fclose(volumes[1]);
     puts(

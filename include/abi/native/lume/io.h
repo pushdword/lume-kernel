@@ -56,12 +56,16 @@ enum
     LUME_BOOT_ACTIVATE,
     LUME_BOOT_ABORT,
     LUME_BOOT_CAPABILITIES,
-    LUME_BOOT_CONFIRM
+    LUME_BOOT_CONFIRM,
+    LUME_BOOT_SELECT_PARTITION
 };
 
-/* CAPABILITIES returns flags in total. Trial updates require a matching boot volume. */
+/* CAPABILITIES returns flags in total and an available alternate partition in active.
+ * SELECT_PARTITION arms that partition for the next restart. It requires a matching
+ * active value and zero count, total, offset and crc. Trial updates retain their slots. */
 #define LUME_BOOT_CAP_RESTART_GUARD 1u
 #define LUME_BOOT_CAP_TRIAL 2u
+#define LUME_BOOT_CAP_PARTITION 4u
 #define LUME_BOOT_STATE_TRIAL 1u
 
 struct lume_boot_request

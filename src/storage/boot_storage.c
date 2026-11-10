@@ -1,6 +1,8 @@
 #include "lume/abi.h"
 #include "lume/boot_storage.h"
 #include "lume/boot_trial.h"
+#include "lume/storage.h"
+#include "lume/sd.h"
 #include "ff.h"
 #include <string.h>
 
@@ -137,21 +139,52 @@ void lume_boot_release(unsigned pid)
     }
 }
 
+static unsigned alternate_partition(void)
+{
+    unsigned char sector[512];
+    struct lume_volume volume;
+    return lume_sd_read(0, sector) &&
+                   lume_volume_alternate_boot_select(sector, lume_sd_sectors(), &volume)
+               ? 3u
+               : 0u;
+}
+
 int lume_boot_call(unsigned pid, unsigned op, struct lume_boot_request *r)
 {
-    if (r->version != LUME_IO_VERSION || op > LUME_BOOT_CONFIRM || r->count > LUME_IO_BYTES)
+    if (r->version != LUME_IO_VERSION || op > LUME_BOOT_SELECT_PARTITION ||
+        r->count > LUME_IO_BYTES)
         return -LUME_EINVAL;
     if (op == LUME_BOOT_CAPABILITIES)
     {
         r->total = LUME_BOOT_CAP_RESTART_GUARD;
-        if (lume_storage_boot_mount() && trial_volume())
-            r->total |= LUME_BOOT_CAP_TRIAL;
+        r->active = 0;
+        if (lume_storage_boot_mount())
+        {
+            if (trial_volume())
+                r->total |= LUME_BOOT_CAP_TRIAL;
+            r->active = lume_boot_trial_supported() ? alternate_partition() : 0;
+            if (r->active)
+                r->total |= LUME_BOOT_CAP_PARTITION;
+        }
         return 0;
     }
     if (!lume_storage_boot_mount())
         return -LUME_EROFS;
     if (op == LUME_BOOT_CONFIRM)
         return confirm(r);
+    if (op == LUME_BOOT_SELECT_PARTITION)
+    {
+        if (owner || selection_attempted || lume_boot_trial_running())
+            return -LUME_EBUSY;
+        unsigned partition = alternate_partition();
+        if (!partition || r->active != partition || r->count || r->total || r->offset || r->crc)
+            return -LUME_EINVAL;
+        if (!lume_boot_partition_select(partition))
+            return -LUME_EOPNOTSUPP;
+        selection_attempted = true;
+        return 0;
+    }
+
     if (op == LUME_BOOT_INFO || op == LUME_BOOT_BEGIN)
     {
         if ((owner || selection_attempted || lume_boot_trial_running()) && op == LUME_BOOT_BEGIN)

@@ -1,5 +1,6 @@
 #ifndef LUME_AMD64_CONTEXT_QUERY_H
 #define LUME_AMD64_CONTEXT_QUERY_H
+#include "lume/tty.h"
 
 static bool user_context_address(uint64_t address)
 {
@@ -25,6 +26,9 @@ static struct
 } query_epochs[LUME_TASK_LIMIT];
 
 _Static_assert(sizeof(struct amd64_query_cache) == 128, "query CPU cache size");
+_Static_assert(LUME_SYS_READ == LUME_AMD64_QUERY_SYSCALL_READ, "read query syscall number");
+_Static_assert(LUME_SYS_WRITE == LUME_AMD64_QUERY_SYSCALL_WRITE, "write query syscall number");
+_Static_assert(LUME_SYS_TTY == LUME_AMD64_QUERY_SYSCALL_TTY, "terminal query syscall number");
 _Static_assert(LUME_SYS_GETPID == LUME_AMD64_QUERY_SYSCALL_PID, "PID query syscall number");
 _Static_assert(LUME_SYS_THREAD == LUME_AMD64_QUERY_SYSCALL_THREAD, "thread query syscall number");
 
@@ -89,7 +93,10 @@ bool lume_amd64_query_try(uint64_t *registers)
     bool pid = number == LUME_SYS_GETPID;
     bool tid = number == LUME_SYS_THREAD && registers[8] == LUME_THREAD_SELF && !registers[9] &&
                !registers[11];
-    if (!pid && !tid)
+    bool pipe = number == LUME_SYS_READ || number == LUME_SYS_WRITE;
+    bool terminal = number == LUME_SYS_TTY && registers[8] == LUME_TTY_GET &&
+                    registers[11] == sizeof(struct lume_tty_request);
+    if (!pid && !tid && !pipe && !terminal)
         return false;
     uint64_t marker = registers[16];
     if (marker > LUME_CPU_LIMIT)
@@ -100,13 +107,30 @@ bool lume_amd64_query_try(uint64_t *registers)
     struct amd64_query_cache *cache = query_cpus + cpu;
     bool sample = !(cache->calls & 63u);
     uint64_t began = sample ? query_stamp() : 0;
-    unsigned required = pid ? LUME_QUERY_PID : LUME_QUERY_TID;
+    unsigned required = pipe || terminal ? LUME_QUERY_PIPE : pid ? LUME_QUERY_PID : LUME_QUERY_TID;
     if (!(cache->allowed & required) || !cache->epoch || cache->owner >= LUME_TASK_LIMIT ||
         !cache->pid || cache->pid > LUME_TASK_LIMIT ||
         cache->epoch != query_epoch(cache->pid - 1) || registers[18] != 0x23 ||
         !user_context_address(registers[17]) || !user_context_address(registers[20]))
         return false;
-    registers[8] = pid ? cache->pid : cache->tid;
+    uint64_t result;
+    if (pipe)
+    {
+        int64_t transferred;
+        if (!lume_task_pipe_try(cache->owner, registers[8], registers[9], registers[11],
+                                number == LUME_SYS_WRITE, &transferred))
+            return false;
+        result = (uint64_t)transferred;
+    }
+    else if (terminal)
+    {
+        if (!lume_task_pipe_terminal_request(cache->owner, registers[9]))
+            return false;
+        result = (uint64_t)-25;
+    }
+    else
+        result = pid ? cache->pid : cache->tid;
+    registers[8] = result;
     registers[19] = (registers[19] & UINT64_C(0x240dd5)) | 0x202;
     registers[21] = 0x1b;
     ++cache->calls;

@@ -13,7 +13,7 @@ int64_t lume_socket_message_call_buffer(struct lume_files *, unsigned, int,
                                         struct lume_socket_buffer *);
 bool lume_socket_network_io(struct lume_files *, unsigned);
 bool lume_socket_reap_pending(void);
-/* Closed TCP contexts are reclaimed only while owning the NETWORK lane. */
+/* Reclaim closed TCP contexts with NETWORK ownership or after all workers stop. */
 void lume_socket_reap(void);
 void lume_socket_stream_notify(unsigned owner, unsigned handle);
 #endif

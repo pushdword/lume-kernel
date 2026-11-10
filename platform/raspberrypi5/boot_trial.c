@@ -2,6 +2,7 @@
 #include "lume/counter.h"
 #include "lume/dma.h"
 #include "lume/mmio.h"
+#include "lume/watchdog.h"
 #include <libfdt.h>
 #include <stdint.h>
 
@@ -9,6 +10,7 @@
 
 static _Alignas(64) uint32_t message[16];
 static bool supported, running, timed_out;
+static unsigned next_partition;
 static const unsigned char *root;
 static size_t root_bytes;
 static uint64_t deadline;
@@ -71,6 +73,30 @@ bool lume_boot_trial_arm(void)
 {
     return supported && !running && property(UINT32_C(0x00038064), 4, 1) &&
            property(UINT32_C(0x00030048), 0, 0);
+}
+
+bool lume_boot_partition_select(unsigned partition)
+{
+    if (!supported || running || !partition || partition >= 63 || next_partition)
+        return false;
+    next_partition = partition;
+    return true;
+}
+
+bool lume_boot_restart_prepare(void)
+{
+    if (!supported)
+        return !next_partition;
+    if (!property(UINT32_C(0x00030048), 0, 0))
+        return false;
+    uint32_t encoded = 0;
+    for (unsigned bit = 0; bit < 6; ++bit)
+        encoded |= (next_partition & (1u << bit)) << bit;
+    /* Firmware consumes the partition spread across alternating reset-status bits. */
+    uint32_t status = lume_mmio_read32(LUME_PM_BASE + LUME_PM_RSTS);
+    status = (status & UINT32_C(0x00fffaaa)) | LUME_PM_PASSWORD | encoded;
+    lume_mmio_write32_sync(LUME_PM_BASE + LUME_PM_RSTS, status);
+    return true;
 }
 
 bool lume_boot_trial_progress(void)

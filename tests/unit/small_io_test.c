@@ -3,6 +3,7 @@
 #undef main
 #include "fd.h"
 #include "lume/wait.h"
+#include "lume/tty.h"
 
 static unsigned small_calls;
 static int64_t small_result;
@@ -66,6 +67,43 @@ static void resident_pipes(void)
     struct lume_fd_request request = {.version = LUME_FD_VERSION, .bytes = sizeof(request)};
     CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &request) == 0);
     int reading = request.fd, writing = request.other;
+    uint64_t terminal_address = destination + 4080;
+    uint64_t terminal_aliases[2];
+    struct lume_tty_request terminal = {
+        .version = LUME_TTY_VERSION, .bytes = sizeof(terminal), .fd = reading};
+    CHECK(lume_user_buffer_resident(1, terminal_address, sizeof(terminal), true, terminal_aliases));
+    memcpy((void *)(uintptr_t)terminal_aliases[0], &terminal, 16);
+    memcpy((void *)(uintptr_t)terminal_aliases[1], (unsigned char *)&terminal + 16,
+           sizeof(terminal) - 16);
+    unsigned metadata_before = allocation_live;
+    allocation_budget = 0;
+    CHECK(lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    CHECK(allocation_live == metadata_before);
+    CHECK(!lume_user_io_pipe_terminal(&files[0], 1, destination + 8191));
+    terminal.reserved = 1;
+    memcpy((void *)(uintptr_t)terminal_aliases[1], (unsigned char *)&terminal + 16,
+           sizeof(terminal) - 16);
+    CHECK(!lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    terminal.reserved = 0;
+    terminal.version = 0;
+    memcpy((void *)(uintptr_t)terminal_aliases[0], &terminal, 16);
+    memcpy((void *)(uintptr_t)terminal_aliases[1], (unsigned char *)&terminal + 16,
+           sizeof(terminal) - 16);
+    CHECK(!lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    terminal.version = LUME_TTY_VERSION;
+    terminal.fd = image_fd;
+    memcpy((void *)(uintptr_t)terminal_aliases[0], &terminal, 16);
+    CHECK(!lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    terminal.fd = reading;
+    memcpy((void *)(uintptr_t)terminal_aliases[0], &terminal, 16);
+    CHECK(vm(0, LUME_VM_PROTECT, destination, 8192, LUME_PROT_READ, 0, -1) == 0);
+    CHECK(lume_user_buffer(destination, 8192, false));
+    CHECK(!lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    CHECK(vm(0, LUME_VM_PROTECT, destination, 8192, 3, 0, -1) == 0);
+    CHECK(lume_user_buffer(destination, 8192, true));
+    CHECK(lume_user_io_pipe_terminal(&files[0], 1, terminal_address));
+    fill_destination(0xa7);
+    allocation_budget = -1;
     unsigned before = allocation_live;
     allocation_budget = 0;
     int64_t transferred = 123;

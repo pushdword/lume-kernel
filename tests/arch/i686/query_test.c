@@ -21,13 +21,14 @@ static bool writable_page[3] = {true, true, false};
 static bool terminal_handled;
 static unsigned terminal_calls;
 static unsigned pipe_calls;
-static bool pipe_handled;
+static bool pipe_handled, expected_writing = true;
 static int64_t pipe_result;
 
 bool lume_task_pipe_try(unsigned owner, uint64_t fd, uint64_t address, uint64_t bytes, bool writing,
                         int64_t *result)
 {
-    assert(owner == 7 && fd == 9 && address == BASE + 64 && bytes == 17 && writing);
+    assert(owner == 7 && fd == 9 && address == BASE + 64 && bytes == 17 &&
+           writing == expected_writing);
     ++pipe_calls;
     *result = pipe_result;
     return pipe_handled;
@@ -109,6 +110,49 @@ static void accepted(uint32_t registers[15], uint64_t value)
                                 : i == 12 ? ((before[i] & UINT32_C(0x240dd5)) | 0x202)
                                 : i == 14 ? 0x23
                                           : before[i]));
+}
+
+static void direct_io_queries(void)
+{
+    uint32_t registers[15];
+    struct lume_query_account account;
+    lume_arch_query_drain(&account);
+    lume_arch_query_publish(7, 3, 0x1408, LUME_QUERY_PIPE);
+    unsigned calls = pipe_calls, walks = translations;
+    for (unsigned writing = 0; writing < 2; ++writing)
+    {
+        unsigned number = writing ? LUME_SYS_WRITE : LUME_SYS_READ;
+        frame(registers, 129, number);
+        registers[4] = 9;
+        registers[6] = BASE + 64;
+        registers[5] = 17;
+        expected_writing = writing != 0;
+        pipe_handled = true;
+        pipe_result = 17;
+        accepted(registers, 17);
+        frame(registers, 129, number);
+        registers[4] = 9;
+        registers[6] = BASE + 64;
+        registers[5] = 17;
+        pipe_handled = false;
+        denied(registers);
+        struct lume_context context = {.pc = registers[10],
+                                       .raw = {[7] = number, [4] = 9, [6] = BASE + 64, [5] = 17}};
+        assert(query_decode(&context));
+        assert(context.syscall_pc == context.pc && context.reg[8] == number);
+        assert(context.reg[0] == 9 && context.reg[1] == BASE + 64 && context.reg[2] == 17);
+        context.pc -= LUME_SYSCALL_INSTRUCTION_BYTES;
+        lume_context_finish_syscall(&context);
+        assert(context.raw[7] == number && context.raw[4] == 9 && context.raw[6] == BASE + 64 &&
+               context.raw[5] == 17);
+    }
+    assert(pipe_calls == calls + 4 && translations == walks);
+    lume_arch_query_drain(&account);
+    assert(account.calls == 2 &&
+           account.mask == ((UINT64_C(1) << LUME_SYS_READ) | (UINT64_C(1) << LUME_SYS_WRITE)));
+    struct lume_context unknown = {.pc = LUME_USER_BASE + 4096, .raw = {[7] = 0xffff}};
+    assert(!query_decode(&unknown) && unknown.reg[0] == (uint64_t)-LUME_ENOSYS);
+    expected_writing = true;
 }
 
 static void terminal_queries(void)
@@ -247,7 +291,7 @@ int main(void)
     decoded.reg[0] = UINT64_C(0xabcdef0198765432);
     lume_context_finish_syscall(&decoded);
     assert(decoded.raw[7] == 0x98765432 && decoded.raw[5] == 0xabcdef01 && !decoded.syscall_pc);
-    decoded.raw[7] = LUME_SYS_WRITE;
+    decoded.raw[7] = LUME_SYS_OPEN;
     assert(!query_decode(&decoded) && decoded.reg[0] == (uint64_t)-LUME_ENOSYS);
     lume_context_finish_syscall(&decoded);
     assert(decoded.raw[7] == (uint32_t)-LUME_ENOSYS && decoded.raw[5] == UINT32_MAX);
@@ -374,6 +418,7 @@ int main(void)
     lume_arch_query_publish(LUME_TASK_LIMIT, 0, 0, LUME_QUERY_PID);
     frame(registers, 129, LUME_SYS_GETPID);
     denied(registers);
+    direct_io_queries();
     terminal_queries();
     drain_accounting();
 #ifdef _WIN32

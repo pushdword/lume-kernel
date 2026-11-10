@@ -33,6 +33,8 @@
 #include "lume/process.h"
 #include "lume/tty_device.h"
 #include "lume/user_io.h"
+#include "lume/socket_file.h"
+#include "lume/datagram.h"
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
 #include "lume/query.h"
 #endif
@@ -2144,6 +2146,13 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
             lume_value("SHELL_EXIT_STATUS", LUME_CONTEXT_REG(frame, 0));
             if (LUME_CONTEXT_REG(frame, 0) && shell_script)
                 lume_fail("public shell exit status");
+            tasks[task].context = *frame;
+            if (!kernel_cleanup_ready(task))
+            {
+                LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
+                sched_charge(&policy, lume_cpu_index(), now());
+                return wait_ready_task();
+            }
             service_bus_stop();
             task_query_revoke(LUME_TASK_LIMIT);
             for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
@@ -2331,7 +2340,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         cpus[i] = (struct cpu_state){.current = LUME_TASK_LIMIT};
     lume_worker_start();
     lume_vfs_reap_start();
-    uint64_t before = lume_pages_free() + lume_program_staging_pages();
+    uint64_t before = lume_pages_free() + lume_program_staging_pages() + lume_vm_cache_pages();
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         kernel_lanes[i] = (struct kernel_io_lane){.owner = LUME_TASK_LIMIT};
     kernel_control_queue = (struct io_queue){0};
@@ -2473,6 +2482,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     lume_smp_unlock();
     lume_run_user(first);
     lume_smp_quiesce();
+    lume_smp_lock();
     bool ok = !active && tasks[0].exits && tasks[0].calls;
     if (script)
     {
@@ -2496,7 +2506,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
         if (owned[i])
             release_program(i);
-    lume_files_release(&tasks[0].files);
+    detach_program(0);
     lume_vm_release(0);
     lume_heap_release(1);
     lume_elf_release(&images[0]);
@@ -2507,7 +2517,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     if (service_loaded)
     {
         lume_value("NET_SERVICE_PUBLIC_SYSCALLS", tasks[2].calls);
-        lume_files_release(&tasks[2].files);
+        detach_program(2);
         lume_vm_release(2);
         lume_heap_release(3);
         lume_elf_release(&images[2]);
@@ -2517,7 +2527,29 @@ bool lume_shell_start(uint64_t frequency, bool script)
             ok = lume_page_free(tasks[2].stack[i]) && ok;
         service_loaded = false;
     }
-    return ok && before == lume_pages_free() + lume_program_staging_pages();
+    while (lume_vfs_reap_pending() || lume_socket_reap_pending() || lume_datagram_reap_pending())
+    {
+        if (lume_vfs_reap_pending() && !lume_vfs_reap(16))
+            lume_fail("file cleanup stalled");
+        if (lume_socket_reap_pending())
+            lume_socket_reap();
+        if (lume_datagram_reap_pending())
+            lume_datagram_reap();
+    }
+    uint64_t after = lume_pages_free() + lume_program_staging_pages() + lume_vm_cache_pages();
+    if (!ok || before != after)
+    {
+        lume_value("SHELL_CLEANUP_STATE_OK", ok);
+        lume_value("SHELL_PAGES_BEFORE", before);
+        lume_value("SHELL_PAGES_AFTER", after);
+        lume_value("SHELL_FREE_PAGES", lume_pages_free());
+        lume_value("SHELL_STAGING_PAGES", lume_program_staging_pages());
+        lume_value("SHELL_VM_CACHE_PAGES", lume_vm_cache_pages());
+    }
+    /* Interactive commands can retain new entries in the shared filesystem namespace. */
+    ok = ok && (!script || before == after);
+    lume_smp_unlock();
+    return ok;
 }
 
 void lume_tasks_secondary(void)

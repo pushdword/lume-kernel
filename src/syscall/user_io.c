@@ -4,6 +4,7 @@
 #include "lume/kernel_memory.h"
 #include "lume/vfs.h"
 #include "lume/file_io.h"
+#include "lume/tty.h"
 #include <string.h>
 
 static unsigned active_buffers;
@@ -84,6 +85,17 @@ static bool pipe_resident(struct lume_files *files, unsigned pid, uint64_t fd, u
     if (!writing && *result > 0)
         resident_copy(physical, buffer, (size_t)*result, true);
     return true;
+}
+
+bool lume_user_io_pipe_terminal(struct lume_files *files, unsigned pid, uint64_t address)
+{
+    struct lume_tty_request request;
+    uint64_t physical[2];
+    if (!lume_user_buffer_resident(pid, address, sizeof(request), true, physical))
+        return false;
+    resident_copy(physical, &request, sizeof(request), false);
+    return request.version == LUME_TTY_VERSION && request.bytes == sizeof(request) &&
+           !request.reserved && lume_vfs_pipe_io(files, (uint64_t)(int64_t)request.fd);
 }
 
 bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,

@@ -74,6 +74,8 @@ struct lume_volume
 
 bool lume_volume_select(const unsigned char mbr[512], uint64_t sectors, struct lume_volume *);
 bool lume_volume_boot_select(const unsigned char mbr[512], uint64_t sectors, struct lume_volume *);
+bool lume_volume_alternate_boot_select(const unsigned char mbr[512], uint64_t sectors,
+                                       struct lume_volume *);
 const struct lume_storage_ops *lume_storage_start(void);
 /* Schedule expired partial-sector and metadata flushes on the serialized kernel worker. */
 void lume_storage_poll_background(void);

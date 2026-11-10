@@ -18,6 +18,26 @@ bool lume_task_pipe_terminal_query(unsigned task, uint64_t fd)
     return handled;
 }
 
+bool lume_task_pipe_terminal_request(unsigned task, uint64_t address)
+{
+    if (lume_smp_owned())
+        return false;
+    lume_smp_lock();
+    bool handled = false;
+    if (public_mode && active && task == current_task && task < LUME_TASK_LIMIT &&
+        states[task] == 2)
+    {
+        unsigned process = process_slot(task);
+        struct lume_files *files = &tasks[process].files;
+        handled = !process_exiting[process] && !process_stopped[process] &&
+                  !main_thread_done[process] && !task_signal_pending(task) &&
+                  !task_signal_pending(process) && !files->identity.sandbox_profile &&
+                  lume_user_io_pipe_terminal(files, process + 1, address);
+    }
+    lume_smp_unlock();
+    return handled;
+}
+
 bool lume_task_pipe_try(unsigned task, uint64_t fd, uint64_t address, uint64_t bytes, bool writing,
                         int64_t *result)
 {
@@ -32,7 +52,7 @@ bool lume_task_pipe_try(unsigned task, uint64_t fd, uint64_t address, uint64_t b
         struct lume_files *files = &tasks[process].files;
         if (!process_exiting[process] && !process_stopped[process] && !main_thread_done[process] &&
             !task_signal_pending(task) && !task_signal_pending(process) &&
-            !lume_vm_buffer_busy(process, address, bytes) &&
+            !files->identity.sandbox_profile && !lume_vm_buffer_busy(process, address, bytes) &&
             !lume_sandbox_io(files, fd, writing) &&
             lume_user_io_pipe_try(files, process + 1, fd, address, bytes, writing, result))
         {

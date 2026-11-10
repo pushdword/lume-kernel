@@ -18,4 +18,5 @@ bool lume_user_io_pipe_try(struct lume_files *, unsigned, uint64_t, uint64_t, ui
                            int64_t *);
 bool lume_user_io_pipe_read_ready(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t,
                                   int64_t *);
+bool lume_user_io_pipe_terminal(struct lume_files *, unsigned, uint64_t);
 #endif

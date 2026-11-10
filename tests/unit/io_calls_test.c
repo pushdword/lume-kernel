@@ -573,6 +573,14 @@ bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, 
     return resident_ready;
 }
 
+bool lume_user_io_pipe_terminal(struct lume_files *files, unsigned pid, uint64_t address)
+{
+    assert(pipe_locked && files == &tasks[process_slot(current_task)].files);
+    assert(pid == process_slot(current_task) + 1 && address == 0x123000);
+    ++resident_calls;
+    return resident_ready;
+}
+
 bool lume_user_io_pipe_read_ready(struct lume_files *files, unsigned pid, uint64_t fd,
                                   uint64_t address, uint64_t bytes, int64_t *result)
 {
@@ -1132,6 +1140,22 @@ static void terminal_pipe_query(void)
     states[3] = 1;
     assert(!lume_task_pipe_terminal_query(3, 3));
     assert(!pipe_locked && !resident_calls && !charges && !selections && !clock_reads);
+    states[3] = 2;
+    resident_ready = true;
+    assert(lume_task_pipe_terminal_request(3, 0x123000));
+    assert(resident_calls == 1 && !pipe_locked);
+    resident_ready = false;
+    assert(!lume_task_pipe_terminal_request(3, 0x123000));
+    assert(resident_calls == 2 && !pipe_locked);
+    resident_ready = true;
+    tasks[1].files.identity.sandbox_profile = 1;
+    assert(!lume_task_pipe_terminal_request(3, 0x123000));
+    tasks[1].files.identity.sandbox_profile = 0;
+    pending_signal = 1;
+    assert(!lume_task_pipe_terminal_request(3, 0x123000));
+    pending_signal = 0;
+    assert(!lume_task_pipe_terminal_request(4, 0x123000));
+    assert(resident_calls == 2 && !pipe_locked && !charges && !selections && !clock_reads);
 }
 
 static void resident_pipe_completion(void)
@@ -1180,6 +1204,10 @@ static void resident_pipe_completion(void)
     main_thread_done[3] = true;
     assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
     main_thread_done[3] = false;
+    tasks[3].files.identity.sandbox_profile = 1;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
+    assert(resident_calls == before && !pipe_locked);
+    tasks[3].files.identity.sandbox_profile = 0;
     assert(io_queue_push(&kernel_control_queue, 0, false));
     assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result));
     io_queue_cancel(&kernel_control_queue, 0);

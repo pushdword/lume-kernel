@@ -411,6 +411,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
         lume_display_stop();
     if (!lume_sd_stop())
         lume_fail("SDHCI stop");
+    if (!lume_boot_restart_prepare())
+        lume_fail("firmware restart preparation");
     lume_puts("LUME: RESTARTING SYSTEM\n");
     lume_uart_flush();
     lume_value("PSCI_RESET_RETURNED", lume_psci_call(UINT64_C(0x84000009)));

@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 /* INT 0x80 passes four 64-bit words through a user buffer addressed by EAX.
- * INT 0x81 accepts GETPID in EAX without a user request buffer. */
+ * INT 0x81 takes simple call numbers in EAX and 32-bit arguments in EBX, ECX and EDX. */
 struct lume_context
 {
     uint64_t reg[32], sp, pc, status, tls, flags;

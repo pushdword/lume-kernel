@@ -5,13 +5,30 @@ static uint32_t u32(const unsigned char *p)
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-static bool partition(const unsigned char *p, bool boot, uint32_t first, uint32_t count)
+static bool typed_partition(const unsigned char *p, bool boot, unsigned type, uint32_t first,
+                            uint32_t count)
 {
-    const unsigned char fields[8] = {boot ? 0x80 : 0, 0xfe, 0xff, 0xff, 0x0c, 0xfe, 0xff, 0xff};
+    const unsigned char fields[8] = {boot ? 0x80 : 0,     0xfe, 0xff, 0xff,
+                                     (unsigned char)type, 0xfe, 0xff, 0xff};
     for (unsigned i = 0; i < sizeof(fields); ++i)
         if (p[i] != fields[i])
             return false;
     return u32(p + 8) == first && u32(p + 12) == count;
+}
+
+static bool partition(const unsigned char *p, bool boot, uint32_t first, uint32_t count)
+{
+    return typed_partition(p, boot, 0x0c, first, count);
+}
+
+static bool secondary(const unsigned char p[512], uint64_t sectors, uint64_t data_end)
+{
+    uint32_t first = u32(p + 486), count = u32(p + 490);
+    uint32_t root = u32(p + 502), root_count = u32(p + 506);
+    return first >= data_end && !(first & 2047u) && count >= 65536 &&
+           (uint64_t)first + count <= root && !(root & 2047u) && root_count >= 65536 &&
+           (uint64_t)root + root_count <= sectors && partition(p + 478, false, first, count) &&
+           typed_partition(p + 494, false, 0x83, root, root_count);
 }
 
 static bool dedicated(const unsigned char p[512], uint64_t sectors, struct lume_volume *out)
@@ -26,9 +43,11 @@ static bool dedicated(const unsigned char p[512], uint64_t sectors, struct lume_
         !partition(p + 446, true, LUME_CARD_BOOT_FIRST, LUME_CARD_BOOT_SECTORS) ||
         !partition(p + 462, false, LUME_CARD_DATA_FIRST, data_count))
         return false;
+    bool extra = false;
     for (unsigned i = 478; i < 510; ++i)
-        if (p[i])
-            return false;
+        extra |= p[i] != 0;
+    if (extra && !secondary(p, sectors, LUME_CARD_DATA_FIRST + data_count))
+        return false;
     *out = (struct lume_volume){LUME_CARD_DATA_FIRST, data_count};
     return true;
 }
@@ -91,5 +110,16 @@ bool lume_volume_boot_select(const unsigned char p[512], uint64_t sectors, struc
         !dedicated(p, sectors, &data))
         return false;
     *out = (struct lume_volume){LUME_CARD_BOOT_FIRST, LUME_CARD_BOOT_SECTORS};
+    return true;
+}
+
+bool lume_volume_alternate_boot_select(const unsigned char p[512], uint64_t sectors,
+                                       struct lume_volume *out)
+{
+    struct lume_volume data;
+    *out = (struct lume_volume){0};
+    if (!lume_volume_boot_select(p, sectors, &data) || !u32(p + 490))
+        return false;
+    *out = (struct lume_volume){u32(p + 486), u32(p + 490)};
     return true;
 }

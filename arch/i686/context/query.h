@@ -24,13 +24,21 @@ _Static_assert(LUME_SYS_THREAD == LUME_I686_QUERY_SYSCALL_THREAD, "thread query 
 static bool query_decode(struct lume_context *frame)
 {
     frame->syscall_pc = (uint32_t)frame->pc;
-    if (frame->raw[7] != LUME_SYS_GETPID)
+    unsigned number = frame->raw[7];
+    if (number == LUME_SYS_GETPID)
+        frame->reg[0] = frame->reg[1] = frame->reg[2] = 0;
+    else if (number == LUME_SYS_READ || number == LUME_SYS_WRITE)
+    {
+        frame->reg[0] = frame->raw[4];
+        frame->reg[1] = frame->raw[6];
+        frame->reg[2] = frame->raw[5];
+    }
+    else
     {
         frame->reg[0] = (uint64_t)-LUME_ENOSYS;
         return false;
     }
-    frame->reg[8] = LUME_SYS_GETPID;
-    frame->reg[0] = frame->reg[1] = frame->reg[2] = 0;
+    frame->reg[8] = number;
     return true;
 }
 
@@ -110,9 +118,19 @@ bool lume_i686_query_try(uint32_t *registers)
     uint64_t result;
     if (registers[8] == 129)
     {
-        if (number != LUME_SYS_GETPID || !(query_cache.allowed & LUME_QUERY_PID))
+        if (number == LUME_SYS_GETPID && (query_cache.allowed & LUME_QUERY_PID))
+            result = query_cache.pid;
+        else if ((number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
+                 (query_cache.allowed & LUME_QUERY_PIPE))
+        {
+            int64_t transferred;
+            if (!lume_task_pipe_try(query_cache.owner, registers[4], registers[6], registers[5],
+                                    number == LUME_SYS_WRITE, &transferred))
+                return false;
+            result = (uint64_t)transferred;
+        }
+        else
             return false;
-        result = query_cache.pid;
     }
     else
     {
