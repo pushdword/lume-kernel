@@ -247,12 +247,19 @@ $(OUT)/tests/boot-trial$(HOSTEXE): tests/unit/boot_trial_test.c tests/unit/boot_
 check-boot-trial: $(OUT)/tests/boot-trial$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
 .PHONY: check-storage-handles
-$(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+$(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 check-storage-handles: $(OUT)/tests/storage-handles$(HOSTEXE)
 	env "$<"
 .PHONY: check-storage-sync
+.PHONY: check-storage-seek
+check-storage-seek: $(OUT)/tests/storage-seek$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/storage-seek$(HOSTEXE): tests/unit/storage_seek_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c vendor/fatfs/ffconf.h tests/unit/sd_blocks_mock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
+check: check-storage-seek
 check-storage-sync: $(OUT)/tests/storage-sync$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/storage-sync$(HOSTEXE): tests/unit/storage_sync_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h

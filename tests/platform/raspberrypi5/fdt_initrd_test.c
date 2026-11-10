@@ -92,7 +92,7 @@ int main(void)
             }
             T(!lume_fdt_set_initrd(data, n, 0, 0x1000));
             T(!lume_fdt_set_initrd(data, n, 0x1000, 0x1000));
-            T(!lume_fdt_set_initrd(data, n, 0x1000, 0x5001000));
+            T(!lume_fdt_set_initrd(data, n, 0x1000, 0x10001001));
             T(!lume_fdt_set_initrd(data, n, UINT64_MAX, 0));
             T(memcmp(data, saved, sizeof(data)) == 0);
             bool wide = a == 8 && b == 8;
@@ -110,7 +110,11 @@ int main(void)
     T(!lume_fdt_read(data, n, &f));
     n = make(data, 8, 8, 0x8000000, 0x7ffffff);
     T(!lume_fdt_read(data, n, &f));
-    n = make(data, 8, 8, 0x8000000, 0xc000001);
+    n = make(data, 8, 8, 0x10000000, 0x20000000);
+    T(lume_fdt_read(data, n, &f));
+    T(lume_fdt_set_initrd(data, n, 0x20000000, 0x30000000));
+    T(!lume_fdt_set_initrd(data, n, 0x20000000, 0x30000001));
+    n = make(data, 8, 8, 0x10000000, 0x20000001);
     T(!lume_fdt_read(data, n, &f));
     n = make(data, 8, 8, 0x1ffffff00, 0x200000100);
     T(!lume_fdt_read(data, n, &f));

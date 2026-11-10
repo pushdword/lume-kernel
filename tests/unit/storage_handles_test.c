@@ -241,8 +241,12 @@ static bool aliases(const struct lume_storage_ops *ops)
     T(ops->write_handle(writer, UINT32_MAX, out, 2) == -LUME_EINVAL);
     T(!lume_storage_start());
     T(ops->read_handle(reader, 510, out, 1) == 1);
-    T(ops->remove("/data/EMPTY.BIN") == -LUME_EBUSY);
-    T(ops->rename("/data/empty.bin", "/data/moved.bin") == -LUME_EBUSY);
+    T(ops->remove("/data/EMPTY.BIN") == 0);
+    T(ops->read_handle(reader, 510, out, 1) == 1 && !out[0]);
+    T(ops->rename("/data/empty.bin", "/data/moved.bin") == -LUME_ENOENT);
+    T(ops->create("/data/empty.bin", false) == 0);
+    T(ops->write("/data/empty.bin", 0, "new", 3) == 3);
+    T(ops->read_handle(reader, 510, out, 1) == 1 && !out[0]);
     T(ops->close(writer) == 0);
     T(ops->close(reader) == 0);
     T(ops->close(reader) == -LUME_EBADF);
@@ -257,11 +261,10 @@ static bool aliases(const struct lume_storage_ops *ops)
     T(ops->write_handle(alias, 0, "alias", 5) == 5);
     T(ops->read_handle(alias, 0, out, 5) == -LUME_EBADF);
     T(ops->read_handle(reader, 0, out, 5) == 5 && !memcmp(out, "alias", 5));
-    T(ops->remove(path) == -LUME_EBUSY);
-    T(ops->rename(path, "/data/moved.bin") == -LUME_EBUSY);
-    T(ops->close(alias) == 0 && ops->close(reader) == 0);
     T(ops->rename(path, "/data/moved.bin") == 0);
     T(ops->remove("/data/moved.bin") == 0);
+    T(ops->read_handle(reader, 0, out, 5) == 5 && !memcmp(out, "alias", 5));
+    T(ops->close(alias) == 0 && ops->close(reader) == 0);
     T(ops->create("/data/parent", true) == 0);
     T(ops->create("/data/parent/file", false) == 0);
     T(ops->open("/data/parent/file", LUME_O_RDWR, &writer) == 0);
@@ -524,12 +527,12 @@ static bool writeback(const struct lume_storage_ops *ops)
 static bool unicode_visit(const char *path, bool directory, uint64_t bytes, void *opaque)
 {
     unsigned *found = opaque;
-    if (!strcmp(path, "/data/informação"))
+    if (!strcmp(path, "/data/Informação"))
     {
         T(directory && !(*found & 1));
         *found |= 1;
     }
-    else if (!strcmp(path, "/data/informação/ação-€-Á.txt"))
+    else if (!strcmp(path, "/data/Informação/ação-€-Á.txt"))
     {
         T(!directory && bytes == 12 && !(*found & 2));
         *found |= 2;

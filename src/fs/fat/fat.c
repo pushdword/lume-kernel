@@ -24,7 +24,7 @@ bool lume_fat_mount(struct lume_fat *f, const void *data, size_t bytes)
         return false;
     uint32_t sectors = u32(p + 32), fat = u32(p + 36), reserved = u16(p + 14);
     uint64_t first = (uint64_t)reserved + (uint64_t)p[16] * fat;
-    if (!fat || !sectors || sectors > 131072 || first >= sectors || (uint64_t)sectors * 512 > bytes)
+    if (!fat || !sectors || sectors > 524288 || first >= sectors || (uint64_t)sectors * 512 > bytes)
         return false;
     uint32_t clusters = (sectors - (uint32_t)first) / p[13];
     if (clusters < 65525 || clusters >= 0x0ffffff5 ||

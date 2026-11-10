@@ -124,6 +124,12 @@ static void signal_queue(unsigned owner, unsigned number)
         exit_signals[owner] = number;
         request_exit(owner, 128 + number);
     }
+    else if (vm_fault_wait[owner])
+    {
+        /* Preserve the fault context until the pager wakes the task. */
+        lume_smp_wake();
+        return;
+    }
     else if (signal_wake_waiter(owner))
     {
         lume_smp_wake();

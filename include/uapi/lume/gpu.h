@@ -17,7 +17,8 @@ enum
 enum
 {
     LUME_GPU_BACKEND_NONE,
-    LUME_GPU_BACKEND_V3D71
+    LUME_GPU_BACKEND_V3D71,
+    LUME_GPU_BACKEND_QEMU2D
 };
 
 struct lume_gpu_rect

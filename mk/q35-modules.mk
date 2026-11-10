@@ -1,4 +1,6 @@
 PLATFORM_MODULE_NAMES := vblk vnet vrng vga ps2 xhci
+PLATFORM_MODULE_NAMES += lume2d
+Q35_lume2d := drivers/gpu/lume2d/module.c
 ifeq ($(PROFILE),recovery)
 PLATFORM_MODULE_NAMES := $(filter-out vnet,$(PLATFORM_MODULE_NAMES))
 endif

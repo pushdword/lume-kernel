@@ -488,7 +488,7 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             if ((out->initrd_start || out->initrd_end) &&
                 (!out->initrd_start || out->initrd_start >= out->initrd_end ||
                  out->initrd_end > UINT64_C(0x200000000) ||
-                 out->initrd_end - out->initrd_start > UINT64_C(0x4000000)))
+                 out->initrd_end - out->initrd_start > UINT64_C(0x10000000)))
                 return false;
             return true;
         }
@@ -503,7 +503,7 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
 bool lume_fdt_set_initrd(void *blob, size_t available, uint64_t start, uint64_t end)
 {
     struct lume_fdt current;
-    if (!start || end <= start || end > UINT64_C(0x200000000) || end - start > 0x4000000 ||
+    if (!start || end <= start || end > UINT64_C(0x200000000) || end - start > 0x10000000 ||
         !lume_fdt_read(blob, available, &current))
         return false;
     unsigned char *b = blob, *values[2] = {0};

@@ -25,6 +25,10 @@ static struct storage_file
     int write_error;
     bool dirty;
     bool retired;
+#if FF_USE_FASTSEEK
+    DWORD cluster_map[32];
+    bool map_attempted;
+#endif
 } storage_files[STORAGE_HANDLES];
 
 static struct storage_handle
@@ -313,6 +317,13 @@ static const char *name(const char *path)
 
 static void content_changed(struct storage_file *file)
 {
+#if FF_USE_FASTSEEK
+    if (file)
+    {
+        file->file.cltbl = NULL;
+        file->map_attempted = false;
+    }
+#endif
     if (file && file->generation)
         ++file->generation;
 }
@@ -373,6 +384,10 @@ static int open_handle(const char *path, unsigned flags, void **handle)
     {
         if (flags && !(file->file.flag & FA_WRITE))
         {
+#if FF_USE_FASTSEEK
+            file->file.cltbl = NULL;
+            file->map_attempted = false;
+#endif
             result = f_close(&file->file);
             if (result == FR_OK)
                 file->file = candidate;
@@ -461,6 +476,24 @@ static int read_handle(void *handle, uint64_t offset, void *data, size_t bytes)
     FIL *file = &description->file->file;
     if (!bytes || offset >= f_size(file))
         return 0;
+#if FF_USE_FASTSEEK
+    struct storage_file *storage = description->file;
+    if (!storage->map_attempted && !(file->flag & FA_WRITE) && f_size(file) >= 1024u * 1024u)
+    {
+        /* A bounded extent map avoids walking the FAT from the start after
+         * backward executable-page reads. Writable aliases disable the map. */
+        storage->map_attempted = true;
+        storage->cluster_map[0] = sizeof(storage->cluster_map) / sizeof(storage->cluster_map[0]);
+        file->cltbl = storage->cluster_map;
+        FRESULT mapped = f_lseek(file, CREATE_LINKMAP);
+        if (mapped != FR_OK)
+        {
+            file->cltbl = NULL;
+            if (mapped != FR_NOT_ENOUGH_CORE)
+                return error(mapped);
+        }
+    }
+#endif
     UINT count = 0;
     FRESULT result = f_lseek(file, (FSIZE_t)offset);
     if (result == FR_OK)

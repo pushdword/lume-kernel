@@ -12,9 +12,17 @@ static uint64_t capacity, allowed_first, allowed_count;
 
 #define BLOCK_REQUESTS 4u
 #define BLOCK_REQUEST_SECTORS 32u
+#define READ_CACHE_SECTORS 128u
+
+static unsigned char read_cache[READ_CACHE_SECTORS * 512u];
+static uint64_t read_cache_first;
+static unsigned read_cache_count;
 
 _Static_assert(BLOCK_REQUESTS *BLOCK_REQUEST_SECTORS >= LUME_SD_MAX_SECTORS,
                "Block request slots must cover a complete transfer");
+_Static_assert(READ_CACHE_SECTORS == LUME_SD_MAX_SECTORS &&
+                   !(READ_CACHE_SECTORS & (READ_CACHE_SECTORS - 1u)),
+               "Read cache must cover one power-of-two transfer window");
 
 static struct block_request
 {
@@ -97,6 +105,8 @@ static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffe
                        count > capacity - sector)))
         return false;
     transferring = true;
+    if (type == 1)
+        read_cache_count = 0;
     bool success = true;
     unsigned first = 0;
     do
@@ -141,9 +151,39 @@ static bool flush(void)
     return true;
 }
 
+static bool cached_read(uint64_t sector, unsigned count, void *buffer)
+{
+    if (device.failed || transferring || !buffer || !count || count > LUME_SD_MAX_SECTORS ||
+        sector >= capacity || count > capacity - sector)
+        return false;
+    if (read_cache_count >= count && sector >= read_cache_first &&
+        sector - read_cache_first <= read_cache_count - count)
+    {
+        memcpy(buffer, read_cache + (size_t)(sector - read_cache_first) * 512u, count * 512u);
+        return true;
+    }
+    /* Metadata and executable-page reads share a bounded window. Writes invalidate it
+     * before submission, including writes that later fail. */
+    read_cache_count = 0;
+    uint64_t first = sector & ~(uint64_t)(READ_CACHE_SECTORS - 1u);
+    if (sector - first > READ_CACHE_SECTORS - count)
+        first = sector;
+    unsigned sectors =
+        capacity - first < READ_CACHE_SECTORS ? (unsigned)(capacity - first) : READ_CACHE_SECTORS;
+    if (transfer(0, first, sectors, read_cache))
+    {
+        read_cache_first = first;
+        read_cache_count = sectors;
+        memcpy(buffer, read_cache + (size_t)(sector - first) * 512u, count * 512u);
+        return true;
+    }
+    /* A failed speculative read must not hide a readable requested range. */
+    return transfer(0, sector, count, buffer);
+}
+
 static bool read_sector(uint64_t sector, void *buffer)
 {
-    return transfer(0, sector, 1, buffer);
+    return cached_read(sector, 1, buffer);
 }
 
 static bool write_sector(uint64_t sector, const void *buffer)
@@ -160,7 +200,7 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
         count > capacity - sector)
         return false;
-    if (!transfer(0, sector, count, buffer))
+    if (!cached_read(sector, count, buffer))
         return false;
     lume_worker_checkpoint(count * 512);
     return true;
@@ -237,6 +277,7 @@ static const struct lume_platform_sd_ops operations = {
 
 static int module_start(struct lume_hardware *hardware, void *context)
 {
+    read_cache_count = 0;
     struct q35_binding *binding = context;
     uint32_t pci;
     int result = q35_module_pci(hardware, 0x1af4, 0x1001, &pci);
@@ -259,6 +300,7 @@ static int module_start(struct lume_hardware *hardware, void *context)
 
 static int module_stop(struct lume_hardware *hardware, void *context)
 {
+    read_cache_count = 0;
     (void)hardware;
     struct q35_binding *binding = context;
     if (binding->registered)

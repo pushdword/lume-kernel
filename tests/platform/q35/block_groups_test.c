@@ -40,6 +40,7 @@ static unsigned char card[512][512], durable[sizeof(card)];
 static unsigned pending[32], pending_count, peak, submits, flushes, checkpoints, released;
 static unsigned queue_count = 32;
 static bool registered, short_read, bad_id, hold, fail_flush, reset_ack = true;
+static bool fail_read_group;
 
 uint32_t lume_in32(uint16_t port)
 {
@@ -100,6 +101,8 @@ bool lume_virtio_take(struct lume_virtqueue *q, unsigned *id, unsigned *written)
     assert(bytes <= BLOCK_REQUEST_SECTORS * 512 && bytes % 512 == 0);
     assert(request->header.sector + bytes / 512 <= 512);
     request->status = 0;
+    if (request->header.type == 0 && fail_read_group && bytes > 512)
+        request->status = 1;
     if (request->header.type == 0)
         memcpy(request->data, card[request->header.sector], bytes);
     else if (request->header.type == 1)
@@ -205,6 +208,30 @@ int main(void)
     short_read = false;
     assert(write_sector(16, input) && read_sector(16, output));
     assert(!memcmp(input, output, 512));
+    before = submits;
+    assert(read_sector(17, output) && !memcmp(output, card[17], 512));
+    assert(read_blocks(18, 4, output) && !memcmp(output, card[18], 2048));
+    assert(submits == before);
+    assert(write_deferred(17, 1, input + 7));
+    assert(read_sector(17, output) && !memcmp(output, input + 7, 512));
+    assert(operations.lume_sd_sync());
+    assert(read_blocks(200, 8, output) && !memcmp(output, card[200], 4096));
+    before = submits;
+    assert(read_blocks(208, 8, output) && !memcmp(output, card[208], 4096));
+    assert(submits == before);
+    assert(write_deferred(200, 8, input));
+    assert(read_blocks(200, 8, output) && !memcmp(output, input, 4096));
+    assert(operations.lume_sd_sync());
+    fail_read_group = true;
+    before = submits;
+    assert(read_sector(400, output) && !memcmp(output, card[400], 512));
+    assert(submits == before + READ_CACHE_SECTORS / BLOCK_REQUEST_SECTORS + 1 && !device.failed);
+    fail_read_group = false;
+    capacity = 509;
+    assert(read_sector(508, output) && !memcmp(output, card[508], 512));
+    before = submits;
+    assert(!read_sector(509, output) && !read_sector(508, NULL) && submits == before);
+    capacity = 512;
     bad_id = true;
     assert(!read_blocks(16, 128, output) && device.failed && pending_count);
     before = submits;

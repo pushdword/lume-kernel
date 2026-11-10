@@ -953,6 +953,7 @@ bool lume_tasks_active(void)
 
 static struct lume_context *select_task(unsigned next)
 {
+    vm_fault_wait[next] = vm_fault_ready[next] = false;
     lume_wait_cancel(pipe_queues[next], next);
     pipe_queues[next] = 0;
     pipe_wait[next] = false;
