@@ -36,6 +36,7 @@
 #define CLOCK_ENABLE (UINT32_C(1) << 11)
 #define CLOCK_AUX_MASK (UINT32_C(31) << 5)
 #define CLOCK_XOSC (UINT32_C(2) << 5)
+#define CLOCK_CONFIG_MASK (CLOCK_ENABLE | CLOCK_AUX_MASK)
 
 /* GPIO45 is bank 2 pin 11. PWM1 channel 3 uses ALT0 on this pin. */
 #define GPIO45_CTRL 0x805cu

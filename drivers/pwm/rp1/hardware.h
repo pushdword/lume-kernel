@@ -216,6 +216,24 @@ static uint32_t write_register(uintptr_t address, uint32_t value)
     return lume_mmio_read32(address);
 }
 
+static int write_clock_control(struct pwm_context *pwm, uint32_t value)
+{
+    uintptr_t address = (uintptr_t)pwm->auxiliary[0].base + CLOCK_CTRL;
+    uint32_t current = lume_mmio_read32(address);
+    uint32_t requested = (current & ~CLOCK_CONFIG_MASK) | (value & CLOCK_CONFIG_MASK);
+    uint32_t observed = write_register(address, requested);
+    /* Clock status can change independently of the enable and source controls. */
+    if ((observed ^ requested) & CLOCK_CONFIG_MASK)
+    {
+        lume_puts("RP1 PWM: clock configuration did not latch\n");
+        lume_value("CPUFAN_REGISTER", address);
+        lume_value("CPUFAN_EXPECTED", requested);
+        lume_value("CPUFAN_OBSERVED", observed);
+        return -LUME_EIO;
+    }
+    return 0;
+}
+
 static int write_pwm(struct pwm_context *pwm, unsigned offset, uint32_t value)
 {
     return write_register((uintptr_t)pwm->registers.base + offset, value) == value ? 0 : -LUME_EIO;
@@ -321,11 +339,16 @@ static int restore(struct pwm_context *pwm)
             return result;
     }
     uintptr_t clock = (uintptr_t)pwm->auxiliary[0].base;
-    (void)write_register(clock + CLOCK_CTRL, pwm->saved_clock & ~CLOCK_ENABLE);
+    int result = write_clock_control(pwm, pwm->saved_clock & ~CLOCK_ENABLE);
+    if (result)
+        return result;
     if (write_register(clock + CLOCK_DIV_INT, pwm->saved_div_int) != pwm->saved_div_int ||
-        write_register(clock + CLOCK_DIV_FRAC, pwm->saved_div_frac) != pwm->saved_div_frac ||
-        write_register(clock + CLOCK_CTRL, pwm->saved_clock) != pwm->saved_clock ||
-        write_register((uintptr_t)pwm->auxiliary[2].base, pwm->saved_pad) != pwm->saved_pad ||
+        write_register(clock + CLOCK_DIV_FRAC, pwm->saved_div_frac) != pwm->saved_div_frac)
+        return -LUME_EIO;
+    result = write_clock_control(pwm, pwm->saved_clock);
+    if (result)
+        return result;
+    if (write_register((uintptr_t)pwm->auxiliary[2].base, pwm->saved_pad) != pwm->saved_pad ||
         write_register((uintptr_t)pwm->auxiliary[1].base, pwm->saved_gpio) != pwm->saved_gpio)
         return -LUME_EIO;
     pwm->saved = false;
@@ -407,15 +430,15 @@ static int fan_prepare(struct pwm_context *pwm)
         (pwm->saved_pad & ~(PAD_OUTPUT_DISABLE | PAD_PULL_MASK)) | PAD_INPUT_ENABLE | PAD_PULL_DOWN;
     if (write_register(gpio, gpio_safe) != gpio_safe || write_register(pad, pad_value) != pad_value)
         return -LUME_EIO;
-    (void)write_register(clock + CLOCK_CTRL, pwm->saved_clock & ~CLOCK_ENABLE);
+    result = write_clock_control(pwm, pwm->saved_clock & ~CLOCK_ENABLE);
+    if (result)
+        return result;
     uint32_t clock_value =
         (pwm->saved_clock & ~(CLOCK_ENABLE | CLOCK_AUX_MASK)) | CLOCK_XOSC | CLOCK_ENABLE;
     if (write_register(clock + CLOCK_DIV_INT, pwm->divider >> 16) != pwm->divider >> 16 ||
-        write_register(clock + CLOCK_DIV_FRAC, pwm->divider << 16) != pwm->divider << 16 ||
-        write_register(clock + CLOCK_CTRL, clock_value) != clock_value)
+        write_register(clock + CLOCK_DIV_FRAC, pwm->divider << 16) != pwm->divider << 16)
         return -LUME_EIO;
-
-    return 0;
+    return write_clock_control(pwm, clock_value);
 }
 
 static int fan_publish(struct pwm_context *pwm)

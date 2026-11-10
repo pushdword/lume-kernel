@@ -14,6 +14,8 @@ static void lume_mmio_write32_sync(uintptr_t address, uint32_t value);
 static uintptr_t rp1;
 static uint32_t pwm_regs[64], clock_regs[64], gpio_control, gpio_pad;
 static unsigned writes, fail_write, updates;
+static unsigned clock_reads;
+#define CLOCK_STATUS_BIT (UINT32_C(1) << 28)
 static unsigned enable_on_messages, enable_off_messages, update_messages;
 static bool stuck, no_rpm, no_levels;
 static uint32_t parent_id, oscillator_id, clock_id, gpio_id, pwm_id, fan_id;
@@ -38,6 +40,8 @@ static uint32_t lume_mmio_read32(uintptr_t address)
     uint32_t *value = reg(address);
     if (address == rp1 + 0x9c000 + PWM_GLOBAL_CTRL && !stuck)
         *value &= ~PWM_GLOBAL_SET_UPDATE;
+    if (address == rp1 + 0x18000 + RP1_CLOCK_PWM1 + CLOCK_CTRL)
+        return (*value & ~CLOCK_STATUS_BIT) | (++clock_reads & 1 ? CLOCK_STATUS_BIT : 0);
     return *value;
 }
 
@@ -49,6 +53,8 @@ static void lume_mmio_write32_sync(uintptr_t address, uint32_t value)
         return;
     if (address == rp1 + 0x9c000 + PWM_GLOBAL_CTRL)
         updates += (value & PWM_GLOBAL_SET_UPDATE) != 0;
+    if (address == rp1 + 0x18000 + RP1_CLOCK_PWM1 + CLOCK_CTRL)
+        value &= ~CLOCK_STATUS_BIT;
     *reg(address) = value;
 }
 
@@ -82,7 +88,8 @@ void lume_puts(const char *value)
 
 void lume_value(const char *name, uint64_t value)
 {
-    assert(name && value);
+    assert(name);
+    (void)value;
 }
 
 static int firmware_property(const void *context, uint64_t token, const char *name, unsigned kind,
@@ -167,7 +174,7 @@ static void fixture(uintptr_t base)
     clock_regs[(RP1_CLOCK_PWM1 + CLOCK_DIV_INT) / 4] = 5;
     gpio_control = 0x01000005;
     gpio_pad = PAD_OUTPUT_DISABLE | PAD_INPUT_ENABLE;
-    writes = updates = fail_write = 0;
+    writes = updates = fail_write = clock_reads = 0;
     enable_on_messages = enable_off_messages = update_messages = 0;
     stuck = no_rpm = no_levels = false;
     oscillator_hz = requested_hz = 50000000;
@@ -228,6 +235,8 @@ static void normal(void)
     assert(pwm_regs[PWM_CHAN3_PHASE / 4] == 0);
     assert(pwm_regs[PWM_CHAN3_RANGE / 4] == 2078);
     assert(pwm_regs[PWM_CHAN3_DUTY / 4] == 2078);
+    assert((clock_regs[(RP1_CLOCK_PWM1 + CLOCK_CTRL) / 4] & CLOCK_CONFIG_MASK) ==
+           (CLOCK_ENABLE | CLOCK_XOSC));
     assert(pwm_regs[0] == 8 && pwm_regs[0x3c / 4] == 4250 && updates == 2);
     assert(enable_on_messages == 1 && enable_off_messages == 1 && update_messages == 2);
     assert(!(gpio_control & GPIO_CONFIG_MASK));
