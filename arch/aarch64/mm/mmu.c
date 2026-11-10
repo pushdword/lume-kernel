@@ -102,7 +102,8 @@ void lume_mmu_secondary(void)
     __asm__ volatile("dsb sy; msr mair_el1, %0; msr tcr_el1, %1; msr ttbr0_el1, %2;"
                      "isb; tlbi vmalle1; dsb sy; isb; ic iallu; dsb sy; isb; mrs %3, sctlr_el1"
                      : "+r"(mair), "+r"(tcr), "+r"(base), "=r"(sctlr)::"memory");
-    sctlr |= 1 | 4 | (UINT64_C(1) << 12) | (UINT64_C(1) << 19);
+    /* EL0 cache-zero stores retain the mapping's write permission checks. */
+    sctlr |= 1 | 4 | (UINT64_C(1) << 12) | (UINT64_C(1) << 14) | (UINT64_C(1) << 19);
     __asm__ volatile("msr sctlr_el1, %0; isb" ::"r"(sctlr) : "memory");
     uint64_t counter_control;
     __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(counter_control));

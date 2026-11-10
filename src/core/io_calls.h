@@ -11,11 +11,53 @@ static bool kernel_pipe_buffer_busy(unsigned task, const struct lume_context *fr
            lume_vm_buffer_busy(process, LUME_CONTEXT_REG(frame, 1), LUME_CONTEXT_REG(frame, 2));
 }
 
+static bool task_signal_pending(unsigned);
+
+static void kernel_pipe_read_complete(unsigned task, struct lume_wait_queue *queue)
+{
+    struct lume_context *frame = &tasks[task].context;
+    if (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) != LUME_SYS_READ)
+        return;
+    unsigned process = process_slot(task);
+    struct lume_files *files = &tasks[process].files;
+    uint64_t fd = LUME_CONTEXT_REG(frame, 0), address = LUME_CONTEXT_REG(frame, 1);
+    uint64_t bytes = LUME_CONTEXT_REG(frame, 2);
+    if (process_exiting[process] || process_stopped[process] || main_thread_done[process] ||
+        task_signal_pending(task) || task_signal_pending(process) ||
+        files->identity.sandbox_profile || lume_vfs_pipe_queue(files, fd, false) != queue ||
+        lume_vm_buffer_busy(process, address, bytes) || lume_sandbox_io(files, fd, false))
+        return;
+    int64_t result;
+    if (lume_user_io_pipe_read_ready(files, process + 1, fd, address, bytes, &result) &&
+        result >= 0)
+    {
+        LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
+        LUME_CONTEXT_PC(frame) += LUME_SYSCALL_INSTRUCTION_BYTES;
+    }
+}
+
+static bool kernel_pipe_single_waiter(const struct lume_wait_queue *queue)
+{
+    bool found = false;
+    for (unsigned word = 0; word <= LUME_WAIT_EXTRA_WORDS; ++word)
+    {
+        uint64_t bits = word ? queue->waiting_more[word - 1] | queue->ready_more[word - 1]
+                             : queue->waiting | queue->ready;
+        if (bits)
+        {
+            if (found || (bits & (bits - 1)))
+                return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
 static void kernel_pipe_wake(struct lume_wait_queue *queue)
 {
     if (!queue)
         return;
-    bool woken = false;
+    bool woken = false, single = kernel_pipe_single_waiter(queue);
     for (unsigned word = 0; word <= LUME_WAIT_EXTRA_WORDS; ++word)
     {
         uint64_t ready = word ? queue->ready_more[word - 1] : queue->ready;
@@ -27,6 +69,8 @@ static void kernel_pipe_wake(struct lume_wait_queue *queue)
             if (task >= LUME_TASK_LIMIT || states[task] != 4 || !pipe_wait[task] ||
                 kernel_wait[task] || pipe_queues[task] != queue || !lume_wait_take(queue, task))
                 continue;
+            if (single)
+                kernel_pipe_read_complete(task, queue);
             pipe_queues[task] = NULL;
             pipe_wait[task] = input_wait[task] = kernel_wait[task] = false;
             states[task] = 1;

@@ -83,6 +83,8 @@ int main(void)
         pages[i] = lume_page_alloc_uninitialized(0);
         assert(pages[i] / 0x40000000 == i % 8);
         assert(pages[i] != 0x60200000);
+        if (i < 8 && i != 1)
+            assert((pages[i] >> 12 & 15) == (i * 2 & 15));
         for (unsigned j = 0; j < i; ++j)
             assert(pages[i] != pages[j]);
     }

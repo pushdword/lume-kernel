@@ -56,8 +56,8 @@ static void resident_copy(const uint64_t physical[2], void *buffer, size_t bytes
     }
 }
 
-bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
-                           uint64_t bytes, bool writing, int64_t *result)
+static bool pipe_resident(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                          uint64_t bytes, bool writing, bool remote, int64_t *result)
 {
     if (bytes > LUME_USER_RESIDENT_MAX || !lume_vfs_pipe_io(files, fd))
         return false;
@@ -69,7 +69,10 @@ bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, 
     }
     bytes = (uint64_t)accepted;
     uint64_t physical[2];
-    if (!lume_user_buffer_resident(pid, address, (size_t)bytes, !writing, physical))
+    bool valid =
+        remote ? lume_user_buffer_resident_remote(pid, address, (size_t)bytes, !writing, physical)
+               : lume_user_buffer_resident(pid, address, (size_t)bytes, !writing, physical);
+    if (!valid)
         return false;
     unsigned char buffer[LUME_USER_RESIDENT_MAX];
     if (writing && bytes)
@@ -81,6 +84,18 @@ bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, 
     if (!writing && *result > 0)
         resident_copy(physical, buffer, (size_t)*result, true);
     return true;
+}
+
+bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, uint64_t address,
+                           uint64_t bytes, bool writing, int64_t *result)
+{
+    return pipe_resident(files, pid, fd, address, bytes, writing, false, result);
+}
+
+bool lume_user_io_pipe_read_ready(struct lume_files *files, unsigned pid, uint64_t fd,
+                                  uint64_t address, uint64_t bytes, int64_t *result)
+{
+    return pipe_resident(files, pid, fd, address, bytes, false, true, result);
 }
 
 static int64_t transfer(struct lume_files *files, uint64_t fd, void *data, uint64_t bytes,

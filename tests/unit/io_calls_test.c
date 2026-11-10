@@ -57,6 +57,7 @@ static unsigned resident_calls;
 static bool terminal_pipe_descriptor;
 static unsigned clock_reads;
 static int64_t resident_result;
+static unsigned remote_task = LUME_TASK_LIMIT, remote_reads;
 static bool worker_suspended[LUME_WORK_DOMAINS], work_pending[LUME_WORK_DOMAINS];
 static bool worker_blocked[LUME_WORK_DOMAINS];
 static bool work_requeue[LUME_WORK_DOMAINS];
@@ -531,6 +532,11 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
 
 int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
 {
+    if (remote_task < LUME_TASK_LIMIT && files == &tasks[remote_task].files)
+    {
+        assert(fd == 3 && !writing);
+        return sandbox_result;
+    }
     assert(files == &tasks[process_slot(current_task)].files && fd == 3);
     if (pipe_locked)
         assert(writing == expect_writing);
@@ -567,6 +573,16 @@ bool lume_user_io_pipe_try(struct lume_files *files, unsigned pid, uint64_t fd, 
     return resident_ready;
 }
 
+bool lume_user_io_pipe_read_ready(struct lume_files *files, unsigned pid, uint64_t fd,
+                                  uint64_t address, uint64_t bytes, int64_t *result)
+{
+    assert(pipe_locked && remote_task < LUME_TASK_LIMIT && files == &tasks[remote_task].files);
+    assert(pid == remote_task + 1 && fd == 3 && address == 0x123000 && bytes == 17);
+    ++remote_reads;
+    *result = resident_result;
+    return resident_ready;
+}
+
 bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
 {
     assert(pipe_locked && files == &tasks[process_slot(current_task)].files);
@@ -581,6 +597,8 @@ bool lume_vfs_pipe_wait(struct lume_files *files, uint64_t fd)
 
 struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *files, uint64_t fd, bool writing)
 {
+    if (remote_task < LUME_TASK_LIMIT && files == &tasks[remote_task].files)
+        return fd == 3 && !writing ? &pipe_peer_queue : NULL;
     assert(files == &tasks[pipe_process].files && fd == 3);
     return writing == expect_writing ? &pipe_queue : &pipe_peer_queue;
 }
@@ -646,6 +664,8 @@ void *lume_kernel_allocate(size_t bytes)
 
 static void reset(void)
 {
+    remote_task = LUME_TASK_LIMIT;
+    remote_reads = 0;
     active = resident_ready = terminal_pipe_descriptor = true;
     pipe_locked = false;
     resident_calls = 0;
@@ -926,6 +946,56 @@ static void directed_pipe_wake(void)
     assert(pipe_peer_queue.ready & (UINT64_C(1) << 17));
     call.x[0] = 3;
     assert(kernel_pipe_result(&call) == &call && wake_count[65] == 1);
+}
+
+static void completed_pipe_read_wake(void)
+{
+    for (unsigned mode = 0; mode < 10; ++mode)
+    {
+        reset();
+        remote_task = 3;
+        current_task = 1;
+        pipe_locked = true;
+        states[3] = 4;
+        pipe_wait[3] = true;
+        pipe_queues[3] = &pipe_peer_queue;
+        tasks[3].context = pipe_frame(false);
+        tasks[3].context.x[1] = 0x123000;
+        tasks[3].context.x[2] = 17;
+        tasks[3].context.pc -= LUME_SYSCALL_INSTRUCTION_BYTES;
+        struct lume_context before = tasks[3].context;
+        resident_result = mode == 1 ? -LUME_EAGAIN : mode == 2 ? 0 : 17;
+        if (mode == 3)
+            pending_signal = true;
+        if (mode == 4)
+            process_stopped[3] = true;
+        if (mode == 5)
+            process_exiting[3] = true;
+        if (mode == 6)
+            tasks[3].files.identity.sandbox_profile = 1;
+        if (mode == 7)
+            vm_busy[3] = true;
+        if (mode == 8)
+            resident_ready = false;
+        if (mode == 9)
+        {
+            states[65] = 4;
+            pipe_wait[65] = true;
+            pipe_queues[65] = &pipe_peer_queue;
+            assert(lume_wait_subscribe(&pipe_peer_queue, 65));
+        }
+        assert(lume_wait_subscribe(&pipe_peer_queue, 3));
+        lume_wait_wake(&pipe_peer_queue);
+        kernel_pipe_wake(&pipe_peer_queue);
+        assert(states[3] == 1 && !pipe_wait[3] && !pipe_queues[3] && wake_count[3] == 1);
+        if (mode == 0 || mode == 2)
+        {
+            before.x[0] = (uint64_t)resident_result;
+            before.pc += LUME_SYSCALL_INSTRUCTION_BYTES;
+        }
+        assert(!memcmp(&before, &tasks[3].context, sizeof(before)));
+        assert(remote_reads == (mode <= 2 || mode == 8 ? 1u : 0u));
+    }
 }
 
 static void inline_pipe_wait_and_replay(void)
@@ -1901,6 +1971,7 @@ int main(void)
     pipe_and_fairness();
     inline_pipe_completion();
     directed_pipe_wake();
+    completed_pipe_read_wake();
     inline_pipe_wait_and_replay();
     pipe_ready_handoff();
     terminal_pipe_query();

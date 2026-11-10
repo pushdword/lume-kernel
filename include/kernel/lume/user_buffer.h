@@ -33,4 +33,5 @@ void lume_user_buffer_invalidate_root(unsigned);
 /* Resident spans require the scheduler lock through their final copy. They do
  * not resolve faults or retain mappings across callbacks or suspension. */
 bool lume_user_buffer_resident(unsigned, uint64_t, size_t, bool, uint64_t[2]);
+bool lume_user_buffer_resident_remote(unsigned, uint64_t, size_t, bool, uint64_t[2]);
 #endif

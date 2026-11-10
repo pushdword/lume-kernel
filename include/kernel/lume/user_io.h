@@ -16,4 +16,6 @@ int64_t lume_user_io_vector_call(struct lume_files *, unsigned, uint64_t, uint64
  * A false result leaves the pipe and user buffer untouched. */
 bool lume_user_io_pipe_try(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t, bool,
                            int64_t *);
+bool lume_user_io_pipe_read_ready(struct lume_files *, unsigned, uint64_t, uint64_t, uint64_t,
+                                  int64_t *);
 #endif

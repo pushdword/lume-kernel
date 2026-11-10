@@ -81,6 +81,17 @@ static void resident_pipes(void)
         lume_user_io_pipe_try(&files[0], 1, writing, destination + 4080, 512, true, &transferred));
     CHECK(transferred == 512 && lume_wait_take(queue, 7));
     fill_destination(0x42);
+    uint64_t saved_root = active_root;
+    active_root = 4;
+    CHECK(!lume_user_io_pipe_try(&files[0], 1, reading, destination + 4080, 512, false,
+                                 &transferred));
+    CHECK(
+        lume_user_io_pipe_read_ready(&files[0], 1, reading, destination + 4080, 512, &transferred));
+    CHECK(transferred == 512);
+    CHECK(active_root == 4);
+    active_root = saved_root;
+    CHECK(
+        lume_user_io_pipe_try(&files[0], 1, writing, destination + 4080, 512, true, &transferred));
     CHECK(
         !lume_user_io_pipe_try(&files[0], 1, reading, destination + 8191, 2, false, &transferred));
     CHECK(vm(0, LUME_VM_PROTECT, destination, 8192, LUME_PROT_READ, 0, -1) == 0);

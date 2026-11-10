@@ -28,18 +28,22 @@ static bool view_matches(const struct lume_user_buffer_token *token)
 #endif
 }
 
-bool lume_user_buffer_resident(unsigned pid, uint64_t first, size_t bytes, bool write,
-                               uint64_t physical[2])
+static bool resident(unsigned pid, uint64_t first, size_t bytes, bool write, bool remote,
+                     uint64_t physical[2])
 {
     if (!lume_smp_owned() || !pid || pid > LUME_TASK_LIMIT || bytes > LUME_USER_RESIDENT_MAX ||
         first > UINTPTR_MAX || bytes > UINTPTR_MAX - first)
         return false;
     unsigned owner = pid - 1;
     uint64_t root = user_root(owner);
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    if (remote)
+        root = lume_mmu_task_view_root(owner, false);
+#endif
     if (!root || !lume_vm_buffer_ready(owner, first, bytes))
         return false;
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-    if (!lume_mmu_root_active(root))
+    if (!remote && !lume_mmu_root_active(root))
         return false;
 #endif
     if (!bytes)
@@ -49,6 +53,18 @@ bool lume_user_buffer_resident(unsigned pid, uint64_t first, size_t bytes, bool 
     size_t part = 4096u - (size_t)(first & 4095u);
     return bytes <= part ||
            lume_mmu_translate(root, first + part, write, true, false, physical + 1);
+}
+
+bool lume_user_buffer_resident(unsigned pid, uint64_t first, size_t bytes, bool write,
+                               uint64_t physical[2])
+{
+    return resident(pid, first, bytes, write, false, physical);
+}
+
+bool lume_user_buffer_resident_remote(unsigned pid, uint64_t first, size_t bytes, bool write,
+                                      uint64_t physical[2])
+{
+    return resident(pid, first, bytes, write, true, physical);
 }
 
 int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid, uint64_t first,

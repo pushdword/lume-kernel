@@ -278,7 +278,15 @@ uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
                 continue;
             uint64_t start = region_cursor[region];
             if (start < low || start >= end)
-                start = low;
+            {
+                start = find_page(low, end);
+                if (!start)
+                    continue;
+                /* Stagger bank cursors across the sixteen page colours in L2. */
+                unsigned phase = region * (16 / region_count);
+                if (end - start > phase)
+                    start += phase;
+            }
             p = find_page(start, end);
             if (!p && start > low)
                 p = find_page(low, start);
