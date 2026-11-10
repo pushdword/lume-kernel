@@ -95,7 +95,9 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
                 continue; /* Null and ATF have no kernel mapping. */
             unsigned l1 = (unsigned)(p >> 30), l2 = (unsigned)((p >> 21) & 511);
             root[l1] = table(ram_l2[l1]);
-            ram_l2[l1][l2] = p | NORMAL | PXN | UXN | 1;
+            /* User roots replace these identity aliases with private pages. */
+            uint64_t scope = p >= LUME_USER_BASE && p < LUME_USER_LIMIT ? NG : 0;
+            ram_l2[l1][l2] = p | NORMAL | PXN | UXN | scope | 1;
         }
     }
     root[0] = table(ram_l2[0]);

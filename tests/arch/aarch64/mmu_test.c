@@ -143,6 +143,20 @@ _Noreturn void lume_fail(const char *message)
     abort();
 }
 
+static uint64_t descriptor(uint64_t root, uint64_t address)
+{
+    uint64_t *entries = (void *)(uintptr_t)(root & UINT64_C(0x0000fffffffff000));
+    for (unsigned shift = 39;; shift -= 9)
+    {
+        uint64_t entry = entries[(address >> shift) & 511];
+        CHECK(entry & 1);
+        if (shift == 12 || (entry & 3) == 1)
+            return entry;
+        CHECK((entry & 3) == 3);
+        entries = (void *)(uintptr_t)(entry & UINT64_C(0x0000fffffffff000));
+    }
+}
+
 int main(void)
 {
     struct lume_fdt fdt = {.ram_count = 2,
@@ -150,6 +164,10 @@ int main(void)
     struct lume_layout layout = {0x200000, 0x204000, 0x207000, 0x300000, 0x2ef000, 0x2dd000};
     CHECK(lume_mmu_tables(&fdt, &layout));
     uint64_t pa, root = lume_mmu_root();
+    CHECK(descriptor(root, LUME_USER_BASE) & (UINT64_C(1) << 11));
+    CHECK(descriptor(root, LUME_USER_LIMIT - 4096) & (UINT64_C(1) << 11));
+    CHECK(!(descriptor(root, LUME_USER_LIMIT) & (UINT64_C(1) << 11)));
+    CHECK(!(descriptor(root, 0x200000) & (UINT64_C(1) << 11)));
     CHECK(!lume_mmu_translate(root, 0, false, false, false, &pa));
     CHECK(!lume_mmu_translate(root, 0x80000, false, false, false, &pa));
     CHECK(lume_mmu_translate(root, 0x200000, false, false, true, &pa) && pa == 0x200000);
@@ -324,6 +342,8 @@ int main(void)
           page_invalidations[0] == invalidated);
     uint64_t reader = lume_mmu_task_view_root(0, false), writer = lume_mmu_task_view_root(0, true);
     CHECK(reader && writer && reader != writer);
+    CHECK(descriptor(reader, LUME_USER_BASE) & (UINT64_C(1) << 11));
+    CHECK(descriptor(writer, LUME_USER_BASE) & (UINT64_C(1) << 11));
     CHECK(reader >> 48 == 1 && writer >> 48 == 2);
     CHECK(lume_mmu_task_view_root(1, false) >> 48 == 3);
     CHECK(lume_mmu_task_view_root(1, true) >> 48 == 4);
