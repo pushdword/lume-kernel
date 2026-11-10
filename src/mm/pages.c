@@ -18,6 +18,8 @@ static uint64_t used[MAX_PAGES / 64], managed[MAX_PAGES / 64], free_count;
 static uint64_t cursor;
 static uint64_t span_cursor;
 static uint64_t total_count;
+static uint64_t region_cursor[16], region_pages;
+static unsigned region_count, next_region;
 
 static bool overlaps(uint64_t a, uint64_t size, uint64_t b, uint64_t bytes)
 {
@@ -69,6 +71,29 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
         }
     }
     total_count = free_count;
+    region_count = 0;
+    next_region = 0;
+    for (unsigned i = 0; i < 16; ++i)
+        region_cursor[i] = 0;
+    if (fdt->pi5 && fdt->memory_regions > 1 && fdt->memory_regions <= 16 &&
+        !(fdt->memory_regions & (fdt->memory_regions - 1)))
+    {
+        uint64_t extent = 0;
+        for (unsigned r = 0; r < fdt->ram_count; ++r)
+        {
+            uint64_t end = fdt->ram[r].base + fdt->ram[r].size;
+            if (end > PHYSICAL_LIMIT)
+                end = PHYSICAL_LIMIT;
+            if (end > extent)
+                extent = end;
+        }
+        uint64_t aligned = 4096;
+        while (aligned < extent)
+            aligned *= 2;
+        region_pages = aligned / 4096 / fdt->memory_regions;
+        if (region_pages >= 512)
+            region_count = fdt->memory_regions;
+    }
 }
 
 uint64_t lume_pages_total(void)
@@ -218,6 +243,17 @@ uint64_t lume_pages_alloc_span(unsigned count)
     return physical;
 }
 
+static uint64_t find_page(uint64_t first, uint64_t end)
+{
+    for (uint64_t word = first / 64; first < end && word <= (end - 1) / 64; ++word)
+    {
+        uint64_t available = ~used[word] & span_mask(word, first, end);
+        if (available)
+            return word * 64 + (unsigned)__builtin_ctzll(available);
+    }
+    return 0;
+}
+
 uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
 {
     if (!free_count || minimum >= PHYSICAL_LIMIT)
@@ -225,22 +261,48 @@ uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
     uint64_t first = (minimum + 4095) / 4096;
     if (!first)
         first = 1;
-    uint64_t count = MAX_PAGES - first;
-    uint64_t start = cursor >= first && cursor < MAX_PAGES ? cursor : first;
-    for (uint64_t n = 0, p = start; n < count; ++n)
+    uint64_t p = 0;
+    if (region_count)
     {
-        uint64_t mask = UINT64_C(1) << (p & 63);
-        if (!(used[p / 64] & mask))
+        /* Firmware regions select SDRAM banks. Rotate single-page allocations
+         * across banks while keeping DMA spans physically contiguous. */
+        for (unsigned n = 0; n < region_count; ++n)
         {
-            used[p / 64] |= mask;
-            --free_count;
-            cursor = p + 1;
-            return p * 4096;
+            unsigned region = (next_region + n) % region_count;
+            uint64_t low = region * region_pages, end = low + region_pages;
+            if (end > MAX_PAGES)
+                end = MAX_PAGES;
+            if (low < first)
+                low = first;
+            if (low >= end)
+                continue;
+            uint64_t start = region_cursor[region];
+            if (start < low || start >= end)
+                start = low;
+            p = find_page(start, end);
+            if (!p && start > low)
+                p = find_page(low, start);
+            if (p)
+            {
+                region_cursor[region] = p + 1;
+                next_region = (region + 1) % region_count;
+                break;
+            }
         }
-        if (++p == MAX_PAGES)
-            p = first;
     }
-    return 0;
+    else
+    {
+        uint64_t start = cursor >= first && cursor < MAX_PAGES ? cursor : first;
+        p = find_page(start, MAX_PAGES);
+        if (!p && start > first)
+            p = find_page(first, start);
+    }
+    if (!p)
+        return 0;
+    used[p / 64] |= UINT64_C(1) << (p & 63);
+    --free_count;
+    cursor = p + 1;
+    return p * 4096;
 }
 
 uint64_t lume_page_alloc(uint64_t minimum)

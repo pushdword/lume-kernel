@@ -219,6 +219,21 @@ vector_common:
     mrs x1, tpidr_el0
     str x1, [sp, #272]
     str xzr, [sp, #280]
+    cmp x0, #8
+    b.ne vector_save_fp
+    mrs x1, CurrentEL
+    cmp x1, #4
+    b.ne vector_save_fp
+    mrs x1, esr_el1
+    mov x0, sp
+    bl lume_aarch64_query_try
+    cbz w0, vector_query_miss
+    mov x30, sp
+    add sp, sp, #816
+    b restore_integer_context
+vector_query_miss:
+    mov x0, #8
+vector_save_fp:
     stp q0, q1, [sp, #288]
     stp q2, q3, [sp, #320]
     stp q4, q5, [sp, #352]
@@ -268,6 +283,7 @@ restore_context:
     ldr x2, [x30, #808]
     msr fpcr, x1
     msr fpsr, x2
+restore_integer_context:
     ldr x1, [x30, #248]
     msr sp_el0, x1
     ldp x1, x2, [x30, #256]

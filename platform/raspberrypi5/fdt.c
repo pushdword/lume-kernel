@@ -45,6 +45,35 @@ static bool span(uint32_t start, uint32_t count, uint32_t size)
     return start <= size && count <= size - start;
 }
 
+static unsigned memory_regions(const unsigned char *text, size_t bytes)
+{
+    static const char prefix[] = "numa=fake=";
+    unsigned regions = 0;
+    for (size_t at = 0; at < bytes && text[at];)
+    {
+        while (at < bytes && (text[at] == ' ' || text[at] == '\t'))
+            ++at;
+        size_t first = at;
+        while (at < bytes && text[at] && text[at] != ' ' && text[at] != '\t')
+            ++at;
+        size_t end = at;
+        unsigned i = 0;
+        while (i < sizeof(prefix) - 1 && first + i < end && text[first + i] == prefix[i])
+            ++i;
+        if (i != sizeof(prefix) - 1)
+            continue;
+        unsigned value = 0;
+        for (first += i; first < end && text[first] >= '0' && text[first] <= '9'; ++first)
+        {
+            if (value > 16)
+                break;
+            value = value * 10 + text[first] - '0';
+        }
+        regions = first == end && value && value <= 16 && !(value & (value - 1)) ? value : 0;
+    }
+    return regions;
+}
+
 static uint64_t be64(const unsigned char *p)
 {
     return (uint64_t)be32(p) << 32 | be32(p + 4);
@@ -427,6 +456,12 @@ bool lume_fdt_read(const void *blob, size_t available, struct lume_fdt *out)
             }
             if (depth == 2 && in_psci && equals(key, key_len + 1, "method"))
                 out->psci_smc = equals(b + pos, n, "smc");
+            if (chosen[depth - 1] && equals(key, key_len + 1, "bootargs"))
+            {
+                if (length(b + pos, n) == n)
+                    return false;
+                out->memory_regions = memory_regions(b + pos, n);
+            }
             if (chosen[depth - 1] && (equals(key, key_len + 1, "linux,initrd-start") ||
                                       equals(key, key_len + 1, "linux,initrd-end")))
             {

@@ -33,7 +33,7 @@
 #include "lume/process.h"
 #include "lume/tty_device.h"
 #include "lume/user_io.h"
-#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
 #include "lume/query.h"
 #endif
 #include <string.h>
@@ -185,7 +185,7 @@ static void task_query_publish(const struct lume_context *);
 
 static void task_query_revoke(unsigned process)
 {
-#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
     if (process == LUME_TASK_LIMIT)
         for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
             lume_arch_query_revoke(i);
@@ -209,7 +209,7 @@ void lume_task_trap_enter(uint64_t at)
 void lume_task_account_enter(const struct lume_context *frame)
 {
     uint64_t query_ticks = 0;
-#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
     struct lume_query_account query;
     lume_arch_query_drain(&query);
     if (query.calls)
@@ -821,7 +821,7 @@ static bool task_signal_pending(unsigned owner)
 
 static void task_query_publish(const struct lume_context *frame)
 {
-#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
     unsigned task = current_task, allowed = 0, pid = 0;
     uint64_t tid = 0;
     if (frame && !(LUME_CONTEXT_STATUS(frame) & 15) && public_mode && active &&
@@ -832,12 +832,14 @@ static void task_query_publish(const struct lume_context *frame)
             !task_signal_pending(task) && !task_signal_pending(process))
         {
             static const struct lume_context pid_query = {
-                .reg = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_GETPID}};
+                .LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_GETPID}};
             static const struct lume_context tid_query = {
-                .reg = {[0] = LUME_THREAD_SELF, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
+                .LUME_CONTEXT_REGISTERS = {[0] = LUME_THREAD_SELF,
+                                           [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
             pid = process + 1;
             tid = thread_id(thread_slots, task);
-            allowed |= LUME_QUERY_PIPE;
+            if (!tasks[process].files.identity.sandbox_profile)
+                allowed |= LUME_QUERY_PIPE;
             if (!lume_sandbox_check(&tasks[process].files, pid, &pid_query))
                 allowed |= LUME_QUERY_PID;
             if (!lume_sandbox_check(&tasks[process].files, pid, &tid_query))

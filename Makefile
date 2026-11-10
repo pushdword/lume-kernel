@@ -93,7 +93,7 @@ NATIVE_CPPFLAGS ?= -nostdinc -isystem "$(SDK)/sdk/bare"
 native-directories: $(OUT)/diagnostic.elf $(OUT)/configuration
 	mkdir -p $(foreach directory,$(sort $(dir $(OBJECTS))),"$(directory)")
 native-responses: native-directories
-	$(foreach source,$(KERNEL_C),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF "$(OUT)/obj/$(source).o.d" -MT "$(OUT)/obj/$(source).o" -c "$(source)" -o "$(OUT)/obj/$(source).o"))
+	$(foreach source,$(KERNEL_C),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(CFLAGS) $(if $(filter arch/aarch64/context/query.c,$(source)),-mgeneral-regs-only) -MMD -MP -MF "$(OUT)/obj/$(source).o.d" -MT "$(OUT)/obj/$(source).o" -c "$(source)" -o "$(OUT)/obj/$(source).o"))
 	$(foreach source,$(KERNEL_S),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(filter-out -mgeneral-regs-only,$(CFLAGS)) $(if $(filter arch/aarch64/boot/elf_blob.S,$(source)),-DLUME_USER_ELF_FILE='"$(OUT)/diagnostic.elf"') $(if $(filter arch/aarch64/boot/shell_blob.S,$(source)),-DLUME_SHELL_ELF_FILE='"$(SHELL_ELF)"') -c "$(source)" -o "$(OUT)/obj/$(source).o"))
 	$(file >$(OUT)/native-jobs)
 	$(foreach object,$(OBJECTS),$(file >>$(OUT)/native-jobs,$(object).rsp))
@@ -147,6 +147,7 @@ headers:
 	mkdir -p "$(OUT)/include"
 	cp -Rp include/uapi/. "$(OUT)/include/"
 	cp -Rp $(UAPI_ABI)/. "$(OUT)/include/"
+$(OUT)/obj/arch/aarch64/context/query.c.o: CFLAGS += -mgeneral-regs-only
 $(OUT)/obj/%.c.o: %.c $(OUT)/configuration Makefile
 	mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF "$@.d" -MT "$@" -c "$<" -o "$@"
@@ -393,6 +394,19 @@ $(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h 
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 .PHONY: check-amd64-query
+.PHONY: check-aarch64-query
+.PHONY: check-page-regions
+check-page-regions: $(OUT)/tests/page-regions$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/page-regions$(HOSTEXE): tests/platform/raspberrypi5/page_regions_test.c src/mm/pages.c platform/raspberrypi5/fdt.c include/kernel/lume/early.h include/kernel/lume/worker.h arch/aarch64/include/kernel/lume/context.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Iarch/aarch64/include/kernel -Iinclude/kernel -Iinclude/ddk -Iinclude/abi/native -Iinclude/uapi "$<" -o "$@"
+
+check-aarch64-query: $(OUT)/tests/aarch64-query$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/aarch64-query$(HOSTEXE): tests/arch/aarch64/query_test.c arch/aarch64/context/query.c arch/aarch64/include/kernel/lume/aarch64_query.h include/kernel/lume/query.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Iarch/aarch64/include/kernel -Iinclude/kernel -Iinclude/ddk -Iinclude/abi/native -Iinclude/uapi "$<" -o "$@"
 check-amd64-query: $(OUT)/tests/amd64-query$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/kernel/lume/vm.h

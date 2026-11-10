@@ -23,6 +23,7 @@
 #include "lume/activity.h"
 #include "lume/boot_trial.h"
 #include "lume/uart_rx.h"
+#include "lume/aarch64_query.h"
 #include <libfdt.h>
 
 #ifndef LUME_BUILD_ID
@@ -144,6 +145,14 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     if (translated && (vector == 5 || vector == 9) && lume_pi5_uart_rx_interrupt(&irq_token))
         return frame;
     bool user = (frame->spsr & 15) == 0;
+    if (translated && user && vector == 8)
+    {
+        uint64_t cause;
+        __asm__ volatile("mrs %0, esr_el1" : "=r"(cause));
+        struct lume_context *next;
+        if (lume_aarch64_pipe_try(frame, cause, &next))
+            return next;
+    }
     if (user)
         lume_task_trap_enter(lume_counter_read());
     /* Translation gives the kernel lock Normal memory attributes. Early
@@ -260,6 +269,7 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     lume_puts("LUME CHECK MMU CACHE WX GUARD PASS\n");
     lume_smp_configure(&fdt);
     lume_pages_start(&fdt, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end);
+    lume_value("MEMORY_REGIONS", fdt.pi5 ? fdt.memory_regions : 0);
     lume_value("FREE_PHYSICAL_PAGES", lume_pages_free());
     if (LUME_BOOT_PROFILE == LUME_BOOT_DIAGNOSTIC && !lume_pages_check())
         lume_fail("physical page allocator");

@@ -231,6 +231,15 @@ int main(void)
     CHECK(lume_mmu_user_root(0, 0x100000000, stacks));
     CHECK(lume_mmu_user_root(1, 0x100001000, stacks));
     CHECK(lume_mmu_user_root(2, 0x100002000, stacks));
+    for (unsigned task = 127; task < LUME_TASK_LIMIT; task += 127)
+    {
+        CHECK(lume_mmu_user_root(task, 0x100003000, stacks));
+        uint64_t collision = lume_mmu_task_view_root(task, false);
+        CHECK(collision >> 48 == lume_mmu_task_view_root(0, false) >> 48);
+        CHECK(collision != lume_mmu_task_view_root(0, false));
+        CHECK(lume_mmu_task_view_root(task, true) >> 48 == 2);
+        lume_mmu_release_user(task);
+    }
     CHECK(lume_mmu_translate(lume_mmu_task_root(1), 0x600000, false, false, true, &pa));
     CHECK(!lume_mmu_translate(lume_mmu_task_root(1), 0x600000, true, false, false, &pa));
     CHECK(lume_mmu_module_protect(0x600000, 4096, LUME_MODULE_READ | LUME_MODULE_WRITE));
@@ -315,6 +324,9 @@ int main(void)
           page_invalidations[0] == invalidated);
     uint64_t reader = lume_mmu_task_view_root(0, false), writer = lume_mmu_task_view_root(0, true);
     CHECK(reader && writer && reader != writer);
+    CHECK(reader >> 48 == 1 && writer >> 48 == 2);
+    CHECK(lume_mmu_task_view_root(1, false) >> 48 == 3);
+    CHECK(lume_mmu_task_view_root(1, true) >> 48 == 4);
     CHECK(lume_mmu_jit_scope(0, true) == 0 && switches == 1 && lume_mmu_task_root(0) == writer);
     CHECK(lume_mmu_jit_scope(0, true) == 0 && switches == 1);
     CHECK(lume_mmu_jit_scope(0, false) == 0 && switches == 1);
@@ -325,7 +337,11 @@ int main(void)
     buffers[0].first = LUME_HEAP_BASE + 0x200000;
     buffers[0].valid = true;
     CHECK(lume_mmu_swap_user(0, 1));
-    CHECK(lume_mmu_task_root(0) == owner1 && lume_mmu_task_root(1) == reader);
+    CHECK((lume_mmu_task_root(0) & UINT64_C(0x0000ffffffffffff)) ==
+              (owner1 & UINT64_C(0x0000ffffffffffff)) &&
+          (lume_mmu_task_root(1) & UINT64_C(0x0000ffffffffffff)) ==
+              (reader & UINT64_C(0x0000ffffffffffff)));
+    CHECK(lume_mmu_task_root(0) >> 48 == 1 && lume_mmu_task_root(1) >> 48 == 3);
     CHECK(root_invalidations[0] == roots0 + 1 && root_invalidations[1] == roots1 + 1);
     CHECK(!buffers[0].valid && !buffers[1].valid && buffers[2].valid);
     CHECK(lume_mmu_swap_user(0, 1));

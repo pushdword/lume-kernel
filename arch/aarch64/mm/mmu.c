@@ -2,6 +2,7 @@
 #include "lume/smp.h"
 #include "lume/vm.h"
 #define ADDRESS UINT64_C(0x0000fffffffff000)
+static uint64_t asid_roots[LUME_CPU_LIMIT][256];
 
 void lume_sync_code_defer(uint64_t address, size_t bytes)
 {
@@ -60,10 +61,20 @@ bool lume_mmu_root_active(uint64_t base)
 
 void lume_mmu_switch(uint64_t base)
 {
-    /* Shared ASIDs distinguish views. Every root switch invalidates local translations. */
     base &= ~UINT64_C(1);
-    __asm__ volatile("dsb ish; msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb ish; isb" ::"r"(base)
-                     : "memory");
+    unsigned asid = (unsigned)(base >> 48);
+    if (asid >= 256)
+        lume_fail("address space identifier");
+    uint64_t *remembered = &asid_roots[lume_cpu_index()][asid];
+    if (*remembered != (base & ADDRESS))
+    {
+        /* Colliding process slots invalidate only their reused local ASID.
+         * Mapping changes and table reclamation retain broadcast invalidation. */
+        uint64_t operand = (uint64_t)asid << 48;
+        __asm__ volatile("dsb ishst; tlbi aside1, %0; dsb ish" ::"r"(operand) : "memory");
+        *remembered = base & ADDRESS;
+    }
+    __asm__ volatile("dsb ish; msr ttbr0_el1, %0; isb" ::"r"(base) : "memory");
 }
 
 bool lume_mmu_start(const struct lume_fdt *fdt)

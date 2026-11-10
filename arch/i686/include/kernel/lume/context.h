@@ -16,6 +16,7 @@ struct lume_context
 _Static_assert(offsetof(struct lume_context, vector) == 336, "i686 x87 save offset");
 _Static_assert(sizeof(struct lume_context) == 448, "i686 context layout");
 #define LUME_CONTEXT_REG(c, n) ((c)->reg[(n)])
+#define LUME_CONTEXT_REGISTERS reg
 #define LUME_CONTEXT_PC(c) ((c)->pc)
 #define LUME_CONTEXT_SP(c) ((c)->sp)
 #define LUME_CONTEXT_STATUS(c) ((c)->status)

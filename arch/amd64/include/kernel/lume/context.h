@@ -14,6 +14,7 @@ struct lume_context
 _Static_assert(offsetof(struct lume_context, vector) == 176, "AMD64 FXSAVE offset");
 _Static_assert(sizeof(struct lume_context) == 688, "AMD64 context layout");
 #define LUME_CONTEXT_REG(c, n) ((c)->reg[(n)])
+#define LUME_CONTEXT_REGISTERS reg
 #define LUME_CONTEXT_PC(c) ((c)->pc)
 #define LUME_CONTEXT_SP(c) ((c)->sp)
 #define LUME_CONTEXT_STATUS(c) ((c)->status)

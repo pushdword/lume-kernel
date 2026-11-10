@@ -16,6 +16,7 @@ _Static_assert(offsetof(struct lume_context, fpcr) == 800, "AArch64 FPCR offset"
 _Static_assert(offsetof(struct lume_context, fpsr) == 808, "AArch64 FPSR offset");
 
 #define LUME_CONTEXT_REG(c, n) ((c)->x[(n)])
+#define LUME_CONTEXT_REGISTERS x
 #define LUME_CONTEXT_PC(c) ((c)->elr)
 #define LUME_CONTEXT_SP(c) ((c)->sp_el0)
 #define LUME_CONTEXT_STATUS(c) ((c)->spsr)

@@ -1,4 +1,5 @@
 KERNEL_C_aarch64 := \
+    arch/aarch64/context/query.c \
     src/device/graphics.c \
     src/device/gpu.c \
     src/device/tty.c \

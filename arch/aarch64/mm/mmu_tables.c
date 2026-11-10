@@ -150,7 +150,10 @@ uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
     task = user_owner(task);
     if (task >= LUME_TASK_LIMIT || !user_root[task][writer ? 1 : 0])
         return 0;
-    return (uintptr_t)user_root[task][writer ? 1 : 0] | ((uint64_t)(writer ? 2 : 1) << 48);
+    /* ASID zero belongs to the kernel. Each process has separate execute and
+     * write views within the eight-bit ASID range supported by ARMv8. */
+    unsigned asid = 1 + 2 * (task % 127) + (writer ? 1 : 0);
+    return (uintptr_t)user_root[task][writer ? 1 : 0] | ((uint64_t)asid << 48);
 }
 
 uint64_t lume_mmu_task_root(unsigned task)
@@ -171,7 +174,7 @@ bool lume_mmu_jit_active(unsigned task)
 #ifdef __aarch64__
     uint64_t base;
     __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(base));
-    return lume_mmu_root_matches(task, base) && (base >> 48) == 2;
+    return lume_mmu_root_matches(task, base) && !((base >> 48) & 1);
 #else
     (void)task;
     return false;

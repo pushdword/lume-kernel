@@ -11,6 +11,7 @@ struct lume_fdt
     bool psci_smc;
     char model[96];
     unsigned ram_count, reserved_count;
+    unsigned memory_regions;
 
     struct lume_range
     {
