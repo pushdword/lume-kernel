@@ -11,7 +11,8 @@
 #include "lume/socket_buffer.h"
 #include <string.h>
 
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define PAIRS 128u
 #else
 #define PAIRS 8u

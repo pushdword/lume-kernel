@@ -3,6 +3,7 @@
 #include "lume/socket_file.h"
 #include "lume/graphics.h"
 #include "lume/gpu.h"
+#include "lume/render.h"
 #include "lume/credential.h"
 #include "lume/thread.h"
 #include "lume/signal.h"
@@ -18,6 +19,8 @@ static bool kernel_local_control_call(const struct lume_context *frame)
     return (number == LUME_SYS_THREAD &&
             (action == LUME_THREAD_WAIT || action == LUME_THREAD_WAKE ||
              action == LUME_THREAD_WAIT_REALTIME)) ||
+           (number == LUME_SYS_THREAD &&
+            (action == LUME_THREAD_WAIT_SHARED || action == LUME_THREAD_WAKE_SHARED)) ||
            (number == LUME_SYS_SIGNAL &&
             (action == LUME_SIGNAL_MASK || action == LUME_SIGNAL_TRY_WAIT ||
              action == LUME_SIGNAL_WAIT));
@@ -53,7 +56,11 @@ static bool kernel_call_mutates(const struct lume_context *frame)
     case LUME_SYS_GRAPHICS:
         return LUME_CONTEXT_REG(frame, 0) == LUME_GRAPHICS_ACQUIRE;
     case LUME_SYS_GPU:
-        return LUME_CONTEXT_REG(frame, 0) == LUME_GPU_BIND;
+        return LUME_CONTEXT_REG(frame, 0) == LUME_GPU_BIND ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_OPEN ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_RESOURCE_EXPORT ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_EXPORT ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_IMPORT;
     case LUME_SYS_CREDENTIAL:
         return LUME_CONTEXT_REG(frame, 0) != LUME_CREDENTIAL_GET &&
                LUME_CONTEXT_REG(frame, 0) != LUME_CREDENTIAL_LIMIT_GET;
@@ -115,11 +122,17 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
             action == LUME_SOCKET_SHUTDOWN)
             return kernel_socket_network[task] ? LUME_WORK_NETWORK : LUME_WORK_GENERAL;
         return LUME_WORK_NETWORK;
-    case LUME_SYS_GRAPHICS:
     case LUME_SYS_GPU:
+        if (action == LUME_RENDER_OPEN)
+            return LUME_WORK_STORAGE;
+        if (action >= LUME_RENDER_OPEN && action <= LUME_RENDER_LAST)
+            return LUME_WORK_RENDER;
+        return LUME_WORK_DISPLAY;
+    case LUME_SYS_GRAPHICS:
         return LUME_WORK_DISPLAY;
     case LUME_SYS_VM:
-        return action == LUME_VM_MAP ? LUME_WORK_STORAGE : LUME_WORK_GENERAL;
+        return action == LUME_VM_MAP && kernel_vm_storage[task] ? LUME_WORK_STORAGE
+                                                                : LUME_WORK_GENERAL;
     case LUME_SYS_BRK:
     case LUME_SYS_MEMORY:
     case LUME_SYS_TELEMETRY:

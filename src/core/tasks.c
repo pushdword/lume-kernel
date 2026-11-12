@@ -1334,6 +1334,7 @@ static int start_program_with_scratch(struct lume_context *frame,
     bool files_ready = true;
     kernel_memory_release[child] = KERNEL_MEMORY_LIVE;
     kernel_socket_network[child] = false;
+    kernel_vm_storage[child] = false;
     kernel_retry_launch[child] = false;
     tasks[child].context = (struct lume_context){0};
     tasks[child].data = 0;
@@ -1382,7 +1383,8 @@ static int start_program_with_scratch(struct lume_context *frame,
         lume_gpu_release(owner + 1);
         lume_heap_swap(owner, child);
         lume_vm_swap(owner, child);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
         lume_mmu_jit_copy(owner, child);
 #endif
         memcpy(executable_paths[owner], executable, sizeof(scratch->executable));
@@ -1546,6 +1548,7 @@ static int fork_program(struct lume_context *frame)
     memset(&tasks[child], 0, sizeof(tasks[child]));
     kernel_memory_release[child] = KERNEL_MEMORY_LIVE;
     kernel_socket_network[child] = false;
+    kernel_vm_storage[child] = false;
     kernel_retry_launch[child] = false;
     tasks[child].data = lume_page_alloc(0);
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
@@ -1583,7 +1586,8 @@ static int fork_program(struct lume_context *frame)
     if (!lume_files_clone(&tasks[child].files, &tasks[owner].files))
         goto fail;
     tasks[child].context = *frame;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     lume_mmu_jit_copy(child, current_task);
 #endif
     LUME_CONTEXT_REG(&tasks[child].context, 0) = 0;
@@ -1765,6 +1769,22 @@ static void report_program_fault(unsigned process, unsigned task, const struct l
     lume_value("PROGRAM_FAULT_ESR", esr);
     lume_value("PROGRAM_FAULT_ADDRESS", far);
     lume_value("PROGRAM_FAULT_PC", LUME_CONTEXT_PC(frame));
+    lume_value("PROGRAM_FAULT_SP", LUME_CONTEXT_SP(frame));
+#if defined(LUME_ARCH_I686)
+    uint32_t fp = frame->raw[2];
+    lume_value("PROGRAM_FAULT_FRAME", fp);
+    uint64_t physical, root = lume_mmu_task_root(process);
+    if (fp >= LUME_USER_BASE && fp <= LUME_USER_LIMIT - 3 * sizeof(uint32_t) &&
+        lume_mmu_translate(root, fp, false, true, false, &physical) &&
+        lume_mmu_translate(root, fp + 3 * sizeof(uint32_t) - 1, false, true, false, &physical))
+    {
+        uint32_t words[3];
+        memcpy(words, (const void *)(uintptr_t)fp, sizeof(words));
+        lume_value("PROGRAM_FAULT_FRAME_WORD0", words[0]);
+        lume_value("PROGRAM_FAULT_FRAME_WORD1", words[1]);
+        lume_value("PROGRAM_FAULT_FRAME_WORD2", words[2]);
+    }
+#endif
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64)
     lume_value("PROGRAM_FAULT_LINK", LUME_CONTEXT_REG(frame, 30));
     lume_value("PROGRAM_FAULT_ARG0", LUME_CONTEXT_REG(frame, 0));
@@ -1798,7 +1818,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         int64_t result = -LUME_EINVAL;
         if (!LUME_CONTEXT_REG(frame, 1) && !LUME_CONTEXT_REG(frame, 2))
         {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
             result = lume_mmu_jit_scope(task, LUME_CONTEXT_REG(frame, 0) == LUME_VM_JIT_BEGIN);
 #else
             result = -LUME_ENOSYS;
@@ -1891,7 +1912,18 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
             else if (svc)
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
             if (!kernel_enqueue(task, domain, !direct))
+            {
+                struct io_queue *queue = kernel_domain_queue(domain);
+                lume_value("IO_QUEUE_TASK=", task);
+                lume_value("IO_QUEUE_DOMAIN=", domain);
+                lume_value("IO_QUEUE_COUNT=", queue->count);
+                lume_value("IO_QUEUE_QUEUED=", queue->queued[task]);
+                lume_value("IO_QUEUE_GRANTED=", queue->granted);
+                lume_value("IO_QUEUE_GRANT_TASK=", queue->grant.task);
+                lume_value("IO_QUEUE_SYSCALL=",
+                           LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER));
                 lume_fail("I/O queue capacity");
+            }
             kernel_wait[task] = true;
             states[task] = 4;
             sched_charge(&policy, lume_cpu_index(), now());
@@ -2377,6 +2409,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         pipe_wait[i] = false;
         kernel_wait[i] = false;
         kernel_socket_network[i] = false;
+        kernel_vm_storage[i] = false;
         kernel_retry_launch[i] = false;
         pipe_queues[i] = 0;
         capabilities[i] = 0;

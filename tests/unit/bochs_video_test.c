@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "lume/platform_driver.h"
+#include "lume/abi.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -21,6 +22,18 @@ struct q35_binding
 static unsigned reg_index, io_writes, vbe_version = 0xb0c5;
 static uint16_t regs[16];
 static unsigned cap_width = 1920, cap_height = 1200, cap_bytes = 16 * 1024 * 1024;
+static bool pci_present = true, registered_display, registered_graphics, fail_graphics;
+static bool virtio_present;
+static unsigned pci_class = 0x0300;
+
+int lume_q35_pci_find(uint16_t vendor, uint16_t product, uint32_t *address)
+{
+    *address = 0;
+    if (vendor == 0x1234 && product == 0x1111)
+        return pci_present ? 0 : -LUME_ENOENT;
+    assert(vendor == 0x1af4 && product == 0x1050);
+    return virtio_present ? 0 : -LUME_ENOENT;
+}
 
 void lume_out16(uint16_t port, uint16_t value)
 {
@@ -49,6 +62,8 @@ uint16_t lume_in16(uint16_t port)
 uint32_t lume_q35_pci_read(uint32_t pci, unsigned offset)
 {
     (void)pci;
+    if (offset == 8)
+        return pci_class << 16;
     assert(offset == 4 || offset == 16);
     return offset == 16 ? 0xe0000000u : 3;
 }
@@ -59,27 +74,44 @@ void lume_q35_pci_write(uint32_t pci, unsigned offset, uint32_t value)
     assert(offset == 4 && value == 3);
 }
 
-static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint16_t product,
-                          uint32_t *address)
+void lume_fail(const char *message)
 {
-    (void)hardware;
-    (void)vendor;
-    (void)product;
-    *address = 0;
-    return 0;
+    fputs(message, stderr);
+    abort();
 }
 
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
     (void)ops;
-    assert(kind == LUME_PLATFORM_DISPLAY && bytes == sizeof(struct lume_platform_display_ops));
+    if (kind == LUME_PLATFORM_DISPLAY)
+    {
+        assert(bytes == sizeof(struct lume_platform_display_ops) && !registered_display);
+        registered_display = true;
+    }
+    else
+    {
+        assert(kind == LUME_PLATFORM_GRAPHICS &&
+               bytes == sizeof(struct lume_platform_graphics_ops) && !registered_graphics);
+        if (fail_graphics)
+            return -LUME_EIO;
+        registered_graphics = true;
+    }
     return 0;
 }
 
 int lume_platform_driver_unregister(unsigned kind, const void *ops)
 {
     (void)ops;
-    assert(kind == LUME_PLATFORM_DISPLAY);
+    if (kind == LUME_PLATFORM_DISPLAY)
+    {
+        assert(registered_display);
+        registered_display = false;
+    }
+    else
+    {
+        assert(kind == LUME_PLATFORM_GRAPHICS && registered_graphics);
+        registered_graphics = false;
+    }
     return 0;
 }
 
@@ -97,6 +129,16 @@ int main(void)
 #endif
     assert(memory == wanted);
     memset((char *)memory + cap_bytes, 0xa5, 4096);
+#ifdef LUME_ARCH_I686
+    pci_present = false;
+    assert(lume_bochs_display_register() == -LUME_ENOENT && !registered_display);
+    pci_present = true;
+    fail_graphics = true;
+    assert(lume_bochs_display_register() == -LUME_EIO && !registered_display &&
+           !registered_graphics && !enabled && !framebuffer);
+    fail_graphics = false;
+    assert(!lume_bochs_display_register() && registered_display && registered_graphics);
+#endif
     assert(start(0));
     assert(video_control(LUME_VIDEO_MODE_COUNT, 0, NULL) == 9);
     for (unsigned mode = 0; mode < 9; ++mode)
@@ -141,8 +183,12 @@ int main(void)
     assert(!memcmp(custom_font, uploaded, sizeof(uploaded)));
     uint32_t pixels[] = {0x123456, 0xabcdef, 0x112233, 0x445566};
     struct lume_graphics_request graphics = {.format = LUME_GRAPHICS_XRGB8888,
-                                              .width = 2, .height = 2, .pitch = 8,
-                                              .x = 11, .y = 23, .pixels = (uintptr_t)pixels};
+                                             .width = 2,
+                                             .height = 2,
+                                             .pitch = 8,
+                                             .x = 11,
+                                             .y = 23,
+                                             .pixels = (uintptr_t)pixels};
     assert(!graphics_claim(true));
     assert(video_control(LUME_VIDEO_MODE_SELECT, 0, NULL) == -LUME_EBUSY);
     assert(!graphics_present(&graphics));
@@ -155,6 +201,21 @@ int main(void)
     assert(!graphics_claim(false));
     assert(graphics_present(&graphics) == -LUME_EBADF);
     stop();
+#ifdef LUME_ARCH_I686
+    assert(!lume_bochs_display_unregister());
+    pci_present = false;
+    virtio_present = true;
+    pci_class = 0x0302;
+    assert(lume_bochs_display_register() == -LUME_ENOENT);
+    pci_class = 0x0300;
+    assert(!lume_bochs_display_register());
+    assert(!graphics_claim(true));
+    assert(lume_bochs_display_unregister() == -LUME_EBUSY);
+    assert(registered_display && registered_graphics);
+    assert(!graphics_claim(false));
+    assert(!lume_bochs_display_unregister());
+    assert(!registered_display && !registered_graphics);
+#endif
 #ifdef _WIN32
     assert(VirtualFree(memory, 0, MEM_RELEASE));
 #else

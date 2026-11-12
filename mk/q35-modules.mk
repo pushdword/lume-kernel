@@ -1,5 +1,7 @@
 PLATFORM_MODULE_NAMES := vblk vnet vrng vga ps2 xhci
-PLATFORM_MODULE_NAMES += lume2d
+PLATFORM_MODULE_NAMES += lume2d vgpu
+Q35_vgpu := drivers/gpu/virtio_gpu/module.c src/device/virtio_pci.c src/device/virtio_gpu.c
+Q35_vgpu += drivers/display/bochs_vbe/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 Q35_lume2d := drivers/gpu/lume2d/module.c
 ifeq ($(PROFILE),recovery)
 PLATFORM_MODULE_NAMES := $(filter-out vnet,$(PLATFORM_MODULE_NAMES))
@@ -8,7 +10,7 @@ PLATFORM_MODULES := $(addprefix $(OUT)/modules/,$(addsuffix .lkm,$(PLATFORM_MODU
 Q35_vblk := drivers/storage/virtio_blk/block.c platform/q35/virtio.c
 Q35_vnet := drivers/net/virtio_net/net.c platform/q35/virtio.c
 Q35_vrng := drivers/entropy/virtio_rng/rng.c platform/q35/virtio.c
-Q35_vga := drivers/display/bochs_vbe/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
+Q35_vga := drivers/display/bochs_vbe/module.c drivers/display/bochs_vbe/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 Q35_ps2 := drivers/input/ps2/keyboard.c drivers/input/usb_hid/hid_keyboard.c
 Q35_xhci := platform/q35/modules/usb.c drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c
 Q35_MODULE_SOURCES := $(sort $(foreach name,$(PLATFORM_MODULE_NAMES),$(Q35_$(name))))

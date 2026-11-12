@@ -13,13 +13,17 @@ enum
     LUME_THREAD_WAKE,
     LUME_THREAD_STACK,
     LUME_THREAD_NAME,
-    LUME_THREAD_WAIT_REALTIME
+    LUME_THREAD_WAIT_REALTIME,
+    LUME_THREAD_WAIT_SHARED,
+    LUME_THREAD_WAKE_SHARED
 };
 
 #define LUME_THREAD_CREATE_NATIVE64 UINT64_C(1)
+#define LUME_THREAD_CREATE_NATIVE32 UINT64_C(2)
 
 /* CREATE.value accepts NATIVE64 for 64-bit thread addresses. A low-entry image with
- * value zero retains legacy addresses. A large-entry image uses Native64 addresses. */
+ * value zero retains legacy addresses. A large-entry image uses native addresses.
+ * NATIVE32 selects guarded VM stacks on i686. */
 struct lume_thread_request
 {
     uint64_t entry, argument, stack_bytes, tid, value, address, timeout_ms;
@@ -28,7 +32,8 @@ struct lume_thread_request
 #define LUME_PTHREAD_COMPAT_STACK_DEFAULT (128u * 1024u)
 #define LUME_PTHREAD_COMPAT_STACK_MAX (768u * 1024u)
 
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define LUME_PTHREAD_STACK_DEFAULT (2u * 1024u * 1024u)
 #define LUME_PTHREAD_STACK_MAX (8u * 1024u * 1024u)
 #else
@@ -44,4 +49,8 @@ struct lume_thread_request
  * address points to stack_bytes bytes. value selects read (0) or write (1). */
 /* WAIT_REALTIME compares the same word as WAIT and takes an absolute UTC deadline
  * in milliseconds. An unset clock fails without registering a wait. */
+/* WAIT_SHARED and WAKE_SHARED use the shared anonymous memory object and offset.
+ * They synchronize processes mapping the same word at different addresses.
+ * WAIT_SHARED takes the same relative timeout as WAIT. Private mappings and
+ * regular file mappings do not support these shared operations. */
 #endif

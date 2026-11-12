@@ -11,6 +11,7 @@ void lume_i686_context_start(void);
 int lume_pc_display_register(void);
 int lume_pc_keyboard_start(void);
 int lume_pc_ide_register(void);
+int lume_pc_virtio_block_start(bool *present);
 static uint64_t program_memory;
 static unsigned program_pages;
 
@@ -74,11 +75,21 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     lume_platform_firmware_configure(&memory);
     if (lume_q35_hardware_start())
         lume_fail("PCI hardware services");
-    if (lume_pc_ide_register())
-        lume_fail("IDE disk initialization");
+    extern int lume_pc_virtio_gpu_start(void);
+    int gpu_result = lume_pc_virtio_gpu_start();
+    if (gpu_result)
+        lume_value("VIRTIO_GPU_ERROR", (uint64_t)(int64_t)gpu_result);
+    bool virtio_disk = false;
+    int disk_result = lume_pc_virtio_block_start(&virtio_disk);
+    if (!disk_result && !virtio_disk)
+        disk_result = lume_pc_ide_register();
+    else if (!disk_result)
+        lume_puts("LUME PC VIRTIO BLOCK READY\n");
+    if (disk_result)
+        lume_fail("PC disk initialization");
     const struct lume_storage_ops *storage = lume_storage_start();
     if (!storage || !lume_vfs_mount_storage(storage))
-        lume_fail("IDE data volume");
+        lume_fail("PC data volume");
     lume_value("PERSISTENT_VOLUME_READY", 1);
     extern int lume_pc_entropy_start(void);
     lume_value("PC_ENTROPY_READY", lume_pc_entropy_start() == 0);

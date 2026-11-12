@@ -5,6 +5,8 @@
 #include "lume/wait.h"
 #include "lume/service.h"
 #include "lume/supervision.h"
+#include "lume/thread.h"
+#include "lume/vm.h"
 #include "poll_state.h"
 #include <assert.h>
 #include <stdio.h>
@@ -49,7 +51,10 @@ static uint32_t watched[LUME_TASK_LIMIT];
 static struct lume_context suspended;
 static unsigned current_task, policy, unit = 1;
 static unsigned checks, preparations, blocked, charges, wakes, buffer_checks, progress;
+static unsigned ipis;
 static uint64_t clock_ms, denied, generation = 1;
+static uint64_t clock_increment;
+static unsigned clock_reads;
 static unsigned readiness, notify_during_scan;
 static bool signal_during_scan;
 static bool active = true, public_mode = true, worker_busy, input_ready;
@@ -107,7 +112,10 @@ static bool lume_worker_busy(void)
 
 static uint64_t lume_clock_monotonic(void)
 {
-    return clock_ms;
+    uint64_t value = clock_ms;
+    clock_ms += clock_increment;
+    ++clock_reads;
+    return value;
 }
 
 static uint32_t now(void)
@@ -129,6 +137,7 @@ static void sched_wake(unsigned *p, unsigned task, unsigned tick, unsigned extra
 
 void lume_smp_wake(void)
 {
+    ++ipis;
 }
 
 static void lume_watchdog_progress(void)
@@ -270,7 +279,7 @@ static struct lume_context *kernel_buffer_failure(struct lume_context *frame, in
     return frame;
 }
 
-static bool lume_vm_code_address(unsigned task, uint64_t address)
+bool lume_vm_code_address(unsigned task, uint64_t address)
 {
     uint64_t physical;
     return lume_mmu_translate(lume_mmu_task_root(task), address, false, true, true, &physical);
@@ -282,6 +291,27 @@ static bool task_signal_pending(unsigned owner)
 {
     return (signals[owner].pending & ~signals[owner].mask) != 0;
 }
+
+static uint64_t thread_realtime_deadline[LUME_TASK_LIMIT];
+static bool thread_realtime_wait[LUME_TASK_LIMIT];
+static uint64_t shared_objects[LUME_TASK_LIMIT], shared_offsets[LUME_TASK_LIMIT];
+
+int lume_vm_shared_word_key(unsigned owner, uint64_t address, struct lume_vm_word_key *key)
+{
+    assert(owner < LUME_TASK_LIMIT);
+    if (address != (uintptr_t)&watched[owner] || !shared_objects[owner])
+        return -LUME_EOPNOTSUPP;
+    *key = (struct lume_vm_word_key){shared_objects[owner], shared_offsets[owner]};
+    return 0;
+}
+
+int lume_clock_realtime_ms(uint64_t monotonic, uint64_t *realtime)
+{
+    *realtime = monotonic + 1000;
+    return 0;
+}
+
+#include "thread_wait_calls.h"
 
 #include "service_calls.h"
 #include "poll_calls.h"
@@ -383,6 +413,10 @@ static void reset(void)
     memset(pipe_wait, 0, sizeof(pipe_wait));
     memset(kernel_wait, 0, sizeof(kernel_wait));
     memset(futex_address, 0, sizeof(futex_address));
+    memset(thread_shared_keys, 0, sizeof(thread_shared_keys));
+    memset(thread_realtime_wait, 0, sizeof(thread_realtime_wait));
+    memset(shared_objects, 0, sizeof(shared_objects));
+    memset(shared_offsets, 0, sizeof(shared_offsets));
     service_bus_reset();
     memset(service_waits, 0, sizeof(service_waits));
     service_alive = true;
@@ -394,6 +428,7 @@ static void reset(void)
     queue = (struct lume_wait_queue){0};
     memset(watched, 0, sizeof(watched));
     clock_ms = 100;
+    clock_increment = clock_reads = 0;
     denied = readiness = checks = preparations = blocked = charges = buffer_checks = 0;
     notify_during_scan = progress = wakes = current_task = 0;
     worker_busy = input_ready = cached_input = signal_during_scan = false;
@@ -404,6 +439,7 @@ static void reset(void)
     tty_access_result = 0;
     signal_when_waiting = expected_exit_status = exit_requests = 0;
     generation = 1;
+    ipis = 0;
     states[0] = 2;
     signal_inherit(0, 0, false);
 }
@@ -975,6 +1011,116 @@ static void check_supervision_waits(void)
     assert(request.result == -LUME_EIO && !service_waits[0].active);
 }
 
+static void check_shared_words(void)
+{
+    reset();
+    thread_slots[1].process = 1;
+    shared_objects[0] = shared_objects[1] = 17;
+    struct lume_context frame = {0};
+    struct lume_thread_request request = {
+        .address = (uintptr_t)&watched[0], .value = 0, .timeout_ms = UINT64_MAX};
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &suspended);
+    assert(states[0] == 4 && thread_shared_keys[0].object == 17);
+    request.address = (uintptr_t)&watched[1];
+    request.value = 1;
+    shared_objects[1] = 18;
+    assert(thread_word_call(&frame, 1, 1, LUME_THREAD_WAKE_SHARED, &request) == &frame);
+    assert(!frame.x[0] && states[0] == 4);
+    shared_objects[1] = 17;
+    shared_offsets[1] = 4;
+    assert(thread_word_call(&frame, 1, 1, LUME_THREAD_WAKE_SHARED, &request) == &frame);
+    assert(!frame.x[0] && states[0] == 4);
+    shared_offsets[1] = 0;
+    assert(thread_word_call(&frame, 1, 1, LUME_THREAD_WAKE_SHARED, &request) == &frame);
+    assert(frame.x[0] == 1 && states[0] == 1 && !futex_address[0] && !thread_shared_keys[0].object);
+
+    request.address = (uintptr_t)&watched[0];
+    request.value = 0;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT, &request) == &suspended);
+    request.value = 1;
+    assert(thread_word_call(&frame, 1, 1, LUME_THREAD_WAKE, &request) == &frame);
+    assert(!frame.x[0] && states[0] == 4);
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAKE_SHARED, &request) == &frame);
+    assert(!frame.x[0] && states[0] == 4);
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAKE, &request) == &frame);
+    assert(frame.x[0] == 1 && states[0] == 1);
+
+    request.value = 0;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &suspended);
+    request.value = 1;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAKE, &request) == &frame);
+    assert(!frame.x[0] && states[0] == 4);
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAKE_SHARED, &request) == &frame);
+    assert(frame.x[0] == 1 && states[0] == 1);
+
+    request.value = 1;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &frame);
+    assert((int64_t)frame.x[0] == -LUME_EAGAIN && states[0] == 1);
+    request.value = 0;
+    request.timeout_ms = 0;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &frame);
+    assert((int64_t)frame.x[0] == -LUME_ETIMEDOUT);
+    request.timeout_ms = UINT64_MAX - 1;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &frame);
+    assert((int64_t)frame.x[0] == -LUME_EINVAL);
+    request.timeout_ms = UINT64_MAX;
+    shared_objects[0] = 0;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_SHARED, &request) == &frame);
+    assert((int64_t)frame.x[0] == -LUME_EOPNOTSUPP);
+    request.timeout_ms = clock_ms + 1001;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAIT_REALTIME, &request) == &suspended);
+    assert(thread_realtime_wait[0] && thread_realtime_deadline[0] == request.timeout_ms &&
+           !thread_shared_keys[0].object);
+    request.value = 1;
+    assert(thread_word_call(&frame, 0, 0, LUME_THREAD_WAKE, &request) == &frame);
+    assert(frame.x[0] == 1 && !thread_realtime_wait[0]);
+    for (unsigned shared = 0; shared < 2; ++shared)
+    {
+        reset();
+        shared_objects[0] = shared_objects[1] = shared_objects[2] = 17;
+        unsigned wait_op = shared ? LUME_THREAD_WAIT_SHARED : LUME_THREAD_WAIT;
+        unsigned wake_op = shared ? LUME_THREAD_WAKE_SHARED : LUME_THREAD_WAKE;
+        unsigned owner = shared ? 1 : 0;
+        thread_slots[1].process = owner;
+        thread_slots[2].process = shared ? 2 : 0;
+        thread_slots[1].thread = thread_slots[2].thread = !shared;
+        for (unsigned round = 0; round < 2; ++round)
+        {
+            request = (struct lume_thread_request){.address = (uintptr_t)&watched[0],
+                                                   .timeout_ms = UINT64_MAX};
+            assert(thread_word_call(&frame, 0, 0, wait_op, &request) == &suspended);
+            request.address = (uintptr_t)&watched[shared ? 2 : 0];
+            assert(thread_word_call(&frame, 2, shared ? 2 : 0, wait_op, &request) == &suspended);
+            request.address = (uintptr_t)&watched[owner];
+            unsigned before = ipis;
+            assert(thread_word_call(&frame, 1, owner, wake_op, &request) == &frame);
+            assert(!frame.x[0] && ipis == before && states[0] == 4 && states[2] == 4);
+            request.value = round ? 2 : 1;
+            assert(thread_word_call(&frame, 1, owner, wake_op, &request) == &frame);
+            assert(frame.x[0] == request.value && ipis == before + 1 && states[0] == 1);
+            if (!round)
+            {
+                assert(states[2] == 4);
+                request.value = UINT32_MAX;
+                assert(thread_word_call(&frame, 1, owner, wake_op, &request) == &frame);
+                assert(frame.x[0] == 1 && ipis == before + 2);
+            }
+            assert(states[2] == 1);
+        }
+        clock_ms = 100;
+        clock_increment = 1;
+        unsigned reads = clock_reads;
+        request = (struct lume_thread_request){.address = (uintptr_t)&watched[0],
+                                               .timeout_ms = UINT64_MAX - 101};
+        assert(thread_word_call(&frame, 0, 0, wait_op, &request) == &suspended);
+        assert(clock_reads == reads + 1 && clock_ms == 101 && wake_at[0] == UINT64_MAX - 1);
+        clock_increment = 0;
+        request.address = (uintptr_t)&watched[owner];
+        request.value = 1;
+        assert(thread_word_call(&frame, 1, owner, wake_op, &request) == &frame && frame.x[0] == 1);
+    }
+}
+
 int main(void)
 {
     check_waits();
@@ -988,6 +1134,7 @@ int main(void)
     check_service_results();
     check_service_waits();
     check_supervision_waits();
+    check_shared_words();
     puts("PASS_POLL_WAIT snapshots, events, deadlines, copyout, cancellation and signal replay");
     return 0;
 }

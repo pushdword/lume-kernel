@@ -109,9 +109,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                        : lume_vfs_stat_mode(files, (uint64_t)request.fd,
                                             (void *)(uintptr_t)request.buffer);
         }
-        result = lume_vfs_canonical_at(files, request.fd, second, first);
-        return result ? result
-                      : lume_vfs_stat_path(files, first, (void *)(uintptr_t)request.buffer);
+        return lume_vfs_stat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer);
     }
     case LUME_FILES_VOLUME:
     {
@@ -188,8 +186,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                 return -LUME_EINVAL;
         }
         int result = path_at(files, request.path, request.fd, first,
-                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN,
-                             false);
+                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN, false);
         if (result)
             return result;
         if (operation == LUME_FILES_OPEN && (flags & LUME_FILES_OPEN_DIRECTORY))

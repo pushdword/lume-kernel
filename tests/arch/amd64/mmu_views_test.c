@@ -175,6 +175,8 @@ static void reset_fixture(void)
     memset(shared, 0, sizeof(shared));
     memset(jit_depth, 0, sizeof(jit_depth));
     memset(sparse, 0, sizeof(sparse));
+    const struct lume_fdt description = {0};
+    device_mapping_start(&description);
     page_calls = node_calls = page_frees = node_frees = flushes = checkpoints = 0;
     fail_page_call = fail_node_call = 0;
 }
@@ -185,6 +187,8 @@ static void initialize_task(unsigned task)
     for (unsigned view = 0; view < 2; ++view)
     {
         task_root[task][view][0] = table(task_pdpt[task][view], true);
+        memcpy(task_device_pdpt[task][view], device_pdpt, sizeof(device_pdpt));
+        task_root[task][view][1] = table(task_device_pdpt[task][view], true);
         task_pdpt[task][view][1] = table(task_pd[task][view], true);
     }
 }
@@ -340,6 +344,81 @@ static void check_shared_selection(void)
     puts("PASS shared-thread selection preserves the owner view");
 }
 
+static void check_device_mappings(void)
+{
+    reset_fixture();
+    const uint64_t device = UINT64_C(0xc000000000);
+    assert(!lume_mmu_device_mapping(device));
+    assert(lume_mmu_device_prepare(device, 16384));
+    assert(lume_mmu_device_mapping(device) && lume_mmu_device_mapping(device + 16383));
+    assert(!lume_mmu_device_mapping(device - 4096));
+    assert(!lume_mmu_device_mapping(device + 16384));
+    uint64_t physical;
+    assert(lume_mmu_translate((uintptr_t)root, device, true, false, false, &physical));
+    assert(physical == device);
+    initialize_task(0);
+    initialize_task(1);
+    const uint64_t stack = LUME_THREAD_VM_BASE + 4096;
+    assert((stack >> 39) == (device >> 39));
+    assert(lume_mmu_map_user_jit(0, stack, UINT64_C(0x2000000), true, true));
+    assert(lume_mmu_map_user_jit(1, stack, UINT64_C(0x3000000), true, true));
+    expect_pair(0, stack, UINT64_C(0x2000000), true);
+    expect_pair(1, stack, UINT64_C(0x3000000), true);
+    assert(lume_mmu_device_prepare(device + UINT64_C(0x40000000), 4096));
+    for (unsigned task = 0; task < 2; ++task)
+        for (unsigned view = 0; view < 2; ++view)
+        {
+            uint64_t selected = lume_mmu_task_view_root(task, view);
+            assert(lume_mmu_translate(selected, device + 37, true, false, false, &physical));
+            assert(physical == device + 37);
+            assert(!lume_mmu_translate(selected, device, false, true, false, &physical));
+            assert(!lume_mmu_translate(selected, device, false, false, true, &physical));
+            assert(lume_mmu_translate(selected, device + UINT64_C(0x40000000), true, false, false,
+                                      &physical));
+        }
+    assert(lume_mmu_swap_user(0, 1));
+    expect_pair(0, stack, UINT64_C(0x3000000), true);
+    expect_pair(1, stack, UINT64_C(0x2000000), true);
+    begin_retirement();
+    lume_mmu_release_user(0);
+    check_retirement = false;
+    expect_pair(1, stack, UINT64_C(0x2000000), true);
+    assert(lume_mmu_translate(lume_mmu_task_root(1), device, true, false, false, &physical));
+    assert(!lume_mmu_device_prepare(stack, 4096));
+    assert(!lume_mmu_device_prepare(device, 0));
+    assert(!lume_mmu_device_prepare(DEVICE_END - 4096, 8192));
+    assert(!lume_mmu_device_prepare(UINT64_MAX - 4095, 8192));
+    device_ram[0] = (struct lume_range){device + UINT64_C(0x80000000), 4096};
+    device_ram_count = 1;
+    assert(!lume_mmu_device_prepare(device_ram[0].base + 1, 1));
+    assert(!lume_mmu_device_mapping(device_ram[0].base));
+    puts("PASS supervisor-only PCI64 mappings preserve thread isolation and address-space swaps");
+}
+
+static void check_device_mapping_capacity(void)
+{
+    reset_fixture();
+    for (unsigned i = 0; i < DEVICE_TABLE_LIMIT; ++i)
+        assert(lume_mmu_device_prepare(DEVICE_FIRST + i * BLOCK, 4096));
+    unsigned directories_before = device_directory_count;
+    assert(!lume_mmu_device_prepare(DEVICE_FIRST + DEVICE_TABLE_LIMIT * BLOCK, 4096));
+    uint64_t start = DEVICE_FIRST + (DEVICE_TABLE_LIMIT - 1) * BLOCK + 4096;
+    assert(!lume_mmu_device_mapping(start));
+    assert(!lume_mmu_device_prepare(start, BLOCK));
+    assert(!lume_mmu_device_mapping(start));
+    assert(device_table_count == DEVICE_TABLE_LIMIT &&
+           device_directory_count == directories_before);
+    assert(lume_mmu_device_prepare(DEVICE_FIRST, 4096));
+    reset_fixture();
+    for (unsigned i = 0; i < DEVICE_DIRECTORY_LIMIT; ++i)
+        assert(lume_mmu_device_prepare(DEVICE_FIRST + (uint64_t)i * UINT64_C(0x40000000), 4096));
+    assert(!lume_mmu_device_prepare(
+        DEVICE_FIRST + (uint64_t)DEVICE_DIRECTORY_LIMIT * UINT64_C(0x40000000), 4096));
+    assert(device_directory_count == DEVICE_DIRECTORY_LIMIT &&
+           device_table_count == DEVICE_DIRECTORY_LIMIT);
+    puts("PASS bounded PCI64 page-table allocation rejects exhaustion without partial mappings");
+}
+
 int main(void)
 {
     check_permissions();
@@ -349,7 +428,9 @@ int main(void)
     check_unmap_validation();
     check_swap_release();
     check_shared_selection();
+    check_device_mappings();
+    check_device_mapping_capacity();
     reset_fixture();
-    puts("AMD64 page-table host checks passed: 7 cases");
+    puts("AMD64 page-table host checks passed: 9 cases");
     return 0;
 }

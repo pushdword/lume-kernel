@@ -1,3 +1,5 @@
+#include "lume/render.h"
+#include "lume/render_device.h"
 #include "lume/early.h"
 #include "lume/vfs.h"
 #include "lume/net.h"
@@ -33,6 +35,7 @@
 #include "lume/io_redirect.h"
 #include <string.h>
 #include "process_file_lock.h"
+#include "process_vm.h"
 
 static struct lume_realtime realtime;
 
@@ -167,9 +170,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             .ddk_version = LUME_DDK_VERSION,
             .boot_profile = LUME_BOOT_PROFILE,
             .capabilities = lume_task_capabilities(pid)};
+#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+        ((struct lume_system_features *)(uintptr_t)a)->features |= LUME_FEATURE_SHARED_WORD_WAIT;
+#endif
 #if defined(LUME_ARCH_I686)
-        ((struct lume_system_features *)(uintptr_t)a)->features &=
-            ~(LUME_FEATURE_THREADS | LUME_FEATURE_MODULES);
+        ((struct lume_system_features *)(uintptr_t)a)->features &= ~LUME_FEATURE_MODULES;
+        extern bool lume_i686_sse_state(void);
+        if (lume_i686_sse_state())
+            ((struct lume_system_features *)(uintptr_t)a)->features |= LUME_FEATURE_SIMD_CONTEXT;
         if (!lume_platform_driver_ready(LUME_PLATFORM_ENTROPY))
             ((struct lume_system_features *)(uintptr_t)a)->features &= ~LUME_FEATURE_RANDOM;
 #endif
@@ -302,6 +310,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_GPU:
     {
+        if (a >= LUME_RENDER_OPEN && a <= LUME_RENDER_LAST)
+            return lume_render_call(files, pid, (unsigned)a, b, n);
         if (a > LUME_GPU_COPY || n != sizeof(struct lume_gpu_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
@@ -323,17 +333,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return result;
     }
     case LUME_SYS_VM:
-    {
-        if (a > LUME_VM_SYNC || n != sizeof(struct lume_vm_request))
-            return -LUME_EINVAL;
-        if (!lume_user_buffer(b, n, false) || (a == LUME_VM_INFO && !lume_user_buffer(b, n, true)))
-            return -LUME_EFAULT;
-        struct lume_vm_request request = *(const struct lume_vm_request *)(uintptr_t)b;
-        int64_t result = lume_vm_call(files, pid, (unsigned)a, &request);
-        if (a == LUME_VM_INFO)
-            *(struct lume_vm_request *)(uintptr_t)b = request;
-        return result;
-    }
+        return process_vm_call(files, pid, a, b, n);
     case LUME_SYS_MEMORY:
         if (b != sizeof(struct lume_memory_snapshot))
             return -LUME_EINVAL;

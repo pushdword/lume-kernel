@@ -2,8 +2,13 @@
 #define LUME_HEAP_H
 #include "lume/process.h"
 #include <stdint.h>
+#if defined(LUME_ARCH_I686)
+#define LUME_HEAP_EXTENDED_BASE UINT64_C(0x90000000)
+#define LUME_HEAP_EXTENDED_LIMIT UINT64_C(0xa0000000)
+#else
 #define LUME_HEAP_EXTENDED_BASE UINT64_C(0x4100000000)
 #define LUME_HEAP_EXTENDED_LIMIT UINT64_C(0x5100000000)
+#endif
 struct lume_context;
 int64_t lume_heap_brk(unsigned, uint64_t);
 int64_t lume_heap_brk_flags(unsigned, uint64_t, uint64_t);

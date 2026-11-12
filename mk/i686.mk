@@ -18,3 +18,7 @@ LINK_FLAGS := -m elf_i386 -z max-page-size=4096 --build-id=sha1
 PAYLOAD := $(OUT)/lume-i686.bin
 $(OUT)/lume-i686.bin: $(OUT)/lume.elf
 	$(OBJCOPY) -O binary "$<" "$@"
+
+KERNEL_C += drivers/gpu/virtio_gpu/module.c
+KERNEL_C += drivers/storage/virtio_blk/block.c platform/q35/virtio.c
+KERNEL_C += drivers/display/bochs_vbe/display.c

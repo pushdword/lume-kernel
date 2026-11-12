@@ -19,6 +19,7 @@ static struct
 
 static bool process_exiting[LUME_TASK_LIMIT];
 static bool kernel_socket_network[LUME_TASK_LIMIT];
+static bool kernel_vm_storage[LUME_TASK_LIMIT];
 
 static unsigned process_slot(unsigned task)
 {
@@ -67,6 +68,10 @@ int main(void)
     check(LUME_SYS_GRAPHICS, LUME_GRAPHICS_ACQUIRE, LUME_WORK_DISPLAY, true);
     check(LUME_SYS_GPU, LUME_GPU_BIND, LUME_WORK_DISPLAY, true);
     check(LUME_SYS_GPU, LUME_GPU_COPY, LUME_WORK_DISPLAY, false);
+    check(LUME_SYS_GPU, LUME_RENDER_OPEN, LUME_WORK_STORAGE, true);
+    check(LUME_SYS_GPU, LUME_RENDER_RESOURCE_EXPORT, LUME_WORK_RENDER, true);
+    check(LUME_SYS_GPU, LUME_RENDER_WAIT, LUME_WORK_RENDER, false);
+    check(LUME_SYS_GPU, LUME_RENDER_SUBMIT, LUME_WORK_RENDER, false);
     check(LUME_SYS_NET, 7, LUME_WORK_NETWORK, false);
     check(LUME_SYS_NETCTL, 0, LUME_WORK_NETWORK, false);
     check(LUME_SYS_STREAM, 0, LUME_WORK_NETWORK, false);
@@ -89,6 +94,11 @@ int main(void)
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_MASK, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_TRY_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_WAIT, LUME_WORK_GENERAL, false);
+    check(LUME_SYS_VM, LUME_VM_MAP, LUME_WORK_GENERAL, true);
+    kernel_vm_storage[1] = true;
+    check(LUME_SYS_VM, LUME_VM_MAP, LUME_WORK_STORAGE, true);
+    check(LUME_SYS_VM, LUME_VM_INFO, LUME_WORK_GENERAL, true);
+    kernel_vm_storage[1] = false;
     check(LUME_SYS_BRK, 0, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 4096, LUME_WORK_GENERAL, true);
     check(LUME_SYS_MEMORY, 0, LUME_WORK_GENERAL, false);

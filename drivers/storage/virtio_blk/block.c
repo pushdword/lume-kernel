@@ -1,5 +1,9 @@
 #include "lume/virtio.h"
+#if !defined(LUME_ARCH_I686)
 #include "lume/q35_module.h"
+#else
+#include "lume/q35_binding.h"
+#endif
 #include "lume/platform_driver.h"
 #include "lume/sd.h"
 #include "lume/worker.h"
@@ -326,4 +330,64 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     return 0;
 }
 
+#if !defined(LUME_ARCH_I686)
 Q35_MODULE("q35-virtio-blk", LUME_HARDWARE_ID_PCI, "pci,1af4:1001", 1u << LUME_RESOURCE_IOPORT);
+#else
+static bool claimed;
+
+static int probe(struct lume_hardware *hardware, void *context)
+{
+    (void)hardware;
+    if (claimed)
+        return -LUME_EBUSY;
+    claimed = true;
+    ((struct q35_binding *)context)->claimed = true;
+    return 0;
+}
+
+static int release(struct lume_hardware *hardware, void *context)
+{
+    struct q35_binding *binding = context;
+    if (!binding->claimed)
+        return 0;
+    int result = module_stop(hardware, context);
+    if (!result)
+    {
+        binding->claimed = false;
+        claimed = false;
+    }
+    return result;
+}
+
+int lume_pc_virtio_block_start(bool *present)
+{
+    *present = false;
+    static const struct lume_hardware_identity matches[] = {
+        {LUME_HARDWARE_ID_PCI, 0, "pci,1af4:1001"}};
+    static const struct lume_hardware_ops lifecycle = {
+        .probe = probe, .start = module_start, .stop = release};
+    static const struct lume_driver driver = {.version = LUME_DRIVER_VERSION,
+                                              .name = "pc-virtio-blk",
+                                              .matches = matches,
+                                              .match_count = 1,
+                                              .context_bytes = sizeof(struct q35_binding),
+                                              .resource_kinds = 1u << LUME_RESOURCE_IOPORT,
+                                              .ops = &lifecycle};
+    int result = lume_driver_register(&driver);
+    if (result)
+        return result;
+    for (unsigned i = 0; i < lume_hardware_count(); ++i)
+    {
+        struct lume_hardware_info info;
+        result = lume_hardware_info(i, &info);
+        if (result)
+            return result;
+        if (lume_driver_matches(&driver, info.id))
+        {
+            *present = true;
+            return lume_hardware_bind(info.id, &driver);
+        }
+    }
+    return 0;
+}
+#endif

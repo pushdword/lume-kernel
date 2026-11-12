@@ -41,6 +41,26 @@ static bool fpu_disabled(void)
     return (control & 8u) != 0;
 }
 
+static bool fpu_fxsr;
+
+bool lume_i686_sse_state(void)
+{
+    return fpu_fxsr;
+}
+
+static void fpu_configure(void)
+{
+    uint32_t a = 1, b, c = 0, d, control;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d) : : "memory");
+    fpu_fxsr = (d & (UINT32_C(3) << 24)) == (UINT32_C(3) << 24);
+    __asm__ volatile("movl %%cr4, %0" : "=r"(control));
+    /* Task contexts preserve x87 and SSE through the FXSAVE format. */
+    control &= ~(UINT32_C(0x600) | (UINT32_C(1) << 18));
+    if (fpu_fxsr)
+        control |= UINT32_C(0x600);
+    __asm__ volatile("movl %0, %%cr4" : : "r"(control) : "memory");
+}
+
 static void fpu_enable(void)
 {
     __asm__ volatile("clts" : : : "memory");

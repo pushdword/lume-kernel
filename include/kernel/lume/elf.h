@@ -7,6 +7,10 @@
 #define LUME_LARGE_ELF_BASE UINT64_C(0x4000000000)
 #define LUME_LARGE_ELF_LIMIT UINT64_C(0x4100000000)
 #define LUME_ELF_PAGES ((LUME_LARGE_ELF_LIMIT - LUME_LARGE_ELF_BASE) / 4096u)
+#elif defined(LUME_ARCH_I686)
+#define LUME_LARGE_ELF_BASE UINT64_C(0x70000000)
+#define LUME_LARGE_ELF_LIMIT UINT64_C(0x90000000)
+#define LUME_ELF_PAGES ((LUME_LARGE_ELF_LIMIT - LUME_LARGE_ELF_BASE) / 4096u)
 #else
 #define LUME_LARGE_ELF_BASE LUME_ELF_BASE
 #define LUME_LARGE_ELF_LIMIT LUME_ELF_LIMIT
@@ -51,7 +55,8 @@ void lume_elf_release(struct lume_elf_image *);
 int64_t lume_elf_protect(struct lume_elf_image *, uint64_t, uint64_t, unsigned);
 int64_t lume_task_protect_image(unsigned, uint64_t, uint64_t, unsigned);
 bool lume_mmu_map_user(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 bool lume_mmu_map_user_jit(unsigned task, uint64_t va, uint64_t pa, bool write, bool execute);
 #endif
 #define LUME_MMU_BATCH_PAGES 16u

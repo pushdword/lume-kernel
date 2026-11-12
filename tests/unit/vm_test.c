@@ -40,6 +40,7 @@ static struct
 {
     const struct lume_file_ops *ops;
     void *context;
+    unsigned mode;
 } descriptors[64];
 
 #define CHECK(test)                                                                                \
@@ -408,6 +409,7 @@ int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, v
         {
             descriptors[fd].ops = ops;
             descriptors[fd].context = context;
+            descriptors[fd].mode = LUME_O_RDWR;
             return fd;
         }
     return -LUME_EMFILE;
@@ -419,11 +421,19 @@ void *lume_vfs_external(struct lume_files *files, unsigned fd, const struct lume
     return fd < 64 && descriptors[fd].ops == ops ? descriptors[fd].context : NULL;
 }
 
+const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *files, unsigned fd, unsigned *mode)
+{
+    (void)files;
+    if (fd >= 64 || !descriptors[fd].ops || !descriptors[fd].ops->memory || !mode)
+        return NULL;
+    *mode = descriptors[fd].mode;
+    return descriptors[fd].ops->memory(descriptors[fd].context);
+}
+
 void lume_vfs_access_mode(struct lume_files *files, unsigned fd, unsigned mode)
 {
     (void)files;
-    (void)fd;
-    (void)mode;
+    descriptors[fd].mode = mode;
 }
 
 int lume_vfs_hold(struct lume_files *files, unsigned fd)
@@ -519,10 +529,12 @@ static void clean(void)
     CHECK(!metadata_live && !physical_live && !mappings_live && !retired_threads && !file_holds);
 }
 
+static void dma_pin_cases(void);
 static void write_cases(void);
 static void fault_suspend_cases(void);
 static void thread_region_cases(void);
 static void file_mapping_cases(void);
+static void shared_word_cases(void);
 static int memory_file(void);
 
 static void buffer_transaction_cases(void)
@@ -560,6 +572,7 @@ static void buffer_transaction_cases(void)
 
 int main(void)
 {
+    dma_pin_cases();
     buffer_transaction_cases();
     const unsigned anonymous = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
     const uint64_t span = UINT64_C(4) * 1024 * 1024 * 1024;
@@ -666,6 +679,7 @@ int main(void)
     fault_suspend_cases();
     thread_region_cases();
     file_mapping_cases();
+    shared_word_cases();
     printf("PASS_VM_PRODUCT_HOST checks=%u metadata=%u frames=%u ptes=%u\n", checks, metadata_live,
            physical_live, mappings_live);
     return 0;
@@ -676,6 +690,49 @@ static int memory_file(void)
     int fd = (int)call(0, LUME_VM_CREATE, 0, 0, 0, LUME_MEMFD_ALLOW_SEALING, -1);
     CHECK(fd >= 0);
     return fd;
+}
+
+static void shared_word_cases(void)
+{
+    int fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    uint64_t first = call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_SHARED, fd);
+    uint64_t second = call(1, LUME_VM_MAP, LUME_VM_BASE + 8 * PAGE, PAGE, 3,
+                           LUME_MAP_SHARED | LUME_MAP_FIXED, fd);
+    CHECK((int64_t)first > 0 && (int64_t)second > 0 && first != second);
+    struct lume_vm_word_key a, b, c;
+    CHECK(!lume_vm_shared_word_key(0, first + 64, &a) && a.object && a.offset == 64);
+    CHECK(!lume_vm_shared_word_key(1, second + 64, &b));
+    CHECK(a.object == b.object && a.offset == b.offset);
+    CHECK(!lume_vm_shared_word_key(1, second + 68, &c));
+    CHECK(a.object == c.object && a.offset != c.offset);
+    CHECK(lume_vm_shared_word_key(0, first + 1, &c) == -LUME_EINVAL);
+    CHECK(lume_vm_shared_word_key(0, first + PAGE, &c) == -LUME_EFAULT);
+    changing[1] = true;
+    CHECK(lume_vm_shared_word_key(1, second + 64, &c) == -LUME_EAGAIN);
+    changing[1] = false;
+    uint64_t private = call(1, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_PRIVATE, fd);
+    CHECK((int64_t)private > 0);
+    CHECK(lume_vm_shared_word_key(1, private, &c) == -LUME_EOPNOTSUPP);
+    CHECK(!lume_vfs_close(&files, fd));
+    CHECK(!lume_vm_shared_word_key(1, second + 64, &b) && b.object == a.object);
+    clean();
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    first = call(0, LUME_VM_MAP, first, PAGE, 3, LUME_MAP_SHARED | LUME_MAP_FIXED, fd);
+    CHECK((int64_t)first > 0);
+    CHECK(!lume_vm_shared_word_key(0, first + 64, &b) && b.object != a.object);
+    clean();
+    uint64_t previous_serial = serial;
+    serial = UINT64_MAX - UINT64_C(0x40000000) - 1;
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    first = call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_SHARED, fd);
+    CHECK((int64_t)first > 0);
+    CHECK(!lume_vm_shared_word_key(0, first, &b) && b.object == UINT64_MAX);
+    CHECK(call(0, LUME_VM_CREATE, 0, 0, 0, LUME_MEMFD_ALLOW_SEALING, -1) == -LUME_ENOMEM);
+    clean();
+    serial = previous_serial;
 }
 
 static uint64_t file_size(int fd)
@@ -864,6 +921,15 @@ static void alias_fault_during_allocation(void)
     CHECK(lume_vm_fault(1, pause_other, false, false) == 1);
 }
 
+static void alias_retry_during_write(void)
+{
+    CHECK(lume_vm_fault(1, pause_other, false, false) == 2);
+    struct lume_vm_dma_pin *pin = NULL;
+    struct lume_vm_dma_span span;
+    CHECK(lume_vm_dma_pin(&files, (unsigned)pause_fd, 0, PAGE, true, &pin, &span) == -LUME_EBUSY);
+    CHECK(call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, pause_fd) == -LUME_EBUSY);
+}
+
 static void private_write_during_allocation(void)
 {
     uint64_t page = physical(0, pause_base, true, false);
@@ -981,7 +1047,7 @@ static void fault_suspend_cases(void)
     pause_fd = memory_file();
     CHECK(!call(0, LUME_VM_RESIZE, 0, 8192, 0, 0, pause_fd));
     pause_other = call(1, LUME_VM_MAP, 0, 8192, 1, LUME_MAP_SHARED, pause_fd);
-    allocation_pause = alias_fault_during_allocation;
+    allocation_pause = alias_retry_during_write;
     unsigned char data[64], output[64];
     memset(data, 0x7a, sizeof(data));
     CHECK(descriptors[pause_fd].ops->write(descriptors[pause_fd].context, data, sizeof(data)) ==
@@ -992,7 +1058,7 @@ static void fault_suspend_cases(void)
         ++chunks;
     printf("VM_WRITE_FAULT_SHARED chunks=%u frames=%u ptes=%u\n", chunks, physical_live,
            mappings_live);
-    CHECK(!allocation_pause && chunks == 1 && physical_live == 1 && mappings_live == 1);
+    CHECK(!allocation_pause && chunks == 1 && physical_live == 1 && mappings_live == 0);
     uint64_t mapped = physical(1, pause_other, false, false);
     CHECK(!memcmp((void *)(uintptr_t)mapped, data, sizeof(data)));
     CHECK(descriptors[pause_fd].ops->pread(descriptors[pause_fd].context, output, sizeof(output),
@@ -1242,5 +1308,151 @@ static void file_mapping_cases(void)
     CHECK(file_cache->loading && !spaces[0]);
     file_load(file_cache);
     storage_context = true;
+    clean();
+}
+
+static int pin_close_fd;
+
+static void close_during_pin(void)
+{
+    CHECK(call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, pin_close_fd) == -LUME_EBUSY);
+    CHECK(!lume_vfs_close(&files, (unsigned)pin_close_fd));
+}
+
+static const struct lume_vm_dma_pin *device_memory(void *context)
+{
+    return context;
+}
+
+static void close_device_memory(void *context)
+{
+    struct lume_vm_dma_pin *pin = context;
+    lume_vm_dma_unpin(&pin);
+}
+
+static const struct lume_file_ops device_memory_ops = {
+    .kind = LUME_NODE_FILE, .close = close_device_memory, .memory = device_memory};
+
+static void dma_pin_cases(void)
+{
+    struct lume_vm_dma_pin *pin = NULL;
+    struct lume_vm_dma_span span;
+    CHECK(!lume_vm_dma_allocate(&files, 2 * PAGE, &pin, &span));
+    int provider = lume_vfs_attach(&files, &device_memory_ops, pin, 0);
+    CHECK(provider >= 0);
+    lume_vfs_access_mode(&files, (unsigned)provider, LUME_O_RDONLY);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_SHARED, provider) == -LUME_EACCES);
+    lume_vfs_access_mode(&files, (unsigned)provider, LUME_O_RDWR);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_PRIVATE, provider) == -LUME_EACCES);
+    CHECK(call(0, LUME_VM_MAP, 0, 3 * PAGE, 3, LUME_MAP_SHARED, provider) == -LUME_EINVAL);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 5, LUME_MAP_SHARED, provider) == -LUME_EACCES);
+    int64_t device_mapping = call(0, LUME_VM_MAP, 0, 2 * PAGE, 3, LUME_MAP_SHARED, provider);
+    CHECK(device_mapping > 0 && physical(0, device_mapping, true, false) == span.pages[0]);
+    CHECK(!lume_vfs_close(&files, (unsigned)provider));
+    pin = NULL;
+    CHECK(physical(0, device_mapping, false, false));
+    clean();
+    int provider_source = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE, 0, 0, provider_source));
+    CHECK(!lume_vm_dma_pin(&files, (unsigned)provider_source, PAGE, PAGE, false, &pin, &span));
+    provider = lume_vfs_attach(&files, &device_memory_ops, pin, 0);
+    CHECK(provider >= 0);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_SHARED, provider) == -LUME_EACCES);
+    device_mapping = call(0, LUME_VM_MAP, 0, PAGE, 1, LUME_MAP_SHARED, provider);
+    CHECK(device_mapping > 0 && physical(0, device_mapping, false, false) == span.pages[0]);
+    CHECK(!lume_vfs_close(&files, (unsigned)provider_source));
+    CHECK(!lume_vfs_close(&files, (unsigned)provider));
+    pin = NULL;
+    CHECK(physical(0, device_mapping, false, false));
+    clean();
+    CHECK(!lume_vm_dma_allocate(&files, 2 * PAGE, &pin, &span));
+    CHECK(span.count == 2 && span.offset == 0 && span.bytes == 2 * PAGE);
+    int exported = lume_vm_dma_export(&files, pin, true);
+    CHECK(exported >= 0);
+    int64_t mapped = call(0, LUME_VM_MAP, 0, 2 * PAGE, 3, LUME_MAP_SHARED, exported);
+    CHECK(mapped > 0 && physical(0, mapped, true, false) == span.pages[0]);
+    CHECK(!lume_vfs_close(&files, (unsigned)exported));
+    lume_vm_dma_unpin(&pin);
+    CHECK(physical(0, mapped, false, false));
+    clean();
+    CHECK(!lume_vm_dma_allocate(&files, PAGE, &pin, &span));
+    exported = lume_vm_dma_export(&files, pin, false);
+    CHECK(exported >= 0);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_SHARED, exported) == -LUME_EACCES);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 1, LUME_MAP_SHARED, exported) > 0);
+    lume_vm_dma_unpin(&pin);
+    clean();
+    int fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE, 0, 0, fd));
+    uint64_t base = call(0, LUME_VM_MAP, 0, 3 * PAGE, 3, LUME_MAP_SHARED, fd);
+    CHECK(base > 0);
+    CHECK(!lume_vm_dma_pin(&files, (unsigned)fd, PAGE, 2 * PAGE, true, &pin, &span));
+    CHECK(span.serial && span.offset == PAGE && span.bytes == 2 * PAGE && span.count == 2);
+    CHECK(lume_vm_dma_export(&files, pin, true) == -LUME_EINVAL);
+    CHECK(span.pages[0] == physical(0, base + PAGE, true, false));
+    CHECK(call(0, LUME_VM_RESIZE, 0, 4 * PAGE, 0, 0, fd) == -LUME_EBUSY);
+    CHECK(call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd) == -LUME_EBUSY);
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE, 0, 0, fd));
+    unsigned char value = 0x5a;
+    unsigned frames_before = physical_live;
+    CHECK(descriptors[fd].ops->seek(descriptors[fd].context, 3 * PAGE, 0) == 3 * PAGE);
+    CHECK(descriptors[fd].ops->write(descriptors[fd].context, &value, 1) == -LUME_EBUSY);
+    CHECK(descriptors[fd].ops->pwrite(descriptors[fd].context, &value, 1, 4 * PAGE) == -LUME_EBUSY);
+    CHECK(file_size(fd) == 3 * PAGE && physical_live == frames_before);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 1, LUME_MAP_PRIVATE, fd) == -LUME_EBUSY);
+    CHECK(!call(0, LUME_VM_PROTECT, base, 3 * PAGE, 1, 0, -1));
+    CHECK(call(0, LUME_VM_PROTECT, base, 3 * PAGE, 5, 0, -1) == -LUME_EACCES);
+    CHECK(call(0, LUME_VM_ADD_SEALS, 0, 0, 0, LUME_SEAL_FUTURE_WRITE, fd) == -LUME_EBUSY);
+    CHECK(!lume_vfs_close(&files, (unsigned)fd));
+    lume_vm_release(0);
+    drain();
+    CHECK(physical_live == 2);
+    lume_vm_dma_unpin(&pin);
+    CHECK(!pin);
+    lume_vm_dma_unpin(&pin);
+    clean();
+
+    for (unsigned failure = 0; failure < 3; ++failure)
+    {
+        fd = memory_file();
+        CHECK(!call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd));
+        if (failure)
+            physical_budget = (int)failure - 1;
+        else
+            metadata_budget = 0;
+        CHECK(lume_vm_dma_pin(&files, (unsigned)fd, 0, 2 * PAGE, true, &pin, &span) ==
+              -LUME_ENOMEM);
+        CHECK(!pin && !span.pages);
+        struct vm_object *object = ((struct vm_handle *)descriptors[fd].context)->object;
+        CHECK(!object->changing && !object->dma_pins && !object->dma_writers);
+        clean();
+    }
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    pin_close_fd = fd;
+    allocation_pause = close_during_pin;
+    CHECK(!lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, true, &pin, &span));
+    CHECK(!descriptors[fd].ops && physical_live == 1);
+    lume_vm_dma_unpin(&pin);
+    clean();
+
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 1, LUME_MAP_PRIVATE, fd) > 0);
+    CHECK(lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, true, &pin, &span) == -ENOTSUP);
+    clean();
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 5, LUME_MAP_SHARED, fd) > 0);
+    CHECK(lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, false, &pin, &span) == -LUME_EACCES);
+    clean();
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd));
+    CHECK(!lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, false, &pin, &span));
+    CHECK(!call(0, LUME_VM_ADD_SEALS, 0, 0, 0, LUME_SEAL_WRITE, fd));
+    lume_vm_dma_unpin(&pin);
+    CHECK(lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, true, &pin, &span) == -LUME_EACCES);
+    CHECK(!lume_vm_dma_pin(&files, (unsigned)fd, 0, PAGE, false, &pin, &span));
+    lume_vm_dma_unpin(&pin);
     clean();
 }

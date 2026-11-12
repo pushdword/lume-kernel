@@ -2,6 +2,8 @@
 #define LUME_EXTERNAL_FILE_H
 #include "vfs.h"
 
+struct lume_vm_dma_pin;
+
 struct lume_file_ops
 {
     unsigned kind;
@@ -17,10 +19,14 @@ struct lume_file_ops
     int64_t (*resize)(void *, uint64_t);
     int64_t (*pread)(void *, void *, uint64_t, uint64_t);
     int64_t (*pwrite)(void *, const void *, uint64_t, uint64_t);
+    /* Memory callbacks return stable pin metadata without suspending. The VM
+     * retains the object before another caller can close the description. */
+    const struct lume_vm_dma_pin *(*memory)(void *);
 };
 
 int lume_vfs_attach(struct lume_files *, const struct lume_file_ops *, void *, unsigned);
 void *lume_vfs_external(struct lume_files *, unsigned, const struct lume_file_ops *);
+const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *, unsigned, unsigned *);
 int lume_vfs_hold(struct lume_files *, unsigned);
 int lume_vfs_install(struct lume_files *, int);
 void lume_vfs_drop(int);

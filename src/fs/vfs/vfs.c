@@ -3,6 +3,7 @@
 #include "alias.h"
 #include "lume/wait.h"
 #include "lume/devfs.h"
+#include "lume/devfs_character.h"
 #include "lume/external_file.h"
 #include "lume/file_modes.h"
 #include "lume/file_mode.h"
@@ -205,7 +206,8 @@ static void bind_descriptor(struct lume_files *files, unsigned fd, int object, u
 
 /* Duplicated and inherited descriptors share one offset and access mode. Pipe endpoints
  * keep their channel alive until the last reference to each open description closes. */
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define OPEN_FILES 512u
 #else
 #define OPEN_FILES 256u
@@ -299,6 +301,7 @@ static struct node
     uint64_t version;
     unsigned char *data;
     struct lume_block *block;
+    struct lume_devfs_character *character;
     struct lume_devfs_group *group;
     const struct lume_devfs_attribute *attribute;
 } default_nodes[NODES];
@@ -313,6 +316,12 @@ static unsigned namespace_generation;
 static void (*mapping_changed)(uint64_t, uint64_t, uint64_t);
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
 static struct lume_devfs_group *attribute_groups[LUME_DEVICE_LIMIT];
+
+static struct
+{
+    struct lume_devfs_character *device;
+    unsigned opening;
+} character_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
 
@@ -777,6 +786,34 @@ static int add_block(struct lume_block *b)
     return 0;
 }
 
+static size_t initial_device_nodes(void)
+{
+    size_t total = 11;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        total += block_devices[i] != NULL;
+        if (attribute_groups[i])
+            total += attribute_groups[i]->count + 1;
+        struct lume_devfs_character *device = character_devices[i].device;
+        if (!device)
+            continue;
+        ++total;
+        bool first = true;
+        for (unsigned j = 0; j < i; ++j)
+            if (character_devices[j].device &&
+                equal(character_devices[j].device->directory, device->directory))
+                first = false;
+        total += first;
+    }
+    return total;
+}
+
+static bool reserved_device_directory(const char *name)
+{
+    return equal(name, "console") || equal(name, "null") || equal(name, "zero") ||
+           equal(name, "pts");
+}
+
 int lume_devfs_register_block(struct lume_block *b)
 {
     if (!b || !b->device || !b->ops || !b->ops->read || !b->sectors || !b->max_sectors ||
@@ -790,6 +827,11 @@ int lume_devfs_register_block(struct lume_block *b)
     for (const char *p = name; *p; ++p)
         if (*p == '/')
             return -LUME_EINVAL;
+    if (reserved_device_directory(name))
+        return -LUME_EEXIST;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (character_devices[i].device && equal(character_devices[i].device->directory, name))
+            return -LUME_EEXIST;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (attribute_groups[i] && equal(attribute_groups[i]->name, name))
             return -LUME_EEXIST;
@@ -801,7 +843,7 @@ int lume_devfs_register_block(struct lume_block *b)
         if (!block_devices[i] && slot == LUME_DEVICE_LIMIT)
             slot = i;
     }
-    if (slot == LUME_DEVICE_LIMIT)
+    if (slot == LUME_DEVICE_LIMIT || (!count && initial_device_nodes() + 1 > node_capacity))
         return -LUME_ENOSPC;
     int error = count ? add_block(b) : 0;
     if (error)
@@ -840,6 +882,110 @@ static bool attribute_name(const char *name)
         if (*p == '/')
             return false;
     return true;
+}
+
+static void character_path(const struct lume_devfs_character *device, bool directory,
+                           char path[LUME_FILES_PATH_MAX])
+{
+    copy(path, "/dev/", 5);
+    size_t used = length(device->directory);
+    copy(path + 5, device->directory, used + 1);
+    if (!directory)
+    {
+        path[5 + used] = '/';
+        copy(path + 6 + used, device->name, length(device->name) + 1);
+    }
+}
+
+static int add_character(struct lume_devfs_character *device)
+{
+    char path[LUME_FILES_PATH_MAX], directory[LUME_FILES_PATH_MAX];
+    character_path(device, false, path);
+    character_path(device, true, directory);
+    if (find(path) >= 0)
+        return -LUME_EEXIST;
+    int parent = find(directory);
+    if (parent >= 0 &&
+        (nodes[parent].kind != LUME_NODE_DIR || nodes[parent].group || nodes[parent].persistent))
+        return -LUME_ENOTDIR;
+    size_t available = node_capacity - count;
+    for (unsigned entry = free_nodes; entry; entry = nodes[entry - 1].path_next)
+        ++available;
+    if (available < (parent < 0 ? 2u : 1u))
+        return -LUME_ENOSPC;
+    char *owned = lume_path_duplicate(path);
+    char *owned_directory = parent < 0 ? lume_path_duplicate(directory) : NULL;
+    if (!owned || (parent < 0 && !owned_directory))
+    {
+        lume_path_release(owned);
+        lume_path_release(owned_directory);
+        return -LUME_ENOMEM;
+    }
+    if (parent < 0)
+    {
+        unsigned slot = reserve_node(owned_directory, LUME_NODE_DIR);
+        nodes[slot].writable = false;
+        publish_node(slot);
+    }
+    unsigned slot = reserve_node(owned, LUME_NODE_CHAR);
+    nodes[slot].character = device;
+    publish_node(slot);
+    return 0;
+}
+
+int lume_devfs_register_character(struct lume_devfs_character *device)
+{
+    if (!device || !device->open || !attribute_name(device->directory) ||
+        !attribute_name(device->name) ||
+        length(device->directory) + length(device->name) + 7 > LUME_FILES_PATH_MAX)
+        return -LUME_EINVAL;
+    if (reserved_device_directory(device->directory))
+        return -LUME_EEXIST;
+    unsigned slot = LUME_DEVICE_LIMIT;
+    bool existing_directory = false;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        if ((block_devices[i] && equal(block_devices[i]->device->name, device->directory)) ||
+            (attribute_groups[i] && equal(attribute_groups[i]->name, device->directory)))
+            return -LUME_EEXIST;
+        struct lume_devfs_character *other = character_devices[i].device;
+        if (other && equal(other->directory, device->directory))
+            existing_directory = true;
+        if (other && equal(other->directory, device->directory) && equal(other->name, device->name))
+            return -LUME_EEXIST;
+        if (!other && slot == LUME_DEVICE_LIMIT)
+            slot = i;
+    }
+    if (slot == LUME_DEVICE_LIMIT ||
+        (!count && initial_device_nodes() + 1 + !existing_directory > node_capacity))
+        return -LUME_ENOSPC;
+    int result = count ? add_character(device) : 0;
+    if (!result)
+        character_devices[slot].device = device;
+    return result;
+}
+
+int lume_devfs_unregister_character(struct lume_devfs_character *device)
+{
+    if (!device)
+        return -LUME_EINVAL;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (character_devices[i].device == device)
+        {
+            if (character_devices[i].opening)
+                return -LUME_EBUSY;
+            for (unsigned j = 0; j < count; ++j)
+                if (nodes[j].character == device && nodes[j].linked)
+                {
+                    index_remove(j);
+                    nodes[j].linked = false;
+                    nodes[j].character = NULL;
+                    release_ram(&nodes[j]);
+                }
+            character_devices[i].device = NULL;
+            return 0;
+        }
+    return 0;
 }
 
 static void group_path(const struct lume_devfs_group *group, const char *name,
@@ -897,7 +1043,7 @@ int lume_devfs_register_group(struct lume_devfs_group *group)
     if (!group || !attribute_name(group->name) || !group->attributes || !group->count ||
         group->count > LUME_DEVFS_ATTRIBUTES)
         return -LUME_EINVAL;
-    if (equal(group->name, "console") || equal(group->name, "null") || equal(group->name, "zero"))
+    if (reserved_device_directory(group->name))
         return -LUME_EEXIST;
     for (size_t i = 0; i < group->count; ++i)
     {
@@ -910,17 +1056,18 @@ int lume_devfs_register_group(struct lume_devfs_group *group)
                 return -LUME_EEXIST;
     }
     unsigned slot = LUME_DEVICE_LIMIT;
-    size_t initial_nodes = 11 + group->count + 1;
+    size_t initial_nodes = initial_device_nodes() + group->count + 1;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
     {
-        initial_nodes += block_devices[i] != NULL;
+        if (character_devices[i].device &&
+            equal(character_devices[i].device->directory, group->name))
+            return -LUME_EEXIST;
         if (block_devices[i] && equal(block_devices[i]->device->name, group->name))
             return -LUME_EEXIST;
         if (attribute_groups[i])
         {
             if (equal(attribute_groups[i]->name, group->name))
                 return -LUME_EEXIST;
-            initial_nodes += attribute_groups[i]->count + 1;
         }
         else if (slot == LUME_DEVICE_LIMIT)
             slot = i;
@@ -1047,6 +1194,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (attribute_groups[i] && add_group(attribute_groups[i]))
             lume_fail("device attribute namespace allocation");
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (character_devices[i].device && add_character(character_devices[i].device))
+            lume_fail("character device namespace allocation");
 }
 
 static int new_object(int node, int pipe, uint32_t flags)
@@ -1482,6 +1632,15 @@ void *lume_vfs_external(struct lume_files *files, unsigned fd, const struct lume
     return object && object->external == ops ? object->context : 0;
 }
 
+const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *files, unsigned fd, unsigned *mode)
+{
+    struct open_file *object = descriptor(files, fd);
+    if (!object || !object->external || !object->external->memory || !mode)
+        return NULL;
+    *mode = object->flags & 3u;
+    return object->external->memory(object->context);
+}
+
 int lume_vfs_hold(struct lume_files *files, unsigned fd)
 {
     struct open_file *object = descriptor(files, fd);
@@ -1791,6 +1950,21 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         }
         n->bytes = 0;
         node_changed(n);
+    }
+    if (n->character)
+    {
+        struct lume_devfs_character *device = n->character;
+        for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+            if (character_devices[i].device == device)
+            {
+                if (character_devices[i].opening == UINT32_MAX)
+                    return -LUME_EBUSY;
+                ++character_devices[i].opening;
+                int result = device->open(device->context, f, flags);
+                --character_devices[i].opening;
+                return result;
+            }
+        return -LUME_EIO;
     }
     int object = new_object(index, -1, (uint32_t)flags);
     if (object < 0)
@@ -2573,13 +2747,35 @@ int64_t lume_vfs_stat_inode(uint64_t inode, struct lume_stat *out)
     return stat_node((unsigned)inode - 1, out);
 }
 
+static int sandbox_stat(struct lume_files *files, const char *canonical, unsigned index)
+{
+    int permission = lume_sandbox_path(files, canonical);
+    if (!permission || files->identity.sandbox_profile != LUME_SANDBOX_NETWORK ||
+        nodes[index].kind != LUME_NODE_DIR)
+        return permission;
+    struct lume_directory_authorities *authorities = files->directory_authorities;
+    if (!authorities || authorities->generation != namespace_generation || !files_ready(files))
+        return permission;
+    /* Ancestor metadata does not grant access to directory contents. */
+    for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
+    {
+        struct directory_authority *entry = &authorities->entry[i];
+        if (!entry->active)
+            continue;
+        int anchor = open_files[entry->object].node;
+        if (anchor >= 0 && (unsigned)anchor < count && directory_contains(index, (unsigned)anchor))
+            return 0;
+    }
+    return permission;
+}
+
 int64_t lume_vfs_stat_path(struct lume_files *f, const char *input, struct lume_stat *out)
 {
     char p[LUME_FILES_PATH_MAX];
     int i = resolve(f, input, p);
     if (i >= 0)
     {
-        int permission = lume_sandbox_path(f, p);
+        int permission = sandbox_stat(f, p, (unsigned)i);
         if (permission)
             return permission;
     }
@@ -3913,8 +4109,8 @@ int lume_vfs_canonical(struct lume_files *files, const char *input, char output[
     return 0;
 }
 
-int lume_vfs_canonical_at(struct lume_files *files, int64_t directory, const char *input,
-                          char output[LUME_FILES_PATH_MAX])
+static int resolve_at(struct lume_files *files, int64_t directory, const char *input,
+                      char output[LUME_FILES_PATH_MAX])
 {
     output[0] = 0;
     struct lume_files base;
@@ -3948,7 +4144,25 @@ int lume_vfs_canonical_at(struct lume_files *files, int64_t directory, const cha
         }
         return result;
     }
-    return lume_sandbox_path(files, output);
+    return result;
+}
+
+int lume_vfs_canonical_at(struct lume_files *files, int64_t directory, const char *input,
+                          char output[LUME_FILES_PATH_MAX])
+{
+    int result = resolve_at(files, directory, input, output);
+    return result < 0 ? result : lume_sandbox_path(files, output);
+}
+
+int64_t lume_vfs_stat_at(struct lume_files *files, int64_t directory, const char *input,
+                         struct lume_stat *out)
+{
+    char canonical[LUME_FILES_PATH_MAX];
+    int index = resolve_at(files, directory, input, canonical);
+    if (index < 0)
+        return index;
+    int permission = sandbox_stat(files, canonical, (unsigned)index);
+    return permission ? permission : stat_node((unsigned)index, out);
 }
 
 int lume_vfs_fd_path(struct lume_files *files, int64_t fd, char output[LUME_FILES_PATH_MAX])

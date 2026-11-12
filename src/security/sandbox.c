@@ -13,6 +13,7 @@
 #include "lume/file_io.h"
 #include "lume/files.h"
 #include "lume/vfs_paths.h"
+#include "lume/render.h"
 #include <string.h>
 
 int64_t lume_sandbox_call(struct lume_files *files, unsigned pid, uint64_t operation,
@@ -60,6 +61,9 @@ int lume_sandbox_path(struct lume_files *files, const char *canonical)
     if (files->identity.sandbox_profile < LUME_SANDBOX_RENDERER ||
         files->identity.sandbox_profile > LUME_SANDBOX_GPU_SOFTWARE)
         return -LUME_EPERM;
+    if (files->identity.sandbox_profile == LUME_SANDBOX_GPU_SOFTWARE &&
+        !strcmp(canonical, "/dev/dri/renderD128"))
+        return 0;
     static const char *const directories[] = {"/data/lib/chromium",
                                               "/data/share/chromium",
                                               "/data/share/fonts",
@@ -95,6 +99,9 @@ int lume_sandbox_open(struct lume_files *files, const char *input, uint64_t flag
         return lume_vfs_sandbox_directory(files, canonical, true) ? 0 : -LUME_EPERM;
     if (result)
         return result;
+    if (files->identity.sandbox_profile == LUME_SANDBOX_GPU_SOFTWARE &&
+        !strcmp(canonical, "/dev/dri/renderD128"))
+        return flags == LUME_O_RDWR ? 0 : -LUME_EPERM;
     if (flags)
         return lume_vfs_sandbox_directory(files, canonical, false) ? 0 : -LUME_EPERM;
     return lume_sandbox_path(files, canonical);
@@ -143,6 +150,33 @@ int lume_sandbox_io(struct lume_files *files, uint64_t fd, bool writing)
     if (profile < LUME_SANDBOX_RENDERER || profile > LUME_SANDBOX_GPU_SOFTWARE)
         return -LUME_EPERM;
     return lume_vfs_sandbox_access(files, fd, writing);
+}
+
+static bool render_operation(uint64_t action)
+{
+    switch (action)
+    {
+    case LUME_RENDER_OPEN:
+    case LUME_RENDER_INFO:
+    case LUME_RENDER_CAPSET_INFO:
+    case LUME_RENDER_CAPSET:
+    case LUME_RENDER_CONTEXT:
+    case LUME_RENDER_RESOURCE_CREATE:
+    case LUME_RENDER_RESOURCE_EXPORT:
+    case LUME_RENDER_RESOURCE_CLOSE:
+    case LUME_RENDER_TRANSFER:
+    case LUME_RENDER_SUBMIT:
+    case LUME_RENDER_WAIT:
+    case LUME_RENDER_RESOURCE_INFO:
+    case LUME_RENDER_RESOURCE_WAIT:
+    case LUME_RENDER_PCI:
+    case LUME_RENDER_PRIME_EXPORT:
+    case LUME_RENDER_PRIME_IMPORT:
+    case LUME_RENDER_DISPLAY:
+        return true;
+    default:
+        return false;
+    }
 }
 
 int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume_context *frame)
@@ -222,13 +256,15 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
                    ? 0
                    : -LUME_EPERM;
     case LUME_SYS_THREAD:
-        return action <= LUME_THREAD_WAIT_REALTIME ? 0 : -LUME_EPERM;
+        return action <= LUME_THREAD_WAKE_SHARED ? 0 : -LUME_EPERM;
     case LUME_SYS_VM:
         if (action == LUME_VM_JIT_BEGIN || action == LUME_VM_JIT_END)
             return LUME_CONTEXT_REG(frame, 1) || LUME_CONTEXT_REG(frame, 2) ? -LUME_EINVAL : 0;
         return action <= LUME_VM_SYNC && action != LUME_VM_OPEN && action != LUME_VM_UNLINK
                    ? 0
                    : -LUME_EPERM;
+    case LUME_SYS_GPU:
+        return profile == LUME_SANDBOX_GPU_SOFTWARE && render_operation(action) ? 0 : -LUME_EPERM;
     case LUME_SYS_SOCKET:
         return local_operation((unsigned)action) || profile == LUME_SANDBOX_NETWORK ||
                        profile == LUME_SANDBOX_GPU_SOFTWARE

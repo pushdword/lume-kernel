@@ -185,6 +185,10 @@ int lume_pc_display_register(void)
     int result = lume_s3_display_register();
     if (result != -LUME_ENOENT)
         return result;
+    extern int lume_bochs_display_register(void);
+    result = lume_bochs_display_register();
+    if (result != -LUME_ENOENT)
+        return result;
     static const struct lume_platform_display_ops operations = {start, putc, write,
                                                                 clear, stop, video_control};
     return lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));

@@ -110,7 +110,7 @@ enum
 #define LUME_PATH_MAX 128u
 #define LUME_NAME_MAX 47u
 #if defined(__aarch64__) || defined(__x86_64__) || defined(LUME_ARCH_AARCH64) ||                   \
-    defined(LUME_ARCH_AMD64)
+    defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #define LUME_FD_MAX 256u
 #else
 #define LUME_FD_MAX 32u

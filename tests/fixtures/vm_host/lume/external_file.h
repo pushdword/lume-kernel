@@ -6,6 +6,7 @@
 #define LUME_POLLIN 1u
 #define LUME_POLLOUT 4u
 struct lume_poll_source;
+struct lume_vm_dma_pin;
 
 struct lume_files
 {
@@ -29,10 +30,12 @@ struct lume_file_ops
     int64_t (*resize)(void *, uint64_t);
     int64_t (*pread)(void *, void *, uint64_t, uint64_t);
     int64_t (*pwrite)(void *, const void *, uint64_t, uint64_t);
+    const struct lume_vm_dma_pin *(*memory)(void *);
 };
 
 int lume_vfs_attach(struct lume_files *, const struct lume_file_ops *, void *, unsigned);
 void *lume_vfs_external(struct lume_files *, unsigned, const struct lume_file_ops *);
+const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *, unsigned, unsigned *);
 void lume_vfs_access_mode(struct lume_files *, unsigned, unsigned);
 int lume_vfs_hold(struct lume_files *, unsigned);
 int64_t lume_vfs_stat(struct lume_files *, unsigned, struct lume_stat *);

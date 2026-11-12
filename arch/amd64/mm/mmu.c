@@ -46,6 +46,8 @@ static uint64_t table(const uint64_t *p, bool user)
     return (uintptr_t)p | PRESENT | WRITE | (user ? USER : 0);
 }
 
+#include "device_mapping.h"
+
 void lume_mmu_ap_trampoline(bool enable)
 {
     /* The startup page is writable only until every AP enters the kernel mappings. */
@@ -66,6 +68,8 @@ void lume_mmu_switch(uint64_t physical)
 
 bool lume_mmu_start(const struct lume_fdt *description)
 {
+    if (description->ram_count > sizeof(device_ram) / sizeof(device_ram[0]))
+        return false;
     uint64_t initrd_start = description->initrd_start;
     uint64_t initrd_end = description->initrd_end;
     bool initrd_valid = false;
@@ -163,6 +167,7 @@ bool lume_mmu_start(const struct lume_fdt *description)
     }
     /* No low-memory identity mapping survives into application execution. */
     directories[0][0] = 0;
+    device_mapping_start(description);
     lume_mmu_switch((uintptr_t)root);
     return true;
 }
@@ -313,6 +318,7 @@ void lume_mmu_release_user(unsigned task)
     memset(task_root[task], 0, sizeof(task_root[task]));
     memset(task_pdpt[task], 0, sizeof(task_pdpt[task]));
     memset(task_pd[task], 0, sizeof(task_pd[task]));
+    memset(task_device_pdpt[task], 0, sizeof(task_device_pdpt[task]));
 }
 
 static bool user_address(uint64_t va)
@@ -585,6 +591,8 @@ bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack)
         memcpy(task_pdpt[task][view], pdpt, sizeof(pdpt));
         memcpy(task_pd[task][view], directories[1], sizeof(task_pd[task][view]));
         task_root[task][view][0] = table(task_pdpt[task][view], true);
+        memcpy(task_device_pdpt[task][view], device_pdpt, sizeof(device_pdpt));
+        task_root[task][view][1] = table(task_device_pdpt[task][view], true);
         task_pdpt[task][view][1] = table(task_pd[task][view], true);
     }
     if (!lume_mmu_map_user(task, LUME_USER_BASE, (uintptr_t)__user_code_start, false, true) ||
@@ -625,7 +633,13 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
             task_pdpt[a][view][i] = task_pdpt[b][view][i];
             task_pdpt[b][view][i] = value;
         }
-        for (unsigned i = 1; i < 128; ++i)
+        for (unsigned i = 0; i < 512; ++i)
+        {
+            uint64_t value = task_device_pdpt[a][view][i];
+            task_device_pdpt[a][view][i] = task_device_pdpt[b][view][i];
+            task_device_pdpt[b][view][i] = value;
+        }
+        for (unsigned i = 2; i < 128; ++i)
         {
             uint64_t value = task_root[a][view][i];
             task_root[a][view][i] = task_root[b][view][i];
@@ -681,7 +695,7 @@ void lume_sync_code(uint64_t address, size_t bytes)
 
 bool lume_mmu_device_mapping(uint64_t address)
 {
-    return address >= 0xc0000000 && address < 0x100000000;
+    return device_mapping_present(address);
 }
 
 bool lume_mmu_module_prepare(uint64_t physical, size_t bytes)

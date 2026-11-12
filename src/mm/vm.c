@@ -1,4 +1,5 @@
 #include "lume/vm.h"
+#include "lume/vm_dma.h"
 #include "lume/vfs.h"
 #include "lume/early.h"
 #include "lume/elf.h"
@@ -25,7 +26,7 @@ struct vm_area;
 struct vm_object
 {
     uint64_t bytes, serial;
-    unsigned references, seals;
+    unsigned references, seals, dma_pins, dma_writers;
     bool persistent, changing, discardable;
     unsigned uid, gid, mode;
     struct vm_chunk *chunks[HASH];
@@ -55,6 +56,14 @@ struct vm_handle
     struct vm_object *object;
     uint64_t offset;
     bool write;
+};
+
+struct lume_vm_dma_pin
+{
+    struct vm_object *object;
+    uint64_t serial, offset, bytes;
+    bool write;
+    uint64_t pages[];
 };
 
 static struct vm_area *spaces[LUME_TASK_LIMIT];
@@ -129,13 +138,16 @@ static uint64_t get_page(struct vm_object *object, uint64_t page)
 
 static struct vm_object *new_object(uint64_t bytes, bool persistent)
 {
+    if (serial >= UINT64_MAX - UINT64_C(0x40000000))
+        return NULL;
+    uint64_t identity = UINT64_C(0x40000000) + ++serial;
     struct vm_object *object = allocate(sizeof(*object));
     if (object)
     {
         object->bytes = bytes;
         object->persistent = persistent;
         object->discardable = true;
-        object->serial = UINT64_C(0x40000000) + ++serial;
+        object->serial = identity;
         object->references = 1;
     }
     return object;
@@ -228,6 +240,27 @@ static struct vm_area *find_area(unsigned task, uint64_t address)
         if (address < area->end)
             return area;
     return NULL;
+}
+
+int lume_vm_shared_word_key(unsigned task, uint64_t address, struct lume_vm_word_key *key)
+{
+    if (task >= LUME_TASK_LIMIT || !key || (address & 3))
+        return -LUME_EINVAL;
+    if (changing[task])
+        return -LUME_EAGAIN;
+    struct vm_area *area = find_area(task, address);
+    if (!area || area->end - address < sizeof(uint32_t) || !(area->protection & LUME_PROT_READ))
+        return -LUME_EFAULT;
+    struct vm_object *object = area->object;
+    if (area->retiring || object->changing)
+        return -LUME_EAGAIN;
+    if (!area->shared || object->file || object->backing)
+        return -LUME_EOPNOTSUPP;
+    uint64_t offset = area->offset + address - area->first;
+    if (offset > object->bytes || object->bytes - offset < sizeof(uint32_t))
+        return -LUME_EFAULT;
+    *key = (struct lume_vm_word_key){object->serial, offset};
+    return 0;
 }
 
 static bool overlap(uint64_t a, uint64_t z, uint64_t b, uint64_t e)
@@ -528,7 +561,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     if (!(area->protection & required))
         return 0;
     bool writer = false;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     writer = lume_mmu_jit_active(task);
 #endif
     if (area->jit &&
@@ -550,7 +584,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
             return -1;
     }
     uint64_t generation = area->generation, root = lume_mmu_task_root(task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     root = lume_mmu_task_view_root(task, writer);
 #endif
     ++object->references;
@@ -583,7 +618,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         goto out;
     }
     uint64_t current_root = lume_mmu_task_root(task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     if (lume_mmu_jit_active(task) != writer)
     {
         result = 2;
@@ -694,7 +730,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         if (!lume_mmu_unmap_user_batch(task, &aligned, 1))
             lume_fail("copy-on-write mapping replacement");
     bool mapped;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     if (area->jit)
         mapped = lume_mmu_map_user_jit(task, aligned, physical,
                                        private && (area->protection & LUME_PROT_WRITE),
@@ -728,7 +765,8 @@ bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)
 {
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
         if (spaces[task] &&
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
             lume_mmu_root_matches(task, root)
 #else
             lume_mmu_task_root(task) == root
@@ -764,7 +802,8 @@ bool lume_vm_code_address(unsigned task, uint64_t address)
     {
         if (area->retiring || !(area->protection & LUME_PROT_EXEC))
             return false;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
         if (area->jit && lume_mmu_jit_active(task))
             return false;
 #endif
@@ -890,6 +929,8 @@ static void zero_old_tail(struct vm_object *object)
 
 static int64_t resize_object(struct vm_object *object, uint64_t bytes)
 {
+    if (object->dma_pins && bytes != object->bytes)
+        return -LUME_EBUSY;
     if (object->changing)
         return -LUME_EAGAIN;
     if (bytes > INT64_MAX || (bytes < object->bytes && (object->seals & LUME_SEAL_SHRINK)) ||
@@ -960,11 +1001,19 @@ static int64_t handle_write(void *context, const void *data, uint64_t bytes)
         return -LUME_EACCES;
     if (end > object->bytes)
     {
+        if (object->dma_pins)
+            return -LUME_EBUSY;
         if (object->seals & LUME_SEAL_GROW)
             return -LUME_EPERM;
-        zero_old_tail(object);
     }
+    if (object->references == UINT32_MAX)
+        return -LUME_EBUSY;
+    ++object->references;
+    object->changing = true;
+    if (end > object->bytes)
+        zero_old_tail(object);
     uint64_t done = 0;
+    unsigned copied_pages = 0;
     while (done < bytes)
     {
         uint64_t offset = first + done, physical = get_page(object, offset / PAGE);
@@ -975,10 +1024,14 @@ static int64_t handle_write(void *context, const void *data, uint64_t bytes)
             part = (unsigned)(bytes - done);
         memcpy((void *)(uintptr_t)(physical + offset % PAGE), (const char *)data + done, part);
         done += part;
+        if (++copied_pages % 16 == 0)
+            lume_worker_checkpoint(0);
     }
     handle->offset += done;
     if (done && handle->offset > object->bytes)
         object->bytes = handle->offset;
+    object->changing = false;
+    drop(object);
     return done ? (int64_t)done : -LUME_ENOMEM;
 }
 
@@ -1048,6 +1101,118 @@ static int attach(struct lume_files *files, struct vm_object *object, bool write
         lume_vfs_access_mode(files, (unsigned)fd, write ? LUME_O_RDWR : LUME_O_RDONLY);
     }
     return fd;
+}
+
+static int pin_object(struct vm_object *object, uint64_t offset, uint64_t bytes, bool write,
+                      struct lume_vm_dma_pin **output, struct lume_vm_dma_span *span)
+{
+    if (object->changing || object->dma_pins == UINT32_MAX || object->references == UINT32_MAX)
+        return -LUME_EBUSY;
+    if (!object->persistent || object->cached || object->backing || object->children)
+        return -ENOTSUP;
+    if (offset > object->bytes || bytes > object->bytes - offset)
+        return -LUME_EINVAL;
+    if (write && (object->seals & (LUME_SEAL_WRITE | LUME_SEAL_FUTURE_WRITE)))
+        return -LUME_EACCES;
+    for (struct vm_area *area = object->areas; area; area = area->object_next)
+        if (area->protection & LUME_PROT_EXEC)
+            return -LUME_EACCES;
+    ++object->references;
+    object->changing = true;
+    unsigned count = (unsigned)(bytes / PAGE);
+    struct lume_vm_dma_pin *pin = allocate(sizeof(*pin) + (size_t)count * sizeof(uint64_t));
+    if (!pin)
+        goto memory;
+    pin->object = object;
+    pin->serial = object->serial;
+    pin->offset = offset;
+    pin->bytes = bytes;
+    pin->write = write;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        pin->pages[i] = get_page(object, offset / PAGE + i);
+        if (!pin->pages[i])
+        {
+            lume_kernel_free(pin);
+            goto memory;
+        }
+        if ((i + 1) % 16 == 0)
+            lume_worker_checkpoint(0);
+    }
+    ++object->dma_pins;
+    if (write)
+        ++object->dma_writers;
+    object->changing = false;
+    *span = (struct lume_vm_dma_span){pin->pages, object->serial, offset, bytes, count};
+    *output = pin;
+    return 0;
+memory:
+    object->changing = false;
+    drop(object);
+    return -LUME_ENOMEM;
+}
+
+int lume_vm_dma_pin(struct lume_files *files, unsigned fd, uint64_t offset, uint64_t bytes,
+                    bool write, struct lume_vm_dma_pin **output, struct lume_vm_dma_span *span)
+{
+    if (!files || !output || !span || *output || !bytes || ((offset | bytes) & (PAGE - 1)) ||
+        bytes / PAGE > LUME_VM_DMA_MAX_PAGES)
+        return -LUME_EINVAL;
+    *span = (struct lume_vm_dma_span){0};
+    struct vm_handle *handle = lume_vfs_external(files, fd, &handle_ops);
+    if (!handle)
+        return -LUME_EBADF;
+    if (write && !handle->write)
+        return -LUME_EACCES;
+    return pin_object(handle->object, offset, bytes, write, output, span);
+}
+
+int lume_vm_dma_allocate(struct lume_files *files, uint64_t bytes, struct lume_vm_dma_pin **output,
+                         struct lume_vm_dma_span *span)
+{
+    if (!files || !output || !span || *output || !bytes || (bytes & (PAGE - 1)) ||
+        bytes / PAGE > LUME_VM_DMA_MAX_PAGES)
+        return -LUME_EINVAL;
+    *span = (struct lume_vm_dma_span){0};
+    struct vm_object *object = new_object(bytes, true);
+    if (!object)
+        return -LUME_ENOMEM;
+    object->uid = files->identity.euid;
+    object->gid = files->identity.egid;
+    object->mode = 0600;
+    object->seals = LUME_SEAL_SEAL;
+    int result = pin_object(object, 0, bytes, true, output, span);
+    drop(object);
+    return result;
+}
+
+int lume_vm_dma_export(struct lume_files *files, const struct lume_vm_dma_pin *pin, bool write)
+{
+    if (!files || !pin || pin->serial != pin->object->serial || pin->offset ||
+        pin->bytes != pin->object->bytes)
+        return -LUME_EINVAL;
+    struct vm_object *object = pin->object;
+    if (write && !pin->write)
+        return -LUME_EACCES;
+    if (object->changing || object->references == UINT32_MAX)
+        return -LUME_EBUSY;
+    return attach(files, object, write, LUME_MEMFD_CLOEXEC);
+}
+
+void lume_vm_dma_unpin(struct lume_vm_dma_pin **owner)
+{
+    if (!owner || !*owner)
+        return;
+    struct lume_vm_dma_pin *pin = *owner;
+    struct vm_object *object = pin->object;
+    if (pin->serial != object->serial || !object->dma_pins || (pin->write && !object->dma_writers))
+        lume_fail("virtual memory DMA ownership");
+    *owner = NULL;
+    --object->dma_pins;
+    if (pin->write)
+        --object->dma_writers;
+    lume_kernel_free(pin);
+    drop(object);
 }
 
 struct page_copy
@@ -1123,7 +1288,8 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                              LUME_MAP_ANONYMOUS | LUME_MAP_NORESERVE | LUME_MAP_FIXED_NOREPLACE |
                              LUME_MAP_JIT;
     bool jit = (flags & LUME_MAP_JIT) != 0;
-#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64)
+#if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64) &&           \
+    !defined(LUME_ARCH_I686)
     if (jit)
         return -LUME_ENOSYS;
 #endif
@@ -1178,7 +1344,26 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
     }
     else
     {
+        struct vm_handle memory_handle;
         struct vm_handle *handle = lume_vfs_external(files, (unsigned)request->fd, &handle_ops);
+        if (!handle)
+        {
+            unsigned mode;
+            const struct lume_vm_dma_pin *pin =
+                lume_vfs_memory(files, (unsigned)request->fd, &mode);
+            if (pin)
+            {
+                if (!(flags & LUME_MAP_SHARED) || mode == LUME_O_WRONLY)
+                    goto access;
+                if (pin->serial != pin->object->serial || offset > pin->bytes ||
+                    length > pin->bytes - offset || pin->offset > INT64_MAX - offset)
+                    goto invalid;
+                memory_handle = (struct vm_handle){.object = pin->object,
+                                                   .write = pin->write && mode == LUME_O_RDWR};
+                handle = &memory_handle;
+                offset += pin->offset;
+            }
+        }
         if (handle && (flags & LUME_MAP_SHARED))
         {
             object = handle->object;
@@ -1191,6 +1376,7 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                           ? 7u
                           : 5u;
             if ((protection & ~maximum) || offset > INT64_MAX || length > INT64_MAX - offset ||
+                ((protection & LUME_PROT_EXEC) && object->dma_pins) ||
                 writable_alias(object, offset, offset + length, protection, LUME_TASK_LIMIT, 0, 0))
                 goto access;
             ++object->references;
@@ -1222,7 +1408,7 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
                 else
                     error = held;
             }
-            if (!source || source->changing)
+            if (!source || source->changing || source->dma_pins)
             {
                 if (held >= 0)
                     lume_vfs_drop(held);
@@ -1460,6 +1646,7 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
                 if (area->object->changing)
                     return -LUME_EBUSY;
                 if (((protection & 6u) == 6u && !area->jit) || (protection & ~area->maximum) ||
+                    ((protection & LUME_PROT_EXEC) && area->object->dma_pins) ||
                     ((protection & LUME_PROT_WRITE) && area->shared &&
                      (area->object->seals & LUME_SEAL_WRITE)) ||
                     writable_alias(area->object, area->offset + position - area->first,
@@ -1661,6 +1848,8 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
             return -LUME_EPERM;
         if (seals & ~31u)
             return -LUME_EINVAL;
+        if (handle->object->dma_writers && (seals & (LUME_SEAL_WRITE | LUME_SEAL_FUTURE_WRITE)))
+            return -LUME_EBUSY;
         if ((seals & LUME_SEAL_WRITE) &&
             writable_alias(handle->object, 0, UINT64_MAX, LUME_PROT_EXEC, LUME_TASK_LIMIT, 0, 0))
             return -LUME_EBUSY;
@@ -1801,7 +1990,23 @@ bool lume_vm_thread_region(unsigned owner, unsigned task, uint64_t tls_bytes, ui
     if (owner >= LUME_TASK_LIMIT || task >= LUME_TASK_LIMIT || !tls || !stack || tls > 17 * PAGE ||
         stack > LUME_THREAD_STACK_MAX || tls + PAGE + stack > LUME_THREAD_STRIDE - PAGE)
         return false;
+#if defined(LUME_ARCH_I686)
+    uint64_t base = LUME_THREAD_VM_BASE + PAGE;
+    uint64_t span = tls + PAGE + stack;
+    for (struct vm_area *area = spaces[owner]; area; area = area->next)
+    {
+        if (area->end <= LUME_THREAD_VM_BASE)
+            continue;
+        if (area->first >= base + span + PAGE)
+            break;
+        if (area->end + PAGE > base)
+            base = area->end + PAGE;
+    }
+    if (base >= LUME_THREAD_VM_LIMIT || span + PAGE > LUME_THREAD_VM_LIMIT - base)
+        return false;
+#else
     uint64_t base = LUME_THREAD_VM_BASE + (uint64_t)task * LUME_THREAD_STRIDE + PAGE;
+#endif
     struct vm_area *a = allocate(sizeof(*a)), *b = allocate(sizeof(*b));
     struct vm_object *ta = new_object(tls, false), *sa = new_object(stack, false);
     if (!a || !b || !ta || !sa || !free_range(owner, base, base + tls + PAGE + stack))

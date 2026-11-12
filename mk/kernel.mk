@@ -2,6 +2,10 @@ KERNEL_C_aarch64 := \
     arch/aarch64/context/query.c \
     src/device/graphics.c \
     src/device/gpu.c \
+    src/device/render.c \
+    src/device/virtio_pci.c \
+    src/device/virtio_gpu.c \
+    src/device/virtio_gpu_device.c \
     src/device/tty.c \
     src/storage/block.c \
     platform/raspberrypi5/boot_fdt.c \

@@ -1,7 +1,9 @@
 #include "lume/vfs.h"
 #include "lume/devfs.h"
+#include "lume/devfs_character.h"
 #include "lume/poll.h"
 #include "lume/file_mode.h"
+#include "lume/external_file.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +50,177 @@ static int write_attribute(void *context, const char *data, size_t bytes)
     return write_error;
 }
 
+static unsigned character_opens, character_closes;
+static struct lume_devfs_character character;
+
+static void character_close(void *context)
+{
+    assert(context == &character);
+    ++character_closes;
+}
+
+static int64_t character_read(void *context, void *data, uint64_t bytes)
+{
+    assert(context == &character);
+    if (bytes)
+        *(char *)data = 'G';
+    return bytes ? 1 : 0;
+}
+
+static const struct lume_file_ops character_ops = {
+    .kind = LUME_NODE_CHAR, .close = character_close, .read = character_read, .memory_io = true};
+
+static int character_open(void *context, struct lume_files *files, uint64_t flags)
+{
+    assert(context == &character && flags == LUME_O_RDWR);
+    assert(lume_devfs_unregister_character(&character) == -LUME_EBUSY);
+    ++character_opens;
+    return lume_vfs_attach(files, &character_ops, context, 0);
+}
+
+static void character_devices(void)
+{
+    character = (struct lume_devfs_character){
+        .directory = "dri", .name = "renderD128", .context = &character, .open = character_open};
+    assert(!lume_devfs_register_character(&character));
+    assert(lume_devfs_register_character(&character) == -LUME_EEXIST);
+    struct lume_files files;
+    lume_files_init(&files);
+    struct lume_stat info;
+    assert(lume_vfs_stat_path(&files, "/dev/dri/renderD128", &info) >= 0 &&
+           info.kind == LUME_NODE_CHAR);
+    int fd = (int)lume_vfs_open(&files, "/dev/dri/renderD128", LUME_O_RDWR);
+    assert(fd >= 0 && character_opens == 1 && !lume_vfs_console_io(&files, (unsigned)fd));
+    char value = 0;
+    assert(lume_vfs_read(&files, (unsigned)fd, &value, 1) == 1 && value == 'G');
+    assert(!lume_vfs_close(&files, (unsigned)fd) && character_closes == 1);
+    assert(!lume_devfs_unregister_character(&character));
+    assert(lume_vfs_open(&files, "/dev/dri/renderD128", LUME_O_RDWR) == -LUME_ENOENT);
+    for (unsigned i = 0; i < 32; ++i)
+    {
+        assert(!lume_devfs_register_character(&character));
+        assert(!lume_devfs_unregister_character(&character));
+    }
+    struct lume_devfs_character invalid = character;
+    invalid.directory = "../escape";
+    assert(lume_devfs_register_character(&invalid) == -LUME_EINVAL);
+    invalid = character;
+    invalid.name = "../escape";
+    assert(lume_devfs_register_character(&invalid) == -LUME_EINVAL);
+    assert(!lume_devfs_register_character(&character));
+    lume_files_release(&files);
+    lume_vfs_init("", 0);
+    lume_files_init(&files);
+    fd = (int)lume_vfs_open(&files, "/dev/dri/renderD128", LUME_O_RDWR);
+    assert(fd >= 0 && character_opens == 2);
+    assert(!lume_vfs_close(&files, (unsigned)fd) && character_closes == 2);
+    assert(!lume_devfs_unregister_character(&character));
+    lume_files_release(&files);
+}
+
+static int unused_block_read(struct lume_block *block, uint64_t sector, unsigned count, void *data)
+{
+    (void)block;
+    (void)sector;
+    (void)count;
+    (void)data;
+    assert(false);
+    return -LUME_EIO;
+}
+
+static void initial_character_namespace(struct lume_devfs_group *existing)
+{
+    struct lume_devfs_character probe = {
+        .directory = "dri", .name = "renderD128", .context = &character, .open = character_open};
+    const char *reserved[] = {"console", "null", "zero", "pts"};
+    for (unsigned i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+    {
+        probe.directory = reserved[i];
+        assert(lume_devfs_register_character(&probe) == -LUME_EEXIST);
+    }
+    probe.directory = existing->name;
+    assert(lume_devfs_register_character(&probe) == -LUME_EEXIST);
+    probe.directory = "dri";
+    assert(!lume_devfs_register_character(&probe));
+    struct lume_devfs_group conflict = *existing;
+    conflict.name = "dri";
+    assert(lume_devfs_register_group(&conflict) == -LUME_EEXIST);
+    const struct lume_block_ops operations = {.read = unused_block_read};
+    struct lume_device block_device = {.name = "dri", .state = LUME_DEVICE_CLAIMED};
+    struct lume_block block = {.device = &block_device,
+                               .ops = &operations,
+                               .sectors = 8,
+                               .sector_bytes = 512,
+                               .max_sectors = 1};
+    assert(lume_devfs_register_block(&block) == -LUME_EEXIST);
+    assert(!lume_devfs_unregister_character(&probe));
+    assert(!lume_devfs_register_block(&block));
+    assert(lume_devfs_register_character(&probe) == -LUME_EEXIST);
+    assert(!lume_devfs_unregister_block(&block));
+
+    struct lume_devfs_character characters[LUME_DEVICE_LIMIT];
+    char character_names[LUME_DEVICE_LIMIT][8];
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        snprintf(character_names[i], sizeof(character_names[i]), "c%02u", i);
+        characters[i] = probe;
+        characters[i].directory = character_names[i];
+        assert(!lume_devfs_register_character(&characters[i]));
+    }
+    struct lume_devfs_attribute attributes[LUME_DEVFS_ATTRIBUTES];
+    char attribute_names[LUME_DEVFS_ATTRIBUTES][8];
+    for (unsigned i = 0; i < LUME_DEVFS_ATTRIBUTES; ++i)
+    {
+        snprintf(attribute_names[i], sizeof(attribute_names[i]), "a%02u", i);
+        attributes[i] =
+            (struct lume_devfs_attribute){.name = attribute_names[i], .read = read_attribute};
+    }
+    struct lume_devfs_group groups[LUME_DEVICE_LIMIT];
+    char group_names[LUME_DEVICE_LIMIT][8];
+    unsigned groups_registered = 0;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        snprintf(group_names[i], sizeof(group_names[i]), "g%02u", i);
+        groups[i] = (struct lume_devfs_group){
+            .name = group_names[i], .attributes = attributes, .count = LUME_DEVFS_ATTRIBUTES};
+        int result = lume_devfs_register_group(&groups[i]);
+        if (result)
+        {
+            assert(result == -LUME_ENOSPC);
+            break;
+        }
+        ++groups_registered;
+    }
+    assert(groups_registered && groups_registered < LUME_DEVICE_LIMIT);
+    struct lume_device devices[LUME_DEVICE_LIMIT];
+    struct lume_block blocks[LUME_DEVICE_LIMIT];
+    char block_names[LUME_DEVICE_LIMIT][8];
+    unsigned blocks_registered = 0;
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+    {
+        snprintf(block_names[i], sizeof(block_names[i]), "b%02u", i);
+        devices[i] = block_device;
+        devices[i].name = block_names[i];
+        blocks[i] = block;
+        blocks[i].device = &devices[i];
+        int result = lume_devfs_register_block(&blocks[i]);
+        if (result)
+        {
+            assert(result == -LUME_ENOSPC);
+            break;
+        }
+        ++blocks_registered;
+    }
+    assert(blocks_registered && blocks_registered < LUME_DEVICE_LIMIT);
+    lume_vfs_init("", 0);
+    for (unsigned i = 0; i < blocks_registered; ++i)
+        assert(!lume_devfs_unregister_block(&blocks[i]));
+    for (unsigned i = 0; i < groups_registered; ++i)
+        assert(!lume_devfs_unregister_group(&groups[i]));
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        assert(!lume_devfs_unregister_character(&characters[i]));
+}
+
 int main(void)
 {
     struct lume_devfs_attribute entries[] = {
@@ -57,6 +230,7 @@ int main(void)
         .name = "cpufan", .attributes = entries, .count = 2, .context = &reads};
     assert(!lume_devfs_register_group(&group));
     assert(lume_devfs_register_group(&group) == -LUME_EEXIST);
+    initial_character_namespace(&group);
     lume_vfs_init("", 0);
     struct lume_files files, inherited;
     lume_files_init(&files);
@@ -133,6 +307,8 @@ int main(void)
     entries[1].name = "rpm";
     entries[1].read = NULL;
     assert(lume_devfs_register_group(&group) == -LUME_EINVAL);
+    lume_files_release(&files);
+    character_devices();
     puts("DEVFS_GROUP_PASS namespace snapshots callbacks permissions polling lifetime reuse");
     return 0;
 }

@@ -21,6 +21,7 @@ static struct io_queue kernel_control_queue;
 static unsigned kernel_lane_cursor;
 static uint64_t kernel_parallel_epoch;
 static bool kernel_socket_network[LUME_TASK_LIMIT];
+static bool kernel_vm_storage[LUME_TASK_LIMIT];
 /* Direct continuations retain launch semantics until their next admission. */
 static bool kernel_retry_launch[LUME_TASK_LIMIT];
 

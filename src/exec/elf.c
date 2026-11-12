@@ -200,7 +200,8 @@ bool lume_elf_load_file(unsigned task, int file, const struct lume_elf_plan *pla
 static bool image_page_mapped(const struct lume_elf_image *image, unsigned index)
 {
     uint64_t physical;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     for (unsigned view = 0; view < 2; ++view)
         if (!lume_mmu_translate(lume_mmu_task_view_root(image->task, view != 0),
                                 image->pages[index].address, false, false, false, &physical) ||

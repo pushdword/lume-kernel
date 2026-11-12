@@ -1,5 +1,5 @@
 #include "lume/q35.h"
-#include "lume/q35_module.h"
+#include "lume/bochs_vbe.h"
 #include "lume/display.h"
 #include "lume/platform_driver.h"
 #include "lume/abi.h"
@@ -16,7 +16,7 @@ static const unsigned modes[] = {800 | 600u << 16,  1024 | 768u << 16,  640 | 48
 static volatile uint32_t *framebuffer;
 static struct terminal terminal;
 static uint32_t cells[MAX_COLUMNS * MAX_ROWS], shown[MAX_COLUMNS * MAX_ROWS];
-static bool enabled, custom_loaded, graphics_owned;
+static bool enabled, custom_loaded, graphics_owned, registered;
 static uint32_t pci, address, video_bytes;
 static unsigned width, height, max_width, max_height, columns, rows;
 static unsigned font_index = CONSOLE_FONT_DEFAULT;
@@ -124,7 +124,11 @@ static void paint_background(void)
         framebuffer[i] = palette[0];
     unsigned saved_font = font_index;
     font_index = CONSOLE_FONT_DEFAULT;
+#ifdef LUME_ARCH_I686
+    const char title[] = "Lume OS / i686 / QEMU PC";
+#else
     const char title[] = "Lume OS / AMD64 / QEMU q35";
+#endif
     for (unsigned i = 0; i < sizeof(title) - 1; ++i)
         glyph(title[i], 8 + i * 12, 3, palette[11], palette[0], false);
     font_index = saved_font;
@@ -356,15 +360,12 @@ static int graphics_present(const struct lume_graphics_request *request)
 static const struct lume_platform_graphics_ops graphics_operations = {
     graphics_query, graphics_claim, graphics_present};
 
-static int module_start(struct lume_hardware *hardware, void *context)
+static int register_display(void)
 {
-    struct q35_binding *binding = context;
-    int result = q35_module_pci(hardware, 0x1234, 0x1111, &pci);
-    if (result)
-        return result;
     if (!start(0))
         return -LUME_ENOENT;
-    result = lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
+    int result =
+        lume_platform_driver_register(LUME_PLATFORM_DISPLAY, &operations, sizeof(operations));
     if (!result)
     {
         result = lume_platform_driver_register(LUME_PLATFORM_GRAPHICS, &graphics_operations,
@@ -372,27 +373,59 @@ static int module_start(struct lume_hardware *hardware, void *context)
         if (result)
             (void)lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
     }
-    binding->registered = !result;
+    if (result)
+        stop();
     return result;
 }
 
-static int module_stop(struct lume_hardware *hardware, void *context)
+int lume_bochs_display_register_at(uint32_t address)
 {
-    (void)hardware;
-    struct q35_binding *binding = context;
-    if (binding->registered)
+    if (registered)
+        return -LUME_EBUSY;
+    pci = address;
+    int result = register_display();
+    registered = !result;
+    return result;
+}
+
+bool lume_bochs_display_busy(void)
+{
+    return graphics_owned;
+}
+
+int lume_bochs_display_unregister(void)
+{
+    if (!registered)
+        return 0;
+    if (graphics_owned)
+        return -LUME_EBUSY;
+    int result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
+    if (result)
+        return result;
+    result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
+    if (result)
     {
-        int result = lume_platform_driver_unregister(LUME_PLATFORM_GRAPHICS, &graphics_operations);
-        if (result)
-            return result;
-        result = lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &operations);
-        if (result)
-            return result;
-        binding->registered = false;
+        int restored = lume_platform_driver_register(LUME_PLATFORM_GRAPHICS, &graphics_operations,
+                                                     sizeof(graphics_operations));
+        if (restored)
+            lume_fail("framebuffer service restoration");
+        return result;
     }
+    registered = false;
     stop();
     return 0;
 }
 
-Q35_MODULE("q35-vga", LUME_HARDWARE_ID_PCI, "pci,1234:1111",
-           (1u << LUME_RESOURCE_MMIO) | (1u << LUME_RESOURCE_IOPORT));
+#ifdef LUME_ARCH_I686
+int lume_bochs_display_register(void)
+{
+    uint32_t address;
+    if (lume_q35_pci_find(0x1234, 0x1111, &address))
+    {
+        if (lume_q35_pci_find(0x1af4, 0x1050, &address) ||
+            (lume_q35_pci_read(address, 8) >> 16) != 0x0300)
+            return -LUME_ENOENT;
+    }
+    return lume_bochs_display_register_at(address);
+}
+#endif

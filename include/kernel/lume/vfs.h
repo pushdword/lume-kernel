@@ -30,7 +30,8 @@ struct lume_fd
     struct lume_poll_source changed;
 };
 
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define LUME_FILES_DYNAMIC 1
 #else
 #define LUME_FILES_DYNAMIC 0
@@ -104,6 +105,7 @@ void lume_vfs_process_release(unsigned);
 int64_t lume_vfs_stat(struct lume_files *, uint64_t fd, struct lume_stat *);
 int64_t lume_vfs_stat_mode(struct lume_files *, uint64_t, struct lume_stat *);
 int64_t lume_vfs_stat_path(struct lume_files *, const char *, struct lume_stat *);
+int64_t lume_vfs_stat_at(struct lume_files *, int64_t, const char *, struct lume_stat *);
 int lume_vfs_volume_path(struct lume_files *, const char *, struct lume_files_volume *);
 int lume_vfs_volume_fd(struct lume_files *, uint64_t, struct lume_files_volume *);
 int64_t lume_vfs_truncate(struct lume_files *, uint64_t);

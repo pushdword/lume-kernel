@@ -308,7 +308,10 @@ static uint64_t lume_clock_monotonic(void)
 
 static unsigned kernel_call_domain(unsigned task, const struct lume_context *frame)
 {
-    (void)frame;
+    if (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_VM &&
+        LUME_CONTEXT_REG(frame, 0) == LUME_VM_MAP && kernel_vm_storage[task] &&
+        !process_exiting[process_slot(task)])
+        return LUME_WORK_STORAGE;
     return process_exiting[process_slot(task)] ? KERNEL_IO_EXCLUSIVE : task_domain[task];
 }
 
@@ -620,6 +623,14 @@ void lume_display_service(void)
 {
 }
 
+void lume_virtio_gpu_device_poll(void)
+{
+}
+
+void lume_render_poll_background(void)
+{
+}
+
 static unsigned network_checks, storage_checks, vm_checks;
 
 void lume_net_poll_background(void)
@@ -720,6 +731,7 @@ static void reset(void)
     memset(work_drained, 0, sizeof(work_drained));
     memset(worker_blocked, 0, sizeof(worker_blocked));
     memset(task_domain, 0, sizeof(task_domain));
+    memset(kernel_vm_storage, 0, sizeof(kernel_vm_storage));
     memset(task_mutation, 0, sizeof(task_mutation));
     kernel_control_queue = (struct io_queue){0};
     kernel_lane_cursor = 0;
@@ -1368,6 +1380,23 @@ static void independent_resources(void)
     assert(executed[1] == 1 && !lume_worker_busy());
 }
 
+static void render_wait_keeps_display_progress(void)
+{
+    reset();
+    worker_blocked[LUME_WORK_RENDER] = true;
+    enqueue_domain(0, LUME_WORK_RENDER);
+    enqueue_domain(1, LUME_WORK_DISPLAY);
+    enqueue_domain(2, LUME_WORK_NETWORK);
+    enqueue_domain(3, LUME_WORK_USB);
+    for (unsigned i = 0; i < 4; ++i)
+        kernel_step();
+    assert(!executed[0] && kernel_task_active(0) && kernel_wait[0]);
+    assert(executed[1] == 1 && executed[2] == 1 && executed[3] == 1);
+    worker_blocked[LUME_WORK_RENDER] = false;
+    kernel_step();
+    assert(executed[0] == 1 && !lume_worker_busy());
+}
+
 static void high_process_admission(void)
 {
     _Static_assert(LUME_TASK_LIMIT > 65, "native admission covers multiple task mask words");
@@ -1977,8 +2006,75 @@ static void page_read_dependency(void)
     assert(executed[0] == 1 && executed[1] == 1);
 }
 
+static void mapping_storage_redirect(void)
+{
+    for (unsigned cancelled = 0; cancelled < 2; ++cancelled)
+    {
+        reset();
+        enqueue_domain(0, LUME_WORK_GENERAL);
+        tasks[0].context.x[8] = LUME_SYS_VM;
+        tasks[0].context.x[0] = LUME_VM_MAP;
+        task_mutation[0] = true;
+        override_result = true;
+        inline_result = LUME_IO_RETRY_STORAGE;
+        worker_suspended[LUME_WORK_GENERAL] = cancelled != 0;
+        kernel_step();
+        if (cancelled)
+        {
+            assert(lume_worker_busy_on(LUME_WORK_GENERAL));
+            kernel_cancel(0);
+            kernel_step();
+            assert(!kernel_vm_storage[0] && !kernel_lanes[LUME_WORK_STORAGE].queue.count);
+            assert(states[0] == 1 && (int64_t)tasks[0].context.x[0] == -LUME_EINTR);
+            continue;
+        }
+        assert(kernel_vm_storage[0] && kernel_wait[0] && states[0] == 4);
+        assert(kernel_lanes[LUME_WORK_STORAGE].queue.queued[0]);
+        assert(!kernel_lanes[LUME_WORK_GENERAL].queue.queued[0]);
+        kernel_step();
+        assert(kernel_vm_storage[0] && kernel_wait[0] && states[0] == 4);
+        assert(kernel_lanes[LUME_WORK_STORAGE].queue.queued[0]);
+        inline_result = 0x12345000;
+        kernel_step();
+        assert(!kernel_vm_storage[0] && !kernel_wait[0] && states[0] == 1);
+        assert(tasks[0].context.x[0] == 0x12345000 && wake_count[0] == 1);
+    }
+}
+
+static void mapping_during_child_loading(void)
+{
+    for (unsigned ready = 0; ready < 2; ++ready)
+    {
+        reset();
+        worker_blocked[LUME_WORK_STORAGE] = true;
+        enqueue_domain(0, LUME_WORK_STORAGE);
+        task_mutation[0] = true;
+        kernel_step();
+        kernel_lanes[LUME_WORK_STORAGE].launch = true;
+        kernel_lanes[LUME_WORK_STORAGE].child_snapshot_ready = ready != 0;
+        tasks[0].context.x[8] = LUME_SYS_RUN_ACTIONS;
+        process_owner[1] = 0;
+        enqueue_domain(1, LUME_WORK_GENERAL);
+        tasks[1].context.x[8] = LUME_SYS_VM;
+        tasks[1].context.x[0] = LUME_VM_MAP;
+        task_mutation[1] = true;
+        kernel_step();
+        assert(executed[1] == ready && !executed[0]);
+        assert(lume_worker_busy_on(LUME_WORK_STORAGE));
+        kernel_lanes[LUME_WORK_STORAGE].child_snapshot_ready = true;
+        kernel_step();
+        assert(executed[1] == 1 && !executed[0] && !kernel_vm_storage[1]);
+        struct lume_context thread = {.x = {LUME_THREAD_CREATE}};
+        thread.x[8] = LUME_SYS_THREAD;
+        assert(!kernel_child_snapshot_call(&thread));
+    }
+}
+
 int main(void)
 {
+    mapping_during_child_loading();
+    mapping_storage_redirect();
+    render_wait_keeps_display_progress();
     page_read_dependency();
     pipe_mapping_transaction();
     legacy_scan_parking();

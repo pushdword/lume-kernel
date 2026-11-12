@@ -34,6 +34,11 @@ bool lume_graphics_input_owned(void)
     return active != NULL;
 }
 
+uint64_t lume_graphics_active_generation(void)
+{
+    return active ? active->generation : 0;
+}
+
 void lume_graphics_input(const struct lume_input_event *event)
 {
     if (!active)
@@ -119,6 +124,13 @@ static bool session_matches(struct lume_files *files, unsigned owner, unsigned f
 {
     return active == session && session->generation == generation && session->owner == owner &&
            lume_vfs_external(files, fd, &input_ops) == session;
+}
+
+uint64_t lume_graphics_session_generation(struct lume_files *files, unsigned owner, unsigned fd)
+{
+    return active && session_matches(files, owner, fd, active, active->generation)
+               ? active->generation
+               : 0;
 }
 
 int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action,

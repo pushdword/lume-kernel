@@ -210,7 +210,7 @@ $(OUT)/tests/console-calls$(HOSTEXE): tests/unit/console_calls_test.c src/core/c
 .PHONY: check-poll-wait
 check-poll-wait: $(OUT)/tests/poll-wait$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_calls.h src/core/poll_state.h src/core/signal_calls.h src/core/service_bus.h src/core/service_calls.h src/core/supervision_bus.h include/abi/native/lume/service.h include/abi/native/lume/supervision.h
+$(OUT)/tests/poll-wait$(HOSTEXE): tests/unit/poll_wait_test.c src/core/poll_calls.h src/core/poll_state.h src/core/signal_calls.h src/core/thread_wait_calls.h src/core/service_bus.h src/core/service_calls.h src/core/supervision_bus.h include/abi/native/lume/service.h include/abi/native/lume/supervision.h include/uapi/lume/thread.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check: check-poll-wait
@@ -391,7 +391,7 @@ $(OUT)/tests/io-queue$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
 check: check-io-classify
 check-io-classify: $(OUT)/tests/io-classify$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_classify.h include/abi/native/lume/realtime_abi.h
+$(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_classify.h include/abi/native/lume/realtime_abi.h include/ddk/lume/work.h include/uapi/lume/render.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) "$<" -o "$@"
 check-io-calls: $(OUT)/tests/io-calls$(HOSTEXE)
@@ -401,6 +401,14 @@ $(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h 
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
+.PHONY: check-process-vm-call
+check-process-vm-call: $(OUT)/tests/process-vm-call$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/process-vm-call$(HOSTEXE): tests/unit/process_vm_call_test.c src/syscall/process_vm.h include/kernel/lume/io_redirect.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/syscall "$<" -o "$@"
+check: check-process-vm-call
+
 .PHONY: check-amd64-query
 .PHONY: check-aarch64-query
 .PHONY: check-page-regions
@@ -420,14 +428,25 @@ check-amd64-query: $(OUT)/tests/amd64-query$(HOSTEXE)
 $(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iplatform/q35/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
+ifeq ($(OS),Windows_NT)
+I686_MMU_HOST_FLAGS := -Wl,--image-base,0x10000000 -Wl,--disable-dynamicbase
+else
+I686_MMU_HOST_FLAGS := -no-pie
+endif
+.PHONY: check-i686-mmu
+check-i686-mmu: $(OUT)/tests/i686-mmu$(HOSTEXE)
+	env "$(OUT)/tests/i686-mmu$(HOSTEXE)"
+$(OUT)/tests/i686-mmu$(HOSTEXE): tests/arch/i686/mmu_test.c arch/i686/mm/mmu.c arch/i686/include/kernel/lume/paging.h tests/fixtures/i686_mmu/lume/paging.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 $(I686_MMU_HOST_FLAGS) -Itests/fixtures/i686_mmu -Iarch/i686/include/kernel -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native "$<" -o "$@"
 .PHONY: check-i686-query
 check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(HOSTEXE) $(OUT)/tests/i686-fpu$(HOSTEXE)
 	env "$(OUT)/tests/i686-query$(HOSTEXE)"
 	env "$(OUT)/tests/i686-context$(HOSTEXE)"
 	env "$(OUT)/tests/i686-fpu$(HOSTEXE)"
-$(OUT)/tests/i686-fpu$(HOSTEXE): tests/arch/i686/fpu_test.c arch/i686/context/fpu.h arch/i686/include/kernel/lume/context.h
+$(OUT)/tests/i686-fpu$(HOSTEXE): tests/arch/i686/fpu_test.c arch/i686/context/fpu.h arch/i686/include/kernel/lume/context.h arch/i686/include/kernel/lume/context_asm.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel -Iinclude/kernel "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -mgeneral-regs-only -UNDEBUG -Iarch/i686/include/kernel -Iinclude/kernel "$<" -o "$@"
 $(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/uapi/lume/tty.h arch/i686/include/kernel/lume/context.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 -Iarch/i686/include/kernel -Iplatform/pc/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
@@ -615,7 +634,7 @@ $(OUT)/tests/amd64-context$(HOSTEXE): tests/arch/amd64/context_test.c arch/amd64
 .PHONY: check-amd64-mmu-views
 check-amd64-mmu-views: $(OUT)/tests/amd64-mmu-views$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/amd64-mmu-views$(HOSTEXE): tests/arch/amd64/mmu_views_test.c arch/amd64/mm/mmu.c include/kernel/lume/early.h include/kernel/lume/elf.h include/kernel/lume/vm.h include/kernel/lume/heap.h
+$(OUT)/tests/amd64-mmu-views$(HOSTEXE): tests/arch/amd64/mmu_views_test.c arch/amd64/mm/mmu.c arch/amd64/mm/device_mapping.h include/kernel/lume/early.h include/kernel/lume/elf.h include/kernel/lume/vm.h include/kernel/lume/heap.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -flto -fwhole-program -ffunction-sections -fdata-sections $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -Wl,--gc-sections -o "$@"
 Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
@@ -697,11 +716,7 @@ $(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/w
 check: check-worker-slices
 
 .PHONY: check-io-domains
-check-io-domains: $(OUT)/tests/io-classify$(HOSTEXE)
-	env "$<"
-$(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_classify.h
-	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+check-io-domains: check-io-classify
 check: check-io-domains
 
 .PHONY: check-usb-poll
@@ -803,7 +818,7 @@ $(OUT)/tests/signal-mask$(HOSTEXE): tests/unit/signal_mask_test.c src/core/signa
 .PHONY: check-vm-memory
 check-vm-memory: $(OUT)/tests/vm-memory$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c src/mm/vm_file_cache.h include/kernel/lume/vm.h include/abi/native/lume/memory.h $(wildcard tests/fixtures/vm_host/lume/*.h)
+$(OUT)/tests/vm-memory$(HOSTEXE): tests/unit/vm_test.c src/mm/vm.c src/mm/vm_file_cache.h include/kernel/lume/vm.h include/kernel/lume/external_file.h include/kernel/lume/vm_dma.h include/abi/native/lume/memory.h $(wildcard tests/fixtures/vm_host/lume/*.h)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/vm_host -Iinclude/kernel -Iinclude/abi/native "$<" -o "$@"
 check: check-vm-memory
@@ -892,12 +907,65 @@ $(OUT)/tests/net-tools$(HOSTEXE): tests/unit/net_tools_test.c src/net/net_tools.
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"
 
-$(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/ddk/lume/devfs.h include/kernel/lume/devfs_character.h include/kernel/lume/external_file.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 .PHONY: check-devfs-group
 check-devfs-group: $(OUT)/tests/devfs-group$(HOSTEXE)
 	env "$<"
 
 $(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c
 $(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/fatfs
+
+.PHONY: check-virtio-pci
+check-virtio-pci: $(OUT)/tests/virtio-pci$(HOSTEXE)
+	env "$(OUT)/tests/virtio-pci$(HOSTEXE)"
+$(OUT)/tests/virtio-pci$(HOSTEXE): tests/unit/virtio_pci_test.c src/device/virtio_pci.c include/kernel/lume/virtio_pci.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel -Iinclude/abi/native -Iinclude/uapi $(filter %.c,$^) -o "$@"
+
+.PHONY: check-virtio-gpu
+check-virtio-gpu: $(OUT)/tests/virtio-gpu$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/virtio-gpu$(HOSTEXE): tests/unit/virtio_gpu_test.c src/device/virtio_gpu.c src/device/virtio_pci.c include/kernel/lume/virtio_gpu.h include/kernel/lume/virtio_gpu_wire.h include/kernel/lume/virtio_pci.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native tests/unit/virtio_gpu_test.c src/device/virtio_gpu.c src/device/virtio_pci.c -o "$@"
+
+.PHONY: check-virtio-gpu-device
+check-virtio-gpu-device: $(OUT)/tests/virtio-gpu-device$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/virtio-gpu-device$(HOSTEXE): tests/unit/virtio_gpu_device_test.c src/device/virtio_gpu_device.c include/kernel/lume/virtio_gpu_device.h include/kernel/lume/render_device.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Itests/fixtures/vm_host -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native $(filter %.c,$^) -o "$@"
+
+.PHONY: check-render-control
+.PHONY: check-sandbox-render
+check-sandbox-render: $(OUT)/tests/sandbox-render$(HOSTEXE)
+	env "$<"
+
+$(OUT)/tests/sandbox-render$(HOSTEXE): tests/unit/sandbox_render_test.c src/security/sandbox.c include/uapi/lume/render.h include/abi/native/lume/sandbox.h include/kernel/lume/sandbox_policy.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+
+.PHONY: check-virtio-gpu-start
+check-virtio-gpu-start: $(OUT)/tests/virtio-gpu-start$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/virtio-gpu-start$(HOSTEXE): tests/unit/virtio_gpu_start_test.c drivers/gpu/virtio_gpu/module.c src/device/virtio_gpu.c src/device/virtio_pci.c src/device/virtio_gpu_device.c include/kernel/lume/virtio_gpu.h include/kernel/lume/virtio_pci.h include/kernel/lume/virtio_gpu_device.h platform/q35/include/lume/q35_binding.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 -Iplatform/q35/include -Iarch/i686/include/kernel -Iinclude/kernel -Iinclude/abi/native -Iinclude/uapi -Iinclude/ddk tests/unit/virtio_gpu_start_test.c src/device/virtio_gpu.c src/device/virtio_pci.c src/device/virtio_gpu_device.c -o "$@"
+
+check-render-control: $(OUT)/tests/render-control$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/render-control$(HOSTEXE): tests/unit/render_test.c src/device/render.c src/device/render_virgl.h src/device/render_prime.h src/device/render_display.h src/device/virtio_gpu_device.c include/uapi/lume/render.h include/kernel/lume/render_device.h include/kernel/lume/virtio_gpu_device.h include/kernel/lume/vm_dma.h include/kernel/lume/worker.h include/kernel/lume/devfs_character.h include/ddk/lume/work.h tests/fixtures/render_host/lume/early.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/render_host -Iinclude/kernel -Iinclude/abi/native -Iinclude/uapi -Iinclude/ddk tests/unit/render_test.c src/device/virtio_gpu_device.c -o "$@"
+
+$(OUT)/tests/io-calls$(HOSTEXE) $(OUT)/tests/worker-slices$(HOSTEXE): include/ddk/lume/work.h include/kernel/lume/worker.h
+
+.PHONY: check-vfs-sandbox-stat
+check: check-vfs-sandbox-stat
+check-vfs-sandbox-stat: $(OUT)/tests/vfs-sandbox-stat$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vfs-sandbox-stat$(HOSTEXE): tests/unit/vfs_sandbox_stat_test.c tests/unit/vfs_test.c tests/fixtures/vfs_unrestricted_services.c tests/fixtures/vfs_memory_host.c src/fs/vfs/vfs.c src/security/sandbox.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_MAX_ALLOCATION=65536 $(TEST_CPPFLAGS) tests/unit/vfs_sandbox_stat_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c -o "$@"

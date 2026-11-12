@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "lume/context_asm.h"
+#include "lume/paging.h"
 
 /* INT 0x80 passes four 64-bit words through a user buffer addressed by EAX.
  * INT 0x81 takes simple call numbers in EAX and 32-bit arguments in EBX, ECX and EDX. */
@@ -10,11 +12,12 @@ struct lume_context
 {
     uint64_t reg[32], sp, pc, status, tls, flags;
     uint32_t raw[8], syscall_pc, fpu_valid;
-    _Alignas(16) unsigned char vector[112];
+    _Alignas(16) unsigned char vector[512];
 };
 
-_Static_assert(offsetof(struct lume_context, vector) == 336, "i686 x87 save offset");
-_Static_assert(sizeof(struct lume_context) == 448, "i686 context layout");
+_Static_assert(offsetof(struct lume_context, vector) == LUME_I686_CONTEXT_VECTOR_OFFSET,
+               "i686 floating-point save offset");
+_Static_assert(sizeof(struct lume_context) == LUME_I686_CONTEXT_BYTES, "i686 context layout");
 #define LUME_CONTEXT_REG(c, n) ((c)->reg[(n)])
 #define LUME_CONTEXT_REGISTERS reg
 #define LUME_CONTEXT_PC(c) ((c)->pc)
@@ -73,8 +76,7 @@ static inline void lume_arch_poll_irq(void)
 
 static inline void lume_arch_flush_user_tlb(void)
 {
-    uint32_t root;
-    __asm__ volatile("movl %%cr3, %0\nmovl %0, %%cr3" : "=r"(root) : : "memory");
+    lume_i686_paging_switch(lume_i686_paging_root());
 }
 
 static inline uint64_t lume_arch_tls_size(uint64_t size, uint64_t align)

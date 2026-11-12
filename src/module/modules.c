@@ -26,9 +26,11 @@
 #include "lume/console_output.h"
 #include "lume/block.h"
 #include "lume/gpu_device.h"
+#include "lume/virtio_gpu_device.h"
 #include <string.h>
 #if defined(LUME_ARCH_AMD64)
 #include "lume/q35.h"
+#include "lume/pci.h"
 #include "lume/counter.h"
 #endif
 
@@ -102,6 +104,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_display_write)
     EXPORT(lume_graphics_input)
     EXPORT(lume_graphics_input_owned)
+    EXPORT(lume_virtio_gpu_device_register)
+    EXPORT(lume_virtio_gpu_device_unregister)
     EXPORT(lume_gpu_register)
     EXPORT(lume_gpu_unregister)
     EXPORT(lume_entropy)
@@ -130,6 +134,7 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_irq_save)
     EXPORT(lume_netif_info)
     EXPORT(lume_pages_alloc_span)
+    EXPORT(lume_pages_alloc_span_uninitialized)
     EXPORT(lume_page_alloc)
     EXPORT(lume_page_free)
     EXPORT(lume_pi5_dma_start)
@@ -141,6 +146,7 @@ static int resolve(const char *name, uint64_t *address)
 #if defined(LUME_ARCH_AMD64)
     EXPORT(lume_q35_pci_read)
     EXPORT(lume_q35_pci_write)
+    EXPORT(lume_q35_pci_bars)
     EXPORT(lume_q35_counter_frequency)
     EXPORT(lume_q35_counter_value)
     EXPORT(lume_usb_inventory_add)

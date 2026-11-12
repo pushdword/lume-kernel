@@ -28,7 +28,8 @@ static void thread_drop(unsigned task)
     service_wait_cancel(task);
     service_bus_release(task);
     unsigned owner = process_slot(task);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
     if (!thread_pages[task])
         lume_vm_thread_release(owner, task);
     else
@@ -137,32 +138,33 @@ static struct lume_context *process_terminate(unsigned status)
 
 static int64_t thread_create(const struct lume_thread_request *r)
 {
-#if defined(LUME_ARCH_I686)
-    (void)r;
-    return -LUME_ENOSYS;
-#else
     unsigned owner = process_slot(current_task), task = LUME_TASK_LIMIT;
     uint64_t allowed = 0;
-    bool native64 = false;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+    bool native_vm = false;
+#if defined(LUME_ARCH_I686)
+    allowed = LUME_THREAD_CREATE_NATIVE32;
+    native_vm = true;
+    if (r->argument > UINT32_MAX)
+        return -LUME_EINVAL;
+#elif defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
     allowed = LUME_THREAD_CREATE_NATIVE64;
-    native64 = (r->value & allowed) || (images[owner].entry >= LUME_LARGE_ELF_BASE &&
-                                        images[owner].entry < LUME_LARGE_ELF_LIMIT);
+    native_vm = (r->value & allowed) || (images[owner].entry >= LUME_LARGE_ELF_BASE &&
+                                         images[owner].entry < LUME_LARGE_ELF_LIMIT);
 #endif
-    uint64_t maximum = native64 ? LUME_PTHREAD_STACK_MAX : LUME_PTHREAD_COMPAT_STACK_MAX;
+    uint64_t maximum = native_vm ? LUME_PTHREAD_STACK_MAX : LUME_PTHREAD_COMPAT_STACK_MAX;
     if (!r->entry || !lume_vm_code_address(owner, r->entry) || r->stack_bytes < 32768 ||
         r->stack_bytes > maximum || r->tid || (r->value & ~allowed) || r->address || r->timeout_ms)
         return -LUME_EINVAL;
     uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
     uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
-#if defined(LUME_ARCH_AMD64)
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     tls_size += 16;
 #endif
     uint64_t stack_bytes = (r->stack_bytes + 4095) & ~UINT64_C(4095);
     unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
     unsigned stack_pages = (unsigned)(stack_bytes / 4096);
     unsigned pages = tls_pages + 1 + stack_pages;
-    if (!native64 &&
+    if (!native_vm &&
         (pages > LUME_STACK_PAGES || (uint64_t)pages * 4096 > UINT64_C(0x100000) - 4096))
         return -LUME_EINVAL;
     if (images[owner].tls_file &&
@@ -170,7 +172,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
         return -LUME_EFAULT;
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
         if (i != 2 && !states[i] &&
-            (native64 ||
+            (native_vm ||
              (LUME_THREAD_BASE + (uint64_t)i * 0x100000 + 4096 <= LUME_USER_STACK &&
               (uint64_t)pages * 4096 <=
                   LUME_USER_STACK - (LUME_THREAD_BASE + (uint64_t)i * 0x100000 + 4096))))
@@ -185,6 +187,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
     kernel_wait[task] = true;
     wake_at[task] = UINT64_MAX;
     kernel_socket_network[task] = false;
+    kernel_vm_storage[task] = false;
     kernel_retry_launch[task] = false;
     thread_pages[task] = 0;
     tasks[task].context = (struct lume_context){0};
@@ -192,8 +195,9 @@ static int64_t thread_create(const struct lume_thread_request *r)
         tasks[task].stack[i] = 0;
     uint64_t base, stack_base;
     lume_mmu_share_user(task, owner);
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
-    if (native64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
+    if (native_vm)
     {
         if (!lume_vm_thread_region(owner, task, tls_size, stack_bytes, &base, &stack_base) ||
             !lume_user_buffer(base, tls_size, true))
@@ -226,8 +230,12 @@ static int64_t thread_create(const struct lume_thread_request *r)
     lume_arch_flush_user_tlb();
     uint64_t tid = thread_id(thread_slots, task);
     uint64_t tp = lume_arch_tls_pointer(base, images[owner].tls_size, align);
+#if defined(LUME_ARCH_I686)
+    uint32_t *tcb = (void *)(uintptr_t)tp;
+#else
     uint64_t *tcb = (void *)(uintptr_t)tp;
-#if defined(LUME_ARCH_AMD64)
+#endif
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     tcb[0] = tp;
 #else
     tcb[0] = tid;
@@ -242,6 +250,16 @@ static int64_t thread_create(const struct lume_thread_request *r)
     LUME_CONTEXT_SP(c) = stack_base + stack_bytes;
 #if defined(LUME_ARCH_AMD64)
     LUME_CONTEXT_SP(c) -= 8;
+#elif defined(LUME_ARCH_I686)
+    LUME_CONTEXT_SP(c) -= 20;
+    if (!lume_user_buffer(LUME_CONTEXT_SP(c), 8, true))
+    {
+        thread_drop(task);
+        return -LUME_ENOMEM;
+    }
+    uint32_t *initial_stack = (void *)(uintptr_t)LUME_CONTEXT_SP(c);
+    initial_stack[0] = 0;
+    initial_stack[1] = (uint32_t)r->argument;
 #endif
     LUME_CONTEXT_TLS(c) = tp;
     LUME_CONTEXT_STATUS(c) = LUME_CONTEXT_USER_STATUS;
@@ -264,7 +282,6 @@ static int64_t thread_create(const struct lume_thread_request *r)
     sched_wake(&policy, task, unit, 0);
     lume_smp_wake();
     return (int64_t)tid;
-#endif
 }
 
 static int64_t kernel_thread_create(struct lume_context *frame)
@@ -277,6 +294,8 @@ static int64_t kernel_thread_create(struct lume_context *frame)
         *(const struct lume_thread_request *)(uintptr_t)LUME_CONTEXT_REG(frame, 1);
     return thread_create(&request);
 }
+
+#include "thread_wait_calls.h"
 
 static struct lume_context *thread_call(struct lume_context *frame)
 {
@@ -389,7 +408,8 @@ static struct lume_context *thread_call(struct lume_context *frame)
             unsigned guard = 0;
             if (thread_slots[target].thread)
             {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
                 if (!thread_pages[target])
                 {
                     if (!lume_vm_thread_bounds(owner, target, &base, &bytes))
@@ -420,61 +440,9 @@ static struct lume_context *thread_call(struct lume_context *frame)
             result = 0;
         }
     }
-    else if (op == LUME_THREAD_WAIT || op == LUME_THREAD_WAKE || op == LUME_THREAD_WAIT_REALTIME)
-    {
-        if ((r.address & 3) || !lume_user_buffer(r.address, 4, true))
-            return kernel_buffer_failure(frame, -LUME_EFAULT);
-        else if (op == LUME_THREAD_WAKE)
-        {
-            result = 0;
-            for (unsigned i = 0; i < LUME_TASK_LIMIT && (uint64_t)result < r.value; ++i)
-                if (states[i] == 4 && futex_address[i] == r.address && process_slot(i) == owner)
-                {
-                    futex_address[i] = 0;
-                    thread_realtime_wait[i] = false;
-                    states[i] = 1;
-                    LUME_CONTEXT_REG(&tasks[i].context, 0) = 0;
-                    sched_wake(&policy, i, unit, 0);
-                    ++result;
-                }
-            lume_smp_wake();
-        }
-        else if (*(volatile uint32_t *)(uintptr_t)r.address != (uint32_t)r.value)
-            result = -LUME_EAGAIN;
-        else if (!thread_slots[task].thread && task_signal_pending(task))
-            result = -4;
-        else if (op == LUME_THREAD_WAIT_REALTIME)
-        {
-            uint64_t monotonic = lume_clock_monotonic(), realtime;
-            result = lume_clock_realtime_ms(monotonic, &realtime);
-            if (result == -75 || (!result && realtime >= r.timeout_ms))
-                result = -110;
-            else if (!result)
-            {
-                futex_address[task] = r.address;
-                thread_realtime_deadline[task] = r.timeout_ms;
-                thread_realtime_wait[task] = true;
-                tasks[task].context = *frame;
-                states[task] = 4;
-                wake_at[task] = UINT64_MAX;
-                sched_charge(&policy, lume_cpu_index(), now());
-                return wait_ready_task();
-            }
-        }
-        else if (!r.timeout_ms)
-            result = -110;
-        else if (r.timeout_ms == UINT64_MAX || r.timeout_ms < UINT64_MAX - lume_clock_monotonic())
-        {
-            futex_address[task] = r.address;
-            thread_realtime_wait[task] = false;
-            tasks[task].context = *frame;
-            states[task] = 4;
-            wake_at[task] =
-                r.timeout_ms == UINT64_MAX ? UINT64_MAX : lume_clock_monotonic() + r.timeout_ms;
-            sched_charge(&policy, lume_cpu_index(), now());
-            return wait_ready_task();
-        }
-    }
+    else if (op == LUME_THREAD_WAIT || op == LUME_THREAD_WAKE || op == LUME_THREAD_WAIT_REALTIME ||
+             op == LUME_THREAD_WAIT_SHARED || op == LUME_THREAD_WAKE_SHARED)
+        return thread_word_call(frame, task, owner, op, &r);
     LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
     return frame;
 }

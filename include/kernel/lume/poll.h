@@ -6,7 +6,7 @@
 #include <fd.h>
 
 struct lume_files;
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #define LUME_POLL_TASK_LIMIT 256u
 #else
 #define LUME_POLL_TASK_LIMIT 64u

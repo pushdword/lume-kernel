@@ -1,3 +1,4 @@
+#include "lume/context_asm.h"
 .text
 .macro TRAP n, error=0
 .global lume_isr_\n
@@ -61,7 +62,7 @@ lume_trap_fast_return:
     addl $8, %esp
     iretl
 lume_trap_capture:
-    subl $464, %esp
+    subl $LUME_I686_CONTEXT_STACK_BYTES, %esp
     andl $-16, %esp
     movl %esp, %edi
     subl $8, %esp

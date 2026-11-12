@@ -1,7 +1,8 @@
 #ifndef LUME_NET_LIMITS_H
 #define LUME_NET_LIMITS_H
 
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define LUME_NET_SOCKET_LIMIT 64u
 #define LUME_NET_UDP_SOCKET_LIMIT 32u
 #define LUME_NET_UDP_PCBS 64

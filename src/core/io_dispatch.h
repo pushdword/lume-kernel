@@ -1,4 +1,6 @@
 #include "lume/thread.h"
+#include "lume/virtio_gpu_device.h"
+#include "lume/render_device.h"
 
 bool lume_task_storage_context(void)
 {
@@ -21,7 +23,8 @@ enum kernel_block_reason
 static bool kernel_child_snapshot_call(const struct lume_context *frame)
 {
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
-    if (number == LUME_SYS_BRK)
+    if (number == LUME_SYS_BRK ||
+        (number == LUME_SYS_VM && LUME_CONTEXT_REG(frame, 0) == LUME_VM_MAP))
         return true;
     if (number != LUME_SYS_SOCKET)
         return false;
@@ -214,6 +217,7 @@ static void kernel_cancel(unsigned task)
     if (task < LUME_TASK_LIMIT)
     {
         kernel_socket_network[task] = false;
+        kernel_vm_storage[task] = false;
         kernel_retry_launch[task] = false;
     }
     io_queue_cancel(&kernel_control_queue, task);
@@ -434,6 +438,8 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
     lume_net_poll_background();
     lume_storage_poll_background();
     lume_vm_poll_background();
+    lume_virtio_gpu_device_poll();
+    lume_render_poll_background();
     bool draining = kernel_commit_drain();
     if (admit && !lume_worker_busy() && !kernel_any_grant())
         (void)kernel_admit_queue(KERNEL_IO_EXCLUSIVE);
@@ -549,6 +555,8 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             lane->reclaim = false;
             kernel_wait[owner] = false;
             kernel_socket_network[owner] = false;
+            bool mapping_storage = kernel_vm_storage[owner];
+            kernel_vm_storage[owner] = false;
             kernel_retry_launch[owner] = false;
             bool redirect = lane->result == LUME_IO_RETRY_NETWORK;
             bool storage_retry = lane->result == LUME_IO_RETRY_STORAGE;
@@ -570,9 +578,22 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                 if (!kernel_enqueue(owner, LUME_WORK_NETWORK, false))
                     lume_fail("socket resource requeue");
             }
+            else if (storage_retry && !reclaim && !lane->launch && domain == LUME_WORK_GENERAL &&
+                     LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_VM &&
+                     LUME_CONTEXT_REG(frame, 0) == LUME_VM_MAP && !cancelled &&
+                     !process_exiting[process_slot(owner)])
+            {
+                kernel_vm_storage[owner] = true;
+                kernel_wait[owner] = true;
+                states[owner] = 4;
+                lane->result = 0;
+                if (!kernel_enqueue(owner, LUME_WORK_STORAGE, false))
+                    lume_fail("mapping resource requeue");
+            }
             else if (storage_retry && !reclaim && domain == LUME_WORK_STORAGE && !cancelled &&
                      !process_exiting[process_slot(owner)])
             {
+                kernel_vm_storage[owner] = mapping_storage;
                 kernel_retry_launch[owner] = lane->launch;
                 kernel_wait[owner] = true;
                 states[owner] = 4;

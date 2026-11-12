@@ -64,10 +64,17 @@ static int validate_resource(const struct lume_resource *resource)
                                                                                   : -LUME_EINVAL;
     if (resource->kind == LUME_RESOURCE_IRQ)
         return !resource->domain && resource->base >= 32 && resource->base < 48 ? 0 : -LUME_ENOSYS;
+#if defined(LUME_ARCH_AMD64)
+    return resource->kind == LUME_RESOURCE_MMIO &&
+                   lume_mmu_device_prepare(resource->base, resource->size)
+               ? 0
+               : -LUME_ENOSYS;
+#else
     if (resource->kind != LUME_RESOURCE_MMIO || resource->base < 0xc0000000 ||
         resource->base >= 0x100000000 || resource->size > 0x100000000 - resource->base)
         return -LUME_ENOSYS;
     return 0;
+#endif
 }
 
 static int dma_domain(uint32_t id, struct lume_dma_domain *domain)

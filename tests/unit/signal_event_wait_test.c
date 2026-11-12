@@ -173,43 +173,40 @@ static void page_fault_registers(void)
     tasks[1].context.pc = 0x12340;
     struct lume_context saved = tasks[1].context;
     vm_fault_wait[1] = vm_fault_ready[1] = true;
+    kernel_wait[1] = true;
+    wake_tasks();
+    assert(states[1] == 4 && kernel_wait[1] && vm_fault_wait[1] && vm_fault_ready[1] && !wakes);
+    assert(!memcmp(&saved, &tasks[1].context, sizeof(saved)));
+    kernel_wait[1] = false;
     wake_tasks();
     assert(states[1] == 1 && !vm_fault_wait[1] && !vm_fault_ready[1]);
     assert(!memcmp(&saved, &tasks[1].context, sizeof(saved)));
 }
 
-static void signal_during_page_fault(void)
+static void page_fault_signal_delivery(void)
 {
     reset();
     states[0] = 4;
-    vm_fault_wait[0] = true;
-    signals[0].action[20].handler = 0x1200;
+    signals[0].action[10].handler = 0x8000;
     for (unsigned i = 0; i < 31; ++i)
-        tasks[0].context.x[i] = UINT64_C(0x47101234) + i;
-    tasks[0].context.pc = 0x12340;
+        tasks[0].context.x[i] = UINT64_C(0x49205678) + i;
+    tasks[0].context.pc = 0x23450;
     struct lume_context saved = tasks[0].context;
-    signal_queue(0, 20);
+    vm_fault_wait[0] = true;
+    signal_queue(0, 10);
     assert(states[0] == 4 && vm_fault_wait[0] && !wakes);
-    assert(signals[0].pending == (UINT32_C(1) << 20));
+    assert(signals[0].pending == (UINT32_C(1) << 10));
     assert(!memcmp(&saved, &tasks[0].context, sizeof(saved)));
     vm_fault_ready[0] = true;
     wake_tasks();
     assert(states[0] == 1 && !vm_fault_wait[0] && !vm_fault_ready[0] && wakes == 1);
+    assert(signals[0].pending == (UINT32_C(1) << 10));
     assert(!memcmp(&saved, &tasks[0].context, sizeof(saved)));
-
-    reset();
-    states[1] = 4;
-    kernel_wait[1] = vm_fault_wait[1] = vm_fault_ready[1] = true;
-    wake_tasks();
-    assert(states[1] == 4 && kernel_wait[1] && vm_fault_wait[1] && !wakes);
-    kernel_wait[1] = false;
-    wake_tasks();
-    assert(states[1] == 1 && !vm_fault_wait[1] && wakes == 1);
 }
 
 int main(void)
 {
-    signal_during_page_fault();
+    page_fault_signal_delivery();
     page_fault_registers();
     pending_and_registration();
     competing_waiters();
