@@ -9,6 +9,7 @@
 #include "lume/process.h"
 #include "lume/task_limits.h"
 #include "lume/vm.h"
+#include "lume/user_buffer.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +150,36 @@ bool lume_user_buffer(uint64_t pointer, uint64_t bytes, bool writing)
         return pointer && (!writing || !netctl_fault);
     assert(pointer && bytes == sizeof(struct lume_stream_request));
     return !writing || !stream_fault;
+}
+
+int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid, uint64_t pointer,
+                             size_t bytes, bool write)
+{
+    assert(pid == process_owner[current_task] + 1);
+    if (!lume_user_buffer(pointer, bytes, write))
+        return -LUME_EFAULT;
+    *token = (struct lume_user_buffer_token){
+        .first = pointer, .bytes = bytes, .write = write, .valid = true, .registered = true};
+    return 0;
+}
+
+bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *buffer, size_t bytes,
+                           bool write)
+{
+    assert(token->registered && token->valid && bytes <= token->bytes && (!write || token->write));
+    if (netctl_fault)
+        return false;
+    if (write)
+        memcpy((void *)(uintptr_t)token->first, buffer, bytes);
+    else
+        memcpy(buffer, (const void *)(uintptr_t)token->first, bytes);
+    return true;
+}
+
+void lume_user_buffer_release(struct lume_user_buffer_token *token)
+{
+    assert(token->registered);
+    token->registered = false;
 }
 
 int64_t lume_io_call(unsigned owner, bool stream, uint64_t operation, uint64_t pointer,

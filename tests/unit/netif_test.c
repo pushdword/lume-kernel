@@ -433,9 +433,15 @@ int main(void)
     CHECK(lume_wireless_state(2, &state) == 0 && state.state == LUME_WIFI_FAILED);
     wifi.fail_connect = false;
     /* Dispatch validation must precede state changes, and outputs never echo keys. */
+    unsigned snapshot_polls = polls;
     init(0);
     CHECK(lume_net_control(LUME_NET_ENUM, &request) == 0 && request.count == 2);
     CHECK(request.data.interfaces[0].ifindex == 1 && request.data.interfaces[1].ifindex == 2);
+    init(1);
+    CHECK(lume_net_control(LUME_NET_GET, &request) == 0);
+    init(1);
+    CHECK(lume_net_control(LUME_NET_STATS, &request) == 0);
+    CHECK(polls == snapshot_polls);
     init(0);
     request.version = 2;
     CHECK(lume_net_control(0, &request) == -LUME_EINVAL);

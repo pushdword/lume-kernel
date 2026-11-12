@@ -68,7 +68,7 @@ void lume_mmu_switch(uint64_t base)
     uint64_t *remembered = &asid_roots[lume_cpu_index()][asid];
     if (*remembered != (base & ADDRESS))
     {
-        /* Colliding process slots invalidate only their reused local ASID.
+        /* Reassigned address spaces invalidate their reused local ASID.
          * Mapping changes and table reclamation retain broadcast invalidation. */
         uint64_t operand = (uint64_t)asid << 48;
         __asm__ volatile("dsb ishst; tlbi aside1, %0; dsb ish" ::"r"(operand) : "memory");

@@ -521,6 +521,9 @@ static void file_map_around(unsigned task, const struct vm_area *area, uint64_t 
                                                             : 0;
     uint64_t source_first = object->backing_offset / PAGE;
     uint64_t group_end = (source_first + page + FILE_READ_PAGES) & ~(uint64_t)(FILE_READ_PAGES - 1);
+    uint64_t addresses[FILE_READ_PAGES], frames[FILE_READ_PAGES];
+    unsigned count = 0;
+    bool cleaned = false;
     for (uint64_t next = page + 1; source_first + next < group_end; ++next)
     {
         uint64_t offset = next * PAGE, existing;
@@ -538,13 +541,22 @@ static void file_map_around(unsigned task, const struct vm_area *area, uint64_t 
         if ((area->protection & LUME_PROT_EXEC) &&
             !(entry->code_ready[index / 64] & (UINT64_C(1) << (index % 64))))
         {
-            lume_sync_code(physical, PAGE);
+            lume_sync_code_defer(physical, PAGE);
             entry->code_ready[index / 64] |= UINT64_C(1) << (index % 64);
+            cleaned = true;
         }
-        if (!lume_mmu_map_user(task, address, physical, false,
+        addresses[count] = address;
+        frames[count++] = physical;
+    }
+    if (cleaned)
+    {
+        lume_sync_code_clean_finish();
+        lume_sync_code_finish();
+    }
+    for (unsigned i = 0; i < count; ++i)
+        if (!lume_mmu_map_user(task, addresses[i], frames[i], false,
                                (area->protection & LUME_PROT_EXEC) != 0))
             break;
-    }
 }
 
 int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)

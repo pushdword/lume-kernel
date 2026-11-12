@@ -253,11 +253,15 @@ int main(void)
     {
         CHECK(lume_mmu_user_root(task, 0x100003000, stacks));
         uint64_t collision = lume_mmu_task_view_root(task, false);
-        CHECK(collision >> 48 == lume_mmu_task_view_root(0, false) >> 48);
+        CHECK(collision >> 48 != lume_mmu_task_view_root(0, false) >> 48);
+        CHECK(collision >> 48 != lume_mmu_task_view_root(1, false) >> 48);
+        if (task == 254)
+            CHECK(collision >> 48 != lume_mmu_task_view_root(127, false) >> 48);
         CHECK(collision != lume_mmu_task_view_root(0, false));
-        CHECK(lume_mmu_task_view_root(task, true) >> 48 == 2);
-        lume_mmu_release_user(task);
+        CHECK(lume_mmu_task_view_root(task, true) >> 48 == (collision >> 48) + 1);
     }
+    for (unsigned task = 127; task < LUME_TASK_LIMIT; task += 127)
+        lume_mmu_release_user(task);
     CHECK(lume_mmu_translate(lume_mmu_task_root(1), 0x600000, false, false, true, &pa));
     CHECK(!lume_mmu_translate(lume_mmu_task_root(1), 0x600000, true, false, false, &pa));
     CHECK(lume_mmu_module_protect(0x600000, 4096, LUME_MODULE_READ | LUME_MODULE_WRITE));

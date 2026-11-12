@@ -81,8 +81,13 @@ int64_t lume_net_control(unsigned op, struct lume_net_control *r)
         wipe(&connect, sizeof(connect));
         return result;
     }
-    lume_net_poll();
-    lume_wireless_sync();
+    bool snapshot = op == LUME_NET_ENUM || op == LUME_NET_GET || op == LUME_NET_STATS ||
+                    op == LUME_NET_EVENTS || op == LUME_NET_WIFI_CAPS;
+    if (!snapshot)
+    {
+        lume_net_poll();
+        lume_wireless_sync();
+    }
     switch (op)
     {
     case LUME_NET_ENUM:

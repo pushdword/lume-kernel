@@ -141,9 +141,10 @@ SCHED_CPPFLAGS += -DSCHED_TICK_MS=$(SCHED_INTERVAL_MS)
 endif
 CPPFLAGS += $(SCHED_CPPFLAGS)
 OBJECTS := $(addprefix $(OUT)/obj/,$(addsuffix .o,$(KERNEL_S) $(KERNEL_C)))
-.PHONY: all headers check check-image clean
+.PHONY: all headers user-headers check check-image clean
 all: $(PAYLOAD) headers
-headers:
+headers: user-headers
+user-headers:
 	mkdir -p "$(OUT)/include"
 	cp -Rp include/uapi/. "$(OUT)/include/"
 	cp -Rp $(UAPI_ABI)/. "$(OUT)/include/"
@@ -234,6 +235,13 @@ $(OUT)/tests/io-call$(HOSTEXE): tests/unit/io_call_test.c src/syscall/io.c
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 check-io-call: $(OUT)/tests/io-call$(HOSTEXE)
 	env "$<"
+
+.PHONY: check-net-control-call
+check-net-control-call: $(OUT)/tests/net-control-call$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/net-control-call$(HOSTEXE): tests/unit/net_control_call_test.c src/syscall/net_control.h include/kernel/lume/user_buffer.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"

@@ -522,7 +522,8 @@ static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
         p += 512;
         lume_watchdog_progress();
         lume_watchdog_poll();
-        lume_worker_checkpoint(512);
+        if ((block + 1) % 8 == 0 || block + 1 == count)
+            lume_worker_checkpoint(((block % 8) + 1) * 512);
     }
     if (!event(2, 2000))
         goto failed;

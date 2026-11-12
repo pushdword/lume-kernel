@@ -337,7 +337,7 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    CHECK(bytes == 512 && transferring);
+    CHECK(bytes && bytes <= 4096 && !(bytes % 512) && transferring);
     ++checkpoint_calls;
     if (reenter)
     {
@@ -414,7 +414,8 @@ static void success(bool use_interrupts)
         CHECK(!memcmp(card[16], data + 1, count * 512));
         CHECK(writes == count && data_commands == 1 && status_commands == 1);
         CHECK(auto_stops == (count > 1) && !stops && !resets);
-        CHECK(checkpoint_calls == count && watchdog_calls == count && ready && !transferring);
+        CHECK(checkpoint_calls == (count + 7) / 8 && watchdog_calls == count && ready &&
+              !transferring);
         CHECK(lume_sd_read_blocks(16, count, out + 1));
         CHECK(!memcmp(out + 1, data + 1, count * 512));
         CHECK(reads == count && data_commands == 2 && status_commands == (count > 1 ? 2u : 1u));
@@ -502,7 +503,7 @@ static void failures(bool use_interrupts, bool write)
         if (scenario == 0 && write)
         {
             CHECK(!memcmp(card[16], data, 512));
-            CHECK(card[17][0] == 0x55 && checkpoint_calls == 1);
+            CHECK(card[17][0] == 0x55 && checkpoint_calls == 0);
         }
     }
 }

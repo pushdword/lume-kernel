@@ -36,6 +36,8 @@ static uint64_t *user_root[LUME_TASK_LIMIT][2];
 static unsigned jit_depth[LUME_TASK_LIMIT];
 static struct user_table *owned_tables[LUME_TASK_LIMIT];
 static unsigned shared_user[LUME_TASK_LIMIT];
+static unsigned user_asid[LUME_TASK_LIMIT];
+static uint64_t asid_used[2];
 
 static uint64_t table(const uint64_t *p)
 {
@@ -73,6 +75,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
     zero(&module_l3[0][0], 1024);
     module_first = module_base = module_end = 0;
     zero(top_root, 512);
+    zero(asid_used, 2);
     top_root[0] = table(root);
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
     {
@@ -80,6 +83,7 @@ bool lume_mmu_tables(const struct lume_fdt *fdt, const struct lume_layout *layou
         jit_depth[task] = 0;
         owned_tables[task] = 0;
         shared_user[task] = 0;
+        user_asid[task] = 0;
     }
     for (unsigned bank = 0; bank < fdt->ram_count; ++bank)
     {
@@ -152,9 +156,9 @@ uint64_t lume_mmu_task_view_root(unsigned task, bool writer)
     task = user_owner(task);
     if (task >= LUME_TASK_LIMIT || !user_root[task][writer ? 1 : 0])
         return 0;
-    /* ASID zero belongs to the kernel. Each process has separate execute and
-     * write views within the eight-bit ASID range supported by ARMv8. */
-    unsigned asid = 1 + 2 * (task % 127) + (writer ? 1 : 0);
+    /* Active address spaces own distinct execute and write ASIDs. Threads
+     * share their process pair regardless of the task slot number. */
+    unsigned asid = user_asid[task] + (writer ? 1 : 0);
     return (uintptr_t)user_root[task][writer ? 1 : 0] | ((uint64_t)asid << 48);
 }
 
@@ -226,7 +230,8 @@ static void user_flush(void)
 
 bool lume_mmu_swap_user(unsigned a, unsigned b)
 {
-    if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared_user[a] || shared_user[b])
+    if (a >= LUME_TASK_LIMIT || b >= LUME_TASK_LIMIT || a == b || shared_user[a] ||
+        shared_user[b] || !user_asid[a] || !user_asid[b])
         return false;
     lume_user_buffer_invalidate_root(a);
     lume_user_buffer_invalidate_root(b);
@@ -274,6 +279,12 @@ void lume_mmu_release_user(unsigned task)
         lume_kernel_free(node);
         if (++released % 16 == 0)
             lume_worker_checkpoint(65536);
+    }
+    if (user_asid[task])
+    {
+        unsigned pair = (user_asid[task] - 1) / 2;
+        asid_used[pair / 64] &= ~(UINT64_C(1) << (pair % 64));
+        user_asid[task] = 0;
     }
 }
 
@@ -381,6 +392,15 @@ bool lume_mmu_user_root(unsigned task, uint64_t data, const uint64_t *stack)
         if (!stack[i] || (stack[i] & 4095))
             return false;
     lume_mmu_release_user(task);
+    for (unsigned pair = 0; pair < 127; ++pair)
+        if (!(asid_used[pair / 64] & (UINT64_C(1) << (pair % 64))))
+        {
+            asid_used[pair / 64] |= UINT64_C(1) << (pair % 64);
+            user_asid[task] = 1 + 2 * pair;
+            break;
+        }
+    if (!user_asid[task])
+        return false;
     for (unsigned view = 0; view < 2; ++view)
     {
         uint64_t *l0 = user_allocate(task), *l1 = user_allocate(task), *l2 = user_allocate(task);

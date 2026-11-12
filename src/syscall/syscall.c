@@ -36,6 +36,7 @@
 #include <string.h>
 #include "process_file_lock.h"
 #include "process_vm.h"
+#include "net_control.h"
 
 static struct lume_realtime realtime;
 
@@ -475,31 +476,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_io_call(pid, stream, a, b, n);
     }
     case LUME_SYS_NETCTL:
-    {
-        if ((a == LUME_NET_ADMIN || a == LUME_NET_WIFI_CONNECT || a == LUME_NET_WIFI_DISCONNECT ||
-             a == LUME_NET_DHCP_START || a == LUME_NET_WIFI_SCAN || a == LUME_NET_DHCP_BEGIN ||
-             a == LUME_NET_WIFI_CONNECT_BEGIN || a == LUME_NET_IPV4 || a == LUME_NET_ROUTE_ADD ||
-             a == LUME_NET_ROUTE_DELETE) &&
-            !lume_task_capable(pid, LUME_CAP_NET_ADMIN))
-            return -LUME_EPERM;
-        if (a > LUME_NET_ROUTE_DELETE || n != sizeof(struct lume_net_control))
-            return -LUME_EINVAL;
-        if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
-            return -LUME_EFAULT;
-        struct lume_net_control request;
-        const unsigned char *src = (const void *)(uintptr_t)b;
-        unsigned char *dst = (void *)&request;
-        for (unsigned i = 0; i < sizeof(request); ++i)
-            dst[i] = src[i];
-        int64_t result = lume_net_control((unsigned)a, &request);
-        unsigned char *user = (void *)(uintptr_t)b;
-        for (unsigned i = 0; i < sizeof(request); ++i)
-            user[i] = dst[i];
-        volatile unsigned char *wipe = (void *)&request;
-        for (unsigned i = 0; i < sizeof(request); ++i)
-            wipe[i] = 0;
-        return result;
-    }
+        return net_control_call(pid, a, b, n);
     case LUME_SYS_NET:
     {
         if (a >= LUME_NET_SCAN && a <= LUME_NET_DHCP && !lume_task_capable(pid, LUME_CAP_NET_ADMIN))

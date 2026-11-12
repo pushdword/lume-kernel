@@ -2,6 +2,7 @@
 #define LUME_NETCTL_CALLS_H
 #include "lume/kernel_memory.h"
 #include "lume/wireless.h"
+#include "lume/user_buffer.h"
 #include <stddef.h>
 
 static struct netctl_wait_state
@@ -94,15 +95,22 @@ static int64_t netctl_attempt(unsigned task)
             return -LUME_EPERM;
         if (bytes != (legacy ? sizeof(struct lume_net_request) : sizeof(request)))
             return -LUME_EINVAL;
-        if (!lume_user_buffer(pointer, bytes, false) || !lume_user_buffer(pointer, bytes, true))
+        struct lume_user_buffer_token token;
+        int error = lume_user_buffer_acquire(&token, process + 1, pointer, bytes, true);
+        if (error)
+            return error;
+        struct lume_net_request legacy_request;
+        bool copied = lume_user_buffer_copy(&token, legacy ? (void *)&legacy_request : &request,
+                                            bytes, false);
+        lume_user_buffer_release(&token);
+        if (!copied)
             return -LUME_EFAULT;
         if (legacy)
         {
-            const struct lume_net_request *request = (const void *)(uintptr_t)pointer;
             size_t length = 0;
-            while (length < sizeof(request->argument) && request->argument[length])
+            while (length < sizeof(legacy_request.argument) && legacy_request.argument[length])
                 ++length;
-            if (length == sizeof(request->argument))
+            if (length == sizeof(legacy_request.argument))
                 return -LUME_EINVAL;
         }
         /* A cancelled scan must release its backend reservation before this slot is reused. */
@@ -118,8 +126,6 @@ static int64_t netctl_attempt(unsigned task)
         {
             request.ifindex = lume_net_compat_interface();
         }
-        else
-            memcpy(&request, (const void *)(uintptr_t)pointer, sizeof(request));
         wait->ifindex = request.ifindex;
     }
     wait->pending = false;
@@ -151,20 +157,35 @@ static int64_t netctl_attempt(unsigned task)
     }
     if (wait->pending)
         return -LUME_EAGAIN;
+    struct lume_user_buffer_token token;
     if (wait->legacy)
     {
         char output[sizeof(((struct lume_net_request *)0)->output)];
         result = lume_net_compat_scan(&request, result, output, sizeof(output));
         uint64_t pointer = wait->pointer + offsetof(struct lume_net_request, output);
-        if (!lume_user_buffer(pointer, sizeof(output), true))
-            result = -LUME_EFAULT;
+        int error = lume_user_buffer_acquire(&token, process + 1, pointer, sizeof(output), true);
+        if (error)
+            result = error;
         else
-            memcpy((void *)(uintptr_t)pointer, output, strlen(output) + 1);
+        {
+            if (!lume_user_buffer_copy(&token, output, strlen(output) + 1, true))
+                result = -LUME_EFAULT;
+            lume_user_buffer_release(&token);
+        }
     }
-    else if (!lume_user_buffer(wait->pointer, sizeof(request), true))
-        result = -LUME_EFAULT;
     else
-        memcpy((void *)(uintptr_t)wait->pointer, &request, sizeof(request));
+    {
+        int error =
+            lume_user_buffer_acquire(&token, process + 1, wait->pointer, sizeof(request), true);
+        if (error)
+            result = error;
+        else
+        {
+            if (!lume_user_buffer_copy(&token, &request, sizeof(request), true))
+                result = -LUME_EFAULT;
+            lume_user_buffer_release(&token);
+        }
+    }
     if (result < 0)
         netctl_cancel(task);
     else
