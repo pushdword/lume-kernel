@@ -221,11 +221,11 @@ void lume_mmu_share_user(unsigned task, unsigned owner)
     jit_depth[task] = 0;
 }
 
-static void user_flush(void)
+static void user_flush(unsigned task)
 {
-#ifdef __aarch64__
-    __asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
-#endif
+    task = user_owner(task);
+    if (task < LUME_TASK_LIMIT && user_asid[task])
+        lume_mmu_invalidate_user(user_asid[task], NULL, 0);
 }
 
 bool lume_mmu_swap_user(unsigned a, unsigned b)
@@ -244,7 +244,8 @@ bool lume_mmu_swap_user(unsigned a, unsigned b)
     struct user_table *owned = owned_tables[a];
     owned_tables[a] = owned_tables[b];
     owned_tables[b] = owned;
-    user_flush();
+    user_flush(a);
+    user_flush(b);
     return true;
 }
 
@@ -268,7 +269,7 @@ void lume_mmu_release_user(unsigned task)
             detached = true;
         }
     if (detached)
-        user_flush();
+        user_flush(task);
     unsigned released = 0;
     while (owned_tables[task])
     {
@@ -448,7 +449,7 @@ static bool map_user_views(unsigned task, uint64_t va, uint64_t pa, bool write, 
         for (unsigned view = 0; view < 2; ++view)
             detach_empty(task, view, va, &retired);
         if (retired)
-            user_flush();
+            user_flush(task);
         free_tables(retired);
         return false;
     }
@@ -509,12 +510,7 @@ bool lume_mmu_protect_user_batch(unsigned task, const uint64_t *addresses, const
     for (unsigned i = 0; i < count; ++i)
         for (unsigned view = 0; view < 2; ++view)
             __atomic_store_n(entries[i][view], values[i][view], __ATOMIC_RELAXED);
-#ifdef __aarch64__
-    __asm__ volatile("dsb ishst" ::: "memory");
-    for (unsigned i = 0; i < count; ++i)
-        __asm__ volatile("tlbi vaae1is, %0" ::"r"(addresses[i] >> 12) : "memory");
-    __asm__ volatile("dsb ish; isb" ::: "memory");
-#endif
+    lume_mmu_invalidate_user(user_asid[user_owner(task)], addresses, count);
     return true;
 }
 
@@ -554,15 +550,10 @@ bool lume_mmu_unmap_user_batch(unsigned task, const uint64_t *addresses, unsigne
         for (unsigned view = 0; view < 2; ++view)
             detach_empty(task, view, addresses[i], &retired);
     }
-#ifdef __aarch64__
-    __asm__ volatile("dsb ishst" ::: "memory");
     if (retired)
-        __asm__ volatile("tlbi vmalle1is" ::: "memory");
+        user_flush(task);
     else
-        for (unsigned i = 0; i < count; ++i)
-            __asm__ volatile("tlbi vaae1is, %0" ::"r"(addresses[i] >> 12) : "memory");
-    __asm__ volatile("dsb ish; isb" ::: "memory");
-#endif
+        lume_mmu_invalidate_user(user_asid[user_owner(task)], addresses, count);
     free_tables(retired);
     return true;
 }

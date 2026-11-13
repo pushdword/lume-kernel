@@ -521,14 +521,17 @@ static void file_map_around(unsigned task, const struct vm_area *area, uint64_t 
                                                             : 0;
     uint64_t source_first = object->backing_offset / PAGE;
     uint64_t group_end = (source_first + page + FILE_READ_PAGES) & ~(uint64_t)(FILE_READ_PAGES - 1);
+    uint64_t prefix = (source_first + page) % FILE_READ_PAGES;
+    uint64_t group_first = page > prefix ? page - prefix : 0;
     uint64_t addresses[FILE_READ_PAGES], frames[FILE_READ_PAGES];
     unsigned count = 0;
     bool cleaned = false;
-    for (uint64_t next = page + 1; source_first + next < group_end; ++next)
+    for (uint64_t next = group_first; source_first + next < group_end; ++next)
     {
         uint64_t offset = next * PAGE, existing;
-        if (offset < first || offset + PAGE > end || offset < area->offset ||
-            offset - area->offset >= area->end - area->first)
+        if (offset < first || offset < area->offset)
+            continue;
+        if (offset + PAGE > end || offset - area->offset >= area->end - area->first)
             break;
         uint64_t address = area->first + offset - area->offset;
         struct vm_chunk *entry = chunk(source, source_first + next, false);

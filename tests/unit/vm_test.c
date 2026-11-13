@@ -1131,6 +1131,8 @@ static struct
 {
     uint64_t size, next;
     unsigned calls, maximum, fail_call, short_call;
+    uint64_t last_offset, last_bytes;
+    bool fail_all, short_all;
     uint64_t version;
 } regular_file;
 
@@ -1150,14 +1152,17 @@ static int64_t regular_pread(void *context, void *data, uint64_t bytes, uint64_t
 {
     CHECK(context == &regular_file && bytes <= 65536);
     ++regular_file.calls;
+    regular_file.last_offset = offset;
+    regular_file.last_bytes = bytes;
     if (bytes > regular_file.maximum)
         regular_file.maximum = (unsigned)bytes;
-    if (regular_file.calls == regular_file.fail_call)
+    if (regular_file.fail_all || regular_file.calls == regular_file.fail_call)
         return -LUME_EIO;
     CHECK(offset <= regular_file.size && bytes <= regular_file.size - offset);
     memcpy(data, file_data + offset, (size_t)bytes);
     regular_file.next += bytes;
-    return (int64_t)bytes - (regular_file.calls == regular_file.short_call);
+    return (int64_t)bytes -
+           (regular_file.short_all || regular_file.calls == regular_file.short_call);
 }
 
 int lume_vfs_object_identity(int fd, struct lume_file_identity *id)
@@ -1186,6 +1191,69 @@ static void file_mapping_cases(void)
 {
     for (size_t i = 0; i < sizeof(file_data); ++i)
         file_data[i] = (unsigned char)(i * 37u + i / PAGE);
+    regular_open(32 * PAGE, 0);
+    uint64_t around = call(0, LUME_VM_MAP, 0, 16 * PAGE, LUME_PROT_READ, LUME_MAP_PRIVATE, 63);
+    CHECK(around > 0 && !regular_file.calls);
+    CHECK(!memcmp((void *)(uintptr_t)physical(0, around + 11 * PAGE, false, false),
+                  file_data + 11 * PAGE, PAGE));
+    CHECK(regular_file.calls == 1 && !regular_file.last_offset &&
+          regular_file.last_bytes == 16 * PAGE);
+    for (unsigned i = 0; i < 16; ++i)
+    {
+        uint64_t frame;
+        CHECK(lume_mmu_translate(lume_mmu_task_root(0), around + i * PAGE, false, true, false,
+                                 &frame));
+        CHECK(!memcmp((void *)(uintptr_t)frame, file_data + i * PAGE, PAGE));
+    }
+    clean();
+
+    regular_open(32 * PAGE, 0);
+    struct lume_vm_request around_request = {.version = LUME_VM_VERSION,
+                                             .length = 16 * PAGE,
+                                             .offset = 3 * PAGE,
+                                             .protection = LUME_PROT_READ,
+                                             .flags = LUME_MAP_PRIVATE,
+                                             .fd = 63};
+    around = lume_vm_call(&files, 1, LUME_VM_MAP, &around_request);
+    CHECK(around > 0);
+    CHECK(!memcmp((void *)(uintptr_t)physical(0, around + 11 * PAGE, false, false),
+                  file_data + 14 * PAGE, PAGE));
+    CHECK(regular_file.calls == 1 && !regular_file.last_offset &&
+          regular_file.last_bytes == 16 * PAGE);
+    uint64_t adjacent;
+    CHECK(lume_mmu_translate(lume_mmu_task_root(0), around, false, true, false, &adjacent));
+    CHECK(!lume_mmu_translate(lume_mmu_task_root(0), around - PAGE, false, true, false, &adjacent));
+    CHECK(!lume_mmu_translate(lume_mmu_task_root(0), around + 13 * PAGE, false, true, false,
+                              &adjacent));
+    clean();
+
+    regular_open(16 * PAGE, 0);
+    span_unavailable = true;
+    around = call(0, LUME_VM_MAP, 0, 16 * PAGE, LUME_PROT_READ, LUME_MAP_PRIVATE, 63);
+    CHECK(around > 0);
+    CHECK(!memcmp((void *)(uintptr_t)physical(0, around + 11 * PAGE, false, false),
+                  file_data + 11 * PAGE, PAGE));
+    CHECK(regular_file.calls == 1 && regular_file.last_offset == 11 * PAGE &&
+          regular_file.last_bytes == PAGE && physical_live == 1);
+    clean();
+
+    for (unsigned short_read = 0; short_read < 2; ++short_read)
+    {
+        regular_open(16 * PAGE, 0);
+        around = call(0, LUME_VM_MAP, 0, 16 * PAGE, LUME_PROT_READ, LUME_MAP_PRIVATE, 63);
+        CHECK(around > 0);
+        if (short_read)
+            regular_file.short_call = 1;
+        else
+            regular_file.fail_call = 1;
+        uint64_t frame = physical(0, around + 11 * PAGE, false, false);
+        CHECK(!memcmp((void *)(uintptr_t)frame, file_data + 11 * PAGE, PAGE));
+        CHECK(regular_file.calls == 2 && regular_file.last_offset == 11 * PAGE &&
+              regular_file.last_bytes == PAGE && physical_live == 1);
+        CHECK(!memcmp((void *)(uintptr_t)physical(0, around, false, false), file_data, PAGE));
+        CHECK(regular_file.calls == 3 && physical(0, around + 11 * PAGE, false, false) == frame);
+        clean();
+    }
     const uint64_t available = 2 * 1024 * 1024 + PAGE + 3;
     regular_open(available + PAGE, PAGE);
     unsigned before = span_calls;
@@ -1281,9 +1349,9 @@ static void file_mapping_cases(void)
         base = call(0, LUME_VM_MAP, 0, 131072, 3, LUME_MAP_PRIVATE, 63);
         CHECK(base > 0 && !regular_file.calls);
         if (failure == 0)
-            regular_file.fail_call = 1;
+            regular_file.fail_all = true;
         else if (failure == 1)
-            regular_file.short_call = 1;
+            regular_file.short_all = true;
         else
             physical_budget = 0;
         CHECK(lume_vm_fault(0, base, false, false) == -1);

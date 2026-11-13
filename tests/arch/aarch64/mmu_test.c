@@ -30,6 +30,21 @@ static uint64_t last_first, last_bytes;
 static int budget = -1, node_budget = -1;
 static bool releasing;
 static unsigned releasing_task;
+static unsigned tlb_calls[256], tlb_whole[256], tlb_count, tlb_asid;
+static uint64_t tlb_first;
+
+void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned count)
+{
+    CHECK(asid && asid < 255 && (asid & 1));
+    CHECK(count <= LUME_MMU_UNMAP_PAGES && (!count || addresses));
+    ++tlb_calls[asid];
+    tlb_whole[asid] += !count;
+    tlb_asid = asid;
+    tlb_count = count;
+    tlb_first = count ? addresses[0] : 0;
+    for (unsigned i = 0; i < count; ++i)
+        CHECK(!(addresses[i] & 4095));
+}
 
 static struct
 {
@@ -306,7 +321,10 @@ int main(void)
     buffers[0].valid = buffers[1].valid = buffers[2].valid = true;
     uint64_t address = LUME_HEAP_BASE, physical = 0x12300000;
     invalidated = page_invalidations[0];
+    unsigned own_tlb = tlb_calls[1], other_tlb = tlb_calls[3];
     CHECK(lume_mmu_protect_user_batch(0, &address, &physical, 1, LUME_PROT_READ));
+    CHECK(tlb_calls[1] == own_tlb + 1 && tlb_calls[3] == other_tlb && tlb_asid == 1 &&
+          tlb_count == 1 && tlb_first == address);
     CHECK(page_invalidations[0] == invalidated + 1 && !buffers[0].valid && buffers[1].valid &&
           buffers[2].valid);
     CHECK(lume_mmu_translate(lume_mmu_task_root(0), address, false, true, false, &pa));
@@ -314,15 +332,19 @@ int main(void)
     invalidated = page_invalidations[0];
     buffers[0].valid = true;
     uint64_t wrong_physical = physical + 4096;
+    own_tlb = tlb_calls[1];
     CHECK(!lume_mmu_protect_user_batch(0, &address, &wrong_physical, 1, LUME_PROT_READ));
+    CHECK(tlb_calls[1] == own_tlb && tlb_calls[3] == other_tlb);
     CHECK(page_invalidations[0] == invalidated && buffers[0].valid);
     CHECK(lume_mmu_protect_user_batch(0, &address, &physical, 1, LUME_PROT_READ | LUME_PROT_WRITE));
     buffers[0].valid = true;
     invalidated = page_invalidations[0];
+    unsigned full_tlb = tlb_whole[1];
     CHECK(!lume_mmu_map_user(0, LUME_ELF_BASE, 0x12500000, true, true));
     CHECK(!lume_mmu_map_user(0, LUME_USER_LIMIT, 0x12500000, true, false));
     CHECK(page_invalidations[0] == invalidated && buffers[0].valid);
     lume_mmu_unmap_user(0, LUME_HEAP_BASE);
+    CHECK(tlb_whole[1] == full_tlb + 1 && tlb_calls[3] == other_tlb);
     CHECK(page_invalidations[0] == invalidated + 1 && last_task == 0 &&
           last_first == LUME_HEAP_BASE && !buffers[0].valid && buffers[1].valid &&
           buffers[2].valid);
@@ -360,7 +382,10 @@ int main(void)
     uint64_t owner1 = lume_mmu_task_root(1);
     buffers[0].first = LUME_HEAP_BASE + 0x200000;
     buffers[0].valid = true;
+    full_tlb = tlb_whole[1];
+    unsigned other_full_tlb = tlb_whole[3];
     CHECK(lume_mmu_swap_user(0, 1));
+    CHECK(tlb_whole[1] == full_tlb + 1 && tlb_whole[3] == other_full_tlb + 1);
     CHECK((lume_mmu_task_root(0) & UINT64_C(0x0000ffffffffffff)) ==
               (owner1 & UINT64_C(0x0000ffffffffffff)) &&
           (lume_mmu_task_root(1) & UINT64_C(0x0000ffffffffffff)) ==
@@ -386,7 +411,10 @@ int main(void)
     buffers[0].valid = true;
     invalidated = page_invalidations[0];
     unsigned alias_pages = page_invalidations[3];
+    own_tlb = tlb_calls[1];
+    other_tlb = tlb_calls[3];
     CHECK(lume_mmu_protect_user_batch(3, &address, &physical, 1, LUME_PROT_READ));
+    CHECK(tlb_calls[1] == own_tlb + 1 && tlb_calls[3] == other_tlb && tlb_asid == 1);
     CHECK(page_invalidations[0] == invalidated + 1 && page_invalidations[3] == alias_pages &&
           !buffers[0].valid && buffers[2].valid);
     CHECK(lume_mmu_protect_user_batch(3, &address, &physical, 1, LUME_PROT_READ | LUME_PROT_WRITE));

@@ -202,14 +202,19 @@ static void file_changed(uint64_t key, uint64_t bytes, uint64_t version)
 
 static int file_fill(struct vm_object *object, uint64_t page)
 {
-    uint64_t offset = page * PAGE;
+    uint64_t requested = page, demand_offset = page * PAGE;
     if (object->changing)
         return -LUME_EAGAIN;
-    if (offset >= object->bytes)
+    if (demand_offset >= object->bytes)
         return -LUME_EIO;
+    uint64_t demand_bytes = object->bytes - demand_offset;
+    if (demand_bytes > PAGE)
+        demand_bytes = PAGE;
+    page &= ~(uint64_t)(FILE_READ_PAGES - 1);
+    uint64_t offset = page * PAGE;
     uint64_t version = object->file_version;
     uint64_t bytes = object->bytes - offset;
-    uint64_t maximum = (FILE_READ_PAGES - page % FILE_READ_PAGES) * PAGE;
+    uint64_t maximum = FILE_READ_PAGES * PAGE;
     if (bytes > maximum)
         bytes = maximum;
     unsigned pages = (unsigned)((bytes + PAGE - 1) / PAGE);
@@ -229,15 +234,33 @@ static int file_fill(struct vm_object *object, uint64_t page)
     }
     if (!physical)
     {
+        page = requested;
+        offset = demand_offset;
         pages = 1;
-        if (bytes > PAGE)
-            bytes = PAGE;
+        bytes = demand_bytes;
         physical = lume_page_alloc_uninitialized(0);
     }
     if (!physical)
         return -LUME_ENOMEM;
-    int64_t read =
-        lume_vfs_pread_object(object->file - 1, offset, (void *)(uintptr_t)physical, bytes);
+    int64_t read;
+    for (;;)
+    {
+        read = lume_vfs_pread_object(object->file - 1, offset, (void *)(uintptr_t)physical, bytes);
+        if ((read >= 0 && (uint64_t)read == bytes) || pages == 1 ||
+            version != object->file_version || object->changing)
+            break;
+        /* A failed speculative read must not prevent loading the demanded page. */
+        for (unsigned i = 0; i < pages; ++i)
+            if (!lume_page_free(physical + (uint64_t)i * PAGE))
+                lume_fail("file read-ahead frame release");
+        page = requested;
+        offset = demand_offset;
+        pages = 1;
+        bytes = demand_bytes;
+        physical = lume_page_alloc_uninitialized(0);
+        if (!physical)
+            return -LUME_ENOMEM;
+    }
     int error = read < 0 ? (int)read : (uint64_t)read != bytes ? -LUME_EIO : 0;
     if (!error && (version != object->file_version || object->changing))
         error = -LUME_EAGAIN;

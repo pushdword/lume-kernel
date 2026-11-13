@@ -1,6 +1,7 @@
 #include "lume/mmu.h"
 #include "lume/smp.h"
 #include "lume/vm.h"
+#include "lume/elf.h"
 #define ADDRESS UINT64_C(0x0000fffffffff000)
 static uint64_t asid_roots[LUME_CPU_LIMIT][256];
 
@@ -57,6 +58,27 @@ bool lume_mmu_root_active(uint64_t base)
     uint64_t current;
     __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(current));
     return current == base;
+}
+
+void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned count)
+{
+    if (!asid || asid >= 255 || !(asid & 1) || count > LUME_MMU_UNMAP_PAGES ||
+        (count && !addresses))
+        lume_fail("user translation invalidation range");
+    __asm__ volatile("dsb ishst" ::: "memory");
+    for (unsigned view = 0; view < 2; ++view)
+    {
+        uint64_t tag = (uint64_t)(asid + view) << 48;
+        if (!count)
+            __asm__ volatile("tlbi aside1is, %0" ::"r"(tag) : "memory");
+        else
+            for (unsigned i = 0; i < count; ++i)
+            {
+                uint64_t operand = tag | (addresses[i] >> 12);
+                __asm__ volatile("tlbi vae1is, %0" ::"r"(operand) : "memory");
+            }
+    }
+    __asm__ volatile("dsb ish; isb" ::: "memory");
 }
 
 void lume_mmu_switch(uint64_t base)

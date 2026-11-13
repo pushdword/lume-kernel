@@ -13,6 +13,8 @@ bool lume_mmu_translate(uint64_t root, uint64_t va, bool write, bool user, bool 
 bool lume_mmu_device_mapping(uint64_t address);
 bool lume_mmu_video_mapping(uint64_t physical, size_t bytes);
 bool lume_mmu_swap_user(unsigned, unsigned);
+/* A zero page count invalidates both ASIDs of the complete user address space. */
+void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned count);
 bool lume_mmu_module_prepare(uint64_t physical, size_t bytes);
 bool lume_mmu_module_protect(uint64_t physical, size_t bytes, unsigned flags);
 #endif
