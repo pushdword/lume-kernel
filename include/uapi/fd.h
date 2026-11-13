@@ -6,8 +6,10 @@
 #if defined(__aarch64__) || defined(__x86_64__) || defined(LUME_ARCH_AARCH64) ||                   \
     defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
 #define LUME_FD_LIMIT 256u
+#define LUME_FD_DESCRIPTOR_LIMIT 1024u
 #else
 #define LUME_FD_LIMIT 32u
+#define LUME_FD_DESCRIPTOR_LIMIT 32u
 #endif
 #define LUME_PIPE_BYTES 4096u
 #define LUME_PIPE_ATOMIC 4096u

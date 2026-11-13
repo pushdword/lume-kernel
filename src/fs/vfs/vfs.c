@@ -206,33 +206,15 @@ static void bind_descriptor(struct lume_files *files, unsigned fd, int object, u
 
 /* Duplicated and inherited descriptors share one offset and access mode. Pipe endpoints
  * keep their channel alive until the last reference to each open description closes. */
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
-    defined(LUME_ARCH_I686)
-#define OPEN_FILES 512u
-#else
-#define OPEN_FILES 256u
-#endif
 #define PIPES (2u * LUME_TASK_LIMIT)
 
-static struct open_file
-{
-    int node, pipe;
-    unsigned references, status;
-    uint32_t flags;
-    unsigned directory_authority_generation;
-    bool closing, deferred_close;
-    uint64_t offset;
-    struct lume_fat_cursor fat_cursor;
-    const struct lume_file_ops *external;
-    void *context;
-    void *storage_handle;
-    unsigned attribute_bytes;
-    bool attribute_cached;
-    char attribute_data[LUME_DEVFS_ATTRIBUTE_BYTES];
-} open_files[OPEN_FILES];
+#include "open_files.h"
 
-static unsigned storage_reap_count, storage_reap_cursor;
+static unsigned storage_reap_count, storage_reap_head, storage_reap_tail;
 static bool storage_reap_enabled, storage_reaping;
+
+static unsigned nofile_default = LUME_FD_MAX;
+static void resource_limits_start(void);
 
 struct directory_authority
 {
@@ -262,14 +244,18 @@ static struct channel
 } channels[PIPES];
 
 #if LUME_FILES_DYNAMIC
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define PIPE_MAX_PAGES 16u
-#define PIPE_BUDGET_PAGES 1024u
+#define PIPE_BUDGET_PAGES 8192u
+#define PIPE_BUDGET_MAX_PAGES 65536u
 #else
 #define PIPE_MAX_PAGES 4u
 #define PIPE_BUDGET_PAGES 256u
+#define PIPE_BUDGET_MAX_PAGES PIPE_BUDGET_PAGES
 #endif
 static unsigned pipe_pages;
+static unsigned pipe_page_limit = PIPE_BUDGET_PAGES;
 
 static void pipe_backing_release(struct channel *channel)
 {
@@ -315,7 +301,8 @@ static unsigned free_nodes;
 static unsigned namespace_generation;
 static void (*mapping_changed)(uint64_t, uint64_t, uint64_t);
 static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
-static struct lume_devfs_group *attribute_groups[LUME_DEVICE_LIMIT];
+static struct lume_devfs_group resource_group;
+static struct lume_devfs_group *attribute_groups[LUME_DEVICE_LIMIT] = {&resource_group};
 
 static struct
 {
@@ -345,9 +332,9 @@ static void node_changed(struct node *node)
 
 int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
 {
-    if (!identity || object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
+    if (!identity || object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
         return -LUME_EBADF;
-    const struct open_file *file = &open_files[object];
+    const struct open_file *file = open_file_at(object);
     if ((file->flags & 3) == LUME_O_WRONLY)
         return -LUME_EACCES;
     if (file->external || file->pipe >= 0 || file->node < 0 ||
@@ -360,11 +347,11 @@ int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
 
 int lume_vfs_object_retain(int object)
 {
-    if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
         return -LUME_EBADF;
-    if (open_files[object].references == UINT32_MAX)
+    if (open_file_at(object)->references == UINT32_MAX)
         return -LUME_EOVERFLOW;
-    ++open_files[object].references;
+    ++open_file_at(object)->references;
     return 0;
 }
 
@@ -374,10 +361,11 @@ int lume_vfs_exec_pin(int object)
     int result = lume_vfs_object_identity(object, &identity);
     if (result)
         return result;
-    unsigned index = (unsigned)open_files[object].node;
+    unsigned index = (unsigned)open_file_at(object)->node;
     for (unsigned i = 0; i < OPEN_FILES; ++i)
-        if (open_files[i].references && !open_files[i].external && open_files[i].pipe < 0 &&
-            open_files[i].node == (int)index && (open_files[i].flags & 3))
+        if (open_file_at(i)->references && !open_file_at(i)->external &&
+            open_file_at(i)->pipe < 0 && open_file_at(i)->node == (int)index &&
+            (open_file_at(i)->flags & 3))
             return -LUME_ETXTBSY;
     if (nodes[index].executables == UINT32_MAX)
         return -LUME_EOVERFLOW;
@@ -387,10 +375,10 @@ int lume_vfs_exec_pin(int object)
 
 void lume_vfs_exec_unpin(int object)
 {
-    if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references ||
-        open_files[object].node < 0 || !nodes[open_files[object].node].executables)
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references ||
+        open_file_at(object)->node < 0 || !nodes[open_file_at(object)->node].executables)
         lume_fail("executable reference release");
-    --nodes[open_files[object].node].executables;
+    --nodes[open_file_at(object)->node].executables;
 }
 
 static bool storage_handles(void)
@@ -1113,6 +1101,8 @@ int lume_devfs_unregister_group(struct lume_devfs_group *group)
     return 0;
 }
 
+#include "resource_limits.h"
+
 void lume_vfs_init(const void *shell, size_t bytes)
 {
     if (mapping_changed)
@@ -1122,9 +1112,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
         storage->program_cache_owner(NULL);
     if (storage_handles())
         for (unsigned i = 0; i < OPEN_FILES; ++i)
-            if ((open_files[i].references || open_files[i].deferred_close) &&
-                open_files[i].storage_handle)
-                (void)storage->close(open_files[i].storage_handle);
+            if ((open_file_at(i)->references || open_file_at(i)->deferred_close) &&
+                open_file_at(i)->storage_handle)
+                (void)storage->close(open_file_at(i)->storage_handle);
     for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
         lume_vfs_poll_release(task);
     memset(poll_pending, 0, sizeof(poll_pending));
@@ -1134,9 +1124,8 @@ void lume_vfs_init(const void *shell, size_t bytes)
     poll_input_ready = false;
     lume_file_modes_reset();
     file_lock_count = 0;
-    for (unsigned i = 0; i < OPEN_FILES; ++i)
-        open_files[i] = (struct open_file){0};
-    storage_reap_count = storage_reap_cursor = 0;
+    open_file_reset();
+    storage_reap_count = storage_reap_head = storage_reap_tail = 0;
     storage_reap_enabled = storage_reaping = false;
     for (unsigned i = 0; i < PIPES; ++i)
     {
@@ -1197,24 +1186,25 @@ void lume_vfs_init(const void *shell, size_t bytes)
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (character_devices[i].device && add_character(character_devices[i].device))
             lume_fail("character device namespace allocation");
+    resource_limits_start();
 }
 
 static int new_object(int node, int pipe, uint32_t flags)
 {
-    for (unsigned i = 0; i < OPEN_FILES; ++i)
-        if (!open_files[i].references && !open_files[i].closing)
-        {
-            open_files[i] =
-                (struct open_file){.node = node, .pipe = pipe, .references = 1, .flags = flags};
-            if (node >= 0)
-                ++nodes[node].references;
-            else if (pipe >= 0 && (flags & 3))
-                ++channels[pipe].writers;
-            else if (pipe >= 0)
-                ++channels[pipe].readers;
-            return (int)i;
-        }
-    return -LUME_ENOMEM;
+    int index = open_file_reserve();
+    if (index < 0)
+        return index;
+    struct open_file *file = open_file_at((unsigned)index);
+    file->node = node;
+    file->pipe = pipe;
+    file->flags = flags;
+    if (node >= 0)
+        ++nodes[node].references;
+    else if (pipe >= 0 && (flags & 3))
+        ++channels[pipe].writers;
+    else if (pipe >= 0)
+        ++channels[pipe].readers;
+    return index;
 }
 
 static bool files_ready(const struct lume_files *f)
@@ -1301,8 +1291,8 @@ bool lume_files_init(struct lume_files *f)
     f->identity.umask = 022;
     for (unsigned i = 0; i < LUME_LIMIT_COUNT; ++i)
         f->identity.limit[i].soft = f->identity.limit[i].hard = UINT64_MAX;
-    f->identity.limit[LUME_LIMIT_FILES].soft = f->identity.limit[LUME_LIMIT_FILES].hard =
-        LUME_FD_MAX;
+    f->identity.limit[LUME_LIMIT_FILES].soft = nofile_default;
+    f->identity.limit[LUME_LIMIT_FILES].hard = LUME_FD_MAX;
     f->identity.limit[LUME_LIMIT_PROCESSES].soft = f->identity.limit[LUME_LIMIT_PROCESSES].hard =
         LUME_TASK_LIMIT;
     f->identity.limit[LUME_LIMIT_CORE_SIZE].soft = f->identity.limit[LUME_LIMIT_CORE_SIZE].hard = 0;
@@ -1389,15 +1379,15 @@ bool lume_files_clone(struct lume_files *out, const struct lume_files *in)
         out->fd[i].changed = (struct lume_poll_source){0};
         lume_poll_source_reset(&out->fd[i].changed);
         if (out->fd[i].object >= 0)
-            ++open_files[out->fd[i].object].references;
+            ++open_file_at(out->fd[i].object)->references;
     }
     if (authorities)
     {
         for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
             if (authorities->entry[i].active)
-                ++open_files[authorities->entry[i].object].references;
+                ++open_file_at(authorities->entry[i].object)->references;
         if (authorities->generation == namespace_generation && authorities->x11_active)
-            ++open_files[authorities->x11_object].references;
+            ++open_file_at(authorities->x11_object)->references;
     }
     return true;
 }
@@ -1486,7 +1476,7 @@ static struct open_file *descriptor(struct lume_files *f, uint64_t fd)
                    f->fd &&
 #endif
                    f->fd[fd].object >= 0
-               ? &open_files[f->fd[fd].object]
+               ? open_file_at(f->fd[fd].object)
                : 0;
 }
 
@@ -1541,7 +1531,7 @@ void lume_vfs_pipe_grow(struct lume_files *files, uint64_t fd, uint64_t bytes)
     unsigned pages =
         (unsigned)((bytes < PIPE_MAX_PAGES * 4096u ? bytes : PIPE_MAX_PAGES * 4096u) + 4095u) /
         4096u;
-    if (pages > PIPE_BUDGET_PAGES - pipe_pages)
+    if (pages > pipe_page_limit - pipe_pages)
         return;
     int held = lume_vfs_hold(files, (unsigned)fd);
     if (held < 0)
@@ -1598,7 +1588,7 @@ bool lume_vfs_exec_callbacks(const struct lume_files *files)
     for (unsigned i = 0; i < LUME_FD_MAX; ++i)
     {
         int object = files->fd[i].object;
-        if (object >= 0 && (files->fd[i].flags & LUME_FD_CLOEXEC) && open_files[object].external)
+        if (object >= 0 && (files->fd[i].flags & LUME_FD_CLOEXEC) && open_file_at(object)->external)
             return true;
     }
     return false;
@@ -1619,9 +1609,9 @@ int lume_vfs_attach(struct lume_files *files, const struct lume_file_ops *ops, v
     int object = new_object(-1, -1, LUME_O_RDWR);
     if (object < 0)
         return object;
-    open_files[object].external = ops;
-    open_files[object].context = context;
-    open_files[object].status = flags & LUME_FD_NONBLOCK;
+    open_file_at(object)->external = ops;
+    open_file_at(object)->context = context;
+    open_file_at(object)->status = flags & LUME_FD_NONBLOCK;
     bind_descriptor(files, fd, object, flags & LUME_FD_CLOEXEC);
     return (int)fd;
 }
@@ -1656,7 +1646,7 @@ int lume_vfs_install(struct lume_files *files, int object)
     if (!files->fd)
         return -LUME_ENOMEM;
 #endif
-    if (object < 0 || object >= (int)OPEN_FILES || !open_files[object].references)
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
         return -LUME_EBADF;
     for (unsigned i = 0; i < files->identity.limit[LUME_LIMIT_FILES].soft; ++i)
         if (files->fd[i].object < 0)
@@ -1713,7 +1703,7 @@ int lume_vfs_directory_authority(struct lume_files *files, unsigned operation, u
                 slot = i;
             continue;
         }
-        if (open_files[entry->object].node != file->node)
+        if (open_file_at(entry->object)->node != file->node)
             continue;
         if (operation == LUME_SANDBOX_DIRECTORY_RELEASE)
         {
@@ -1751,7 +1741,7 @@ int lume_vfs_x11_authority(struct lume_files *files, uint64_t fd)
     if (authorities && authorities->generation != namespace_generation)
         return -LUME_EINVAL;
     if (authorities && authorities->x11_active)
-        return open_files[authorities->x11_object].node == file->node ? 0 : -LUME_EBUSY;
+        return open_file_at(authorities->x11_object)->node == file->node ? 0 : -LUME_EBUSY;
     int object = lume_vfs_hold(files, (unsigned)fd);
     if (object < 0)
         return object;
@@ -1781,7 +1771,7 @@ bool lume_vfs_sandbox_x11_authority(struct lume_files *files, const char *canoni
         return false;
     int index = find(canonical);
     return index >= 0 && nodes[index].linked && nodes[index].kind == LUME_NODE_FILE &&
-           open_files[authorities->x11_object].node == index;
+           open_file_at(authorities->x11_object)->node == index;
 }
 
 static bool directory_contains(unsigned anchor, unsigned index)
@@ -1824,7 +1814,7 @@ bool lume_vfs_sandbox_directory(struct lume_files *files, const char *canonical,
     {
         struct directory_authority *entry = &authorities->entry[i];
         if (entry->active &&
-            directory_contains((unsigned)open_files[entry->object].node, (unsigned)index))
+            directory_contains((unsigned)open_file_at(entry->object)->node, (unsigned)index))
             return true;
     }
     return false;
@@ -1972,11 +1962,11 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     if (n->persistent && n->kind == LUME_NODE_FILE && storage_handles())
     {
         int result =
-            storage->open(n->path, (unsigned)(flags & 3), &open_files[object].storage_handle);
+            storage->open(n->path, (unsigned)(flags & 3), &open_file_at(object)->storage_handle);
         if (result)
         {
             --n->references;
-            open_files[object] = (struct open_file){0};
+            open_file_recycle(open_file_at((unsigned)object));
             return result;
         }
     }
@@ -2017,7 +2007,7 @@ static int finish_object(struct open_file *d)
         --nodes[d->node].references;
         release_ram(&nodes[d->node]);
     }
-    d->closing = false;
+    open_file_recycle(d);
     return result;
 }
 
@@ -2027,13 +2017,20 @@ static int release_object(struct open_file *d, bool deferred)
         return -LUME_EBADF;
     if (--d->references)
         return 0;
+    --open_file_live;
     /* A suspended close callback retains its object until device cleanup returns. */
     d->closing = true;
-    file_locks_drop((int)(d - open_files));
+    file_locks_drop((int)d->index);
     if (deferred && storage_reap_enabled && !d->external && d->pipe < 0 && d->storage_handle)
     {
         /* The description retains its node and handle until STORAGE finishes closing it. */
         d->deferred_close = true;
+        d->next_reap = 0;
+        if (storage_reap_tail)
+            open_file_at(storage_reap_tail - 1)->next_reap = d->index + 1;
+        else
+            storage_reap_head = d->index + 1;
+        storage_reap_tail = d->index + 1;
         ++storage_reap_count;
         return 0;
     }
@@ -2056,13 +2053,13 @@ unsigned lume_vfs_reap(unsigned budget)
         return 0;
     storage_reaping = true;
     unsigned done = 0;
-    for (unsigned seen = 0; seen < OPEN_FILES && done < budget && storage_reap_count; ++seen)
+    while (done < budget && storage_reap_count)
     {
-        struct open_file *d = open_files + storage_reap_cursor;
-        if (++storage_reap_cursor == OPEN_FILES)
-            storage_reap_cursor = 0;
-        if (!d->deferred_close)
-            continue;
+        struct open_file *d = open_file_at(storage_reap_head - 1);
+        storage_reap_head = d->next_reap;
+        if (!storage_reap_head)
+            storage_reap_tail = 0;
+        d->next_reap = 0;
         d->deferred_close = false;
         --storage_reap_count;
         (void)finish_object(d);
@@ -2075,7 +2072,7 @@ unsigned lume_vfs_reap(unsigned budget)
 void lume_vfs_drop(int object)
 {
     if (object >= 0 && object < (int)OPEN_FILES)
-        (void)release_object(&open_files[object], true);
+        (void)release_object(open_file_at(object), true);
 }
 
 int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
@@ -2520,7 +2517,7 @@ int64_t lume_vfs_ofd_lock(struct lume_files *files, bool query,
                     : request->whence == LUME_SEEK_CUR ? description->offset
                                                        : node->bytes;
     struct file_lock_record range = {
-        .owner = (int)(description - open_files), .node = description->node, .type = request->type};
+        .owner = (int)description->index, .node = description->node, .type = request->type};
     int result = file_lock_range(request, base, &range);
     return result ? result : file_locks_apply(range, query, request);
 }
@@ -2539,7 +2536,7 @@ int64_t lume_vfs_flock(struct lume_files *files, struct lume_file_lock_request *
         return -95;
     if (nodes[description->node].kind == LUME_NODE_DIR)
         return -LUME_EISDIR;
-    int owner = (int)(description - open_files);
+    int owner = (int)description->index;
     /* Conversion releases only this description's whole-file lock. */
     for (unsigned i = 0; i < file_lock_count;)
         if (file_locks[i].scope == 2 && file_locks[i].owner == owner)
@@ -2762,7 +2759,7 @@ static int sandbox_stat(struct lume_files *files, const char *canonical, unsigne
         struct directory_authority *entry = &authorities->entry[i];
         if (!entry->active)
             continue;
-        int anchor = open_files[entry->object].node;
+        int anchor = open_file_at(entry->object)->node;
         if (anchor >= 0 && (unsigned)anchor < count && directory_contains(index, (unsigned)anchor))
             return 0;
     }
@@ -3382,7 +3379,7 @@ bool lume_vfs_poll_subscribe(struct lume_files *files, const struct lume_poll_wa
         if (fd < 0 || fd >= (int)LUME_FD_MAX || files->fd[fd].object < 0 ||
             files->fd[fd].generation != watch->generations[i])
             continue;
-        struct open_file *file = &open_files[files->fd[fd].object];
+        struct open_file *file = open_file_at(files->fd[fd].object);
         struct lume_poll_source *source = 0;
         if (file->external && file->external->source)
             source = file->external->source(file->context);
@@ -3435,7 +3432,7 @@ bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_pol
         if (fd < 0 || fd >= (int)LUME_FD_MAX || !(watch->records[i].events & LUME_POLLIN) ||
             files->fd[fd].object < 0 || files->fd[fd].generation != watch->generations[i])
             continue;
-        const struct open_file *file = &open_files[files->fd[fd].object];
+        const struct open_file *file = open_file_at(files->fd[fd].object);
         if (!file->external && file->pipe < 0 && nodes[file->node].kind == LUME_NODE_CHAR &&
             !nodes[file->node].device && !nodes[file->node].group &&
             (file->flags & 3) != LUME_O_WRONLY)
@@ -3485,8 +3482,7 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
                                     LUME_PIPE_BYTES, LUME_PIPE_ATOMIC};
         for (unsigned i = 0; i < LUME_FD_MAX; ++i)
             info.open += f->fd[i].object >= 0;
-        for (unsigned i = 0; i < OPEN_FILES; ++i)
-            info.objects += open_files[i].references != 0;
+        info.objects = open_file_live;
         for (unsigned i = 0; i < PIPES; ++i)
             info.pipes += channels[i].readers || channels[i].writers;
         copy((void *)(uintptr_t)r->buffer, &info, sizeof(info));
@@ -3528,7 +3524,7 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
         if (channel == PIPES)
             return -LUME_ENOMEM;
 #if LUME_FILES_DYNAMIC
-        if (pipe_pages == PIPE_BUDGET_PAGES)
+        if (pipe_pages == pipe_page_limit)
             return -LUME_ENOMEM;
         channels[channel].growing = true;
         ++pipe_pages;
@@ -3559,7 +3555,7 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
             return b;
         }
         bind_descriptor(f, second, b, r->flags & LUME_FD_CLOEXEC);
-        open_files[a].status = open_files[b].status = r->flags & LUME_FD_NONBLOCK;
+        open_file_at(a)->status = open_file_at(b)->status = r->flags & LUME_FD_NONBLOCK;
         r->fd = (int)first;
         r->other = (int)second;
         return 0;
@@ -4003,11 +3999,12 @@ static int program_reference(unsigned index)
         return object;
     if (node->persistent && storage_handles())
     {
-        int result = storage->open(node->path, LUME_O_RDONLY, &open_files[object].storage_handle);
+        int result =
+            storage->open(node->path, LUME_O_RDONLY, &open_file_at(object)->storage_handle);
         if (result)
         {
             --node->references;
-            open_files[object] = (struct open_file){0};
+            open_file_recycle(open_file_at((unsigned)object));
             return result;
         }
     }
@@ -4051,9 +4048,9 @@ int lume_vfs_program_hold(struct lume_files *files, const char *input, size_t *b
 /* The caller owns a held open-file reference for the complete positioned read. */
 int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t bytes)
 {
-    if (object < 0 || object >= OPEN_FILES || !open_files[object].references)
+    if (object < 0 || object >= OPEN_FILES || !open_file_at(object)->references)
         return -LUME_EBADF;
-    struct open_file *file = &open_files[object];
+    struct open_file *file = open_file_at(object);
     if ((file->flags & 3) == LUME_O_WRONLY)
         return -LUME_EACCES;
     if (file->external)

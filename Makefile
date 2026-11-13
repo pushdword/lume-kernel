@@ -977,3 +977,15 @@ check-vfs-sandbox-stat: $(OUT)/tests/vfs-sandbox-stat$(HOSTEXE)
 $(OUT)/tests/vfs-sandbox-stat$(HOSTEXE): tests/unit/vfs_sandbox_stat_test.c tests/unit/vfs_test.c tests/fixtures/vfs_unrestricted_services.c tests/fixtures/vfs_memory_host.c src/fs/vfs/vfs.c src/security/sandbox.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_MAX_ALLOCATION=65536 $(TEST_CPPFLAGS) tests/unit/vfs_sandbox_stat_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c -o "$@"
+
+.PHONY: check-desktop-limits
+check-desktop-limits: $(OUT)/tests/desktop-limits$(HOSTEXE) $(OUT)/tests/desktop-storage$(HOSTEXE)
+	env "$(OUT)/tests/desktop-limits$(HOSTEXE)"
+	env "$(OUT)/tests/desktop-storage$(HOSTEXE)"
+$(OUT)/tests/desktop-limits$(HOSTEXE): tests/unit/desktop_limits_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
+
+$(OUT)/tests/desktop-storage$(HOSTEXE): tests/unit/vfs_storage_handles_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"

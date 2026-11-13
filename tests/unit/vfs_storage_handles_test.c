@@ -4,6 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef LUME_VFS_HOST_EXTERNAL_ALLOCATOR
+uint64_t lume_pages_alloc_span_uninitialized(unsigned pages)
+{
+    (void)pages;
+    return 0;
+}
+#endif
+
 static unsigned opens, closes, live, path_reads, path_writes, handle_reads, handle_writes;
 static unsigned syncs, resizes;
 static int open_error, close_error, read_error, write_error, resize_error, sync_error;
@@ -262,11 +270,44 @@ static void fallback_and_reset(void)
     assert(!live && closes == before + 1);
 }
 
+static void deferred_cleanup(void)
+{
+    lume_vfs_init(NULL, 0);
+    assert(lume_vfs_mount_storage(&operations));
+    struct lume_files files;
+    assert(lume_files_init(&files));
+    int objects[4];
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        int fd = (int)lume_vfs_open(&files, "/data/file", LUME_O_RDONLY);
+        assert(fd >= 0);
+        objects[i] = lume_vfs_hold(&files, (unsigned)fd);
+        assert(objects[i] >= 0);
+        assert(!lume_vfs_close(&files, (unsigned)fd));
+    }
+    lume_vfs_reap_start();
+    for (unsigned i = 0; i < 4; ++i)
+        lume_vfs_drop(objects[i]);
+    assert(live == 4 && lume_vfs_reap_pending());
+    assert(lume_vfs_reap(0) == 0 && live == 4);
+    assert(lume_vfs_reap(2) == 2 && live == 2);
+    assert(lume_vfs_reap(1) == 1 && live == 1);
+    int fd = (int)lume_vfs_open(&files, "/data/file", LUME_O_RDONLY);
+    assert(fd >= 0 && live == 2);
+    int extra = lume_vfs_hold(&files, (unsigned)fd);
+    assert(extra >= 0 && !lume_vfs_close(&files, (unsigned)fd));
+    lume_vfs_drop(extra);
+    assert(lume_vfs_reap(8) == 2 && !live && !lume_vfs_reap_pending());
+    assert(lume_vfs_reap(1) == 0);
+    lume_files_release(&files);
+}
+
 int main(void)
 {
     lifetime();
     errors();
     fallback_and_reset();
+    deferred_cleanup();
     puts("PASS_STORAGE_HANDLES lifetime, offsets, rights, errors, fallback and reset");
     return 0;
 }

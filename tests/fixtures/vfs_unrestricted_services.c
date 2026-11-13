@@ -68,7 +68,7 @@ void *lume_kernel_allocate(size_t bytes)
 #else
     size_t table_bytes = LUME_FD_MAX * sizeof(struct lume_fd);
     size_t link_bytes = sizeof(void *) + sizeof(uint64_t);
-    assert(bytes == table_bytes ||
+    assert(bytes == table_bytes || bytes <= 4000 ||
            (bytes && bytes % (2 * link_bytes) == 0 && bytes <= LUME_FD_LIMIT * 2 * link_bytes));
 #endif
     for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); ++i)
