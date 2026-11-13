@@ -428,12 +428,12 @@ $(OUT)/tests/page-regions$(HOSTEXE): tests/platform/raspberrypi5/page_regions_te
 
 check-aarch64-query: $(OUT)/tests/aarch64-query$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/aarch64-query$(HOSTEXE): tests/arch/aarch64/query_test.c arch/aarch64/context/query.c arch/aarch64/include/kernel/lume/aarch64_query.h include/kernel/lume/query.h
+$(OUT)/tests/aarch64-query$(HOSTEXE): tests/arch/aarch64/query_test.c arch/aarch64/context/query.c arch/aarch64/include/kernel/lume/aarch64_query.h include/kernel/lume/query.h src/core/query_values.h src/core/scheduler_config.h include/kernel/lume/early.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Iarch/aarch64/include/kernel -Iinclude/kernel -Iinclude/ddk -Iinclude/abi/native -Iinclude/uapi "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Iarch/aarch64/include/kernel -Isrc/core -Iinclude/kernel -Iinclude/ddk -Iinclude/abi/native -Iinclude/uapi "$<" -o "$@"
 check-amd64-query: $(OUT)/tests/amd64-query$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/kernel/lume/vm.h
+$(OUT)/tests/amd64-query$(HOSTEXE): tests/arch/amd64/query_test.c arch/amd64/context/query.h include/kernel/lume/amd64_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/kernel/lume/vm.h src/core/query_values.h src/core/scheduler_config.h include/kernel/lume/early.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iplatform/q35/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
 ifeq ($(OS),Windows_NT)
@@ -455,7 +455,7 @@ check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(H
 $(OUT)/tests/i686-fpu$(HOSTEXE): tests/arch/i686/fpu_test.c arch/i686/context/fpu.h arch/i686/include/kernel/lume/context.h arch/i686/include/kernel/lume/context_asm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -mgeneral-regs-only -UNDEBUG -Iarch/i686/include/kernel -Iinclude/kernel "$<" -o "$@"
-$(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/uapi/lume/tty.h arch/i686/include/kernel/lume/context.h
+$(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/context/query.h include/kernel/lume/i686_query.h include/kernel/lume/query.h include/abi/native/lume/abi.h include/abi/native/lume/syscall_numbers.h include/uapi/lume/thread.h include/uapi/lume/tty.h arch/i686/include/kernel/lume/context.h src/core/query_values.h src/core/scheduler_config.h include/kernel/lume/early.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 -Iarch/i686/include/kernel -Iplatform/pc/include -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Isrc/core "$<" -o "$@"
 $(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h

@@ -157,9 +157,14 @@ void lume_q35_clock_start(void)
         lume_fail("PIT timer registration");
 }
 
-uint64_t lume_clock_monotonic(void)
+uint64_t lume_clock_read(void)
 {
     return lume_counter_read_relaxed() / 1000;
+}
+
+uint64_t lume_clock_monotonic(void)
+{
+    return lume_clock_read();
 }
 
 uint32_t lume_clock_millis(void)

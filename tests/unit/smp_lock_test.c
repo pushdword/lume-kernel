@@ -20,6 +20,8 @@ typedef pthread_t test_thread;
 static _Thread_local unsigned cpu_index;
 static uint64_t ticks, wait_hooks[4], acquired_hooks[4], released_hooks[4];
 static unsigned value, inside;
+static unsigned first_order[3], order_count;
+static uint32_t delayed_link, release_wait;
 
 static unsigned lume_cpu_index(void)
 {
@@ -43,6 +45,8 @@ static void relax(void)
 static void kernel_lock_wait(void)
 {
     ++wait_hooks[cpu_index];
+    if (!cpu_index && __atomic_load_n(&delayed_link, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&release_wait, 1, __ATOMIC_RELEASE);
     relax();
 }
 
@@ -76,10 +80,32 @@ static THREAD_RESULT contender(void *argument)
     {
         lume_smp_lock();
         assert(lume_smp_owned() && !__atomic_fetch_add(&inside, 1, __ATOMIC_RELAXED));
+        if (!i)
+            first_order[order_count++] = cpu_index;
         ++value;
         assert(__atomic_fetch_sub(&inside, 1, __ATOMIC_RELAXED) == 1);
         lume_smp_unlock();
     }
+    return 0;
+}
+
+static THREAD_RESULT delayed_successor(void *argument)
+{
+    (void)argument;
+    cpu_index = 1;
+    __atomic_store_n(&lock_cpus[1].next, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&lock_cpus[1].granted, 0, __ATOMIC_RELAXED);
+    assert(__atomic_exchange_n(&kernel_lock_tail, 2, __ATOMIC_ACQ_REL) == 1);
+    __atomic_store_n(&delayed_link, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&release_wait, __ATOMIC_ACQUIRE))
+        relax();
+    __atomic_store_n(&lock_cpus[0].next, 2, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&lock_cpus[1].granted, __ATOMIC_ACQUIRE))
+        relax();
+    assert(value == 6001 && !inside);
+    lock_cpus[1].held = true;
+    value = 6002;
+    lume_smp_unlock();
     return 0;
 }
 
@@ -113,7 +139,6 @@ int main(void)
         assert(!strcmp(failure, "kernel lock ownership"));
         assert(!lume_smp_owned() && lume_smp_lock_turn() == turn);
     }
-    kernel_lock.next = kernel_lock.serving = UINT32_MAX - 1;
     lume_smp_lock();
     test_thread threads[3];
     for (unsigned i = 0; i < 3; ++i)
@@ -144,8 +169,34 @@ int main(void)
         assert(lock_cpus[cpu].contentions && lock_cpus[cpu].max_wait_ticks);
         assert(!lock_cpus[cpu].held && !lume_smp_wait_start(cpu));
     }
-    assert(value == 6000 && !inside && kernel_lock.next == kernel_lock.serving);
-    assert(kernel_lock.serving == 5999 && acquired_hooks[0] == 33 && released_hooks[0] == 33);
-    puts("SMP_LOCK_PASS recursion ownership wrap wait-service cpus=4 acquisitions=6033");
+    assert(value == 6000 && !inside && !kernel_lock_tail);
+    assert(order_count == 3 && first_order[0] == 1 && first_order[1] == 2 && first_order[2] == 3);
+    assert(acquired_hooks[0] == 33 && released_hooks[0] == 33);
+    lume_smp_lock();
+#ifdef _WIN32
+    test_thread late = CreateThread(NULL, 0, delayed_successor, NULL, 0, NULL);
+    assert(late);
+#else
+    test_thread late;
+    assert(!pthread_create(&late, NULL, delayed_successor, NULL));
+#endif
+    while (!__atomic_load_n(&delayed_link, __ATOMIC_ACQUIRE))
+        relax();
+    assert(lume_smp_contended());
+    value = 6001;
+    lume_smp_unlock();
+#ifdef _WIN32
+    assert(WaitForSingleObject(late, 20000) == WAIT_OBJECT_0);
+    DWORD status;
+    assert(GetExitCodeThread(late, &status) && !status);
+    assert(CloseHandle(late));
+#else
+    assert(!pthread_join(late, NULL));
+#endif
+    assert(release_wait && value == 6002 && !kernel_lock_tail);
+    lume_smp_lock();
+    assert(value == 6002 && !lume_smp_contended());
+    lume_smp_unlock();
+    puts("SMP_LOCK_PASS recursion ownership FIFO local-wait delayed-link cpus=4 acquisitions=6036");
     return 0;
 }

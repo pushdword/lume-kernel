@@ -71,6 +71,19 @@ bool lume_mmu_translate(uint64_t root, uint64_t address, bool write, bool user, 
     return true;
 }
 
+static unsigned clock_reads;
+
+uint64_t lume_clock_read(void)
+{
+    ++clock_reads;
+    return UINT64_C(0x123456789ab);
+}
+
+unsigned lume_cpu_count(void)
+{
+    return 1;
+}
+
 _Noreturn void lume_fail(const char *reason)
 {
     fprintf(stderr, "%s\n", reason);
@@ -270,6 +283,76 @@ static void drain_accounting(void)
     assert(!account.calls && !account.ticks && !account.mask && frequency_reads == reads);
 }
 
+static void scalar_queries(void)
+{
+    uint32_t registers[15];
+    uint64_t *request = (void *)(uintptr_t)BASE;
+    struct lume_query_account account;
+    lume_arch_query_drain(&account);
+    for (unsigned vector = 128; vector <= 129; ++vector)
+        for (unsigned kind = 0; kind < 3; ++kind)
+        {
+            unsigned flag = LUME_QUERY_CLOCK << kind;
+            unsigned number = kind == 0 ? LUME_SYS_CLOCK : kind == 1 ? LUME_SYS_ABI : LUME_SYS_CPU;
+            uint64_t expected = kind == 0   ? UINT64_C(0x123456789ab)
+                                : kind == 1 ? LUME_ABI_VERSION
+                                            : 1;
+            lume_arch_query_publish(7, 3, 99, flag);
+            request[0] = number;
+            request[1] = request[2] = request[3] = 0;
+            frame(registers, vector, vector == 128 ? BASE : number);
+            registers[4] = registers[6] = registers[5] = 0;
+            accepted(registers, expected);
+            if (kind == 2)
+            {
+                for (unsigned action = 1; action <= 3; ++action)
+                {
+                    request[1] = action;
+                    frame(registers, vector, vector == 128 ? BASE : number);
+                    registers[4] = action;
+                    registers[6] = registers[5] = 0;
+                    if (action == 3)
+                        denied(registers);
+                    else
+                        accepted(registers, action == 1 ? 0 : LUME_SCHED_QUANTUM);
+                }
+                for (unsigned argument = 1; argument < 3; ++argument)
+                {
+                    request[1] = request[2] = request[3] = 0;
+                    request[argument + 1] = 1;
+                    frame(registers, vector, vector == 128 ? BASE : number);
+                    registers[4] = registers[6] = registers[5] = 0;
+                    registers[argument == 1 ? 6 : 5] = 1;
+                    denied(registers);
+                }
+                request[1] = UINT64_C(1) << 32;
+                request[2] = request[3] = 0;
+                frame(registers, 128, BASE);
+                denied(registers);
+            }
+            request[1] = request[2] = request[3] = 0;
+            frame(registers, vector, vector == 128 ? BASE : number);
+            registers[4] = registers[6] = registers[5] = 0;
+            lume_arch_query_revoke(2);
+            denied(registers);
+            lume_arch_query_drain(&account);
+            assert(account.calls == (kind == 2 ? 3 : 1));
+            assert(account.mask == UINT64_C(1) << number);
+            lume_arch_query_publish(7, 3, 99, LUME_QUERY_PID);
+            request[0] = number;
+            request[1] = request[2] = request[3] = 0;
+            frame(registers, vector, vector == 128 ? BASE : number);
+            registers[4] = registers[6] = registers[5] = 0;
+            unsigned before = clock_reads;
+            denied(registers);
+            assert(clock_reads == before);
+            struct lume_context context = {.pc = BASE, .raw = {[7] = number, [4] = 2}};
+            assert(query_decode(&context));
+            assert(context.reg[8] == number && context.reg[0] == (kind == 2 ? 2 : 0));
+        }
+    assert(clock_reads == 2);
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -421,6 +504,7 @@ int main(void)
     direct_io_queries();
     terminal_queries();
     drain_accounting();
+    scalar_queries();
 #ifdef _WIN32
     assert(VirtualFree(allocation, 0, MEM_RELEASE));
 #else

@@ -1,6 +1,7 @@
 #ifndef LUME_I686_CONTEXT_QUERY_H
 #define LUME_I686_CONTEXT_QUERY_H
 #include "lume/tty.h"
+#include "query_values.h"
 
 static struct
 {
@@ -25,9 +26,9 @@ static bool query_decode(struct lume_context *frame)
 {
     frame->syscall_pc = (uint32_t)frame->pc;
     unsigned number = frame->raw[7];
-    if (number == LUME_SYS_GETPID)
+    if (number == LUME_SYS_GETPID || number == LUME_SYS_CLOCK || number == LUME_SYS_ABI)
         frame->reg[0] = frame->reg[1] = frame->reg[2] = 0;
-    else if (number == LUME_SYS_READ || number == LUME_SYS_WRITE)
+    else if (number == LUME_SYS_READ || number == LUME_SYS_WRITE || number == LUME_SYS_CPU)
     {
         frame->reg[0] = frame->raw[4];
         frame->reg[1] = frame->raw[6];
@@ -118,7 +119,10 @@ bool lume_i686_query_try(uint32_t *registers)
     uint64_t result;
     if (registers[8] == 129)
     {
-        if (number == LUME_SYS_GETPID && (query_cache.allowed & LUME_QUERY_PID))
+        unsigned value = query_value_kind(number, registers[4], registers[6], registers[5]);
+        if (value && (query_cache.allowed & value))
+            result = query_value_read(number, registers[4], 0);
+        else if (number == LUME_SYS_GETPID && (query_cache.allowed & LUME_QUERY_PID))
             result = query_cache.pid;
         else if ((number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
                  (query_cache.allowed & LUME_QUERY_PIPE))
@@ -147,7 +151,13 @@ bool lume_i686_query_try(uint32_t *registers)
         number = request->words[0];
         if (request->words[1])
             return false;
-        if (number == LUME_SYS_GETPID && (query_cache.allowed & LUME_QUERY_PID))
+        uint64_t action = (uint64_t)request->words[2] | (uint64_t)request->words[3] << 32;
+        uint64_t second = (uint64_t)request->words[4] | (uint64_t)request->words[5] << 32;
+        uint64_t third = (uint64_t)request->words[6] | (uint64_t)request->words[7] << 32;
+        unsigned value = query_value_kind(number, action, second, third);
+        if (value && (query_cache.allowed & value))
+            result = query_value_read(number, action, 0);
+        else if (number == LUME_SYS_GETPID && (query_cache.allowed & LUME_QUERY_PID))
             result = query_cache.pid;
         else if ((number == LUME_SYS_READ || number == LUME_SYS_WRITE) &&
                  (query_cache.allowed & LUME_QUERY_PIPE))

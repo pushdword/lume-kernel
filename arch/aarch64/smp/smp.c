@@ -13,7 +13,7 @@ static unsigned ready[LUME_CPU_LIMIT], stopped[LUME_CPU_LIMIT];
 
 unsigned lume_cpu_count(void)
 {
-    return online;
+    return __atomic_load_n(&online, __ATOMIC_ACQUIRE);
 }
 
 static void kernel_lock_wait(void)
@@ -37,7 +37,7 @@ static void kernel_lock_released(void)
 
 void lume_smp_wake(void)
 {
-    if (online > 1)
+    if (lume_cpu_count() > 1)
         lume_pi5_irq_notify();
 }
 
@@ -68,9 +68,9 @@ void lume_smp_start(void)
         while (!__atomic_load_n(&ready[i], __ATOMIC_ACQUIRE))
             if (lume_counter_read() - start > limit)
                 lume_fail("secondary CPU startup timeout");
-        ++online;
+        __atomic_add_fetch(&online, 1, __ATOMIC_RELEASE);
     }
-    lume_value("SMP_ONLINE_CPUS", online);
+    lume_value("SMP_ONLINE_CPUS", lume_cpu_count());
 }
 
 _Noreturn void lume_secondary_main(unsigned index)
@@ -92,7 +92,7 @@ void lume_smp_quiesce(void)
 {
     lume_smp_wake();
     uint64_t start = lume_counter_read(), limit = lume_counter_frequency();
-    for (unsigned i = 1; i < online; ++i)
+    for (unsigned i = 1; i < lume_cpu_count(); ++i)
         while (!__atomic_load_n(&stopped[i], __ATOMIC_ACQUIRE))
             if (lume_counter_read() - start > limit)
                 lume_fail("secondary CPU stop timeout");

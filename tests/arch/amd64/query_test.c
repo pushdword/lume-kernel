@@ -31,6 +31,19 @@ uint64_t lume_q35_tsc_frequency(void)
     return 2000000000;
 }
 
+static unsigned clock_reads;
+
+uint64_t lume_clock_read(void)
+{
+    ++clock_reads;
+    return UINT64_C(0x123456789ab);
+}
+
+unsigned lume_cpu_count(void)
+{
+    return LUME_CPU_LIMIT;
+}
+
 _Noreturn void lume_fail(const char *message)
 {
     fprintf(stderr, "%s\n", message);
@@ -96,6 +109,59 @@ static void accepted(uint64_t registers[22], uint64_t expected)
             assert(registers[i] == 0x1b);
         else
             assert(registers[i] == before[i]);
+}
+
+static void scalar_queries(void)
+{
+    uint64_t registers[22];
+    struct lume_query_account account;
+    for (cpu = 0; cpu < LUME_CPU_LIMIT; ++cpu)
+    {
+        lume_arch_query_drain(&account);
+        for (unsigned kind = 0; kind < 3; ++kind)
+        {
+            unsigned flag = LUME_QUERY_CLOCK << kind;
+            unsigned number = kind == 0 ? LUME_SYS_CLOCK : kind == 1 ? LUME_SYS_ABI : LUME_SYS_CPU;
+            lume_arch_query_publish(7, 3, 99, flag);
+            frame(registers, number);
+            if (kind == 2)
+            {
+                registers[8] = registers[9] = registers[11] = 0;
+                accepted(registers, LUME_CPU_LIMIT);
+                registers[8] = 1;
+                accepted(registers, cpu);
+                registers[8] = 2;
+                accepted(registers, LUME_SCHED_QUANTUM);
+                registers[8] = 3;
+                denied(registers);
+                registers[8] = 0;
+                registers[9] = 1;
+                denied(registers);
+                registers[9] = 0;
+                registers[11] = 1;
+                denied(registers);
+            }
+            else
+                accepted(registers, kind == 0 ? UINT64_C(0x123456789ab) : LUME_ABI_VERSION);
+            frame(registers, number);
+            if (kind == 2)
+                registers[8] = registers[9] = registers[11] = 0;
+            lume_arch_query_revoke(2);
+            denied(registers);
+            lume_arch_query_drain(&account);
+            assert(account.calls == (kind == 2 ? 3 : 1));
+            assert(account.mask == UINT64_C(1) << number);
+            lume_arch_query_publish(7, 3, 99, LUME_QUERY_PID);
+            frame(registers, number);
+            if (kind == 2)
+                registers[8] = registers[9] = registers[11] = 0;
+            unsigned before = clock_reads;
+            denied(registers);
+            assert(clock_reads == before);
+        }
+    }
+    cpu = 0;
+    assert(clock_reads == LUME_CPU_LIMIT);
 }
 
 int main(void)
@@ -316,6 +382,7 @@ int main(void)
     registers[9] = LUME_USER_BASE + 8192;
     registers[11] = sizeof(struct lume_tty_request);
     denied(registers);
+    scalar_queries();
     puts(
         "PASS_AMD64_QUERY epochs, CPU ownership, sampled accounting, eligibility, bounds and native frame");
     return 0;

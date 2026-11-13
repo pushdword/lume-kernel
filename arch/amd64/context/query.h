@@ -1,6 +1,7 @@
 #ifndef LUME_AMD64_CONTEXT_QUERY_H
 #define LUME_AMD64_CONTEXT_QUERY_H
 #include "lume/tty.h"
+#include "query_values.h"
 
 static bool user_context_address(uint64_t address)
 {
@@ -30,6 +31,9 @@ _Static_assert(LUME_SYS_READ == LUME_AMD64_QUERY_SYSCALL_READ, "read query sysca
 _Static_assert(LUME_SYS_WRITE == LUME_AMD64_QUERY_SYSCALL_WRITE, "write query syscall number");
 _Static_assert(LUME_SYS_TTY == LUME_AMD64_QUERY_SYSCALL_TTY, "terminal query syscall number");
 _Static_assert(LUME_SYS_GETPID == LUME_AMD64_QUERY_SYSCALL_PID, "PID query syscall number");
+_Static_assert(LUME_SYS_CLOCK == LUME_AMD64_QUERY_SYSCALL_CLOCK, "clock query syscall number");
+_Static_assert(LUME_SYS_ABI == LUME_AMD64_QUERY_SYSCALL_ABI, "ABI query syscall number");
+_Static_assert(LUME_SYS_CPU == LUME_AMD64_QUERY_SYSCALL_CPU, "CPU query syscall number");
 _Static_assert(LUME_SYS_THREAD == LUME_AMD64_QUERY_SYSCALL_THREAD, "thread query syscall number");
 
 static uint64_t query_epoch(unsigned process)
@@ -96,7 +100,8 @@ bool lume_amd64_query_try(uint64_t *registers)
     bool pipe = number == LUME_SYS_READ || number == LUME_SYS_WRITE;
     bool terminal = number == LUME_SYS_TTY && registers[8] == LUME_TTY_GET &&
                     registers[11] == sizeof(struct lume_tty_request);
-    if (!pid && !tid && !pipe && !terminal)
+    unsigned value = query_value_kind(number, registers[8], registers[9], registers[11]);
+    if (!pid && !tid && !pipe && !terminal && !value)
         return false;
     uint64_t marker = registers[16];
     if (marker > LUME_CPU_LIMIT)
@@ -107,7 +112,10 @@ bool lume_amd64_query_try(uint64_t *registers)
     struct amd64_query_cache *cache = query_cpus + cpu;
     bool sample = !(cache->calls & 63u);
     uint64_t began = sample ? query_stamp() : 0;
-    unsigned required = pipe || terminal ? LUME_QUERY_PIPE : pid ? LUME_QUERY_PID : LUME_QUERY_TID;
+    unsigned required = value              ? value
+                        : pipe || terminal ? LUME_QUERY_PIPE
+                        : pid              ? LUME_QUERY_PID
+                                           : LUME_QUERY_TID;
     if (!(cache->allowed & required) || !cache->epoch || cache->owner >= LUME_TASK_LIMIT ||
         !cache->pid || cache->pid > LUME_TASK_LIMIT ||
         cache->epoch != query_epoch(cache->pid - 1) || registers[18] != 0x23 ||
@@ -128,6 +136,8 @@ bool lume_amd64_query_try(uint64_t *registers)
             return false;
         result = (uint64_t)-25;
     }
+    else if (value)
+        result = query_value_read(number, registers[8], cpu);
     else
         result = pid ? cache->pid : cache->tid;
     registers[8] = result;

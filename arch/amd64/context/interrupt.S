@@ -58,6 +58,12 @@ lume_trap_common:
     je lume_trap_query
     cmpq $LUME_AMD64_QUERY_SYSCALL_THREAD, 56(%r12)
     je lume_trap_query
+    cmpq $LUME_AMD64_QUERY_SYSCALL_CLOCK, 56(%r12)
+    je lume_trap_query
+    cmpq $LUME_AMD64_QUERY_SYSCALL_ABI, 56(%r12)
+    je lume_trap_query
+    cmpq $LUME_AMD64_QUERY_SYSCALL_CPU, 56(%r12)
+    je lume_trap_query
     cmpq $LUME_AMD64_QUERY_SYSCALL_READ, 56(%r12)
     je lume_trap_query
     cmpq $LUME_AMD64_QUERY_SYSCALL_WRITE, 56(%r12)

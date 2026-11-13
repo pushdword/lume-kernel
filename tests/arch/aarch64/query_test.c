@@ -25,6 +25,19 @@ static uint64_t lume_counter_read(void)
     return ++tick;
 }
 
+static unsigned clock_reads;
+
+uint64_t lume_clock_read(void)
+{
+    ++clock_reads;
+    return UINT64_C(0x123456789ab);
+}
+
+unsigned lume_cpu_count(void)
+{
+    return LUME_CPU_LIMIT;
+}
+
 _Noreturn void lume_fail(const char *message)
 {
     fprintf(stderr, "%s\n", message);
@@ -66,6 +79,60 @@ static void accepted(struct lume_context *context, uint64_t expected)
     assert(context->x[0] == expected);
     context->x[0] = before.x[0];
     assert(!memcmp(context, &before, sizeof(before)));
+}
+
+static void scalar_queries(void)
+{
+    struct lume_context context;
+    struct lume_query_account account;
+    const uint64_t cause = UINT64_C(0x15) << 26 | 0x4c55;
+    for (cpu = 0; cpu < LUME_CPU_LIMIT; ++cpu)
+    {
+        lume_arch_query_drain(&account);
+        for (unsigned kind = 0; kind < 3; ++kind)
+        {
+            unsigned flag = LUME_QUERY_CLOCK << kind;
+            unsigned number = kind == 0 ? LUME_SYS_CLOCK : kind == 1 ? LUME_SYS_ABI : LUME_SYS_CPU;
+            lume_arch_query_publish(7, 3, 99, flag);
+            frame(&context, number);
+            if (kind == 2)
+            {
+                context.x[0] = context.x[1] = context.x[2] = 0;
+                accepted(&context, LUME_CPU_LIMIT);
+                context.x[0] = 1;
+                accepted(&context, cpu);
+                context.x[0] = 2;
+                accepted(&context, LUME_SCHED_QUANTUM);
+                context.x[0] = 3;
+                denied(&context, cause);
+                context.x[0] = 0;
+                context.x[1] = 1;
+                denied(&context, cause);
+                context.x[1] = 0;
+                context.x[2] = 1;
+                denied(&context, cause);
+            }
+            else
+                accepted(&context, kind == 0 ? UINT64_C(0x123456789ab) : LUME_ABI_VERSION);
+            frame(&context, number);
+            if (kind == 2)
+                context.x[0] = context.x[1] = context.x[2] = 0;
+            lume_arch_query_revoke(2);
+            denied(&context, cause);
+            lume_arch_query_drain(&account);
+            assert(account.calls == (kind == 2 ? 3 : 1));
+            assert(account.mask == UINT64_C(1) << number);
+            lume_arch_query_publish(7, 3, 99, LUME_QUERY_PID);
+            frame(&context, number);
+            if (kind == 2)
+                context.x[0] = context.x[1] = context.x[2] = 0;
+            unsigned before = clock_reads;
+            denied(&context, cause);
+            assert(clock_reads == before);
+        }
+    }
+    cpu = 0;
+    assert(clock_reads == LUME_CPU_LIMIT);
 }
 
 int main(void)
@@ -125,6 +192,7 @@ int main(void)
     assert(account.calls == 1 && account.mask == UINT64_C(1) << LUME_SYS_WRITE);
     lume_arch_query_publish(7, 3, 99, 0);
     assert(!lume_aarch64_pipe_try(&context, cause, &next) && pipe_calls == 2);
+    scalar_queries();
     puts(
         "PASS AArch64 query epochs, SMP ownership, register preservation, accounting and pipe fallback");
     return 0;

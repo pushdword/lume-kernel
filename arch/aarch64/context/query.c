@@ -3,6 +3,7 @@
 #include "lume/thread.h"
 #include "lume/smp.h"
 #include "lume/counter.h"
+#include "query_values.h"
 
 struct query_cache
 {
@@ -65,7 +66,8 @@ bool lume_aarch64_query_try(struct lume_context *frame, uint64_t cause)
     bool pid = number == LUME_SYS_GETPID;
     bool tid = number == LUME_SYS_THREAD && frame->x[0] == LUME_THREAD_SELF && !frame->x[1] &&
                !frame->x[2];
-    if (!pid && !tid)
+    unsigned value = query_value_kind(number, frame->x[0], frame->x[1], frame->x[2]);
+    if (!pid && !tid && !value)
         return false;
     unsigned cpu = lume_cpu_index();
     if (cpu >= LUME_CPU_LIMIT)
@@ -73,12 +75,14 @@ bool lume_aarch64_query_try(struct lume_context *frame, uint64_t cause)
     struct query_cache *cache = query_cpus + cpu;
     bool sample = !(cache->calls & 63u);
     uint64_t began = sample ? lume_counter_read() : 0;
-    unsigned required = pid ? LUME_QUERY_PID : LUME_QUERY_TID;
+    unsigned required = value ? value : pid ? LUME_QUERY_PID : LUME_QUERY_TID;
     if (!(cache->allowed & required) || !cache->epoch || cache->owner >= LUME_TASK_LIMIT ||
         !cache->pid || cache->pid > LUME_TASK_LIMIT ||
         cache->epoch != query_epoch((unsigned)cache->pid - 1))
         return false;
-    frame->x[0] = pid ? cache->pid : cache->tid;
+    frame->x[0] = value ? query_value_read(number, frame->x[0], cpu)
+                  : pid ? cache->pid
+                        : cache->tid;
     ++cache->calls;
     cache->mask |= UINT64_C(1) << number;
     if (sample)

@@ -95,11 +95,16 @@ bool lume_timer_check(uint64_t frequency)
     return timer_ticks - before == 4;
 }
 
+uint64_t lume_clock_read(void)
+{
+    uint64_t t = lume_counter_read_relaxed(), f = lume_counter_frequency();
+    return t / (f / 1000);
+}
+
 uint64_t lume_clock_monotonic(void)
 {
     lume_watchdog_poll();
-    uint64_t t = lume_counter_read_relaxed(), f = lume_counter_frequency();
-    return t / (f / 1000);
+    return lume_clock_read();
 }
 
 uint32_t lume_clock_millis(void)

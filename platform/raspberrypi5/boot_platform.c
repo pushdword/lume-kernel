@@ -70,11 +70,16 @@ void lume_irq_restore(uint64_t flags)
     lume_arch_irq_restore(flags);
 }
 
+uint64_t lume_clock_read(void)
+{
+    uint64_t t = lume_counter_read_relaxed(), f = lume_counter_frequency();
+    return t / (f / 1000);
+}
+
 uint64_t lume_clock_monotonic(void)
 {
     lume_watchdog_poll();
-    uint64_t t = lume_counter_read_relaxed(), f = lume_counter_frequency();
-    return t / (f / 1000);
+    return lume_clock_read();
 }
 
 uint32_t lume_clock_millis(void)

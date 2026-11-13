@@ -134,6 +134,8 @@ static inline uint64_t lume_current_el(void)
 /* Monotonic platform clock shared by protocols and drivers. */
 uint32_t lume_clock_millis(void);
 uint64_t lume_clock_monotonic(void);
+/* Read the platform counter without polling devices or shared watchdog state. */
+uint64_t lume_clock_read(void);
 bool lume_entropy(void *, size_t);
 bool lume_task_storage_context(void);
 void lume_task_vm_ready(void);

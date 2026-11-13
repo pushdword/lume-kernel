@@ -7,7 +7,10 @@ enum
 {
     LUME_QUERY_PID = 1u,
     LUME_QUERY_TID = 2u,
-    LUME_QUERY_PIPE = 4u
+    LUME_QUERY_PIPE = 4u,
+    LUME_QUERY_CLOCK = 8u,
+    LUME_QUERY_ABI = 16u,
+    LUME_QUERY_CPU = 32u
 };
 
 struct lume_query_account

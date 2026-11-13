@@ -846,6 +846,21 @@ static void task_query_publish(const struct lume_context *frame)
                 allowed |= LUME_QUERY_PID;
             if (!lume_sandbox_check(&tasks[process].files, pid, &tid_query))
                 allowed |= LUME_QUERY_TID;
+            static const struct lume_context value_queries[] = {
+                {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CLOCK}},
+                {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_ABI}},
+                {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}},
+                {.LUME_CONTEXT_REGISTERS = {[0] = 1,
+                                            [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}},
+                {.LUME_CONTEXT_REGISTERS = {[0] = 2,
+                                            [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}}};
+            unsigned values = LUME_QUERY_CLOCK | LUME_QUERY_ABI | LUME_QUERY_CPU;
+            for (unsigned i = 0; i < sizeof(value_queries) / sizeof(*value_queries); ++i)
+                if (lume_sandbox_check(&tasks[process].files, pid, value_queries + i))
+                    values &= ~(i == 0   ? LUME_QUERY_CLOCK
+                                : i == 1 ? LUME_QUERY_ABI
+                                         : LUME_QUERY_CPU);
+            allowed |= values;
         }
     }
     lume_arch_query_publish(task, pid, tid, allowed);
