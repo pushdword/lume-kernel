@@ -33,7 +33,8 @@
 #ifndef LUME_PERF_H
 #define LUME_PERF_H
 #include <stdint.h>
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
 #define LUME_PERF_VERSION 2u
 #define LUME_PERF_CORES 4u
 #else
@@ -43,6 +44,8 @@
 #define LUME_PERF_PROCESSES 8u
 #define LUME_PERF_SYSCALL 33u
 #define LUME_PERF_THREAD 0x100u
+#define LUME_PERF_TASK_PAGE 0x200u
+#define LUME_PERF_PAGE_PROCESSES 32u
 
 enum
 {
@@ -73,6 +76,15 @@ struct lume_perf_totals
     uint32_t sd_reads, sd_writes, sd_ticks, cache_hits, cache_misses;
     uint32_t zero_bytes, zero_ticks;
     uint32_t read_bytes, read_ticks, copy_bytes, copy_ticks;
+};
+
+/* A cursor is a task-table position. Start at zero and continue with next until
+ * it is zero. Each call observes live tasks while holding the kernel lock.
+ * Tasks may exit or reuse slots between pages. Existing snapshots are unchanged. */
+struct lume_perf_task_page
+{
+    uint32_t cursor, count, next, slots;
+    struct lume_perf_process processes[LUME_PERF_PAGE_PROCESSES];
 };
 
 struct lume_perf_snapshot

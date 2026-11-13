@@ -297,6 +297,61 @@ static void empty_payload(void)
     CHECK(lume_vfs_close(&files[0], (unsigned)pair.other) == 0);
 }
 
+static void local_allocation_failure(void)
+{
+    unsigned before = allocation_live, descriptors = descriptor_count();
+    for (int budget = 0; budget < 2; ++budget)
+    {
+        struct lume_socket_request pair = {
+            .version = LUME_SOCKET_VERSION, .bytes = sizeof(pair), .family = 1, .type = 1};
+        allocation_budget = budget;
+        CHECK(lume_socket_call(&files[0], LUME_SOCKET_PAIR, &pair) == -LUME_ENOMEM);
+        allocation_budget = -1;
+        CHECK(allocation_live == before && descriptor_count() == descriptors);
+    }
+    struct lume_socket_request pair = socket_pair();
+    CHECK(lume_vfs_close(&files[0], (unsigned)pair.fd) == 0);
+    CHECK(lume_vfs_close(&files[0], (unsigned)pair.other) == 0);
+    CHECK(allocation_live == before && descriptor_count() == descriptors);
+}
+
+static void large_local_stream(void)
+{
+    struct lume_socket_request pair = socket_pair();
+    metadata_setup();
+    uint64_t saved_payload = payload_base;
+    payload_base =
+        (uint64_t)vm(0, LUME_VM_MAP, 0, 65536, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(payload_base >= LUME_VM_BASE && lume_user_buffer(payload_base, 65536, true));
+    unsigned char data[65536];
+    for (unsigned i = 0; i < sizeof(data); ++i)
+        data[i] = (unsigned char)(i * 29 + 7);
+    vm_bytes(payload_base, data, sizeof(data), true);
+    CHECK(call_message_bytes(pair.fd, LUME_SOCKET_SEND_MESSAGE, 0, 0, 0, 60000) == 60000);
+    CHECK(call_message_bytes(pair.other, LUME_SOCKET_RECEIVE_MESSAGE, 0, 0, 0, 40000) == 40000);
+    memset(data, 0, sizeof(data));
+    vm_bytes(payload_base, data, 40000, false);
+    for (unsigned i = 0; i < 40000; ++i)
+        CHECK(data[i] == (unsigned char)(i * 29 + 7));
+    memset(data, 0xc3, sizeof(data));
+    vm_bytes(payload_base, data, sizeof(data), true);
+    CHECK(call_message_bytes(pair.fd, LUME_SOCKET_SEND_MESSAGE, 0, 0, 0, 50000) == 45536);
+    CHECK(call_message_bytes(pair.fd, LUME_SOCKET_SEND_MESSAGE, 0, 0, 0, 1) == -LUME_EAGAIN);
+    CHECK(call_message_bytes(pair.other, LUME_SOCKET_RECEIVE_MESSAGE, 0, LUME_SOCKET_MESSAGE_PEEK,
+                             0, 65536) == 65536);
+    CHECK(call_message_bytes(pair.fd, LUME_SOCKET_SEND_MESSAGE, 0, 0, 0, 1) == -LUME_EAGAIN);
+    CHECK(call_message_bytes(pair.other, LUME_SOCKET_RECEIVE_MESSAGE, 0, 0, 0, 65536) == 65536);
+    vm_bytes(payload_base, data, sizeof(data), false);
+    for (unsigned i = 0; i < sizeof(data); ++i)
+        CHECK(data[i] == (i < 20000 ? (unsigned char)((i + 40000) * 29 + 7) : 0xc3));
+    CHECK(lume_vfs_close(&files[0], (unsigned)pair.fd) == 0);
+    CHECK(call_message_bytes(pair.other, LUME_SOCKET_RECEIVE_MESSAGE, 0, 0, 0, 1) == 0);
+    CHECK(lume_vfs_close(&files[0], (unsigned)pair.other) == 0);
+    CHECK(vm(0, LUME_VM_UNMAP, payload_base, 65536, 0, 0, -1) == 0);
+    payload_base = saved_payload;
+    metadata_cleanup();
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -329,6 +384,8 @@ int main(void)
         for (unsigned request_output = 0; request_output < 2; ++request_output)
             for (unsigned truncated = 0; truncated < 2; ++truncated)
                 failed_metadata(peek != 0, request_output != 0, truncated != 0);
+    local_allocation_failure();
+    large_local_stream();
     no_heap_payload();
     partial_acquire_unwind();
     empty_payload();

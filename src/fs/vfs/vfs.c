@@ -49,10 +49,17 @@ static struct
 
 static bool poll_input_ready;
 static int (*terminal_open)(struct lume_files *, const char *, uint64_t);
+static int64_t (*terminal_stat)(struct lume_files *, const char *, struct lume_stat *);
 
 void lume_vfs_terminal_open(int (*callback)(struct lume_files *, const char *, uint64_t))
 {
     terminal_open = callback;
+}
+
+void lume_vfs_terminal_stat(int64_t (*callback)(struct lume_files *, const char *,
+                                                struct lume_stat *))
+{
+    terminal_stat = callback;
 }
 
 bool lume_vfs_poll_input_ready(void)
@@ -2770,6 +2777,11 @@ int64_t lume_vfs_stat_path(struct lume_files *f, const char *input, struct lume_
 {
     char p[LUME_FILES_PATH_MAX];
     int i = resolve(f, input, p);
+    if (i == -LUME_ENOENT && terminal_stat && !strncmp(p, "/dev/pts/", 9))
+    {
+        int permission = lume_sandbox_path(f, p);
+        return permission ? permission : terminal_stat(f, p, out);
+    }
     if (i >= 0)
     {
         int permission = sandbox_stat(f, p, (unsigned)i);
@@ -4156,6 +4168,11 @@ int64_t lume_vfs_stat_at(struct lume_files *files, int64_t directory, const char
 {
     char canonical[LUME_FILES_PATH_MAX];
     int index = resolve_at(files, directory, input, canonical);
+    if (index == -LUME_ENOENT && terminal_stat && !strncmp(canonical, "/dev/pts/", 9))
+    {
+        int permission = lume_sandbox_path(files, canonical);
+        return permission ? permission : terminal_stat(files, canonical, out);
+    }
     if (index < 0)
         return index;
     int permission = sandbox_stat(files, canonical, (unsigned)index);

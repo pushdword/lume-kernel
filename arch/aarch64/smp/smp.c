@@ -1,6 +1,7 @@
 #include "lume/irq.h"
 #include "lume/smp.h"
 #include "lume/counter.h"
+#include "lume/cpu.h"
 #include "lume/mmio.h"
 #include "lume/ticket_lock.h"
 #include "lume/uart_rx.h"

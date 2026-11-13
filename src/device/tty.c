@@ -262,8 +262,40 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
     return done ? (int64_t)done : -LUME_EAGAIN;
 }
 
-static const struct lume_file_ops tty_ops = {LUME_NODE_CHAR, tty_close,  tty_read, tty_write,
-                                             tty_poll,       tty_source, true};
+static int64_t tty_stat(void *context, struct lume_stat *out)
+{
+    const struct tty_end *end = context;
+    *out = (struct lume_stat){.inode = UINT64_C(0x300000) +
+                                       2 * (unsigned)(end->terminal - terminals) + end->side,
+                              .kind = LUME_NODE_CHAR};
+    return 0;
+}
+
+static const struct lume_file_ops tty_ops = {.kind = LUME_NODE_CHAR,
+                                             .close = tty_close,
+                                             .read = tty_read,
+                                             .write = tty_write,
+                                             .poll = tty_poll,
+                                             .source = tty_source,
+                                             .memory_io = true,
+                                             .stat = tty_stat};
+
+static int64_t tty_stat_path(struct lume_files *files, const char *path, struct lume_stat *out)
+{
+    const char prefix[] = "/dev/pts/";
+    if (strncmp(path, prefix, sizeof(prefix) - 1))
+        return -LUME_ENOSYS;
+    const char *number = path + sizeof(prefix) - 1;
+    if (number[0] < '0' || (unsigned)(number[0] - '0') >= TERMINALS || number[1])
+        return -LUME_ENOENT;
+    struct pseudo_terminal *terminal = terminals + (number[0] - '0');
+    if (!terminal->open[0] || files->identity.jailed)
+        return -LUME_ENOENT;
+    if (files->identity.euid && files->identity.euid != terminal->uid)
+        return -LUME_EACCES;
+    (void)tty_stat(&terminal->ends[1], out);
+    return 0020600;
+}
 
 static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
 {
@@ -349,6 +381,7 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
     if (action == LUME_TTY_CREATE)
     {
         lume_vfs_terminal_open(tty_open);
+        lume_vfs_terminal_stat(tty_stat_path);
         for (unsigned i = 0; i < TERMINALS; ++i)
         {
             struct pseudo_terminal *terminal = terminals + i;

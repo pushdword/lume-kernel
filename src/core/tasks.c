@@ -360,6 +360,67 @@ void lume_task_cpu_snapshot(struct lume_cpu_snapshot *out)
     }
 }
 
+static void telemetry_process(unsigned i, const struct lume_task_info *information,
+                              struct lume_perf_process *p)
+{
+    struct lume_task_info info = *information;
+    p->pid = thread_slots[i].thread ? (uint32_t)thread_id(thread_slots, i) : info.pid;
+    p->parent = info.parent;
+    p->state = info.state | (thread_slots[i].thread ? LUME_PERF_THREAD : 0);
+    p->cores = info.cores;
+    p->user_ticks = (uint32_t)user_ticks[i];
+    p->kernel_ticks = (uint32_t)kernel_ticks[i];
+    p->lock_ticks = (uint32_t)lock_ticks[i];
+    for (unsigned c = 0; c < lume_cpu_count(); ++c)
+        if (cpus[c].worker_running && cpus[c].worker_owner == i)
+        {
+            uint64_t at = counter(), waited = kernel_worker_wait(c, at);
+            p->kernel_ticks += (uint32_t)(at - cpus[c].worker_started - waited);
+            p->lock_ticks += (uint32_t)waited;
+        }
+    for (unsigned c = 0; c < lume_cpu_count(); ++c)
+        if (cpus[c].transmitting && !cpus[c].worker_running && cpus[c].sample_owner == i)
+        {
+            uint64_t at = counter(), waiting = lume_smp_wait_start(c);
+            uint64_t locked = waiting >= cpus[c].sample_started && waiting < at ? at - waiting : 0;
+            p->kernel_ticks += (uint32_t)(at - cpus[c].sample_started - locked);
+            p->lock_ticks += (uint32_t)locked;
+        }
+    for (unsigned c = 0; c < lume_cpu_count(); ++c)
+        if (cpus[c].running_user && !cpus[c].worker_running && cpus[c].current == i)
+        {
+            uint64_t at = counter();
+            uint64_t trap = __atomic_load_n(&cpus[c].trap_at, __ATOMIC_ACQUIRE);
+            uint64_t end = trap > cpus[c].sample_last && trap < at ? trap : at;
+            p->user_ticks += (uint32_t)(end - cpus[c].sample_last);
+            uint64_t waiting = lume_smp_wait_start(c);
+            uint64_t locked = waiting >= end && waiting < at ? at - waiting : 0;
+            p->lock_ticks += (uint32_t)locked;
+            p->kernel_ticks += (uint32_t)(at - end - locked);
+        }
+    p->dispatches = info.runs;
+    p->syscalls = tasks[i].calls;
+    for (unsigned j = 0; j < sizeof(p->name); ++j)
+        p->name[j] = info.name[j];
+}
+
+int lume_task_telemetry_page(struct lume_perf_task_page *page)
+{
+    unsigned cursor = page->cursor;
+    if (cursor > LUME_TASK_LIMIT)
+        return -LUME_EINVAL;
+    *page = (struct lume_perf_task_page){.cursor = cursor, .slots = LUME_TASK_LIMIT};
+    unsigned i = cursor;
+    for (; i < LUME_TASK_LIMIT && page->count < LUME_PERF_PAGE_PROCESSES; ++i)
+    {
+        struct lume_task_info info;
+        if (lume_task_info(i, &info))
+            telemetry_process(i, &info, &page->processes[page->count++]);
+    }
+    page->next = i < LUME_TASK_LIMIT ? i : 0;
+    return 0;
+}
+
 void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
 {
     if (pid && pid <= LUME_TASK_LIMIT)
@@ -413,48 +474,8 @@ void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
     for (unsigned i = 0; i < LUME_TASK_LIMIT && out->process_count < LUME_PERF_PROCESSES; ++i)
     {
         struct lume_task_info info;
-        if (!lume_task_info(i, &info))
-            continue;
-        struct lume_perf_process *p = &out->processes[out->process_count++];
-        p->pid = thread_slots[i].thread ? (uint32_t)thread_id(thread_slots, i) : info.pid;
-        p->parent = info.parent;
-        p->state = info.state | (thread_slots[i].thread ? LUME_PERF_THREAD : 0);
-        p->cores = info.cores;
-        p->user_ticks = (uint32_t)user_ticks[i];
-        p->kernel_ticks = (uint32_t)kernel_ticks[i];
-        p->lock_ticks = (uint32_t)lock_ticks[i];
-        for (unsigned c = 0; c < lume_cpu_count(); ++c)
-            if (cpus[c].worker_running && cpus[c].worker_owner == i)
-            {
-                uint64_t at = counter(), waited = kernel_worker_wait(c, at);
-                p->kernel_ticks += (uint32_t)(at - cpus[c].worker_started - waited);
-                p->lock_ticks += (uint32_t)waited;
-            }
-        for (unsigned c = 0; c < lume_cpu_count(); ++c)
-            if (cpus[c].transmitting && !cpus[c].worker_running && cpus[c].sample_owner == i)
-            {
-                uint64_t at = counter(), waiting = lume_smp_wait_start(c);
-                uint64_t locked =
-                    waiting >= cpus[c].sample_started && waiting < at ? at - waiting : 0;
-                p->kernel_ticks += (uint32_t)(at - cpus[c].sample_started - locked);
-                p->lock_ticks += (uint32_t)locked;
-            }
-        for (unsigned c = 0; c < lume_cpu_count(); ++c)
-            if (cpus[c].running_user && !cpus[c].worker_running && cpus[c].current == i)
-            {
-                uint64_t at = counter();
-                uint64_t trap = __atomic_load_n(&cpus[c].trap_at, __ATOMIC_ACQUIRE);
-                uint64_t end = trap > cpus[c].sample_last && trap < at ? trap : at;
-                p->user_ticks += (uint32_t)(end - cpus[c].sample_last);
-                uint64_t waiting = lume_smp_wait_start(c);
-                uint64_t locked = waiting >= end && waiting < at ? at - waiting : 0;
-                p->lock_ticks += (uint32_t)locked;
-                p->kernel_ticks += (uint32_t)(at - end - locked);
-            }
-        p->dispatches = info.runs;
-        p->syscalls = tasks[i].calls;
-        for (unsigned j = 0; j < sizeof(p->name); ++j)
-            p->name[j] = info.name[j];
+        if (lume_task_info(i, &info))
+            telemetry_process(i, &info, &out->processes[out->process_count++]);
     }
 }
 

@@ -18,6 +18,20 @@ typedef pthread_t test_thread;
 
 #define LUME_CPU_LIMIT 4u
 static _Thread_local unsigned cpu_index;
+static _Thread_local bool irq_masked;
+
+static uint64_t lume_arch_irq_save(void)
+{
+    bool previous = irq_masked;
+    irq_masked = true;
+    return previous;
+}
+
+static void lume_arch_irq_restore(uint64_t flags)
+{
+    irq_masked = flags != 0;
+}
+
 static uint64_t ticks, wait_hooks[4], acquired_hooks[4], released_hooks[4];
 static unsigned value, inside;
 static unsigned first_order[3], order_count;
@@ -44,6 +58,7 @@ static void relax(void)
 
 static void kernel_lock_wait(void)
 {
+    assert(irq_masked);
     ++wait_hooks[cpu_index];
     if (!cpu_index && __atomic_load_n(&delayed_link, __ATOMIC_ACQUIRE))
         __atomic_store_n(&release_wait, 1, __ATOMIC_RELEASE);
@@ -52,11 +67,13 @@ static void kernel_lock_wait(void)
 
 static void kernel_lock_acquired(void)
 {
+    assert(irq_masked);
     ++acquired_hooks[cpu_index];
 }
 
 static void kernel_lock_released(void)
 {
+    assert(irq_masked);
     ++released_hooks[cpu_index];
 }
 
@@ -197,6 +214,15 @@ int main(void)
     lume_smp_lock();
     assert(value == 6002 && !lume_smp_contended());
     lume_smp_unlock();
-    puts("SMP_LOCK_PASS recursion ownership FIFO local-wait delayed-link cpus=4 acquisitions=6036");
+    for (unsigned masked = 0; masked < 2; ++masked)
+    {
+        irq_masked = masked != 0;
+        lume_smp_lock();
+        assert(irq_masked);
+        lume_smp_unlock();
+        assert(irq_masked == (masked != 0));
+    }
+    puts(
+        "SMP_LOCK_PASS recursion ownership FIFO local-wait delayed-link IRQ-restore cpus=4 acquisitions=6038");
     return 0;
 }

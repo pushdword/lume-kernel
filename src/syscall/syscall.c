@@ -370,6 +370,19 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_task_executable(a ? (unsigned)a : pid, (void *)(uintptr_t)b, capacity);
     }
     case LUME_SYS_TELEMETRY:
+        if (n == LUME_PERF_TASK_PAGE)
+        {
+            if (b != sizeof(struct lume_perf_task_page))
+                return -LUME_EINVAL;
+            if (!lume_user_buffer(a, b, true))
+                return -LUME_EFAULT;
+            struct lume_perf_task_page page = {
+                .cursor = ((const struct lume_perf_task_page *)(uintptr_t)a)->cursor};
+            int result = lume_task_telemetry_page(&page);
+            if (!result)
+                *(struct lume_perf_task_page *)(uintptr_t)a = page;
+            return result;
+        }
         if (n >= LUME_ACTIVITY_READ && n <= LUME_ACTIVITY_STOP)
         {
             if (b != sizeof(struct lume_activity_snapshot))

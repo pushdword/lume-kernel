@@ -31,6 +31,7 @@ static unsigned wait_calls, busy_responses, failed_block, error_command;
 static uint32_t deferred, card_error, response_error;
 static bool writing, defer_events, missing_complete, auto_error, reset_stuck, missing_ready;
 static bool reenter, card_busy, abort_inhibit;
+static bool coalesced_ready, late_buffer_ready;
 static unsigned char scr_data[8], switch_data[64];
 static const unsigned char *control_data;
 static unsigned control_bytes, control_words, width_commands, switch_commands, card_width;
@@ -51,6 +52,9 @@ static uint32_t width_error;
 
 static void queue_events(uint32_t events)
 {
+    registers[0x24 / 4] |= (events & 48u) << 6;
+    if (coalesced_ready)
+        events &= ~48u;
     if (defer_events && interrupt_mode)
         deferred |= events;
     else
@@ -65,6 +69,7 @@ static void deliver_irq(void)
 
 static void sector_complete(void)
 {
+    registers[0x24 / 4] &= ~(48u << 6);
     ++sectors_done;
     if (sectors_done == total_blocks)
     {
@@ -104,7 +109,10 @@ static uint32_t model_read(uintptr_t address)
         uint32_t value =
             (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
         if (++control_words * 4 == control_bytes)
+        {
+            registers[0x24 / 4] &= ~(32u << 6);
             queue_events(2);
+        }
         return value;
     }
     CHECK(!writing && words < total_blocks * 128);
@@ -326,6 +334,11 @@ bool lume_worker_pause(uint64_t deadline)
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
 {
     ++wait_calls;
+    if (late_buffer_ready)
+    {
+        registers[0x24 / 4] |= (mask & 48u) << 6;
+        late_buffer_ready = false;
+    }
     registers[0x30 / 4] |= deferred;
     deferred = 0;
     lume_irq_restore(0);
@@ -368,6 +381,7 @@ static void setup(bool use_interrupts)
     deferred = card_error = response_error = 0;
     writing = missing_complete = auto_error = reset_stuck = missing_ready = false;
     reenter = card_busy = abort_inhibit = false;
+    coalesced_ready = late_buffer_ready = false;
     memset(scr_data, 0, sizeof(scr_data));
     memset(switch_data, 0, sizeof(switch_data));
     scr_data[0] = 2;
@@ -588,6 +602,25 @@ static void bus_modes(void)
     CHECK(lume_sd_read(0, data) && !wait_calls && !errors && irq_flags == 0x80);
 }
 
+static void buffer_levels(void)
+{
+    unsigned char data[32 * 512], output[sizeof(data)];
+    for (unsigned i = 0; i < sizeof(data); ++i)
+        data[i] = (unsigned char)(i * 31u + i / 512);
+    for (unsigned mode = 0; mode < 2; ++mode)
+    {
+        setup(mode != 0);
+        coalesced_ready = true;
+        CHECK(lume_sd_write_blocks(16, 32, data));
+        CHECK(lume_sd_read_blocks(16, 32, output));
+        CHECK(!memcmp(data, output, sizeof(data)) && !errors && ready);
+    }
+    setup(true);
+    late_buffer_ready = true;
+    CHECK(event(32u, 1000));
+    CHECK(wait_calls && ticks < frequency / 10 && !errors && ready);
+}
+
 int main(void)
 {
     success(false);
@@ -599,6 +632,7 @@ int main(void)
     failures(true, true);
     command_counts();
     bus_modes();
+    buffer_levels();
     printf("PASS SDHCI PIO groups: cases=%u checks=%u\n", cases, checks);
     return 0;
 }

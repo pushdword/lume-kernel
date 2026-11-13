@@ -14,13 +14,15 @@
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
     defined(LUME_ARCH_I686)
 #define PAIRS 128u
+#define LOCAL_BYTES 65536u
 #else
 #define PAIRS 8u
+#define LOCAL_BYTES 4096u
 #endif
 #define SOCKETS LUME_NET_SOCKET_LIMIT
 #define RIGHTS 8u
 
-_Static_assert(LUME_PIPE_BYTES == 4096, "local socket buffer page size");
+_Static_assert((LOCAL_BYTES & (LOCAL_BYTES - 1)) == 0, "local socket ring size");
 
 extern int lume_stream_nowait(unsigned, unsigned, struct lume_stream_request *);
 extern int lume_stream_socket_create(unsigned, unsigned, struct lume_stream_request *, unsigned);
@@ -87,7 +89,7 @@ struct local_end
 
 static struct local_pair
 {
-    bool open[2], shutdown[2];
+    bool open[2], shutdown[2], allocating;
     struct local_end end[2];
     struct local_ring ring[2];
 } local_pairs[PAIRS];
@@ -305,8 +307,7 @@ static void local_close(void *context)
     if (!pair->open[side ^ 1])
         pair->shutdown[0] = pair->shutdown[1] = false;
     local_notify(pair);
-    if (data && !lume_page_free((uintptr_t)data))
-        lume_fail("socket buffer release");
+    lume_kernel_free(data);
     drop_rights(rights);
 }
 
@@ -321,9 +322,11 @@ static int64_t local_read(void *context, void *data, uint64_t bytes)
         return pair->open[end->side ^ 1] && !pair->shutdown[end->side ^ 1] ? -LUME_EAGAIN : 0;
     if (bytes > ring->count)
         bytes = ring->count;
-    for (unsigned i = 0; i < bytes; ++i)
-        ((unsigned char *)data)[i] = ring->data[(ring->first + i) % LUME_PIPE_BYTES];
-    ring->first = (ring->first + (unsigned)bytes) % LUME_PIPE_BYTES;
+    unsigned first =
+        bytes < LOCAL_BYTES - ring->first ? (unsigned)bytes : LOCAL_BYTES - ring->first;
+    memcpy(data, ring->data + ring->first, first);
+    memcpy((unsigned char *)data + first, ring->data, (size_t)bytes - first);
+    ring->first = (ring->first + (unsigned)bytes) % LOCAL_BYTES;
     ring->count -= (unsigned)bytes;
     ring->consumed += bytes;
     struct local_rights *rights = take_rights(ring, ring->consumed);
@@ -341,16 +344,17 @@ static int64_t local_write(void *context, const void *data, uint64_t bytes)
         return 0;
     if (!pair->open[end->side ^ 1] || pair->shutdown[end->side])
         return -LUME_EPIPE;
-    unsigned available = LUME_PIPE_BYTES - ring->count;
+    unsigned available = LOCAL_BYTES - ring->count;
     if (!available || ring->rights_count == RIGHTS)
         return -LUME_EAGAIN;
     if (bytes > available)
         bytes = available;
     if (ring->produced > UINT64_MAX - bytes)
         return -LUME_ENOSPC;
-    for (unsigned i = 0; i < bytes; ++i)
-        ring->data[(ring->first + ring->count + i) % LUME_PIPE_BYTES] =
-            ((const unsigned char *)data)[i];
+    unsigned start = (ring->first + ring->count) % LOCAL_BYTES;
+    unsigned first = bytes < LOCAL_BYTES - start ? (unsigned)bytes : LOCAL_BYTES - start;
+    memcpy(ring->data + start, data, first);
+    memcpy(ring->data, (const unsigned char *)data + first, (size_t)bytes - first);
     ring->count += (unsigned)bytes;
     ring->produced += bytes;
     local_notify(pair);
@@ -366,8 +370,7 @@ static unsigned local_poll(void *context)
     unsigned events = (in->count || eof ? LUME_POLLIN : 0) | (eof ? LUME_POLLHUP : 0);
     if (!pair->open[end->side ^ 1])
         events |= LUME_POLLERR;
-    else if (pair->shutdown[end->side] ||
-             (out->count < LUME_PIPE_BYTES && out->rights_count < RIGHTS))
+    else if (pair->shutdown[end->side] || (out->count < LOCAL_BYTES && out->rights_count < RIGHTS))
         events |= LUME_POLLOUT;
     return events;
 }
@@ -441,7 +444,7 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
         return message->rights_count ? -LUME_EINVAL : 0;
     if (!pair->open[end->side ^ 1] || pair->shutdown[end->side])
         return -LUME_EPIPE;
-    if (ring->count == LUME_PIPE_BYTES || ring->rights_count == RIGHTS)
+    if (ring->count == LOCAL_BYTES || ring->rights_count == RIGHTS)
         return -LUME_EAGAIN;
     struct local_rights *group = NULL;
     if (message->rights_count)
@@ -480,7 +483,7 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
     }
     /* Allocation can yield while another lane reads or writes this ring. */
     int error = 0;
-    unsigned available = LUME_PIPE_BYTES - ring->count;
+    unsigned available = LOCAL_BYTES - ring->count;
     unsigned bytes = message->count < available ? message->count : available;
     if (!pair->open[end->side ^ 1] || pair->shutdown[end->side])
         error = -LUME_EPIPE;
@@ -494,8 +497,8 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
         return error;
     }
     uint64_t offset = ring->produced;
-    unsigned start = (ring->first + ring->count) % LUME_PIPE_BYTES;
-    unsigned first = bytes < LUME_PIPE_BYTES - start ? bytes : LUME_PIPE_BYTES - start;
+    unsigned start = (ring->first + ring->count) % LOCAL_BYTES;
+    unsigned first = bytes < LOCAL_BYTES - start ? bytes : LOCAL_BYTES - start;
     if (!lume_socket_buffer_check(transfer, 0, bytes, false) ||
         !lume_socket_buffer_copy(transfer, message->buffer, 0, ring->data + start, first, false) ||
         !lume_socket_buffer_copy(transfer, message->buffer, first, ring->data, bytes - first,
@@ -571,7 +574,7 @@ static int64_t local_receive_message(struct lume_files *files, struct local_end 
             --ring->rights_count;
         }
     }
-    unsigned first = bytes < LUME_PIPE_BYTES - ring->first ? bytes : LUME_PIPE_BYTES - ring->first;
+    unsigned first = bytes < LOCAL_BYTES - ring->first ? bytes : LOCAL_BYTES - ring->first;
     bool copied =
         lume_socket_buffer_check(transfer, 0, bytes, true) &&
         lume_socket_buffer_copy(transfer, message->buffer, 0, ring->data + ring->first, first,
@@ -579,7 +582,7 @@ static int64_t local_receive_message(struct lume_files *files, struct local_end 
         lume_socket_buffer_copy(transfer, message->buffer, first, ring->data, bytes - first, true);
     if (!peek)
     {
-        ring->first = (ring->first + bytes) % LUME_PIPE_BYTES;
+        ring->first = (ring->first + bytes) % LOCAL_BYTES;
         ring->count -= bytes;
         ring->consumed += bytes;
         local_notify(pair);

@@ -36,29 +36,33 @@ static struct local_pair *pair_allocate(void)
     for (unsigned i = 0; i < PAIRS; ++i)
     {
         struct local_pair *pair = local_pairs + i;
-        if (pair->open[0] || pair->open[1])
+        if (pair->open[0] || pair->open[1] || pair->allocating)
             continue;
-        uint64_t first = lume_page_alloc(0);
+        pair->allocating = true;
+        unsigned char *first = lume_kernel_allocate(LOCAL_BYTES);
         if (!first)
-            return NULL;
-        uint64_t second = lume_page_alloc(0);
-        if (!second)
         {
-            if (!lume_page_free(first))
-                lume_fail("socket buffer allocation rollback");
+            pair->allocating = false;
             return NULL;
         }
-        /* Single-page allocation and rollback keep endpoint publication serialized. */
+        unsigned char *second = lume_kernel_allocate(LOCAL_BYTES);
+        if (!second)
+        {
+            lume_kernel_free(first);
+            pair->allocating = false;
+            return NULL;
+        }
+        /* Reserve the pair before allocations can yield to another creator. */
         for (unsigned side = 0; side < 2; ++side)
         {
-            pair->ring[side] =
-                (struct local_ring){.data = (void *)(uintptr_t)(side ? second : first)};
+            pair->ring[side] = (struct local_ring){.data = side ? second : first};
             pair->end[side].pair = pair;
             pair->end[side].side = side;
             pair->end[side].uid = pair->end[side].gid = 0;
             lume_poll_source_reset(&pair->end[side].source);
         }
         pair->open[0] = pair->open[1] = true;
+        pair->allocating = false;
         return pair;
     }
     return NULL;

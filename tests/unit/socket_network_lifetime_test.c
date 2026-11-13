@@ -46,6 +46,14 @@ static void transport_wait(unsigned point)
     CHECK(lume_worker_wait_bits(&network_resume, 1, ticks + 1000000));
 }
 
+int lume_sandbox_io(struct lume_files *owner, uint64_t fd, bool write)
+{
+    CHECK(owner && owner->identity.sandbox_profile == LUME_SANDBOX_NONE);
+    (void)fd;
+    (void)write;
+    return 0;
+}
+
 int lume_sandbox_open(struct lume_files *owner, const char *path, uint64_t flags)
 {
     CHECK(owner && owner->identity.sandbox_profile == LUME_SANDBOX_NONE);

@@ -11,6 +11,13 @@ static struct
 } descriptors[LUME_FD_MAX];
 
 static unsigned last_signal, last_group, signal_count;
+static int64_t (*stat_callback)(struct lume_files *, const char *, struct lume_stat *);
+
+void lume_vfs_terminal_stat(int64_t (*callback)(struct lume_files *, const char *,
+                                                struct lume_stat *))
+{
+    stat_callback = callback;
+}
 
 void lume_vfs_terminal_open(int (*callback)(struct lume_files *, const char *, uint64_t))
 {
@@ -103,6 +110,18 @@ int main(void)
         assert(!lume_tty_call(&files, 7, LUME_TTY_CREATE, &r));
         unsigned master = r.fd, slave = r.other;
         void *m = descriptors[master].context, *s = descriptors[slave].context;
+        struct lume_stat named, opened_metadata;
+        assert(stat_callback && stat_callback(&files, "/dev/pts/0", &named) == 0020600);
+        assert(!descriptors[slave].ops->stat(s, &opened_metadata));
+        assert(named.inode == opened_metadata.inode && named.kind == LUME_NODE_CHAR);
+        assert(stat_callback(&files, "/dev/pts/0x", &named) == -LUME_ENOENT);
+        assert(stat_callback(&files, "/other", &named) == -LUME_ENOSYS);
+        files.identity.euid = 42;
+        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_EACCES);
+        files.identity.euid = 0;
+        files.identity.jailed = true;
+        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_ENOENT);
+        files.identity.jailed = false;
         assert(tty_read(s, buffer, sizeof(buffer)) == -LUME_EAGAIN);
         assert(tty_write(m, "abc\177d\r", 6) == 6);
         assert(tty_read(s, buffer, sizeof(buffer)) == 4 && !memcmp(buffer, "abd\n", 4));
@@ -146,6 +165,7 @@ int main(void)
         assert(!lume_tty_call(&files, 7, LUME_TTY_FLUSH, &r));
         unsigned count = signal_count;
         assert(!lume_vfs_close(&files, master));
+        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_ENOENT);
         assert(signal_count == count + 1 && last_signal == 1);
         assert((tty_poll(s) & LUME_POLLHUP) && tty_read(s, buffer, sizeof(buffer)) == 0);
         assert(tty_write(s, "x", 1) == -LUME_EPIPE);

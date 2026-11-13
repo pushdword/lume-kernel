@@ -46,7 +46,7 @@ static void irq_handler(unsigned irq, void *context)
     (void)irq;
     (void)context;
     uint32_t status = rd(0x30);
-    pending |= status;
+    __atomic_fetch_or(&pending, status, __ATOMIC_RELEASE);
     wr(0x30, status);
     ++interrupts;
 }
@@ -101,18 +101,20 @@ static bool event(uint32_t mask, unsigned ms)
             uint32_t asserted = rd(0x30);
             if (asserted)
             {
-                pending |= asserted;
+                __atomic_fetch_or(&pending, asserted, __ATOMIC_RELEASE);
                 wr(0x30, asserted);
             }
         }
-        status = interrupt_mode ? pending : rd(0x30);
+        status = interrupt_mode ? __atomic_load_n(&pending, __ATOMIC_ACQUIRE) : rd(0x30);
         if (status & 0xffff8000u)
             break;
-        if (status & mask)
+        /* Buffer readiness is a level. Its interrupt notifications can coalesce between blocks. */
+        bool buffer_ready = (mask == 16u || mask == 32u) && (rd(0x24) & (mask << 6));
+        if ((status & mask) || buffer_ready)
         {
             if (interrupt_mode)
-                pending &= ~mask;
-            else
+                __atomic_fetch_and(&pending, ~mask, __ATOMIC_ACQ_REL);
+            if (!interrupt_mode || buffer_ready)
                 wr(0x30, mask);
             lume_irq_restore(flags);
             return true;
@@ -129,9 +131,14 @@ static bool event(uint32_t mask, unsigned ms)
             lume_irq_restore(flags & ~UINT64_C(0x80));
             lume_cpu_relax_ordered();
             (void)lume_irq_save();
-            if (!(pending & (mask | 0xffff8000u)))
-                (void)lume_worker_wait_bits(&pending, mask | 0xffff8000u,
-                                            start + frequency * ms / 1000);
+            if (!(__atomic_load_n(&pending, __ATOMIC_ACQUIRE) & (mask | 0xffff8000u)))
+            {
+                uint64_t deadline = start + frequency * ms / 1000;
+                uint64_t check = lume_counter_read() + frequency / 1000;
+                if ((mask == 16u || mask == 32u) && (int64_t)(check - deadline) < 0)
+                    deadline = check;
+                (void)lume_worker_wait_bits(&pending, mask | 0xffff8000u, deadline);
+            }
         }
         else if (!lume_worker_pause(lume_counter_read() + frequency / 1000))
             lume_cpu_relax_ordered();
@@ -165,7 +172,7 @@ static bool command(unsigned index, uint32_t argument, uint32_t flags, uint32_t 
         return false;
     }
     wr(0x30, 0xffffffffu);
-    pending = 0;
+    __atomic_store_n(&pending, 0, __ATOMIC_RELEASE);
     wr(8, argument);
     wr(12, (index << 24) | flags);
     if (!event(1, 1000))
@@ -351,7 +358,7 @@ static int probe(struct lume_device *d)
     (void)d;
     if (!lume_irq_available())
         return -LUME_EIO;
-    pending = 0;
+    __atomic_store_n(&pending, 0, __ATOMIC_RELEASE);
     interrupts = 0;
     return 0;
 }
@@ -390,7 +397,7 @@ static int stop(struct lume_device *d)
         irq_registered = false;
     }
     interrupt_mode = ready = false;
-    pending = 0;
+    __atomic_store_n(&pending, 0, __ATOMIC_RELEASE);
     return 0;
 }
 static const struct lume_driver_ops operations = {probe, start, stop, 0};
