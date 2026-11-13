@@ -1008,6 +1008,7 @@ int main(int argc, char **argv)
     release_and_bounds_cases();
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);
+    lume_vfs_init(NULL, 0);
     while (retired)
         reap(NULL);
     CHECK(allocation_live == baseline_metadata && frame_live == baseline_frames);

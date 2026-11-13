@@ -989,3 +989,10 @@ $(OUT)/tests/desktop-limits$(HOSTEXE): tests/unit/desktop_limits_test.c tests/fi
 $(OUT)/tests/desktop-storage$(HOSTEXE): tests/unit/vfs_storage_handles_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
+
+.PHONY: check-smp-wake
+check-smp-wake: $(OUT)/tests/smp-wake$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/smp-wake$(HOSTEXE): tests/unit/smp_wake_test.c src/core/smp_wake.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG "$<" -o "$@"

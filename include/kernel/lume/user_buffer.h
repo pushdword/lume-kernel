@@ -27,6 +27,9 @@ bool lume_user_buffer_prepare(struct lume_user_buffer_token *, unsigned, uint64_
 bool lume_user_buffer_check(const struct lume_user_buffer_token *, size_t, size_t, bool);
 bool lume_user_buffer_copy_at(struct lume_user_buffer_token *, size_t, void *, size_t, bool);
 bool lume_user_buffer_copy(struct lume_user_buffer_token *, void *, size_t, bool);
+/* Copy compact rows after one complete identity check under the scheduler lock. */
+bool lume_user_buffer_copy_strided(struct lume_user_buffer_token *, void *, size_t, size_t,
+                                   unsigned);
 void lume_user_buffer_release(struct lume_user_buffer_token *);
 void lume_user_buffer_invalidate(unsigned, uint64_t, uint64_t);
 void lume_user_buffer_invalidate_root(unsigned);

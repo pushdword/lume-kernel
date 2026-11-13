@@ -139,11 +139,9 @@ bool lume_user_buffer_check(const struct lume_user_buffer_token *token, size_t o
     return true;
 }
 
-bool lume_user_buffer_copy_at(struct lume_user_buffer_token *token, size_t offset, void *buffer,
-                              size_t bytes, bool to_user)
+static void copy_checked(const struct lume_user_buffer_token *token, size_t offset, void *buffer,
+                         size_t bytes, bool to_user)
 {
-    if (!lume_user_buffer_check(token, offset, bytes, to_user))
-        return false;
     /* The complete range is checked before any byte is copied. Physical aliases
      * cannot fault and no callback or allocator runs before this copy completes. */
     size_t remaining = bytes;
@@ -165,6 +163,34 @@ bool lume_user_buffer_copy_at(struct lume_user_buffer_token *token, size_t offse
         remaining -= part;
         address += part;
     }
+}
+
+bool lume_user_buffer_copy_at(struct lume_user_buffer_token *token, size_t offset, void *buffer,
+                              size_t bytes, bool to_user)
+{
+    if (!lume_user_buffer_check(token, offset, bytes, to_user))
+        return false;
+    copy_checked(token, offset, buffer, bytes, to_user);
+    return true;
+}
+
+bool lume_user_buffer_copy_strided(struct lume_user_buffer_token *token, void *buffer,
+                                   size_t row_bytes, size_t pitch, unsigned rows)
+{
+    if (!rows || !row_bytes || pitch < row_bytes || row_bytes > token->bytes ||
+        (rows > 1 && pitch > (token->bytes - row_bytes) / (rows - 1)))
+        return false;
+    size_t span = (size_t)(rows - 1) * pitch + row_bytes;
+    if (!lume_user_buffer_check(token, 0, span, false))
+        return false;
+    if (pitch == row_bytes)
+    {
+        copy_checked(token, 0, buffer, span, false);
+        return true;
+    }
+    for (unsigned row = 0; row < rows; ++row)
+        copy_checked(token, (size_t)row * pitch, (unsigned char *)buffer + (size_t)row * row_bytes,
+                     row_bytes, false);
     return true;
 }
 

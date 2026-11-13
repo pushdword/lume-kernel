@@ -41,7 +41,7 @@ static unsigned presented_rows, checkpoints, checkpoint_bytes;
 static unsigned char pixels[1024 * 768 * 4];
 static void *private_pixels;
 static size_t private_bytes;
-static unsigned live_tokens, copied_rows;
+static unsigned live_tokens, copied_rows, acquisitions;
 static bool allocation_failure, copy_failure;
 static unsigned fail_row;
 static int backend_error;
@@ -94,8 +94,11 @@ void lume_kernel_free(void *pointer)
 int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned owner, uint64_t pointer,
                              size_t bytes, bool write)
 {
+    ++acquisitions;
     assert(owner == 1 && bytes <= LUME_FILE_IO_MAX);
-    if (!valid_buffer || (!write && fail_row && copied_rows + 1 == fail_row))
+    if (!valid_buffer ||
+        (!write && fail_row && pointer <= (uintptr_t)pixels + (fail_row - 1) * 4096u &&
+         (uintptr_t)pixels + (fail_row - 1) * 4096u - pointer < bytes))
         return -LUME_EFAULT;
     *token = (struct lume_user_buffer_token){
         .first = pointer, .bytes = bytes, .write = write, .valid = true};
@@ -116,6 +119,21 @@ bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *data, siz
         memcpy(data, (void *)(uintptr_t)token->first, bytes);
         if (!token->write)
             ++copied_rows;
+    }
+    return true;
+}
+
+bool lume_user_buffer_copy_strided(struct lume_user_buffer_token *token, void *data,
+                                   size_t row_bytes, size_t pitch, unsigned rows)
+{
+    assert(rows && pitch >= row_bytes && (rows - 1) * pitch + row_bytes <= token->bytes);
+    for (unsigned i = 0; i < rows; ++i)
+    {
+        struct lume_user_buffer_token row = *token;
+        row.first += i * pitch;
+        row.bytes = row_bytes;
+        if (!lume_user_buffer_copy(&row, (unsigned char *)data + i * row_bytes, row_bytes, false))
+            return false;
     }
     return true;
 }
@@ -225,8 +243,10 @@ int main(void)
     valid_buffer = false;
     assert(lume_graphics_call(&files, 1, LUME_GRAPHICS_PRESENT, &r) == -LUME_EFAULT);
     valid_buffer = true;
+    unsigned acquired_before = acquisitions;
     assert(!lume_graphics_call(&files, 1, LUME_GRAPHICS_PRESENT, &r));
     assert(presents == 48 && presented_rows == 768 && checkpoints == 48);
+    assert(acquisitions - acquired_before == 48);
     assert(checkpoint_bytes == 1024 * 768 * 4);
     assert(!private_pixels && !live_tokens && !present_buffers);
     allocation_failure = true;

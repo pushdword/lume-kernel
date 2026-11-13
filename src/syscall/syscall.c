@@ -33,6 +33,7 @@
 #include "lume/socket_io.h"
 #include "lume/work.h"
 #include "lume/io_redirect.h"
+#include <cpu.h>
 #include <string.h>
 #include "process_file_lock.h"
 #include "process_vm.h"
@@ -142,6 +143,17 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return (int64_t)b;
     }
     case LUME_SYS_CPU:
+        if (a == LUME_CPU_SNAPSHOT)
+        {
+            if (n != sizeof(struct lume_cpu_snapshot))
+                return -LUME_EINVAL;
+            if (!lume_task_capable(pid, LUME_CAP_HW_DIAGNOSTIC))
+                return -LUME_EPERM;
+            if (!lume_user_buffer(b, n, true))
+                return -LUME_EFAULT;
+            lume_task_cpu_snapshot((void *)(uintptr_t)b);
+            return 0;
+        }
         if (b || n || a > 2)
             return -LUME_EINVAL;
         return a == 2 ? LUME_SCHED_QUANTUM : a ? lume_cpu_index() : lume_cpu_count();

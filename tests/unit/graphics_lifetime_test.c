@@ -7,6 +7,7 @@
 #include "lume/process.h"
 
 static bool claimed, revoke_claim;
+static unsigned screen_width = 512;
 static unsigned backend_calls, backend_reads, mutations;
 static unsigned mutation;
 static uint64_t request_address;
@@ -44,9 +45,9 @@ void lume_gpu_release(unsigned owner)
 int lume_platform_graphics_query(struct lume_graphics_request *request)
 {
     CHECK(locked);
-    request->width = 512;
+    request->width = screen_width;
     request->height = 64;
-    request->pitch = 2048;
+    request->pitch = screen_width * 4;
     request->format = LUME_GRAPHICS_XRGB8888;
     return 0;
 }
@@ -247,6 +248,77 @@ static void session_cases(void)
     shared_cleanup();
 }
 
+static void strided_cases(void)
+{
+    shared_setup();
+    struct lume_user_buffer_token token = {0};
+    for (unsigned row = 0; row < 2; ++row)
+        for (unsigned x = 0; x < 13; ++x)
+        {
+            uint64_t physical;
+            CHECK(lume_mmu_translate(2, destination + 3 + row * 4093 + x, true, true, false,
+                                     &physical));
+            *(unsigned char *)(uintptr_t)physical = (unsigned char)(row * 37 + x);
+        }
+    CHECK(!lume_user_buffer_acquire(&token, 1, destination + 3, 4106, false));
+    unsigned char pixels[28];
+    memset(pixels, 0xcc, sizeof(pixels));
+    CHECK(lume_user_buffer_copy_strided(&token, pixels + 1, 13, 4093, 2));
+    CHECK(pixels[0] == 0xcc && pixels[27] == 0xcc);
+    for (unsigned row = 0; row < 2; ++row)
+        for (unsigned x = 0; x < 13; ++x)
+            CHECK(pixels[1 + row * 13 + x] == row * 37 + x);
+    unsigned char contiguous[4108];
+    memset(contiguous, 0xcc, sizeof(contiguous));
+    CHECK(lume_user_buffer_copy_strided(&token, contiguous + 1, 2053, 2053, 2));
+    CHECK(contiguous[0] == 0xcc && contiguous[4107] == 0xcc);
+    for (unsigned offset = 0; offset < 4106; ++offset)
+    {
+        uint64_t physical;
+        CHECK(lume_mmu_translate(2, destination + 3 + offset, false, true, false, &physical));
+        CHECK(contiguous[1 + offset] == *(const unsigned char *)(uintptr_t)physical);
+    }
+    CHECK(!lume_user_buffer_copy_strided(&token, pixels, 13, 12, 2));
+    CHECK(!lume_user_buffer_copy_strided(&token, pixels, 13, 4093, 3));
+    CHECK(!lume_user_buffer_copy_strided(&token, pixels, 13, 4093, 0));
+    CHECK(vm(0, LUME_VM_PROTECT, destination, 4096, 1, 0, -1) == 0);
+    CHECK(!lume_user_buffer_copy_strided(&token, pixels, 13, 4093, 2));
+    lume_user_buffer_release(&token);
+    shared_cleanup();
+
+    uint64_t address =
+        (uint64_t)vm(0, LUME_VM_MAP, 0, 12288, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(address >= LUME_VM_BASE && lume_user_buffer(address, 12288, true));
+    for (unsigned offset = 0; offset < 12288; offset += 4096)
+    {
+        uint64_t physical;
+        CHECK(lume_mmu_translate(2, address + offset, true, true, false, &physical));
+        memset((void *)(uintptr_t)physical, 0xa7, 4096);
+    }
+    CHECK(vm(0, LUME_VM_UNMAP, address + 4096, 4096, 0, 0, -1) == 0);
+    screen_width = 4096;
+    unsigned fd = (unsigned)acquire_graphics();
+    graphics_request = graphics_request_init();
+    graphics_request.fd = (int)fd;
+    graphics_request.pixels = address;
+    graphics_request.width = 1;
+    graphics_request.height = 2;
+    graphics_request.pitch = 8192;
+    graphics_request.format = LUME_GRAPHICS_XRGB8888;
+    mutation = MUTATE_NONE;
+    user_call = false;
+    unsigned before = backend_reads;
+    CHECK(lume_worker_submit_on(LUME_WORK_DISPLAY, graphics_operation, NULL));
+    CHECK(lume_worker_resume_on(LUME_WORK_DISPLAY));
+    CHECK(!lume_worker_busy_on(LUME_WORK_DISPLAY));
+    CHECK(!graphics_result && backend_reads == before + 1);
+    CHECK(!lume_vfs_close(&files[0], fd));
+    CHECK(vm(0, LUME_VM_UNMAP, address, 12288, 0, 0, -1) == 0);
+    while (retired)
+        reap(NULL);
+    screen_width = 512;
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -265,6 +337,7 @@ int main(void)
     ownership_cases();
     request_cases();
     session_cases();
+    strided_cases();
 
     struct lume_user_buffer_token tokens[LUME_TASK_LIMIT], extra;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
@@ -275,6 +348,7 @@ int main(void)
     CHECK(vm(0, LUME_VM_UNMAP, request_address, 4096, 0, 0, -1) == 0);
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);
+    lume_vfs_init(NULL, 0);
     while (retired)
         reap(NULL);
     CHECK(frame_live == initial_frames);

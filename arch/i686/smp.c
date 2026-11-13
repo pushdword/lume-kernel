@@ -66,9 +66,12 @@ uint64_t lume_smp_wait_start(unsigned cpu)
     return 0;
 }
 
-void lume_smp_wake(void)
+static void kernel_wake_notify(unsigned targets)
 {
+    (void)targets;
 }
+
+#include "smp_wake.h"
 
 void lume_smp_tlb_service(void)
 {

@@ -20,6 +20,8 @@ uint64_t lume_smp_wait_ticks(void);
 uint64_t lume_smp_wait_total(void);
 uint64_t lume_smp_wait_start(unsigned);
 void lume_smp_wake(void);
+void lume_smp_idle_begin(void);
+void lume_smp_idle_end(void);
 void lume_smp_quiesce(void);
 void lume_smp_tlb_service(void);
 void lume_tasks_secondary(void);

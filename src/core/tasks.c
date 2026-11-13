@@ -39,6 +39,7 @@
 #include "lume/query.h"
 #endif
 #include <string.h>
+#include <cpu.h>
 #include "thread_state.h"
 #include "poll_state.h"
 #include "io_queue.h"
@@ -67,8 +68,10 @@ static struct cpu_state
     uint64_t lock;
     uint64_t worker_started, worker_lock_before;
     _Alignas(8) uint64_t trap_at;
+    uint64_t last_pc, last_status;
     unsigned sample_owner;
     bool running_user, inside_call, waiting_idle, transmitting, worker_running, buffer_retry;
+    bool retired;
 } cpus[LUME_CPU_LIMIT];
 
 #define local cpus[lume_cpu_index()]
@@ -96,10 +99,15 @@ static bool vm_fault_wait[LUME_TASK_LIMIT], vm_fault_ready[LUME_TASK_LIMIT];
 
 void lume_task_vm_ready(void)
 {
+    bool changed = false;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (vm_fault_wait[i])
+        if (vm_fault_wait[i] && !vm_fault_ready[i])
+        {
             vm_fault_ready[i] = true;
-    lume_smp_wake();
+            changed = true;
+        }
+    if (changed)
+        lume_smp_wake();
 }
 
 void lume_task_vm_buffer_wait(void)
@@ -210,6 +218,8 @@ void lume_task_trap_enter(uint64_t at)
 
 void lume_task_account_enter(const struct lume_context *frame)
 {
+    local.last_pc = LUME_CONTEXT_PC(frame);
+    local.last_status = LUME_CONTEXT_STATUS(frame);
     uint64_t query_ticks = 0;
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686) || defined(__aarch64__)
     struct lume_query_account query;
@@ -321,6 +331,33 @@ static uint64_t kernel_worker_wait(unsigned cpu, uint64_t at)
     if (waiting >= state->worker_started && waiting < at)
         waited += at - waiting;
     return waited;
+}
+
+void lume_task_cpu_snapshot(struct lume_cpu_snapshot *out)
+{
+    *out = (struct lume_cpu_snapshot){.version = LUME_CPU_SNAPSHOT_VERSION,
+                                      .bytes = sizeof(*out),
+                                      .count = lume_cpu_count(),
+                                      .counter = counter(),
+                                      .frequency = lume_counter_frequency()};
+    for (unsigned c = 0; c < out->count; ++c)
+    {
+        const struct cpu_state *state = cpus + c;
+        out->cores[c] = (struct lume_cpu_state){
+            .flags = (state->running_user ? LUME_CPU_USER : 0) |
+                     (state->inside_call ? LUME_CPU_SYSCALL : 0) |
+                     (state->waiting_idle ? LUME_CPU_IDLE : 0) |
+                     (state->worker_running ? LUME_CPU_WORKER : 0) |
+                     (state->transmitting ? LUME_CPU_CONSOLE : 0) |
+                     (state->retired ? LUME_CPU_RETIRED : 0),
+            .task = state->current < LUME_TASK_LIMIT ? state->current + 1 : 0,
+            .calls = state->calls,
+            .interrupts = state->interrupts,
+            .pc = state->last_pc,
+            .status = state->last_status,
+            .trap_at = __atomic_load_n(&state->trap_at, __ATOMIC_ACQUIRE),
+            .wait_since = lume_smp_wait_start(c)};
+    }
 }
 
 void lume_task_telemetry(unsigned pid, struct lume_perf_snapshot *out)
@@ -1027,8 +1064,10 @@ static struct lume_context *wait_ready_task(void)
         sched_enter(&policy, lume_cpu_index(), -1, now(), unit, LUME_SCHED_QUANTUM);
         lume_timer_idle(true);
         idle_wait = true;
+        lume_smp_idle_begin();
         lume_smp_unlock();
         lume_arch_idle_irq();
+        lume_smp_idle_end();
         lume_smp_lock();
         idle_wait = false;
         uint64_t elapsed = counter() - began;
@@ -1678,6 +1717,8 @@ static int64_t supervision_request(struct lume_context *frame, unsigned owner)
 
 static struct lume_context *task_interrupt(struct lume_context *frame, bool timer)
 {
+    local.last_pc = LUME_CONTEXT_PC(frame);
+    local.last_status = LUME_CONTEXT_STATUS(frame);
     if (!active)
         return frame;
     ++local.interrupts;
@@ -2612,6 +2653,7 @@ void lume_tasks_secondary(void)
         lume_run_user(frame);
         lume_smp_lock();
     }
+    local.retired = true;
 }
 
 int64_t lume_task_executable(unsigned pid, char *output, size_t bytes)

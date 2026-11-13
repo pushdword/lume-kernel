@@ -222,27 +222,59 @@ int lume_graphics_call(struct lume_files *files, unsigned owner, unsigned action
             part.height = request.height - row < rows ? request.height - row : rows;
             part.pitch = part.width * 4;
             part.pixels = (uint64_t)(uintptr_t)buffer;
-            for (unsigned line = 0; line < part.height; ++line)
+            for (unsigned line = 0; line < part.height;)
             {
                 struct lume_user_buffer_token token = {0};
                 uint64_t address =
                     request.pixels + (uint64_t)(row + line) * request.pitch + (uint64_t)column * 4;
+                unsigned batch = 1 + (LUME_FILE_IO_MAX - part.pitch) / request.pitch;
+                if (batch > part.height - line)
+                    batch = part.height - line;
+                size_t span = (size_t)(batch - 1) * request.pitch + part.pitch;
                 if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
                 {
                     result = -LUME_EBADF;
                     goto out;
                 }
-                result = lume_user_buffer_acquire(&token, owner, address, part.pitch, false);
-                if (result)
+                result = lume_user_buffer_acquire(&token, owner, address, span, false);
+                if (!result)
+                {
+                    if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+                        result = -LUME_EBADF;
+                    else if (!lume_user_buffer_copy_strided(&token,
+                                                            buffer + (size_t)line * part.pitch,
+                                                            part.pitch, request.pitch, batch))
+                        result = -LUME_EFAULT;
+                    lume_user_buffer_release(&token);
+                    if (result)
+                        goto out;
+                    line += batch;
+                    continue;
+                }
+                if (result != -LUME_EFAULT)
                     goto out;
-                if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
-                    result = -LUME_EBADF;
-                else if (!lume_user_buffer_copy(&token, buffer + (size_t)line * part.pitch,
-                                                part.pitch, false))
-                    result = -LUME_EFAULT;
-                lume_user_buffer_release(&token);
-                if (result)
-                    goto out;
+                /* Row padding may be unmapped even when every requested pixel is valid. */
+                for (unsigned i = 0; i < batch; ++i)
+                {
+                    if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+                    {
+                        result = -LUME_EBADF;
+                        goto out;
+                    }
+                    result = lume_user_buffer_acquire(
+                        &token, owner, address + (uint64_t)i * request.pitch, part.pitch, false);
+                    if (result)
+                        goto out;
+                    if (!session_matches(files, owner, (unsigned)request.fd, session, generation))
+                        result = -LUME_EBADF;
+                    else if (!lume_user_buffer_copy(&token, buffer + (size_t)line * part.pitch,
+                                                    part.pitch, false))
+                        result = -LUME_EFAULT;
+                    lume_user_buffer_release(&token);
+                    if (result)
+                        goto out;
+                    ++line;
+                }
             }
             /* Drivers retain only private compact pixels while compute releases the lock. */
             result = lume_platform_graphics_present(&part);

@@ -64,7 +64,9 @@ static inline uint64_t lume_arch_tls_data(uint64_t base, uint64_t size, uint64_t
 
 static inline void lume_arch_idle_irq(void)
 {
-    __asm__ volatile("msr daifclr, #2; dsb sy; wfi; msr daifset, #2" ::: "memory");
+    /* Keep wake interrupts pending until WFI has observed them. */
+    __asm__ volatile("msr daifset, #2; dsb sy; wfi; msr daifclr, #2; isb; msr daifset, #2" ::
+                         : "memory");
 }
 
 static inline void lume_arch_poll_irq(void)

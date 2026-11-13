@@ -91,6 +91,8 @@ struct lume_context *lume_tasks_irq(struct lume_context *);
 struct lume_context *lume_tasks_device_irq(struct lume_context *);
 struct lume_context *lume_tasks_sync(struct lume_context *, uint64_t esr, uint64_t far);
 bool lume_tasks_active(void);
+struct lume_cpu_snapshot;
+void lume_task_cpu_snapshot(struct lume_cpu_snapshot *);
 int64_t lume_task_executable(unsigned, char *, size_t);
 bool lume_task_capable(unsigned pid, uint64_t capabilities);
 uint64_t lume_task_capabilities(unsigned pid);

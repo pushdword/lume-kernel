@@ -35,11 +35,13 @@ static void kernel_lock_released(void)
 
 #include "smp_lock.h"
 
-void lume_smp_wake(void)
+static void kernel_wake_notify(unsigned targets)
 {
-    if (lume_cpu_count() > 1)
-        lume_pi5_irq_notify();
+    (void)targets;
+    lume_pi5_irq_notify();
 }
+
+#include "smp_wake.h"
 
 void lume_smp_configure(const struct lume_fdt *fdt)
 {

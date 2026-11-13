@@ -93,13 +93,14 @@ static void kernel_lock_released(void)
 
 #include "smp_lock.h"
 
-void lume_smp_wake(void)
+static void kernel_wake_notify(unsigned targets)
 {
-    unsigned cpu = lume_cpu_index();
     for (unsigned i = 0; i < lume_cpu_count(); ++i)
-        if (i != cpu)
+        if (targets & (1u << i))
             lume_apic_send(apic_ids[i], LUME_APIC_WAKE);
 }
+
+#include "smp_wake.h"
 
 void lume_smp_configure(const struct lume_fdt *description)
 {
