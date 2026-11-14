@@ -96,8 +96,8 @@ struct lume_render_display
     uint32_t x, y, width, height, enabled, flags;
 };
 
-/* PRESENT selects a resource rectangle on an enabled display. Its dimensions
- * must match the announced mode. input_fd identifies the caller's acquired
+/* PRESENT selects a bounded resource rectangle on an enabled display. The
+ * announced dimensions describe its preferred mode. input_fd identifies the caller's acquired
  * graphics session. A zero handle disables the display with an empty rectangle.
  * The display retains its buffer until replacement or disable is acknowledged. */
 struct lume_render_present

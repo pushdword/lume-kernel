@@ -4,6 +4,8 @@ struct render_scanout
     struct render_buffer *buffer, *pending;
     struct lume_work reap;
     uint64_t generation;
+    struct lume_virtio_gpu_device *mode_device;
+    uint64_t mode_epoch;
     unsigned index, x, y, width, height;
     bool working;
 };
@@ -140,22 +142,28 @@ static int present_resource(struct render_file *file, struct lume_files *files, 
         result = -LUME_EBADF;
         goto done;
     }
+    uint64_t epoch = lume_virtio_gpu_display_epoch(file->device);
+    if (!scanout->buffer || scanout->generation != generation ||
+        scanout->mode_device != file->device || scanout->mode_epoch != epoch)
+    {
+        struct lume_render_display mode;
+        result = display_info(file, present.scanout, &mode);
+        if (result)
+            goto done;
+        if (!mode.enabled)
+        {
+            result = -LUME_EINVAL;
+            goto done;
+        }
+        scanout->mode_device = file->device;
+        scanout->mode_epoch = epoch;
+    }
     bool select = scanout->buffer != buffer || scanout->generation != generation ||
                   scanout->x != present.x || scanout->y != present.y ||
                   scanout->width != present.width || scanout->height != present.height;
     struct virtio_gpu_ctrl_hdr reply;
     if (select)
     {
-        struct lume_render_display mode;
-        result = display_info(file, present.scanout, &mode);
-        if (result)
-            goto done;
-        /* The host advertises a preferred size. The resource bounds constrain the scanout. */
-        if (!mode.enabled)
-        {
-            result = -LUME_EINVAL;
-            goto done;
-        }
         if (generation != lume_graphics_session_generation(files, pid, (unsigned)present.input_fd))
         {
             result = -LUME_EBADF;

@@ -82,3 +82,20 @@ void lume_virtio_gpu_device_poll(void)
         device->failed = true;
     device->polling = false;
 }
+
+uint64_t lume_virtio_gpu_display_epoch(struct lume_virtio_gpu_device *device)
+{
+    struct lume_virtio_pci *transport = device->gpu->queue->device;
+    if (transport->config.bytes >= 8 && transport->io.read && transport->io.write)
+    {
+        uint32_t events = transport->io.read(transport->io.context, transport->config.address, 4);
+        if (events & 1u)
+        {
+            transport->io.write(transport->io.context, transport->config.address + 4, 1u, 4);
+            if (transport->io.barrier)
+                transport->io.barrier(transport->io.context);
+            ++device->display_epoch;
+        }
+    }
+    return device->display_epoch;
+}

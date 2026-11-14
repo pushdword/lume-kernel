@@ -830,6 +830,50 @@ int main(void)
                !device.users && unpins == 1);
         finish();
     }
+    setup();
+    data = request(-1);
+    assert(!call(LUME_RENDER_OPEN, &data));
+    data = request(3);
+    data.id = 1;
+    assert(!call(LUME_RENDER_CONTEXT, &data));
+    resource = (struct lume_render_resource){.bytes = 8192,
+                                             .target = 2,
+                                             .bind = UINT32_C(1) << 18,
+                                             .width = 64,
+                                             .height = 32,
+                                             .depth = 1,
+                                             .array_size = 1};
+    unsigned flip_handles[2];
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        data = request(3);
+        resource.handle = 0;
+        data.data = (uintptr_t)&resource;
+        data.length = sizeof(resource);
+        assert(!call(LUME_RENDER_RESOURCE_CREATE, &data));
+        flip_handles[i] = resource.handle;
+    }
+    graphics_generation = 5;
+    struct lume_render_present flip = {
+        .handle = flip_handles[0], .input_fd = 9, .width = 64, .height = 32};
+    data = request(3);
+    data.data = (uintptr_t)&flip;
+    data.length = sizeof(flip);
+    assert(!call(LUME_RENDER_PRESENT, &data));
+    unsigned before_flip = submits;
+    flip.handle = flip_handles[1];
+    assert(!call(LUME_RENDER_PRESENT, &data) && submits == before_flip + 2);
+    before_flip = submits;
+    ++device.display_epoch;
+    flip.handle = flip_handles[0];
+    assert(!call(LUME_RENDER_PRESENT, &data) && submits == before_flip + 3);
+    graphics_generation = 0;
+    lume_render_poll_background();
+    admin = true;
+    data = request(-1);
+    assert(!call(LUME_RENDER_RESET, &data));
+    finish();
+
     for (unsigned failure = 0; failure < 2; ++failure)
     {
         setup();

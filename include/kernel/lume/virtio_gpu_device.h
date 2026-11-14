@@ -10,6 +10,7 @@ struct lume_virtio_gpu_device
     unsigned users;
     uint32_t next_context, next_resource;
     uint64_t pinned_bytes;
+    uint64_t display_epoch;
     bool registered, failed, polling, resetting;
 };
 
@@ -23,4 +24,5 @@ struct lume_virtio_gpu_device *lume_virtio_gpu_device_hold(void);
 struct lume_virtio_gpu_device *lume_virtio_gpu_device_hold_failed(void);
 void lume_virtio_gpu_device_drop(struct lume_virtio_gpu_device *);
 void lume_virtio_gpu_device_poll(void);
+uint64_t lume_virtio_gpu_display_epoch(struct lume_virtio_gpu_device *);
 #endif

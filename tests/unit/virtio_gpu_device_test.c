@@ -5,6 +5,23 @@
 
 static unsigned polls;
 static int poll_result;
+static uint32_t display_events;
+static unsigned display_clears;
+
+static uint32_t read_config(void *context, uintptr_t address, unsigned width)
+{
+    (void)context;
+    assert(address == 0x1000 && width == 4);
+    return display_events;
+}
+
+static void write_config(void *context, uintptr_t address, uint32_t value, unsigned width)
+{
+    (void)context;
+    assert(address == 0x1004 && width == 4 && value == 1);
+    display_events &= ~value;
+    ++display_clears;
+}
 
 int lume_render_device_register(void)
 {
@@ -38,6 +55,16 @@ int main(void)
     assert(!lume_virtio_gpu_device_hold());
     assert(lume_virtio_gpu_device_register(NULL) < 0);
     assert(!lume_virtio_gpu_device_register(&device));
+    assert(!lume_virtio_gpu_display_epoch(&device));
+    transport.config = (struct lume_virtio_pci_range){0x1000, 8};
+    transport.io.read = read_config;
+    transport.io.write = write_config;
+    display_events = 2;
+    assert(!lume_virtio_gpu_display_epoch(&device) && !display_clears && display_events == 2);
+    display_events = 3;
+    assert(lume_virtio_gpu_display_epoch(&device) == 1 && display_clears == 1 &&
+           display_events == 2);
+    assert(lume_virtio_gpu_display_epoch(&device) == 1 && display_clears == 1);
     assert(lume_virtio_gpu_device_register(&device) < 0);
     assert(lume_virtio_gpu_device_hold() == &device);
     assert(lume_virtio_gpu_device_unregister(&device) < 0);
