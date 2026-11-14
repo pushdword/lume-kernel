@@ -130,10 +130,11 @@ bool lume_net_start(void)
     if (starting)
         return false;
     starting = true;
-    if (!lume_netif_count() || !lume_entropy(&rng, sizeof(rng)))
+    if (!lume_entropy(&rng, sizeof(rng)))
         goto failed;
     struct lume_netif_info first = {0};
-    lume_netif_info(lume_netif_at(0), &first);
+    if (lume_netif_count())
+        lume_netif_info(lume_netif_at(0), &first);
     for (unsigned i = 0; i < 6; ++i)
         rng = (rng * 16777619u) ^ first.mac[i];
     if (!rng)
@@ -201,7 +202,8 @@ static struct lume_work service_work = {.run = network_service, .domain = LUME_W
 
 void lume_net_poll_background(void)
 {
-    if (!lume_netif_count() && !lume_datagram_reap_pending() && !lume_socket_reap_pending())
+    if (!lume_netif_count() && !lume_stream_busy() && !lume_datagram_busy() &&
+        !lume_datagram_reap_pending() && !lume_socket_reap_pending())
         return;
     uint64_t now = lume_clock_monotonic();
     uint64_t interval = tx_waiting || lume_stream_needs_poll() || now < traffic_until ? 1 : 10;
@@ -287,6 +289,7 @@ void lume_net_poll(void)
                 break;
             }
     sys_check_timeouts();
+    netif_poll_all();
     for (unsigned i = 0; i < adapter_count; ++i)
         if (adapters[i].device)
             changed(&adapters[i]);

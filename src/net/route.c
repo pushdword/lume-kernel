@@ -2,7 +2,8 @@
 
 struct netif *lume_ip4_route_src(const ip4_addr_t *source, const ip4_addr_t *destination)
 {
-    (void)destination;
+    if (destination && ip4_addr_isloopback(destination))
+        return NULL;
     if (!source || ip4_addr_isany_val(*source))
         return NULL;
     struct netif *interface;

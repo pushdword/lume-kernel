@@ -56,6 +56,17 @@ int main(void)
     CHECK(ip4_route(&destination) == &ethernet);
     CHECK(ip4_route_src(netif_ip4_addr(&wireless), &destination) == &wireless);
     CHECK(ip4_route_src(netif_ip4_addr(&ethernet), &destination) == &ethernet);
+
+    struct netif loop = {0};
+    IP_ADDR4(&loop.ip_addr, 127, 0, 0, 1);
+    IP_ADDR4(&loop.netmask, 255, 0, 0, 0);
+    loop.flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
+    ethernet.next = &loop;
+    ip4_addr_t local;
+    IP4_ADDR(&local, 127, 0, 0, 1);
+    CHECK(ip4_route_src(netif_ip4_addr(&ethernet), &local) == &loop);
+    CHECK(ip4_route_src(netif_ip4_addr(&wireless), &local) == &loop);
+    ethernet.next = &wireless;
     CHECK(ip4_route_src(netif_ip4_addr(&wireless), &outside) == &wireless);
     CHECK(ip4_route_src(netif_ip4_addr(&ethernet), &outside) == &ethernet);
     CHECK(ip4_route_src(NULL, &destination) == &ethernet);

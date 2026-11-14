@@ -67,6 +67,11 @@ void lume_icmp_release(unsigned owner)
     (void)owner;
 }
 static struct netif interface;
+
+bool lume_net_start(void)
+{
+    return true;
+}
 struct netif *netif_default = &interface;
 static struct tcp_pcb pcb;
 static uint32_t milliseconds;
@@ -526,6 +531,17 @@ int main(void)
     r.version = 0;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
     chained_ring();
+    netif_default = NULL;
+    r = (struct lume_stream_request){
+        .version = LUME_IO_VERSION, .port = 8095, .address = {127, 0, 0, 1}};
+    assert(!lume_stream_call(2, LUME_STREAM_CONNECT, &r));
+    lume_stream_release(2);
+    r.address[0] = 172;
+    assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
+    memset(r.address, 0, sizeof(r.address));
+    assert(!lume_stream_call(2, LUME_STREAM_LISTEN, &r));
+    lume_stream_release(2);
+    netif_default = &interface;
     puts(
         "PASS TCP ownership, backpressure, EOF, reset, async connect, half-close, listener, pure poll, ACK wake and bounded UDP queues");
 }

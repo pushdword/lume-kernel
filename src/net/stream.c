@@ -310,9 +310,14 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         op == LUME_DATAGRAM_CONNECT || op == LUME_DATAGRAM_LISTEN)
     {
         bool listening = op == LUME_STREAM_LISTEN || op == LUME_DATAGRAM_LISTEN;
-        if (!r->port || r->port > 65535 || (!listening && !r->address[0]) || r->address[0] >= 224 ||
-            !netif_default || !netif_is_link_up(netif_default) ||
-            ip4_addr_isany_val(*netif_ip4_addr(netif_default)))
+        bool local = r->address[0] == 127 || (listening && !r->address[0] && !r->address[1] &&
+                                              !r->address[2] && !r->address[3]);
+        if (!r->port || r->port > 65535 || (!listening && !r->address[0]) || r->address[0] >= 224)
+            return -LUME_EINVAL;
+        if (!lume_net_start())
+            return -LUME_ENETDOWN;
+        if (!local && (!netif_default || !netif_is_link_up(netif_default) ||
+                       ip4_addr_isany_val(*netif_ip4_addr(netif_default))))
             return -LUME_EINVAL;
         if (!(s = allocate(pid)))
             return -LUME_ENOMEM;

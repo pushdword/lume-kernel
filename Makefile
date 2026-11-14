@@ -378,6 +378,13 @@ $(OUT)/tests/stream$(HOSTEXE): tests/unit/stream_test.c src/net/stream.c tests/f
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 HOST_LWIP_C := $(filter vendor/lwip/%,$(KERNEL_C_aarch64))
+$(OUT)/tests/loopback$(HOSTEXE): tests/unit/loopback_test.c src/net/route.c include/kernel/lwipopts.h $(HOST_LWIP_C)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $(filter %.c,$^) -o "$@"
+.PHONY: check-loopback
+check: check-loopback
+check-loopback: $(OUT)/tests/loopback$(HOSTEXE)
+	env "$<"
 $(OUT)/tests/net-service$(HOSTEXE): tests/unit/net_service_test.c src/net/net.c src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"

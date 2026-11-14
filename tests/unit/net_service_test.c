@@ -1,6 +1,7 @@
 #include "lume/net.h"
 #include "lume/work.h"
 #include "lume/activity.h"
+#include "lwip/netif.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +9,12 @@
 
 static uint64_t milliseconds;
 static unsigned available, received_frames, checkpoints;
-static bool active_stream, nested_notification;
+static bool active_stream, active_datagram, nested_notification;
+
+void lume_tasks_dns_notify(unsigned owner)
+{
+    (void)owner;
+}
 
 uint64_t lume_clock_monotonic(void)
 {
@@ -43,7 +49,7 @@ bool lume_stream_busy(void)
 
 bool lume_datagram_busy(void)
 {
-    return false;
+    return active_datagram;
 }
 
 bool lume_datagram_reap_pending(void)
@@ -169,6 +175,15 @@ int main(void)
 {
     lume_net_poll_background();
     assert(!lume_work_pending());
+    assert(lume_net_start());
+    assert(!netif_default && netif_list && netif_is_up(netif_list) && netif_list->name[0] == 'l' &&
+           netif_list->name[1] == 'o');
+    active_datagram = true;
+    lume_net_poll_background();
+    assert(lume_work_pending_on(LUME_WORK_NETWORK));
+    assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
+    active_datagram = false;
+    milliseconds = 10;
     const struct lume_netif_ops operations = {poll, link, receive, transmit, admin};
     struct lume_netif_descriptor descriptor = {.name = "eth0",
                                                .kind = LUME_IF_ETHERNET,
