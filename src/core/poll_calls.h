@@ -9,7 +9,11 @@ static void poll_cancel(unsigned task)
 {
     lume_vfs_poll_cancel(task);
     if (poll_waits)
-        poll_waits[task] = (struct poll_wait_state){0};
+    {
+        struct poll_wait_state *wait = &poll_waits[task];
+        wait->watch.count = 0;
+        memset(&wait->request, 0, sizeof(*wait) - offsetof(struct poll_wait_state, request));
+    }
 }
 
 static void poll_interrupt(unsigned task, struct lume_context *frame)
@@ -92,6 +96,7 @@ static struct lume_context *poll_call(struct lume_context *frame)
     struct poll_wait_state *wait = &poll_waits[task];
     unsigned operation = (unsigned)LUME_CONTEXT_REG(frame, 0);
     uint64_t address = LUME_CONTEXT_REG(frame, 1);
+    bool subscribe = true;
     if (!wait->active)
     {
         struct lume_poll_request request;
@@ -138,15 +143,15 @@ static struct lume_context *poll_call(struct lume_context *frame)
             return poll_result(frame, -LUME_EINVAL);
         if ((request.flags & LUME_POLL_SIGNAL_EPOCH) && thread_slots[task].thread)
             return poll_result(frame, -LUME_ENOSYS);
-        *wait = (struct poll_wait_state){
-            .request = address,
-            .output = request.buffer,
-            .deadline = request.timeout_ms == UINT64_MAX ? UINT64_MAX : at + request.timeout_ms,
-            .signal_epoch = request.signal_epoch,
-            .operation = operation,
-            .active = true,
-            .check_epoch = (request.flags & LUME_POLL_SIGNAL_EPOCH) != 0,
-            .tty_read = (request.flags & LUME_POLL_TTY_READ) != 0};
+        subscribe = request.timeout_ms != 0;
+        wait->request = address;
+        wait->output = request.buffer;
+        wait->deadline = request.timeout_ms == UINT64_MAX ? UINT64_MAX : at + request.timeout_ms;
+        wait->signal_epoch = request.signal_epoch;
+        wait->operation = operation;
+        wait->active = true;
+        wait->check_epoch = (request.flags & LUME_POLL_SIGNAL_EPOCH) != 0;
+        wait->tty_read = (request.flags & LUME_POLL_TTY_READ) != 0;
         wait->watch.count = request.count;
         if (bytes)
             memcpy(wait->watch.records, (const void *)(uintptr_t)request.buffer, bytes);
@@ -158,8 +163,9 @@ static struct lume_context *poll_call(struct lume_context *frame)
         return poll_result(frame, -LUME_EINVAL);
     if (poll_signal_changed(task))
         return poll_result(frame, -4);
-    /* Subscription precedes the scan because readiness checks may produce events. */
-    if (!lume_vfs_poll_subscribe(&tasks[process].files, &wait->watch, task))
+    /* Blocking waits subscribe before scanning because readiness checks may produce events.
+     * Nonblocking queries return after the scan without registering a waiter. */
+    if (subscribe && !lume_vfs_poll_subscribe(&tasks[process].files, &wait->watch, task))
         return poll_result(frame, -LUME_EIO);
     if (lume_vfs_poll_console(&tasks[process].files, &wait->watch))
         (void)kernel_console_ready();

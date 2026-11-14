@@ -598,6 +598,36 @@ static void check_signals(void)
     assert(!blocked && !poll_waits[0].active && !queue.waiting);
 }
 
+static void check_nonblocking(void)
+{
+    reset();
+    struct lume_pollfd records[LUME_FD_LIMIT];
+    for (unsigned i = 0; i < LUME_FD_LIMIT; ++i)
+        records[i] = (struct lume_pollfd){.fd = 3, .events = LUME_POLLIN};
+    struct lume_poll_request request = {.version = LUME_POLL_VERSION,
+                                        .bytes = sizeof(request),
+                                        .buffer = (uintptr_t)records,
+                                        .count = LUME_FD_LIMIT};
+    subscribe_allowed = false;
+    struct lume_context frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && !frame.x[0] && !queue.waiting);
+    readiness = LUME_POLLIN;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && frame.x[0] == LUME_FD_LIMIT);
+    for (unsigned i = 0; i < LUME_FD_LIMIT; ++i)
+        assert(records[i].revents == LUME_POLLIN);
+    request.count = 1;
+    readiness = 0;
+    records[1].revents = 0xbeef;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && !frame.x[0]);
+    assert(!records[0].revents && records[1].revents == 0xbeef);
+    request.timeout_ms = 1;
+    frame = frame_for(&request);
+    assert(poll_call(&frame) == &frame && (int64_t)frame.x[0] == -LUME_EIO);
+    assert(!poll_waits[0].active && !queue.waiting && !blocked);
+}
+
 static void check_futex_signal(void)
 {
     for (unsigned restart = 0; restart < 2; ++restart)
@@ -1124,6 +1154,7 @@ static void check_shared_words(void)
 int main(void)
 {
     check_waits();
+    check_nonblocking();
     check_signals();
     check_futex_signal();
     check_console();
