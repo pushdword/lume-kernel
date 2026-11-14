@@ -30,7 +30,8 @@ enum
     LUME_FD_GETMODE,
     LUME_FD_SETMODE,
     LUME_FD_WAIT,
-    LUME_FD_PATH
+    LUME_FD_PATH,
+    LUME_FD_EVENTFD
 };
 
 enum
@@ -38,6 +39,8 @@ enum
     LUME_FD_CLOEXEC = 1u,
     LUME_FD_NONBLOCK = 2u
 };
+
+#define LUME_EVENTFD_SEMAPHORE 4u
 
 enum
 {

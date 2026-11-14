@@ -3453,12 +3453,16 @@ bool lume_vfs_poll_console(const struct lume_files *files, const struct lume_pol
     return false;
 }
 
+#include "eventfd.h"
+
 int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_request *r)
 {
     if (!files_ready(f))
         return -LUME_ENOMEM;
     if (r->version != LUME_FD_VERSION || r->bytes != sizeof(*r))
         return -LUME_EINVAL;
+    if (op == LUME_FD_EVENTFD)
+        return event_counter_create(f, r);
     struct open_file *d = descriptor(f, (unsigned)r->fd);
     if (op == LUME_FD_PATH)
     {

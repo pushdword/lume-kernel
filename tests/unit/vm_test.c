@@ -570,8 +570,44 @@ static void buffer_transaction_cases(void)
     clean();
 }
 
+static void stable_size_cases(void)
+{
+    int fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE, 0, 0, fd));
+    const unsigned stable = LUME_MAP_SHARED | LUME_MAP_STABLE_SIZE;
+    CHECK(call(0, LUME_VM_MAP, 0, 4 * PAGE, 1, stable, fd) == -LUME_EINVAL);
+    CHECK(call(0, LUME_VM_MAP, 0, PAGE, 1, LUME_MAP_PRIVATE | LUME_MAP_STABLE_SIZE, fd) ==
+          -LUME_EINVAL);
+    uint64_t base = call(0, LUME_VM_MAP, 0, 3 * PAGE - 7, 1, stable, fd);
+    CHECK(base == LUME_VM_BASE);
+    CHECK(call(0, LUME_VM_RESIZE, 0, 3 * PAGE - 8, 0, 0, fd) == -LUME_EBUSY);
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE - 7, 0, 0, fd));
+    CHECK(!call(0, LUME_VM_PROTECT, base + PAGE, PAGE, 0, 0, -1));
+    CHECK(call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd) == -LUME_EBUSY);
+    CHECK(!call(0, LUME_VM_UNMAP, base + 2 * PAGE, PAGE, 0, 0, -1));
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd));
+    CHECK(lume_vm_clone(0, 1));
+    lume_vm_release(0);
+    CHECK(call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd) == -LUME_EBUSY);
+    lume_vm_release(1);
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 0, 0, 0, fd));
+    clean();
+
+    fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE, 0, 0, fd));
+    base = call(0, LUME_VM_MAP, 0, 3 * PAGE, 1, LUME_MAP_SHARED, fd);
+    CHECK(base == LUME_VM_BASE);
+    metadata_budget = 1;
+    CHECK(call(0, LUME_VM_MAP, base + PAGE, PAGE, 1, stable | LUME_MAP_FIXED, fd) == -LUME_ENOMEM);
+    metadata_budget = -1;
+    CHECK(!((struct vm_handle *)descriptors[fd].context)->object->stable_builders);
+    CHECK(!call(0, LUME_VM_RESIZE, 0, 0, 0, 0, fd));
+    clean();
+}
+
 int main(void)
 {
+    stable_size_cases();
     dma_pin_cases();
     buffer_transaction_cases();
     const unsigned anonymous = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;

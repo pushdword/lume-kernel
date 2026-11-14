@@ -26,7 +26,7 @@ struct vm_area;
 struct vm_object
 {
     uint64_t bytes, serial;
-    unsigned references, seals, dma_pins, dma_writers;
+    unsigned references, seals, dma_pins, dma_writers, stable_builders;
     bool persistent, changing, discardable;
     unsigned uid, gid, mode;
     struct vm_chunk *chunks[HASH];
@@ -44,7 +44,7 @@ struct vm_object
 
 struct vm_area
 {
-    uint64_t first, end, offset, generation;
+    uint64_t first, end, offset, generation, stable_end;
     unsigned protection, maximum, thread, saved, owner;
     bool shared, retiring, jit, image;
     struct vm_object *object;
@@ -392,6 +392,8 @@ static bool boundaries(unsigned task, uint64_t first, uint64_t end)
         split_a->first = first;
         split_a->offset += first - a->first;
         a->end = first;
+        if (a->stable_end > a->offset + a->end - a->first)
+            a->stable_end = a->offset + a->end - a->first;
         area_changed(a);
         area_changed(split_a);
         a->next = split_a;
@@ -407,6 +409,8 @@ static bool boundaries(unsigned task, uint64_t first, uint64_t end)
         split_z->first = end;
         split_z->offset += end - z->first;
         z->end = end;
+        if (z->stable_end > z->offset + z->end - z->first)
+            z->stable_end = z->offset + z->end - z->first;
         area_changed(z);
         area_changed(split_z);
         z->next = split_z;
@@ -948,6 +952,14 @@ static int64_t resize_object(struct vm_object *object, uint64_t bytes)
         return -LUME_EBUSY;
     if (object->changing)
         return -LUME_EAGAIN;
+    if (bytes < object->bytes)
+    {
+        if (object->stable_builders)
+            return -LUME_EBUSY;
+        for (struct vm_area *area = object->areas; area; area = area->object_next)
+            if (bytes < area->stable_end)
+                return -LUME_EBUSY;
+    }
     if (bytes > INT64_MAX || (bytes < object->bytes && (object->seals & LUME_SEAL_SHRINK)) ||
         (bytes > object->bytes && (object->seals & LUME_SEAL_GROW)))
         return -LUME_EPERM;
@@ -1301,8 +1313,11 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
     unsigned flags = request->flags, protection = request->protection;
     const unsigned allowed = LUME_MAP_SHARED | LUME_MAP_PRIVATE | LUME_MAP_FIXED |
                              LUME_MAP_ANONYMOUS | LUME_MAP_NORESERVE | LUME_MAP_FIXED_NOREPLACE |
-                             LUME_MAP_JIT;
+                             LUME_MAP_JIT | LUME_MAP_STABLE_SIZE;
     bool jit = (flags & LUME_MAP_JIT) != 0;
+    bool stable = (flags & LUME_MAP_STABLE_SIZE) != 0;
+    if (stable && (!(flags & LUME_MAP_SHARED) || (flags & LUME_MAP_ANONYMOUS)))
+        return -LUME_EINVAL;
 #if !defined(__aarch64__) && !defined(LUME_ARCH_AARCH64) && !defined(LUME_ARCH_AMD64) &&           \
     !defined(LUME_ARCH_I686)
     if (jit)
@@ -1443,21 +1458,35 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
     }
     if (!object)
         goto memory;
+    if (stable)
+    {
+        if (offset > object->bytes || request->length > object->bytes - offset)
+        {
+            drop(object);
+            goto invalid;
+        }
+        ++object->stable_builders;
+    }
     for (struct vm_area *old = spaces[task]; old && old->first < address + length; old = old->next)
         if (old->end > address && old->object->changing)
         {
+            if (stable)
+                --object->stable_builders;
             drop(object);
             lume_kernel_free(area);
             return -LUME_EBUSY;
         }
     if (!boundaries(task, address, address + length))
     {
+        if (stable)
+            --object->stable_builders;
         drop(object);
         goto memory;
     }
     *area = (struct vm_area){.first = address,
                              .end = address + length,
                              .offset = offset,
+                             .stable_end = stable ? offset + request->length : 0,
                              .protection = protection,
                              .maximum = maximum,
                              .shared = (flags & LUME_MAP_SHARED) != 0,
@@ -1466,6 +1495,8 @@ static int64_t map(struct lume_files *files, unsigned task, struct lume_vm_reque
     changing[task] = true;
     remove_range(task, address, address + length);
     insert(task, area);
+    if (stable)
+        --object->stable_builders;
     changing[task] = false;
     request->address = address;
     return (int64_t)address;

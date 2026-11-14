@@ -37,6 +37,9 @@ enum lume_vm_operation
 #define LUME_MAP_NORESERVE 0x4000u
 #define LUME_MAP_FIXED_NOREPLACE 0x100000u
 #define LUME_MAP_JIT 0x200000u
+/* Stable shared mappings prevent truncation below their mapped byte ranges.
+ * The backing object must contain the entire requested range when mapping. */
+#define LUME_MAP_STABLE_SIZE 0x400000u
 
 #define LUME_MADV_NORMAL 0u
 #define LUME_MADV_RANDOM 1u

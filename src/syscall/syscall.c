@@ -535,7 +535,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_process_dup2(files, a, b, pid);
     case LUME_SYS_FD:
     {
-        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_PATH)
+        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_EVENTFD)
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
