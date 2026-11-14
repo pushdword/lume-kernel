@@ -157,6 +157,7 @@ static void partition(unsigned char *entry, bool boot, uint32_t first, uint32_t 
 
 static const struct lume_storage_ops *format(bool full)
 {
+    assert(disk_ioctl(0, CTRL_SYNC, NULL) != RES_ERROR);
     memset(mbr, 0, sizeof(mbr));
     memset(disk, 0, sizeof(disk));
     put32(mbr + 440, LUME_CARD_DISK_ID);

@@ -226,8 +226,11 @@ static int reference_property(const void *tree, int node, const char *name, unsi
                              : !strcmp(name, "resets")        ? "#reset-cells"
                              : !strcmp(name, "power-domains") ? "#power-domain-cells"
                              : !strcmp(name, "phys")          ? "#phy-cells"
+                             : !strcmp(name, "gpios")         ? "#gpio-cells"
                                                               : NULL;
-    bool single = !strcmp(name, "phy-handle") || !strcmp(name, "rpm-regmap");
+    size_t length = strlen(name);
+    bool single = !strcmp(name, "phy-handle") || !strcmp(name, "rpm-regmap") ||
+                  (length > 7 && !strcmp(name + length - 7, "-supply"));
     if (!cells_name && !single)
         return -LUME_ENOSYS;
     int bytes;

@@ -16,6 +16,7 @@ static void deliver_irq(void);
 
 #define lume_mmio_read32_relaxed model_read
 #define lume_mmio_write32_sync model_write
+#define lume_mmio_write32_relaxed model_write
 #define lume_counter_read model_counter
 #define lume_counter_delay_us model_delay
 #define lume_cpu_relax_ordered deliver_irq
@@ -37,6 +38,9 @@ static const unsigned char *control_data;
 static unsigned control_bytes, control_words, width_commands, switch_commands, card_width;
 static bool application_command, refuse_high_speed;
 static uint32_t width_error;
+static uint32_t gpio_registers[8], configuration_registers[128];
+static unsigned tuning_commands;
+static bool tuning_failure, voltage_failure;
 
 #define CHECK(condition)                                                                           \
     do                                                                                             \
@@ -99,6 +103,10 @@ static unsigned register_index(uintptr_t address)
 
 static uint32_t model_read(uintptr_t address)
 {
+    if (address >= UINT64_C(0x107d517c00) && address < UINT64_C(0x107d517c20))
+        return gpio_registers[(address - UINT64_C(0x107d517c00)) / 4];
+    if (address >= UINT64_C(0x1000fff400) && address < UINT64_C(0x1000fff600))
+        return configuration_registers[(address - UINT64_C(0x1000fff400)) / 4];
     unsigned reg = register_index(address);
     if (reg != 0x20 / 4)
         return registers[reg];
@@ -126,6 +134,16 @@ static uint32_t model_read(uintptr_t address)
 
 static void model_write(uintptr_t address, uint32_t value)
 {
+    if (address >= UINT64_C(0x107d517c00) && address < UINT64_C(0x107d517c20))
+    {
+        gpio_registers[(address - UINT64_C(0x107d517c00)) / 4] = value;
+        return;
+    }
+    if (address >= UINT64_C(0x1000fff400) && address < UINT64_C(0x1000fff600))
+    {
+        configuration_registers[(address - UINT64_C(0x1000fff400)) / 4] = value;
+        return;
+    }
     unsigned reg = register_index(address);
     if (reg == 0x30 / 4)
     {
@@ -145,6 +163,8 @@ static void model_write(uintptr_t address, uint32_t value)
     }
     if (reg == 0x2c / 4 && (value & 1))
         registers[reg] |= 2;
+    if (reg == 0x2c / 4 && (value & 4) && (gpio_registers[1] & 8) && !voltage_failure)
+        registers[0x24 / 4] |= 15u << 20;
     if (reg == 0x20 / 4)
     {
         CHECK(writing && words < total_blocks * 128);
@@ -158,6 +178,24 @@ static void model_write(uintptr_t address, uint32_t value)
     if (reg != 12 / 4)
         return;
     unsigned index = value >> 24;
+    if (index == 11)
+    {
+        registers[0x24 / 4] &= ~(15u << 20);
+        registers[0x10 / 4] = 0;
+        queue_events(1);
+        return;
+    }
+    if (index == 19)
+    {
+        CHECK(registers[0x34 / 4] == 32);
+        CHECK(!interrupt_mode || registers[0x38 / 4] == 32);
+        ++tuning_commands;
+        if (!tuning_failure && tuning_commands % 3 == 0)
+            registers[0x3c / 4] = (registers[0x3c / 4] & ~(64u << 16)) | (128u << 16);
+        registers[0x10 / 4] = 0;
+        queue_events(32);
+        return;
+    }
     if (index == 55)
     {
         CHECK(registers[8 / 4] == rca);
@@ -191,9 +229,9 @@ static void model_write(uintptr_t address, uint32_t value)
         {
             CHECK(!application_command);
             uint32_t argument = registers[8 / 4];
-            CHECK(argument == 0x00fffff1 || argument == 0x80fffff1);
+            CHECK((argument & 0x7ffffff0u) == 0x00fffff0u);
             if (argument & 0x80000000u)
-                switch_data[16] = refuse_high_speed ? 0 : 1;
+                switch_data[16] = refuse_high_speed ? 0 : (unsigned char)(argument & 15);
             ++switch_commands;
         }
         application_command = false;
@@ -393,6 +431,15 @@ static void setup(bool use_interrupts)
     application_command = refuse_high_speed = false;
     bus_width = 4;
     maximum_hz = 50000000;
+    uhs_modes = 0;
+    tuning_required = tuning_active = false;
+    retune_interval = 0;
+    retune_requested = false;
+    voltage_1v8 = legacy_retry = tuning_failure = voltage_failure = false;
+    bus_hz = tuning_commands = 0;
+    tuned_at = 0;
+    memset(gpio_registers, 0, sizeof(gpio_registers));
+    memset(configuration_registers, 0, sizeof(configuration_registers));
     interrupt_mode = defer_events = use_interrupts;
     pending = 0;
     registers[0x38 / 4] = use_interrupts ? UINT32_MAX : 0;
@@ -593,7 +640,7 @@ static void bus_modes(void)
     CHECK(!lume_sd_configure_bus(8, 50000000));
     CHECK(!lume_sd_configure_bus(4, 100000));
     CHECK(lume_sd_configure_bus(4, 200000000));
-    CHECK(bus_width == 4 && maximum_hz == 50000000);
+    CHECK(bus_width == 4 && maximum_hz == 200000000);
     device.state = LUME_DEVICE_READY;
     CHECK(!lume_sd_configure_bus(1, 25000000));
     setup(true);
@@ -621,6 +668,49 @@ static void buffer_levels(void)
     CHECK(wait_calls && ticks < frequency / 10 && !errors && ready);
 }
 
+static void uhs_bus(void)
+{
+    for (unsigned mode = 0; mode < 6; ++mode)
+    {
+        setup(mode >= 4);
+        device.state = LUME_DEVICE_OFF;
+        CHECK(!lume_sd_configure_uhs(0, 0, 2));
+        CHECK(lume_sd_configure_uhs(UINT64_C(0x1000fff400), UINT64_C(0x107d517c00), 3));
+        CHECK(lume_sd_configure_bus(4, 200000000));
+        gpio_registers[1] = 0x80000010;
+        gpio_registers[2] = UINT32_MAX;
+        CHECK(clock_rate(250));
+        voltage_failure = mode == 3;
+        CHECK(switch_voltage() == !voltage_failure);
+        CHECK((gpio_registers[1] & 0x80000018u) == 0x80000018u);
+        if (voltage_failure)
+        {
+            card_power_cycle();
+            CHECK(!voltage_1v8 && !(gpio_registers[1] & 8));
+            continue;
+        }
+        switch_data[13] = mode == 1 || mode == 5 ? 6 : 14;
+        if (mode == 5)
+            registers[0x44 / 4] = 1u << 13;
+        tuning_failure = mode == 2;
+        CHECK(select_bus(1u << 21, 1u << 22) == !tuning_failure);
+        if (!tuning_failure)
+        {
+            CHECK(bus_hz == (mode == 1 || mode == 5 ? 100000000u : 200000000u));
+            CHECK(tuning_commands == (mode == 1 ? 0u : 3u));
+            CHECK((configuration_registers[0x1ac / 4] & 0x80000001u) == 0x80000000u);
+            CHECK(!tuning_active);
+            if (mode == 0 || mode == 4)
+            {
+                CHECK(tune() && tuning_commands == 6);
+                CHECK(tune() && tuning_commands == 9);
+            }
+        }
+        else
+            CHECK(tuning_commands == 40 && !(registers[0x3c / 4] & (192u << 16)));
+    }
+}
+
 int main(void)
 {
     success(false);
@@ -633,6 +723,7 @@ int main(void)
     command_counts();
     bus_modes();
     buffer_levels();
+    uhs_bus();
     printf("PASS SDHCI PIO groups: cases=%u checks=%u\n", cases, checks);
     return 0;
 }

@@ -255,6 +255,8 @@ $(OUT)/tests/boot-trial$(HOSTEXE): tests/unit/boot_trial_test.c tests/unit/boot_
 check-boot-trial: $(OUT)/tests/boot-trial$(HOSTEXE)
 	env "$<" "$(MBR_IMAGE)" "$(DATA_IMAGE)" "$(BOOT_IMAGE)" "$(ROOT_IMAGE)"
 .PHONY: check-storage-handles
+$(OUT)/tests/storage-handles$(HOSTEXE) $(OUT)/tests/storage-sync$(HOSTEXE) $(OUT)/tests/storage-seek$(HOSTEXE) $(OUT)/tests/storage-replace$(HOSTEXE): HOSTCFLAGS += -DLUME_STORAGE_CACHE_BYTES=0
+$(OUT)/tests/storage-handles$(HOSTEXE) $(OUT)/tests/storage-sync$(HOSTEXE) $(OUT)/tests/storage-seek$(HOSTEXE) $(OUT)/tests/storage-replace$(HOSTEXE): src/storage/sector_cache.h
 $(OUT)/tests/storage-handles$(HOSTEXE): tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
@@ -274,6 +276,13 @@ $(OUT)/tests/storage-sync$(HOSTEXE): tests/unit/storage_sync_test.c tests/unit/s
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
 check: check-storage-handles
+.PHONY: check-storage-cache
+$(OUT)/tests/storage-cache$(HOSTEXE): tests/unit/storage_cache_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/sector_cache.h src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
+check-storage-cache: $(OUT)/tests/storage-cache$(HOSTEXE)
+	env "$<"
+check: check-storage-cache
 .PHONY: check-storage-replace
 $(OUT)/tests/storage-replace$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_MAX_ALLOCATION=131072
 $(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c $(FILE_IO_HOST_FIXTURE)

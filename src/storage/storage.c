@@ -56,7 +56,9 @@ static unsigned flush_cursor;
 static void flush_one(void *);
 static struct lume_work flush_work = {.run = flush_one, .domain = LUME_WORK_STORAGE};
 #define STORAGE_FLUSH_MS 1000u
-#define STORAGE_FLUSH_BYTES (64u * 1024u)
+#define STORAGE_FLUSH_BYTES (1024u * 1024u)
+
+#include "sector_cache.h"
 
 void lume_storage_poll_background(void)
 {
@@ -99,6 +101,8 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
     const struct lume_volume *v = drive_volume(drive);
     if (!v || !count || sector >= v->count || count > v->count - sector)
         return RES_PARERR;
+    if (LUME_STORAGE_CACHE_BYTES && !drive && !replacing)
+        return cache_read(v->first + sector, count, out, v->first + v->count) ? RES_OK : RES_ERROR;
     for (UINT i = 0; i < count;)
     {
         UINT group = count - i < LUME_SD_MAX_SECTORS ? count - i : LUME_SD_MAX_SECTORS;
@@ -123,6 +127,8 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
     if (!v || !(drive == 0 ? mounted : boot_mounted) || !count || sector >= v->count ||
         count > v->count - sector)
         return RES_PARERR;
+    if (LUME_STORAGE_CACHE_BYTES && !drive && !replacing)
+        return cache_write(v->first + sector, count, data) ? RES_OK : RES_ERROR;
     for (UINT i = 0; i < count;)
     {
         UINT group = count - i < LUME_SD_MAX_SECTORS ? count - i : LUME_SD_MAX_SECTORS;
@@ -134,6 +140,8 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
                 replacement_io_failed = true;
             return RES_ERROR;
         }
+        if (!drive)
+            cache_invalidate(v->first + sector + i, group);
         i += group;
     }
     return RES_OK;
@@ -149,7 +157,7 @@ DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
     switch (command)
     {
     case CTRL_SYNC:
-        return lume_sd_sync() ? RES_OK : RES_ERROR;
+        return (drive ? lume_sd_sync() : cache_sync()) ? RES_OK : RES_ERROR;
     case GET_SECTOR_COUNT:
         *(LBA_t *)data = (LBA_t)v->count;
         return RES_OK;
@@ -266,8 +274,7 @@ static int restore_file_size(struct storage_file *file, FSIZE_t bytes)
     return failed;
 }
 
-/* FatFs retains one shared partial-sector and metadata window.
- * Complete sectors still reach the device during f_write. Deferred work flushes one file. */
+/* Deferred work commits one file and the shared sector cache at each deadline. */
 static void flush_one(void *context)
 {
     (void)context;
@@ -742,6 +749,8 @@ static int remove_state(const char *path, unsigned *state)
     if (result)
         return result;
     BYTE progress;
+    if (!cache_sync())
+        return -LUME_EIO;
     replacing = true;
     replacement_io_failed = false;
     content_changed(file);
@@ -786,6 +795,8 @@ static int rename_state(const char *from, const char *to, unsigned *state)
     if (result)
         return result;
     BYTE progress;
+    if (!cache_sync())
+        return -LUME_EIO;
     replacing = true;
     replacement_io_failed = false;
     content_changed(file);
@@ -819,6 +830,8 @@ static int replace_file(const char *from, const char *to, unsigned *state)
     if (prepared)
         return prepared;
     BYTE progress;
+    if (!cache_sync())
+        return -LUME_EIO;
     replacing = true;
     replacement_io_failed = false;
     content_changed(source);
@@ -940,6 +953,9 @@ const struct lume_storage_ops *lume_storage_start(void)
             return 0;
     if (close_read_cache())
         return 0;
+    if (mounted && !cache_sync())
+        return 0;
+    cache_reset();
     mounted = false;
     if (mount_epoch == UINT64_MAX)
         snapshot_exhausted = true;

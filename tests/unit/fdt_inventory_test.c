@@ -52,6 +52,9 @@ static void registers(const char *name, unsigned address, unsigned irq, unsigned
     fdt32_t pwm[] = {cpu_to_fdt32(10), cpu_to_fdt32(3), cpu_to_fdt32(41566), cpu_to_fdt32(1)};
     assert(!fdt_property(tree, "pwms", pwm, sizeof(pwm)));
     cell("rpm-regmap", 10);
+    cell("vqmmc-supply", 10);
+    fdt32_t gpio[] = {cpu_to_fdt32(10), cpu_to_fdt32(3), 0};
+    assert(!fdt_property(tree, "gpios", gpio, sizeof(gpio)));
     static const unsigned char station[6] = {2, 0x12, 0x34, 0x56, 0x78, 0x9a};
     assert(!fdt_property(tree, "local-mac-address", station, sizeof(station)));
     static const char labels[] = "primary\0spare";
@@ -84,6 +87,7 @@ static unsigned fixture(unsigned variant)
     cell("phandle", 10);
     cell("#clock-cells", 1);
     cell("#pwm-cells", 3);
+    cell("#gpio-cells", 2);
     end();
     node("bus");
     text("compatible", "simple-bus");
@@ -167,6 +171,11 @@ static int probe(struct lume_hardware *device, void *context)
            -LUME_ENOENT);
     assert(!lume_hardware_property(device, "rpm-regmap", LUME_PROPERTY_REFERENCE, 0, &property));
     assert(property.count == 1 && property.values[0] == clock_id);
+    assert(!lume_hardware_property(device, "vqmmc-supply", LUME_PROPERTY_REFERENCE, 0, &property));
+    assert(property.count == 1 && property.values[0] == clock_id);
+    assert(!lume_hardware_property(device, "gpios", LUME_PROPERTY_REFERENCE, 0, &property));
+    assert(property.count == 3 && property.values[0] == clock_id && property.values[1] == 3 &&
+           property.values[2] == 0);
     assert(lume_hardware_property(device, "rpm-regmap", LUME_PROPERTY_REFERENCE, 1, &property) ==
            -LUME_EINVAL);
     assert(lume_hardware_property(device, "labels", LUME_PROPERTY_U64, 0, &property) ==
