@@ -8,7 +8,7 @@
  * checkpoints require the scheduler lock and masked subsystem IRQs. Resident raw RX may remain
  * enabled. Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
-#define LUME_WORKER_LIMIT 8u
+#define LUME_WORKER_LIMIT 9u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);
@@ -28,6 +28,10 @@ uint64_t lume_worker_lock_wait_on(unsigned slot);
  * subsystem ownership while releasing the scheduler lock. Callbacks must not allocate,
  * access device registers, invoke kernel services or suspend. Calls outside a worker run inline. */
 void lume_worker_compute(void (*run)(void *), void *context);
+/* Device callbacks access resident registers belonging to the active subsystem.
+ * They release the scheduler lock and retain subsystem admission. They must not
+ * allocate, suspend or call services that require the scheduler lock. */
+void lume_worker_device(void (*run)(void *), void *context);
 /* Large copies release the scheduler lock on SMP. The resource owner must keep both
  * ranges mapped and resident until the copy returns. Small copies run inline. */
 void lume_worker_copy(void *destination, const void *source, size_t bytes);

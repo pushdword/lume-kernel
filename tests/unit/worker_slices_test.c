@@ -713,6 +713,12 @@ static void independent_waits(void)
     T(!lume_worker_busy() && jobs == 3);
 }
 
+static void device_job(void *context)
+{
+    T(!lock_owned && context == &event);
+    __atomic_store_n(&event, 7, __ATOMIC_RELEASE);
+}
+
 static void copy_job(void *context)
 {
     (void)context;
@@ -725,6 +731,8 @@ static void copy_job(void *context)
     before = lock_turn;
     lume_worker_copy(destination, source, 17);
     T(lock_owned && lock_turn == before);
+    lume_worker_device(device_job, (void *)&event);
+    T(lock_owned && lock_turn == before + 1 && event == 7);
 }
 
 static void copy_ownership(void)

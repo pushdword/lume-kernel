@@ -90,12 +90,18 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
         if (action < LUME_FD_MAX && lume_socket_network_io(files, (unsigned)action))
             return LUME_WORK_NETWORK;
         if (number == LUME_SYS_CLOSE && !lume_vfs_storage_io(files, action))
-            return LUME_WORK_GENERAL;
+            return lume_vfs_pipe_io(files, action) ? LUME_WORK_CONTROL : LUME_WORK_GENERAL;
         return LUME_WORK_STORAGE;
     case LUME_SYS_DUP2:
-        return LUME_WORK_GENERAL;
+        return LUME_WORK_CONTROL;
     case LUME_SYS_FD:
-        return action == LUME_FD_SPAWN ? LUME_WORK_STORAGE : LUME_WORK_GENERAL;
+        if (action == LUME_FD_SPAWN)
+            return LUME_WORK_STORAGE;
+        if (action == LUME_FD_DUP || action == LUME_FD_DUP2 ||
+            (action >= LUME_FD_GETFD && action <= LUME_FD_SETFL) || action == LUME_FD_GETMODE ||
+            action == LUME_FD_SETMODE)
+            return LUME_WORK_CONTROL;
+        return LUME_WORK_GENERAL;
     case LUME_SYS_RUN:
     case LUME_SYS_RUN_ENV:
     case LUME_SYS_RUN_FDS:

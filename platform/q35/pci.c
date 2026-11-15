@@ -1,6 +1,18 @@
 #include "lume/q35.h"
 #include "lume/resource.h"
 #include "lume/pci.h"
+#include "lume/irq.h"
+#include "lume/ticket_lock.h"
+
+static struct lume_ticket_lock configuration_lock;
+
+static uint32_t configuration_enter(void)
+{
+    uint32_t ticket = lume_ticket_reserve(&configuration_lock);
+    while (!lume_ticket_ready(&configuration_lock, ticket))
+        __atomic_signal_fence(__ATOMIC_ACQUIRE);
+    return ticket;
+}
 
 uint32_t lume_q35_pci_read(uint32_t device, unsigned offset)
 {
@@ -11,8 +23,13 @@ uint32_t lume_q35_pci_read(uint32_t device, unsigned offset)
         return *(const volatile uint32_t *)(uintptr_t)ecam;
     if (offset >= 256)
         return UINT32_MAX;
+    uint64_t flags = lume_irq_save();
+    uint32_t ticket = configuration_enter();
     lume_out32(0xcf8, 0x80000000u | device | (offset & 252));
-    return lume_in32(0xcfc);
+    uint32_t value = lume_in32(0xcfc);
+    lume_ticket_release(&configuration_lock, ticket);
+    lume_irq_restore(flags);
+    return value;
 }
 
 void lume_q35_pci_write(uint32_t device, unsigned offset, uint32_t value)
@@ -27,8 +44,12 @@ void lume_q35_pci_write(uint32_t device, unsigned offset, uint32_t value)
     }
     if (offset >= 256)
         return;
+    uint64_t flags = lume_irq_save();
+    uint32_t ticket = configuration_enter();
     lume_out32(0xcf8, 0x80000000u | device | (offset & 252));
     lume_out32(0xcfc, value);
+    lume_ticket_release(&configuration_lock, ticket);
+    lume_irq_restore(flags);
 }
 
 int lume_q35_pci_find(uint16_t vendor, uint16_t product, uint32_t *device)

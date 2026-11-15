@@ -59,6 +59,10 @@ bool lume_irq_domain_dispatch(uint32_t id, unsigned irq);
  * before returning. The dispatcher completes the controller EOI. */
 int lume_irq_controller_start(const struct lume_irq_controller *, unsigned lines);
 int lume_irq_register(unsigned, unsigned trigger, lume_irq_handler, void *);
+/* Asynchronous handlers acknowledge resident MMIO and publish atomic events before
+ * the scheduler lock. They cannot call kernel services. Unregister masks the line
+ * and returns EBUSY until active handlers have released their retained context. */
+int lume_irq_register_async(unsigned, unsigned trigger, lume_irq_handler, void *);
 int lume_irq_enable(unsigned, bool);
 int lume_irq_unregister(unsigned, void *context);
 bool lume_irq_dispatch(unsigned token);

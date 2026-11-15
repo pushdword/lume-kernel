@@ -315,6 +315,69 @@ static void local_allocation_failure(void)
     CHECK(allocation_live == before && descriptor_count() == descriptors);
 }
 
+static struct lume_socket_request concurrent_pair;
+static bool concurrent_receive;
+static unsigned concurrent_copies;
+
+static void close_during_local_copy(void)
+{
+    CHECK(!locked && workers[LUME_WORK_GENERAL].computing);
+    cpu_index = 1;
+    lume_smp_lock();
+    unsigned char byte = 0;
+    CHECK(lume_vfs_write(&files[0], concurrent_pair.fd, &byte, 1) == -LUME_EAGAIN);
+    CHECK(lume_vfs_read(&files[0], concurrent_pair.other, &byte, 1) == -LUME_EAGAIN);
+    unsigned before = allocation_live;
+    CHECK(lume_vfs_close(&files[0], (unsigned)concurrent_pair.fd) == 0);
+    CHECK(lume_vfs_close(&files[0], (unsigned)concurrent_pair.other) == 0);
+    CHECK(allocation_live == before - 1);
+    struct lume_socket_request replacement = socket_pair();
+    CHECK(allocation_live == before + 1);
+    CHECK(lume_vfs_read(&files[0], replacement.other, &byte, 1) == -LUME_EAGAIN);
+    CHECK(lume_vfs_close(&files[0], (unsigned)replacement.fd) == 0);
+    CHECK(lume_vfs_close(&files[0], (unsigned)replacement.other) == 0);
+    lume_smp_unlock();
+    cpu_index = 0;
+    ++concurrent_copies;
+}
+
+static void concurrent_local_operation(void *context)
+{
+    (void)context;
+    copy_mutation = close_during_local_copy;
+    int64_t result = call_message_bytes(
+        concurrent_receive ? concurrent_pair.other : concurrent_pair.fd,
+        concurrent_receive ? LUME_SOCKET_RECEIVE_MESSAGE : LUME_SOCKET_SEND_MESSAGE, 0, 0, 0,
+        16384);
+    CHECK(result == (concurrent_receive ? 16384 : -LUME_EPIPE));
+    CHECK(!copy_mutation && locked);
+}
+
+static void concurrent_local_copies(void)
+{
+    metadata_setup();
+    uint64_t saved_payload = payload_base;
+    payload_base =
+        (uint64_t)vm(0, LUME_VM_MAP, 0, 16384, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(payload_base >= LUME_VM_BASE && lume_user_buffer(payload_base, 16384, true));
+    unsigned before = allocation_live;
+    for (unsigned direction = 0; direction < 2; ++direction)
+    {
+        concurrent_receive = direction != 0;
+        concurrent_pair = socket_pair();
+        if (concurrent_receive)
+            CHECK(call_message_bytes(concurrent_pair.fd, LUME_SOCKET_SEND_MESSAGE, 0, 0, 0,
+                                     16384) == 16384);
+        CHECK(lume_worker_submit_on(LUME_WORK_GENERAL, concurrent_local_operation, NULL));
+        CHECK(lume_worker_resume_on(LUME_WORK_GENERAL));
+        CHECK(!lume_worker_busy_on(LUME_WORK_GENERAL) && allocation_live == before);
+    }
+    CHECK(concurrent_copies == 2);
+    CHECK(vm(0, LUME_VM_UNMAP, payload_base, 16384, 0, 0, -1) == 0);
+    payload_base = saved_payload;
+    metadata_cleanup();
+}
+
 static void large_local_stream(void)
 {
     struct lume_socket_request pair = socket_pair();
@@ -386,6 +449,7 @@ int main(void)
                 failed_metadata(peek != 0, request_output != 0, truncated != 0);
     local_allocation_failure();
     large_local_stream();
+    concurrent_local_copies();
     no_heap_payload();
     partial_acquire_unwind();
     empty_payload();

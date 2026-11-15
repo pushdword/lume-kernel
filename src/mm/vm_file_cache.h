@@ -323,7 +323,7 @@ static int file_request(struct vm_object *object, uint64_t page)
     if (lume_task_storage_context())
     {
         if (object->loading && !object->io_running &&
-            (!object->file_work.queued || lume_work_cancel(&object->file_work)))
+            (!lume_work_queued(&object->file_work) || lume_work_cancel(&object->file_work)))
         {
             object->loading = false;
             object->io_ready = 1;

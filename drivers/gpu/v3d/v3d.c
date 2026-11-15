@@ -213,26 +213,26 @@ void lume_v3d_interrupt(struct lume_v3d *gpu)
     uint32_t status = read_register(gpu, V3D_HUB, V3D_HUB_INT_STS);
     write_register(gpu, V3D_HUB, V3D_HUB_INT_CLR, status);
     if (status & V3D_HUB_INT_TFUC)
-        gpu->event |= EVENT_DONE;
+        __atomic_fetch_or(&gpu->event, EVENT_DONE, __ATOMIC_RELEASE);
     if (status & FAULT_MASK)
-        gpu->event |= EVENT_FAULT;
+        __atomic_fetch_or(&gpu->event, EVENT_FAULT, __ATOMIC_RELEASE);
 }
 
 bool lume_v3d_completed(struct lume_v3d *gpu)
 {
     lume_v3d_interrupt(gpu);
-    if (gpu->event & EVENT_FAULT)
+    if (__atomic_load_n(&gpu->event, __ATOMIC_ACQUIRE) & EVENT_FAULT)
         return true;
     uint32_t status = read_register(gpu, V3D_HUB, V3D_TFU_CS(71));
     if (!(status & V3D_TFU_CS_BUSY) && V3D_GET_FIELD(status, V3D_TFU_CS_CVTCT) == gpu->completion)
-        gpu->event |= EVENT_DONE;
-    return gpu->event != 0;
+        __atomic_fetch_or(&gpu->event, EVENT_DONE, __ATOMIC_RELEASE);
+    return __atomic_load_n(&gpu->event, __ATOMIC_ACQUIRE) != 0;
 }
 
 static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsigned width,
                     unsigned height)
 {
-    gpu->event = 0;
+    __atomic_store_n(&gpu->event, 0, __ATOMIC_RELEASE);
     gpu->phase = 12;
     gpu->completion =
         (V3D_GET_FIELD(read_register(gpu, V3D_HUB, V3D_TFU_CS(71)), V3D_TFU_CS_CVTCT) + 1) & 255;
@@ -255,7 +255,7 @@ static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsi
     gpu->io.barrier(gpu->io.context);
     uint64_t deadline = gpu->io.ticks(gpu->io.context) + gpu->io.frequency / 10;
     (void)gpu->io.wait(gpu->io.context, &gpu->event, EVENT_DONE | EVENT_FAULT, deadline);
-    if ((gpu->event & (EVENT_DONE | EVENT_FAULT)) != EVENT_DONE)
+    if ((__atomic_load_n(&gpu->event, __ATOMIC_ACQUIRE) & (EVENT_DONE | EVENT_FAULT)) != EVENT_DONE)
     {
         gpu->status = read_register(gpu, V3D_HUB, V3D_TFU_CS(71));
         gpu->violation = read_register(gpu, V3D_HUB, V3D_MMU_VIO_ADDR);

@@ -1,6 +1,7 @@
 #include "lume/module_services.h"
 #include "lume/modules.h"
 #include "lume/abi.h"
+#include "lume/irq_async.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -8,6 +9,7 @@ static unsigned references, callbacks, opens;
 static bool network_busy, repeat;
 static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
+static bool async_probe;
 static struct lume_block block;
 static struct lume_devfs_group attribute_group;
 static struct lume_work work;
@@ -71,6 +73,8 @@ static void eoi(unsigned irq)
 static void interrupt(unsigned irq, void *context)
 {
     assert(irq == 42 && context == &references && references);
+    if (async_probe)
+        assert(lume_module_irq_unregister(irq, context) == -LUME_EBUSY && references == 1);
     callbacks++;
 }
 
@@ -302,6 +306,12 @@ int main(void)
     assert(lume_module_irq_unregister(42, &work) == -LUME_EPERM && references == 1);
     assert(!lume_irq_enable(42, true) && lume_irq_dispatch(42) && callbacks == 1);
     assert(!lume_module_irq_unregister(42, &references) && !references);
+    async_probe = true;
+    assert(!lume_module_irq_register_async(42, LUME_IRQ_LEVEL, interrupt, &references));
+    assert(references == 1 && !lume_irq_enable(42, true));
+    assert(lume_irq_dispatch_async(42) && references == 1 && callbacks == 2);
+    assert(!lume_module_irq_unregister(42, &references) && !references);
+    async_probe = false;
     work = (struct lume_work){.run = run, .context = &work};
     assert(!lume_module_work_submit(&work) && references == 1);
     assert(!lume_module_work_submit(&work) && references == 1);
@@ -309,7 +319,7 @@ int main(void)
     repeat = true;
     assert(!lume_module_work_submit(&work));
     assert(lume_work_drain(1) == 1 && work.queued && references == 1);
-    assert(lume_work_drain(1) == 1 && !work.queued && !references && callbacks == 3);
+    assert(lume_work_drain(1) == 1 && !work.queued && !references && callbacks == 4);
     const struct lume_netif_ops net_ops = {.poll = run};
     const struct lume_netif_descriptor descriptor = {.ops = &net_ops};
     assert(lume_module_netif_register(&descriptor) == 5 && references == 1);

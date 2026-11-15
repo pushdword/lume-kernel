@@ -202,7 +202,7 @@ bool lume_worker_resume_on(unsigned slot)
     return true;
 }
 
-void lume_worker_compute(void (*run)(void *), void *context)
+static void unlocked_callback(void (*run)(void *), void *context)
 {
     if (!run)
         return;
@@ -223,6 +223,16 @@ void lume_worker_compute(void (*run)(void *), void *context)
     state->lock_wait += waited;
     state->slice_started += waited;
     state->computing = false;
+}
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    unlocked_callback(run, context);
+}
+
+void lume_worker_device(void (*run)(void *), void *context)
+{
+    unlocked_callback(run, context);
 }
 
 struct worker_copy

@@ -28,6 +28,9 @@ int lume_stream_nowait(unsigned, unsigned, struct lume_stream_request *);
 int lume_stream_progress(unsigned, unsigned, struct lume_stream_request *, bool, bool *);
 void lume_tasks_stream_notify(unsigned, unsigned);
 void lume_stream_release(unsigned);
+/* Process exit marks streams for retirement. The NETWORK owner reclaims their
+ * protocol state and receive buffers after any active callback or copy returns. */
+void lume_stream_reap(void);
 int lume_icmp_call(unsigned, unsigned, struct lume_stream_request *);
 void lume_icmp_release(unsigned);
 bool lume_icmp_busy(void);

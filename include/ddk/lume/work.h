@@ -14,6 +14,7 @@ enum lume_work_domain
     LUME_WORK_RENDER,
     LUME_WORK_MEMORY,
     LUME_WORK_DEVICE,
+    LUME_WORK_CONTROL,
     LUME_WORK_DOMAINS
 };
 
@@ -25,8 +26,14 @@ struct lume_work
     uint8_t domain;
 };
 
+static inline bool lume_work_queued(const struct lume_work *work)
+{
+    return work && __atomic_load_n(&work->queued, __ATOMIC_ACQUIRE);
+}
+
 /* Work storage must outlive its queued callback or a successful cancellation. Submit is
- * permitted from IRQ context. The kernel worker drains bounded batches outside IRQ handlers.
+ * permitted from IRQ context. Each queue has its own short IRQ-safe lock. Callbacks run
+ * after that lock is released. The kernel worker drains bounded batches outside IRQ handlers.
  * Callbacks in one resource domain execute in submission order. Independent domains can
  * progress while another domain waits for a device. General callbacks require exclusive entry.
  * The domain stays fixed until a running callback returns. Cancellation of a running callback

@@ -15,6 +15,7 @@ int main(int argc, char **argv)
         return 2;
     stream_contract_main();
     lume_stream_release(2);
+    lume_stream_reap();
     notifications = 0;
     struct lume_stream_request request = {
         .version = LUME_IO_VERSION, .port = 8095, .address = {172, 30, 1, 163}};

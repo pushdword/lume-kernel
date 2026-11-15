@@ -66,7 +66,7 @@ static void poll_scanouts(void)
     {
         struct render_scanout *scanout = render_scanouts + i;
         struct render_buffer *buffer = scanout->buffer ? scanout->buffer : scanout->pending;
-        if (buffer && !scanout->working && !scanout->reap.queued &&
+        if (buffer && !scanout->working && !lume_work_queued(&scanout->reap) &&
             (!scanout->generation || scanout->generation != generation ||
              reset_acknowledged(buffer->owner)) &&
             (!buffer->owner->device->failed || reset_acknowledged(buffer->owner)))
@@ -176,7 +176,7 @@ static int present_resource(struct render_file *file, struct lume_files *files, 
         scanout->reap = (struct lume_work){.run = reap_scanout,
                                            .context = scanout,
                                            .domain = LUME_WORK_RENDER,
-                                           .queued = scanout->reap.queued};
+                                           .queued = lume_work_queued(&scanout->reap)};
         struct virtio_gpu_set_scanout request = {
             .hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT,
             .r = {present.x, present.y, present.width, present.height},

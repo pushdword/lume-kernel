@@ -873,7 +873,7 @@ static void topology_work(void *context)
 
 static void queue_topology(struct host *h)
 {
-    if (h->operation != HOST_IDLE || h->topology.queued ||
+    if (h->operation != HOST_IDLE || lume_work_queued(&h->topology) ||
         (int32_t)(milliseconds(h) - h->next_scan) < 0)
         return;
     h->topology.run = topology_work;
@@ -1116,7 +1116,7 @@ bool lume_usb_stop_host(unsigned index)
         return false;
     if (!h->valid)
         return true;
-    if (h->topology.queued && !lume_work_cancel(&h->topology))
+    if (lume_work_queued(&h->topology) && !lume_work_cancel(&h->topology))
         return false;
     h->operation = HOST_STOP;
     h->running = false;

@@ -1,5 +1,39 @@
 #include "lume/early.h"
 #include "lume/worker.h"
+#include "lume/irq.h"
+#include "lume/ticket_lock.h"
+
+static struct lume_ticket_lock pages_lock;
+
+struct pages_guard
+{
+    uint64_t flags;
+    uint32_t ticket;
+};
+
+static struct pages_guard pages_enter(void)
+{
+    struct pages_guard guard = {.flags = lume_irq_save()};
+    guard.ticket = lume_ticket_reserve(&pages_lock);
+    while (!lume_ticket_ready(&pages_lock, guard.ticket))
+        __atomic_signal_fence(__ATOMIC_ACQUIRE);
+    return guard;
+}
+
+static void pages_leave(struct pages_guard *guard)
+{
+    lume_ticket_release(&pages_lock, guard->ticket);
+    lume_irq_restore(guard->flags);
+}
+
+static void pages_checkpoint(struct pages_guard *guard)
+{
+    if (guard)
+        pages_leave(guard);
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    if (guard)
+        *guard = pages_enter();
+}
 #if defined(LUME_ARCH_I686)
 #define PHYSICAL_LIMIT UINT64_C(0x80000000)
 #define IMAGE_BLOCK UINT64_C(0x400000)
@@ -51,7 +85,7 @@ static uint16_t *pin_find(uint64_t page)
     return link;
 }
 
-bool lume_page_pin(uint64_t page)
+static bool pin_page(uint64_t page)
 {
     if (!page || (page & 4095u))
         return false;
@@ -79,7 +113,7 @@ bool lume_page_pin(uint64_t page)
     return true;
 }
 
-void lume_page_unpin(uint64_t page)
+static void unpin_page(uint64_t page)
 {
     uint16_t *link = pin_find(page), slot = *link;
     if (!slot)
@@ -176,7 +210,10 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
 
 uint64_t lume_pages_total(void)
 {
-    return total_count;
+    struct pages_guard guard = pages_enter();
+    uint64_t result = total_count;
+    pages_leave(&guard);
+    return result;
 }
 
 struct page_zero
@@ -222,7 +259,8 @@ static bool reserve_span(uint64_t first, unsigned count, uint64_t *retry)
     return true;
 }
 
-static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsigned *budget)
+static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsigned *budget,
+                            struct pages_guard *guard)
 {
     uint64_t run = 0;
     uint64_t word = first / 64;
@@ -262,7 +300,7 @@ static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsign
         if (++*budget == 256)
         {
             *budget = 0;
-            lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+            pages_checkpoint(guard);
             if (free_count < count)
                 return 0;
         }
@@ -270,13 +308,13 @@ static uint64_t search_span(uint64_t first, uint64_t end, unsigned count, unsign
     return 0;
 }
 
-uint64_t lume_pages_alloc_span_uninitialized(unsigned count)
+static uint64_t allocate_span(unsigned count, struct pages_guard *guard)
 {
     if (!count || count > MAX_SPAN_PAGES || count > MAX_PAGES || free_count < count)
         return 0;
     unsigned budget = 0;
     uint64_t start = span_cursor && span_cursor < MAX_PAGES ? span_cursor : 1;
-    uint64_t first = search_span(start, MAX_PAGES, count, &budget);
+    uint64_t first = search_span(start, MAX_PAGES, count, &budget, guard);
     if (!first && start > 1)
     {
         /* The second interval includes the tail needed by runs crossing the cursor.
@@ -284,7 +322,7 @@ uint64_t lume_pages_alloc_span_uninitialized(unsigned count)
         uint64_t end = start + count - 1;
         if (end > MAX_PAGES)
             end = MAX_PAGES;
-        first = search_span(1, end, count, &budget);
+        first = search_span(1, end, count, &budget, guard);
     }
     if (!first)
         return 0;
@@ -321,18 +359,26 @@ uint64_t lume_pages_alloc_span(unsigned count)
     return physical;
 }
 
-static uint64_t find_page(uint64_t first, uint64_t end)
+static uint64_t find_page(uint64_t first, uint64_t end, struct pages_guard *guard)
 {
+    unsigned budget = 0;
     for (uint64_t word = first / 64; first < end && word <= (end - 1) / 64; ++word)
     {
         uint64_t available = ~used[word] & span_mask(word, first, end);
         if (available)
             return word * 64 + (unsigned)__builtin_ctzll(available);
+        if (++budget == 256)
+        {
+            budget = 0;
+            pages_checkpoint(guard);
+            if (!free_count)
+                return 0;
+        }
     }
     return 0;
 }
 
-uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
+static uint64_t allocate_page(uint64_t minimum, struct pages_guard *guard)
 {
     if (!free_count || minimum >= PHYSICAL_LIMIT)
         return 0;
@@ -357,7 +403,7 @@ uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
             uint64_t start = region_cursor[region];
             if (start < low || start >= end)
             {
-                start = find_page(low, end);
+                start = find_page(low, end, guard);
                 if (!start)
                     continue;
                 /* Stagger bank cursors across the sixteen page colours in L2. */
@@ -365,9 +411,9 @@ uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
                 if (end - start > phase)
                     start += phase;
             }
-            p = find_page(start, end);
+            p = find_page(start, end, guard);
             if (!p && start > low)
-                p = find_page(low, start);
+                p = find_page(low, start, guard);
             if (p)
             {
                 region_cursor[region] = p + 1;
@@ -379,9 +425,9 @@ uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
     else
     {
         uint64_t start = cursor >= first && cursor < MAX_PAGES ? cursor : first;
-        p = find_page(start, MAX_PAGES);
+        p = find_page(start, MAX_PAGES, guard);
         if (!p && start > first)
-            p = find_page(first, start);
+            p = find_page(first, start, guard);
     }
     if (!p)
         return 0;
@@ -403,7 +449,7 @@ uint64_t lume_page_alloc(uint64_t minimum)
     return physical;
 }
 
-bool lume_page_free(uint64_t page)
+static bool free_page(uint64_t page)
 {
     if (!page || page >= PHYSICAL_LIMIT || (page & 4095))
         return false;
@@ -425,12 +471,54 @@ bool lume_page_free(uint64_t page)
 
 uint64_t lume_pages_free(void)
 {
-    return free_count;
+    struct pages_guard guard = pages_enter();
+    uint64_t result = free_count;
+    pages_leave(&guard);
+    return result;
+}
+
+uint64_t lume_pages_alloc_span_uninitialized(unsigned count)
+{
+    struct pages_guard guard = pages_enter();
+    uint64_t result = allocate_span(count, &guard);
+    pages_leave(&guard);
+    return result;
+}
+
+uint64_t lume_page_alloc_uninitialized(uint64_t minimum)
+{
+    struct pages_guard guard = pages_enter();
+    uint64_t result = allocate_page(minimum, &guard);
+    pages_leave(&guard);
+    return result;
+}
+
+bool lume_page_free(uint64_t page)
+{
+    struct pages_guard guard = pages_enter();
+    bool result = free_page(page);
+    pages_leave(&guard);
+    return result;
+}
+
+bool lume_page_pin(uint64_t page)
+{
+    struct pages_guard guard = pages_enter();
+    bool result = pin_page(page);
+    pages_leave(&guard);
+    return result;
+}
+
+void lume_page_unpin(uint64_t page)
+{
+    struct pages_guard guard = pages_enter();
+    unpin_page(page);
+    pages_leave(&guard);
 }
 
 bool lume_pages_check(void)
 {
-    uint64_t before = free_count, pages[129];
+    uint64_t before = lume_pages_free(), pages[129];
     if (before < 129)
         return false;
     for (unsigned n = 0; n < 129; ++n)
@@ -454,5 +542,5 @@ bool lume_pages_check(void)
     for (unsigned n = 129; n; --n)
         if (!lume_page_free(pages[n - 1]))
             return false;
-    return free_count == before && !lume_page_free(pages[0]) && !lume_page_free(0x200000);
+    return lume_pages_free() == before && !lume_page_free(pages[0]) && !lume_page_free(0x200000);
 }

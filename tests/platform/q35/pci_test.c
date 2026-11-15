@@ -7,6 +7,16 @@ static uint32_t selected, registers[64], masks[64];
 static bool probing[64];
 #define PCI_ADDRESS 0x1800u
 
+uint64_t lume_irq_save(void)
+{
+    return 0;
+}
+
+void lume_irq_restore(uint64_t flags)
+{
+    assert(!flags);
+}
+
 uint32_t lume_in32(uint16_t port)
 {
     assert(port == 0xcfc);

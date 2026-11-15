@@ -349,7 +349,7 @@ check-page-span: $(OUT)/tests/page-span$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/page-span$(HOSTEXE): tests/unit/page_span_test.c src/mm/pages.c include/kernel/lume/worker.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iinclude/kernel "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -Iarch/amd64/include/kernel -Iinclude/kernel -Iinclude/ddk "$<" -o "$@"
 check: check-graphics
 check-graphics: $(OUT)/tests/graphics$(HOSTEXE)
 	env "$<"
@@ -746,6 +746,30 @@ $(OUT)/tests/work-queue$(HOSTEXE): tests/unit/work_queue_test.c src/core/work.c 
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/work_queue_test.c src/core/work.c -o "$@"
 check: check-work-queue
+
+.PHONY: check-kernel-concurrency
+check-kernel-concurrency: $(OUT)/tests/kernel-concurrency$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/kernel-concurrency$(HOSTEXE): tests/unit/kernel_concurrency_test.c src/core/work.c src/mm/pages.c include/ddk/lume/work.h include/kernel/lume/ticket_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< $(if $(filter Windows_NT,$(OS)),,-pthread) -o "$@"
+check: check-kernel-concurrency
+
+.PHONY: check-tty
+check-tty: $(OUT)/tests/tty$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/tty$(HOSTEXE): tests/unit/tty_test.c src/device/tty.c include/kernel/lume/worker.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+check: check-tty
+
+.PHONY: check-scheduler-ready
+check-scheduler-ready: $(OUT)/tests/scheduler-ready$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/scheduler-ready$(HOSTEXE): tests/unit/scheduler_ready_test.c src/core/scheduler.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+check: check-scheduler-ready
 
 .PHONY: check-worker-slices
 check-worker-slices: $(OUT)/tests/worker-slices$(HOSTEXE)

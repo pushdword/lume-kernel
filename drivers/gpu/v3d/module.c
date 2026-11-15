@@ -22,6 +22,7 @@ struct binding
     struct lume_dma_domain dma;
     unsigned hub_irq, core_irq;
     bool claimed, irq_registered, core_irq_registered, registered;
+    uint32_t irq_access;
 };
 
 static uint32_t read_register(void *context, unsigned bank, unsigned offset)
@@ -101,9 +102,16 @@ static int power(void *context, bool enabled)
 static void interrupts(void *context, bool enabled)
 {
     struct binding *binding = context;
+    if (enabled)
+        __atomic_store_n(&binding->irq_access, 0, __ATOMIC_RELEASE);
+    else
+        __atomic_fetch_or(&binding->irq_access, UINT32_C(1) << 31, __ATOMIC_ACQ_REL);
     /* Both V3D interrupt lines can signal completion of shared hub work. */
     if (lume_irq_enable(binding->hub_irq, enabled) || lume_irq_enable(binding->core_irq, enabled))
         lume_fail("V3D interrupt state");
+    if (!enabled)
+        while (__atomic_load_n(&binding->irq_access, __ATOMIC_ACQUIRE) & UINT32_C(0x7fffffff))
+            __atomic_signal_fence(__ATOMIC_ACQUIRE);
 }
 
 static uint64_t allocate_zeroed(void *context, unsigned pages)
@@ -211,7 +219,15 @@ static void interrupt(unsigned irq, void *context)
 {
     (void)irq;
     struct binding *binding = context;
+    uint32_t access = __atomic_load_n(&binding->irq_access, __ATOMIC_ACQUIRE);
+    do
+    {
+        if (access & (UINT32_C(1) << 31))
+            return;
+    } while (!__atomic_compare_exchange_n(&binding->irq_access, &access, access + 1, true,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
     lume_v3d_interrupt(&binding->gpu);
+    __atomic_fetch_sub(&binding->irq_access, 1, __ATOMIC_RELEASE);
 }
 
 static int bind_surface(void *context, const struct lume_gpu_surface *surface, void **session)
@@ -360,11 +376,11 @@ static int start(struct lume_hardware *hardware, void *context)
     if (result)
         return result;
     binding->claimed = true;
-    result = lume_irq_register(binding->hub_irq, LUME_IRQ_LEVEL, interrupt, binding);
+    result = lume_irq_register_async(binding->hub_irq, LUME_IRQ_LEVEL, interrupt, binding);
     if (result)
         return result;
     binding->irq_registered = true;
-    result = lume_irq_register(binding->core_irq, LUME_IRQ_LEVEL, interrupt, binding);
+    result = lume_irq_register_async(binding->core_irq, LUME_IRQ_LEVEL, interrupt, binding);
     if (result)
         return result;
     binding->core_irq_registered = true;

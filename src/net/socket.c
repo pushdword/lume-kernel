@@ -9,6 +9,7 @@
 #include "lume/net_limits.h"
 #include "lume/datagram.h"
 #include "lume/socket_buffer.h"
+#include "lume/worker.h"
 #include <string.h>
 
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
@@ -70,6 +71,7 @@ struct local_ring
     uint64_t consumed, produced;
     unsigned first, count, rights_first, rights_count;
     unsigned char *data;
+    bool copying, retired;
 
     struct
     {
@@ -90,6 +92,7 @@ struct local_end
 static struct local_pair
 {
     bool open[2], shutdown[2], allocating;
+    unsigned active;
     struct local_end end[2];
     struct local_ring ring[2];
 } local_pairs[PAIRS];
@@ -295,20 +298,47 @@ static void local_notify(struct local_pair *pair)
     lume_poll_source_notify(&pair->end[1].source);
 }
 
+static void local_reclaim(struct local_ring *ring)
+{
+    struct local_rights *rights = take_rights(ring, UINT64_MAX);
+    unsigned char *data = ring->data;
+    *ring = (struct local_ring){0};
+    lume_kernel_free(data);
+    drop_rights(rights);
+}
+
+static void local_copy_begin(struct local_pair *pair, struct local_ring *ring)
+{
+    ++pair->active;
+    ring->copying = true;
+}
+
+static void local_copy_finish(struct local_pair *pair, struct local_ring *ring)
+{
+    ring->copying = false;
+    if (ring->retired)
+        local_reclaim(ring);
+    local_notify(pair);
+    --pair->active;
+}
+
 static void local_close(void *context)
 {
     struct local_end *end = context;
     struct local_pair *pair = end->pair;
     unsigned side = end->side;
+    if (!pair->open[side])
+        return;
+    ++pair->active;
     pair->open[side] = false;
-    struct local_rights *rights = take_rights(&pair->ring[side], UINT64_MAX);
-    unsigned char *data = pair->ring[side].data;
-    memset(&pair->ring[side], 0, sizeof(pair->ring[side]));
+    if (pair->ring[side].copying)
+        pair->ring[side].retired = true;
+    else
+        local_reclaim(&pair->ring[side]);
     if (!pair->open[side ^ 1])
         pair->shutdown[0] = pair->shutdown[1] = false;
     local_notify(pair);
-    lume_kernel_free(data);
-    drop_rights(rights);
+    --pair->active;
 }
 
 static int64_t local_read(void *context, void *data, uint64_t bytes)
@@ -318,20 +348,23 @@ static int64_t local_read(void *context, void *data, uint64_t bytes)
     struct local_ring *ring = &pair->ring[end->side];
     if (!bytes)
         return 0;
+    if (ring->copying)
+        return -LUME_EAGAIN;
     if (!ring->count)
         return pair->open[end->side ^ 1] && !pair->shutdown[end->side ^ 1] ? -LUME_EAGAIN : 0;
     if (bytes > ring->count)
         bytes = ring->count;
     unsigned first =
         bytes < LOCAL_BYTES - ring->first ? (unsigned)bytes : LOCAL_BYTES - ring->first;
-    memcpy(data, ring->data + ring->first, first);
-    memcpy((unsigned char *)data + first, ring->data, (size_t)bytes - first);
+    local_copy_begin(pair, ring);
+    lume_worker_copy(data, ring->data + ring->first, first);
+    lume_worker_copy((unsigned char *)data + first, ring->data, (size_t)bytes - first);
     ring->first = (ring->first + (unsigned)bytes) % LOCAL_BYTES;
     ring->count -= (unsigned)bytes;
     ring->consumed += bytes;
     struct local_rights *rights = take_rights(ring, ring->consumed);
-    local_notify(pair);
     drop_rights(rights);
+    local_copy_finish(pair, ring);
     return (int64_t)bytes;
 }
 
@@ -344,6 +377,8 @@ static int64_t local_write(void *context, const void *data, uint64_t bytes)
         return 0;
     if (!pair->open[end->side ^ 1] || pair->shutdown[end->side])
         return -LUME_EPIPE;
+    if (ring->copying)
+        return -LUME_EAGAIN;
     unsigned available = LOCAL_BYTES - ring->count;
     if (!available || ring->rights_count == RIGHTS)
         return -LUME_EAGAIN;
@@ -353,11 +388,17 @@ static int64_t local_write(void *context, const void *data, uint64_t bytes)
         return -LUME_ENOSPC;
     unsigned start = (ring->first + ring->count) % LOCAL_BYTES;
     unsigned first = bytes < LOCAL_BYTES - start ? (unsigned)bytes : LOCAL_BYTES - start;
-    memcpy(ring->data + start, data, first);
-    memcpy(ring->data, (const unsigned char *)data + first, (size_t)bytes - first);
+    local_copy_begin(pair, ring);
+    lume_worker_copy(ring->data + start, data, first);
+    lume_worker_copy(ring->data, (const unsigned char *)data + first, (size_t)bytes - first);
+    if (!pair->open[end->side ^ 1] || pair->shutdown[end->side])
+    {
+        local_copy_finish(pair, ring);
+        return -LUME_EPIPE;
+    }
     ring->count += (unsigned)bytes;
     ring->produced += bytes;
-    local_notify(pair);
+    local_copy_finish(pair, ring);
     return (int64_t)bytes;
 }
 
@@ -367,10 +408,12 @@ static unsigned local_poll(void *context)
     struct local_pair *pair = end->pair;
     struct local_ring *in = &pair->ring[end->side], *out = &pair->ring[end->side ^ 1];
     bool eof = !pair->open[end->side ^ 1] || pair->shutdown[end->side ^ 1];
-    unsigned events = (in->count || eof ? LUME_POLLIN : 0) | (eof ? LUME_POLLHUP : 0);
+    unsigned events =
+        (!in->copying && (in->count || eof) ? LUME_POLLIN : 0) | (eof ? LUME_POLLHUP : 0);
     if (!pair->open[end->side ^ 1])
         events |= LUME_POLLERR;
-    else if (pair->shutdown[end->side] || (out->count < LOCAL_BYTES && out->rights_count < RIGHTS))
+    else if (pair->shutdown[end->side] ||
+             (!out->copying && out->count < LOCAL_BYTES && out->rights_count < RIGHTS))
         events |= LUME_POLLOUT;
     return events;
 }
@@ -434,9 +477,9 @@ static bool rights_cycle(unsigned destination, const struct local_rights *rights
     return false;
 }
 
-static int64_t local_send_message(struct lume_files *files, struct local_end *end,
-                                  const struct lume_socket_message *message,
-                                  struct lume_socket_buffer *transfer)
+static int64_t local_send_reserved(struct lume_files *files, struct local_end *end,
+                                   const struct lume_socket_message *message,
+                                   struct lume_socket_buffer *transfer)
 {
     struct local_pair *pair = end->pair;
     struct local_ring *ring = &pair->ring[end->side ^ 1];
@@ -481,7 +524,7 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
             return -LUME_EINVAL;
         }
     }
-    /* Allocation can yield while another lane reads or writes this ring. */
+    /* The reservation retains this ring across allocation and user copies. */
     int error = 0;
     unsigned available = LOCAL_BYTES - ring->count;
     unsigned bytes = message->count < available ? message->count : available;
@@ -507,6 +550,14 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
         drop_rights(group);
         return -LUME_EFAULT;
     }
+    if (!pair->open[end->side ^ 1] || pair->shutdown[end->side] ||
+        (group && rights_cycle((unsigned)(pair - local_pairs), group)))
+    {
+        int result =
+            !pair->open[end->side ^ 1] || pair->shutdown[end->side] ? -LUME_EPIPE : -LUME_EINVAL;
+        drop_rights(group);
+        return result;
+    }
     ring->count += bytes;
     ring->produced += bytes;
     if (group)
@@ -519,9 +570,25 @@ static int64_t local_send_message(struct lume_files *files, struct local_end *en
     return bytes;
 }
 
-static int64_t local_receive_message(struct lume_files *files, struct local_end *end,
-                                     struct lume_socket_message *message,
-                                     struct lume_socket_buffer *transfer)
+static int64_t local_send_message(struct lume_files *files, struct local_end *end,
+                                  const struct lume_socket_message *message,
+                                  struct lume_socket_buffer *transfer)
+{
+    if (!message->count)
+        return local_send_reserved(files, end, message, transfer);
+    struct local_pair *pair = end->pair;
+    struct local_ring *ring = &pair->ring[end->side ^ 1];
+    if (ring->copying)
+        return -LUME_EAGAIN;
+    local_copy_begin(pair, ring);
+    int64_t result = local_send_reserved(files, end, message, transfer);
+    local_copy_finish(pair, ring);
+    return result;
+}
+
+static int64_t local_receive_reserved(struct lume_files *files, struct local_end *end,
+                                      struct lume_socket_message *message,
+                                      struct lume_socket_buffer *transfer)
 {
     struct local_pair *pair = end->pair;
     struct local_ring *ring = &pair->ring[end->side];
@@ -589,6 +656,22 @@ static int64_t local_receive_message(struct lume_files *files, struct local_end 
         drop_rights(group);
     }
     return copied ? (int64_t)bytes : -LUME_EFAULT;
+}
+
+static int64_t local_receive_message(struct lume_files *files, struct local_end *end,
+                                     struct lume_socket_message *message,
+                                     struct lume_socket_buffer *transfer)
+{
+    if (!message->count)
+        return local_receive_reserved(files, end, message, transfer);
+    struct local_pair *pair = end->pair;
+    struct local_ring *ring = &pair->ring[end->side];
+    if (ring->copying)
+        return -LUME_EAGAIN;
+    local_copy_begin(pair, ring);
+    int64_t result = local_receive_reserved(files, end, message, transfer);
+    local_copy_finish(pair, ring);
+    return result;
 }
 
 int64_t lume_socket_message_call_buffer(struct lume_files *files, unsigned operation, int fd,

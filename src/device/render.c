@@ -221,7 +221,7 @@ void lume_render_poll_background(void)
         next = file->next;
         retire_jobs(file, &budget);
         if (!file->references && (file->context || file->resources) && !file->working &&
-            !file->reap.queued && (!file->device->failed || reset_acknowledged(file)))
+            !lume_work_queued(&file->reap) && (!file->device->failed || reset_acknowledged(file)))
             (void)lume_work_submit(&file->reap);
     }
     poll_scanouts();

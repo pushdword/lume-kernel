@@ -1,5 +1,6 @@
 #include "lume/external_file.h"
 #include "lume/tty_device.h"
+#include "lume/worker.h"
 #include <string.h>
 
 #define TERMINALS 8u
@@ -24,7 +25,7 @@ struct tty_end
 
 static struct pseudo_terminal
 {
-    bool open[2], stopped;
+    bool open[2], stopped, copying;
     struct tty_end ends[2];
     struct tty_ring input, output;
     struct lume_termios termios;
@@ -49,10 +50,23 @@ static unsigned ring_read(struct tty_ring *ring, void *buffer, unsigned bytes)
 {
     if (bytes > ring->count)
         bytes = ring->count;
-    for (unsigned i = 0; i < bytes; ++i)
-        ((unsigned char *)buffer)[i] = ring->data[(ring->first + i) % TTY_BYTES];
+    unsigned first = bytes < TTY_BYTES - ring->first ? bytes : TTY_BYTES - ring->first;
+    lume_worker_copy(buffer, ring->data + ring->first, first);
+    lume_worker_copy((unsigned char *)buffer + first, ring->data, bytes - first);
     ring->first = (ring->first + bytes) % TTY_BYTES;
     ring->count -= bytes;
+    return bytes;
+}
+
+static unsigned ring_write(struct tty_ring *ring, const void *buffer, unsigned bytes)
+{
+    if (bytes > TTY_BYTES - ring->count)
+        bytes = TTY_BYTES - ring->count;
+    unsigned next = (ring->first + ring->count) % TTY_BYTES;
+    unsigned first = bytes < TTY_BYTES - next ? bytes : TTY_BYTES - next;
+    lume_worker_copy(ring->data + next, buffer, first);
+    lume_worker_copy(ring->data, (const unsigned char *)buffer + first, bytes - first);
+    ring->count += bytes;
     return bytes;
 }
 
@@ -87,7 +101,8 @@ static unsigned tty_poll(void *context)
     struct pseudo_terminal *terminal = end->terminal;
     bool peer = terminal->open[end->side ^ 1];
     bool readable =
-        end->side ? input_ready(terminal) : terminal->output.count && !terminal->stopped;
+        !terminal->copying &&
+        (end->side ? input_ready(terminal) : terminal->output.count && !terminal->stopped);
     bool writable = end->side
                         ? terminal->output.count + 2 <= TTY_BYTES
                         : terminal->input.count + terminal->line_bytes < TTY_BYTES &&
@@ -95,7 +110,7 @@ static unsigned tty_poll(void *context)
                                terminal->output.count + 3 <= TTY_BYTES) &&
                               terminal->record_count < RECORDS;
     return (readable || !peer ? LUME_POLLIN : 0) | (!peer ? LUME_POLLHUP : 0) |
-           (peer && writable ? LUME_POLLOUT : 0);
+           (peer && writable && !terminal->copying ? LUME_POLLOUT : 0);
 }
 
 static int64_t tty_read(void *context, void *buffer, uint64_t bytes)
@@ -104,12 +119,16 @@ static int64_t tty_read(void *context, void *buffer, uint64_t bytes)
     struct pseudo_terminal *terminal = end->terminal;
     if (!bytes)
         return 0;
+    if (terminal->copying)
+        return -LUME_EAGAIN;
     if (!end->side)
     {
         if ((!terminal->output.count || terminal->stopped) && terminal->open[1])
             return -LUME_EAGAIN;
+        terminal->copying = true;
         unsigned count =
             ring_read(&terminal->output, buffer, bytes > TTY_BYTES ? TTY_BYTES : (unsigned)bytes);
+        terminal->copying = false;
         tty_notify(terminal);
         return count;
     }
@@ -130,7 +149,9 @@ static int64_t tty_read(void *context, void *buffer, uint64_t bytes)
             --terminal->record_count;
         }
     }
+    terminal->copying = true;
     count = ring_read(&terminal->input, buffer, count);
+    terminal->copying = false;
     tty_notify(terminal);
     return count;
 }
@@ -151,6 +172,25 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
         return 0;
     if (!terminal->open[end->side ^ 1])
         return -LUME_EPIPE;
+    if (terminal->copying)
+        return -LUME_EAGAIN;
+    bool raw =
+        end->side ? !(terminal->termios.output & LUME_TTY_OPOST)
+                  : !(terminal->termios.input & (LUME_TTY_ISTRIP | LUME_TTY_IGNCR | LUME_TTY_ICRNL |
+                                                 LUME_TTY_INLCR | LUME_TTY_IXON)) &&
+                        !(terminal->termios.local &
+                          (LUME_TTY_ICANON | LUME_TTY_ECHO | LUME_TTY_ECHONL | LUME_TTY_ISIG));
+    if (raw)
+    {
+        struct tty_ring *ring = end->side ? &terminal->output : &terminal->input;
+        if (ring->count == TTY_BYTES)
+            return -LUME_EAGAIN;
+        terminal->copying = true;
+        unsigned count = ring_write(ring, data, bytes > TTY_BYTES ? TTY_BYTES : (unsigned)bytes);
+        terminal->copying = false;
+        tty_notify(terminal);
+        return count;
+    }
     unsigned done = 0;
     const unsigned char *source = data;
     while (done < bytes && done < TTY_BYTES)
@@ -227,8 +267,7 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
                 break;
             if (commit)
             {
-                for (unsigned i = 0; i < terminal->line_bytes; ++i)
-                    ring_put(&terminal->input, terminal->line[i]);
+                (void)ring_write(&terminal->input, terminal->line, terminal->line_bytes);
                 if (!eof)
                     ring_put(&terminal->input, byte);
                 unsigned index = (terminal->record_first + terminal->record_count++) % RECORDS;
@@ -385,7 +424,7 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
         for (unsigned i = 0; i < TERMINALS; ++i)
         {
             struct pseudo_terminal *terminal = terminals + i;
-            if (terminal->open[0] || terminal->open[1])
+            if (terminal->open[0] || terminal->open[1] || terminal->copying)
                 continue;
             *terminal = (struct pseudo_terminal){.rows = 24, .columns = 80};
             terminal->termios =
@@ -434,6 +473,8 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
     if (!end)
         return -25;
     struct pseudo_terminal *terminal = end->terminal;
+    if (terminal->copying && (action == LUME_TTY_SET || action == LUME_TTY_FLUSH))
+        return -LUME_EAGAIN;
     if (action == LUME_TTY_SET || action == LUME_TTY_SET_GROUP || action == LUME_TTY_FLUSH)
     {
         int access = lume_tasks_tty_background(owner, terminal->session, terminal->group, 22);
@@ -463,11 +504,9 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
         if ((r->termios.local ^ terminal->termios.local) & LUME_TTY_ICANON)
         {
             terminal->record_first = terminal->record_count = 0;
-            while (terminal->line_bytes && terminal->input.count < TTY_BYTES)
-            {
-                ring_put(&terminal->input, terminal->line[0]);
-                memmove(terminal->line, terminal->line + 1, --terminal->line_bytes);
-            }
+            unsigned committed = ring_write(&terminal->input, terminal->line, terminal->line_bytes);
+            terminal->line_bytes -= committed;
+            memmove(terminal->line, terminal->line + committed, terminal->line_bytes);
             if ((r->termios.local & LUME_TTY_ICANON) && terminal->input.count)
             {
                 terminal->records[0] = terminal->input.count;

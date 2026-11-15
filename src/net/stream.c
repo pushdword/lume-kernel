@@ -32,7 +32,7 @@ struct stream
     u16_t peer_port;
     unsigned owner, handle, first, count;
     unsigned error, failure, data_pages;
-    bool connected, eof, failed, listening, write_closed;
+    bool connected, eof, failed, listening, write_closed, closing;
     unsigned char *data;
     unsigned packet_first, packets;
     unsigned packet_count[STREAM_PACKET_COUNT];
@@ -189,8 +189,8 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
             continue;
         unsigned end = (s->first + s->count) % STREAM_RECEIVE_BYTES;
         unsigned first = q->len < STREAM_RECEIVE_BYTES - end ? q->len : STREAM_RECEIVE_BYTES - end;
-        memcpy(s->data + end, q->payload, first);
-        memcpy(s->data, (const unsigned char *)q->payload + first, q->len - first);
+        lume_worker_copy(s->data + end, q->payload, first);
+        lume_worker_copy(s->data, (const unsigned char *)q->payload + first, q->len - first);
         s->count += q->len;
     }
     pbuf_free(p);
@@ -294,6 +294,13 @@ void lume_stream_release(unsigned pid)
     lume_icmp_release(pid);
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner == pid)
+            streams[i].closing = true;
+}
+
+void lume_stream_reap(void)
+{
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
+        if (streams[i].owner && streams[i].closing)
             close_stream(&streams[i]);
 }
 
@@ -407,7 +414,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         return 0;
     }
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
-        if (streams[i].owner == pid && streams[i].handle == r->handle)
+        if (streams[i].owner == pid && streams[i].handle == r->handle && !streams[i].closing)
             s = &streams[i];
     if (!s)
         return -LUME_EBADF;
@@ -465,7 +472,7 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
                 return -LUME_EAGAIN;
             unsigned slot = s->packet_first;
             unsigned n = r->count < s->packet_count[slot] ? r->count : s->packet_count[slot];
-            memcpy(r->data, s->data + slot * LUME_IO_BYTES, n);
+            lume_worker_copy(r->data, s->data + slot * LUME_IO_BYTES, n);
             memcpy(r->address, &ip_2_ip4(&s->peer)->addr, 4);
             r->port = s->peer_port;
             r->count = n;
@@ -500,8 +507,8 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
             return s->failed ? -(int)s->failure : s->eof ? 0 : -LUME_EAGAIN;
         unsigned n = r->count < s->count ? r->count : s->count;
         unsigned first = n < STREAM_RECEIVE_BYTES - s->first ? n : STREAM_RECEIVE_BYTES - s->first;
-        memcpy(r->data, s->data + s->first, first);
-        memcpy(r->data + first, s->data, n - first);
+        lume_worker_copy(r->data, s->data + s->first, first);
+        lume_worker_copy(r->data + first, s->data, n - first);
         s->first = (s->first + n) % STREAM_RECEIVE_BYTES;
         s->count -= n;
         if (s->pcb)
@@ -569,7 +576,7 @@ int lume_stream_progress(unsigned pid, unsigned op, struct lume_stream_request *
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
     {
         struct stream *s = &streams[i];
-        if (s->owner != pid || s->handle != request->handle)
+        if (s->owner != pid || s->handle != request->handle || s->closing)
             continue;
         if (op == LUME_STREAM_CONNECT)
         {

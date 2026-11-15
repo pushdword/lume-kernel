@@ -3,6 +3,7 @@
 #include "lume/acpi.h"
 #include "lume/hardware.h"
 #include "lume/abi.h"
+#include "lume/worker.h"
 #include <string.h>
 
 #define PCI_DEVICES 192u
@@ -60,16 +61,56 @@ static bool bridge(const struct entry *e)
     return ((lume_q35_pci_read(e->address, 12) >> 16) & 127) == 1;
 }
 
+struct slot_snapshot
+{
+    uint32_t address;
+    unsigned count;
+
+    struct
+    {
+        uint32_t identity, header, buses;
+    } functions[8];
+};
+
+static void read_slot(void *context)
+{
+    struct slot_snapshot *snapshot = context;
+    for (unsigned function = 0; function < 8; ++function)
+    {
+        uint32_t address = snapshot->address | function << 8;
+        uint32_t identity = lume_q35_pci_read(address, 0);
+        if ((identity & 65535) == 65535 && !function)
+            break;
+        uint32_t header = (identity & 65535) == 65535 ? 0 : lume_q35_pci_read(address, 12);
+        snapshot->functions[function].identity = identity;
+        snapshot->functions[function].header = header;
+        snapshot->functions[function].buses =
+            ((header >> 16) & 127) == 1 ? lume_q35_pci_read(address, 24) : 0;
+        ++snapshot->count;
+        if (!function && !(header & 0x00800000))
+            break;
+    }
+}
+
+static void read_unpublished_bars(void *context)
+{
+    struct entry *entry = context;
+    entry->count = lume_q35_pci_bars(entry->address, entry->bars);
+}
+
 static int discover(unsigned bus, unsigned parent, bool visited[256])
 {
     if (visited[bus])
         return 0;
     visited[bus] = true;
     for (unsigned slot = 0; slot < 32; ++slot)
-        for (unsigned function = 0; function < 8; ++function)
+    {
+        struct slot_snapshot snapshot = {.address = bus << 16 | slot << 11};
+        lume_worker_device(read_slot, &snapshot);
+        for (unsigned function = 0; function < snapshot.count; ++function)
         {
             uint32_t address = bus << 16 | slot << 11 | function << 8;
-            uint32_t identity = lume_q35_pci_read(address, 0);
+            uint32_t identity = snapshot.functions[function].identity;
             if ((identity & 65535) == 65535)
             {
                 if (!function)
@@ -89,17 +130,18 @@ static int discover(unsigned bus, unsigned parent, bool visited[256])
                 if (empty == PCI_DEVICES)
                     return -LUME_ENOSPC;
                 n = empty;
-                entries[n] =
-                    (struct entry){.address = address, .identity = identity, .parent = parent};
-                entries[n].count = lume_q35_pci_bars(address, entries[n].bars);
+                struct entry discovered = {
+                    .address = address, .identity = identity, .parent = parent};
+                lume_worker_device(read_unpublished_bars, &discovered);
+                entries[n] = discovered;
             }
             struct entry *e = entries + n;
             /* A retained association at the same BDF must not acquire replacement hardware. */
             if (e->identity == identity)
                 e->seen = true;
-            if (e->seen && bridge(e))
+            if (e->seen && ((snapshot.functions[function].header >> 16) & 127) == 1)
             {
-                uint32_t buses = lume_q35_pci_read(address, 24);
+                uint32_t buses = snapshot.functions[function].buses;
                 unsigned secondary = (buses >> 8) & 255, last = (buses >> 16) & 255;
                 if (secondary > bus && secondary <= last)
                 {
@@ -108,9 +150,8 @@ static int discover(unsigned bus, unsigned parent, bool visited[256])
                         return result;
                 }
             }
-            if (!function && !(lume_q35_pci_read(address, 12) & 0x00800000))
-                break;
         }
+    }
     return 0;
 }
 

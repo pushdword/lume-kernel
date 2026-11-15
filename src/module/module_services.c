@@ -122,8 +122,8 @@ int lume_module_unregister_block(struct lume_block *b)
     return result;
 }
 
-int lume_module_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler,
-                             void *context)
+static int register_interrupt(unsigned irq, unsigned trigger, lume_irq_handler handler,
+                              void *context, bool asynchronous)
 {
     uint64_t flags = lume_irq_save();
     struct registration *r;
@@ -131,12 +131,25 @@ int lume_module_irq_register(unsigned irq, unsigned trigger, lume_irq_handler ha
     if (!result)
     {
         r->irq = irq;
-        result = lume_irq_register(irq, trigger, handler, context);
+        result = asynchronous ? lume_irq_register_async(irq, trigger, handler, context)
+                              : lume_irq_register(irq, trigger, handler, context);
         if (result)
             release(r);
     }
     lume_irq_restore(flags);
     return result;
+}
+
+int lume_module_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler,
+                             void *context)
+{
+    return register_interrupt(irq, trigger, handler, context, false);
+}
+
+int lume_module_irq_register_async(unsigned irq, unsigned trigger, lume_irq_handler handler,
+                                   void *context)
+{
+    return register_interrupt(irq, trigger, handler, context, true);
 }
 
 int lume_module_irq_unregister(unsigned irq, void *context)
@@ -276,7 +289,7 @@ static void run_work(void *context)
     struct lume_work *work = r->object;
     /* A running callback retains its registration while a resubmission gets a new slot. */
     r->kind = RUNNING_WORK;
-    work->queued = false;
+    __atomic_store_n(&work->queued, false, __ATOMIC_RELEASE);
     void (*run)(void *) = work->run;
     void *argument = work->context;
     run(argument);
@@ -291,21 +304,21 @@ int lume_module_work_submit(struct lume_work *work)
     struct registration *running = find(RUNNING_WORK, work);
     struct registration *queued = find(WORK, work);
     if ((running && running->work.domain != work->domain) ||
-        (work->queued && (!queued || queued->work.domain != work->domain)))
+        (lume_work_queued(work) && (!queued || queued->work.domain != work->domain)))
     {
         lume_irq_restore(flags);
         return -LUME_EINVAL;
     }
     struct registration *r;
-    int result = work->queued ? 0 : reserve(WORK, work, (uintptr_t)work->run, &r);
-    if (!result && !work->queued)
+    int result = lume_work_queued(work) ? 0 : reserve(WORK, work, (uintptr_t)work->run, &r);
+    if (!result && !lume_work_queued(work))
     {
         r->work = (struct lume_work){.run = run_work, .context = r, .domain = work->domain};
         result = lume_work_submit(&r->work);
         if (result)
             release(r);
         else
-            work->queued = true;
+            __atomic_store_n(&work->queued, true, __ATOMIC_RELEASE);
     }
     lume_irq_restore(flags);
     return result;
@@ -318,7 +331,7 @@ bool lume_module_work_cancel(struct lume_work *work)
     bool result = r && lume_work_cancel(&r->work);
     if (result)
     {
-        work->queued = false;
+        __atomic_store_n(&work->queued, false, __ATOMIC_RELEASE);
         release(r);
     }
     lume_irq_restore(flags);

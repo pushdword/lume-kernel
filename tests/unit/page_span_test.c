@@ -13,6 +13,16 @@
 
 #include "../../src/mm/pages.c"
 
+uint64_t lume_irq_save(void)
+{
+    return 0;
+}
+
+void lume_irq_restore(uint64_t flags)
+{
+    assert(!flags);
+}
+
 #define REGION_BYTES (4u * 1024u * 1024u)
 static unsigned char *region;
 static uint64_t region_page;
@@ -184,7 +194,7 @@ static void masks_and_search(void)
         }
         uint64_t before = free_count;
         unsigned budget = 0;
-        assert(search_span(begin, end, count, &budget) == expected);
+        assert(search_span(begin, end, count, &budget, NULL) == expected);
         assert(free_count == before - (expected ? count : 0));
         assert(!checkpoints);
         if (expected)
@@ -235,7 +245,7 @@ static void checkpoints_and_collision(void)
     unsigned budget = 0;
     search_budget = &budget;
     uint64_t before = free_count;
-    assert(!search_span(64, 64 + 700 * 64, 2, &budget));
+    assert(!search_span(64, 64 + 700 * 64, 2, &budget, NULL));
     assert(search_checkpoints == 2 && budget == 188 && free_count == before);
     ++cases;
 
@@ -244,7 +254,7 @@ static void checkpoints_and_collision(void)
     budget = 0;
     search_budget = &budget;
     collision = 74;
-    assert(search_span(64, 64 + 16500, 16385, &budget) == 75);
+    assert(search_span(64, 64 + 16500, 16385, &budget, NULL) == 75);
     assert(!collision && occupied(74) && free_count == 16500 - 1 - 16385);
     for (uint64_t page = 64; page < 74; ++page)
         assert(!occupied(page));
@@ -258,7 +268,7 @@ static void checkpoints_and_collision(void)
     budget = 0;
     search_budget = &budget;
     drain_free = true;
-    assert(!search_span(64, 64 + 16500, 16385, &budget));
+    assert(!search_span(64, 64 + 16500, 16385, &budget, NULL));
     assert(!free_count && search_checkpoints == 1 && !budget);
     ++cases;
 

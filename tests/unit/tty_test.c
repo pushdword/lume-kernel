@@ -11,6 +11,19 @@ static struct
 } descriptors[LUME_FD_MAX];
 
 static unsigned last_signal, last_group, signal_count;
+static void (*copy_hook)(void);
+
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    if (bytes >= 4096 && copy_hook)
+    {
+        void (*run)(void) = copy_hook;
+        copy_hook = NULL;
+        run();
+    }
+    memcpy(destination, source, bytes);
+}
+
 static int64_t (*stat_callback)(struct lume_files *, const char *, struct lume_stat *);
 
 void lume_vfs_terminal_stat(int64_t (*callback)(struct lume_files *, const char *,
@@ -100,6 +113,49 @@ int lume_tasks_tty_background(unsigned pid, unsigned session, unsigned group, un
 
 #include "../../src/device/tty.c"
 
+static struct lume_files concurrent_files;
+static struct lume_tty_request concurrent_tty;
+static struct pseudo_terminal *copy_terminal;
+
+static void close_during_copy(void)
+{
+    unsigned char byte = 0;
+    assert(copy_terminal->copying);
+    assert(tty_read(&copy_terminal->ends[0], &byte, 1) == -LUME_EAGAIN);
+    assert(tty_write(&copy_terminal->ends[1], &byte, 1) == -LUME_EAGAIN);
+    assert(lume_tty_call(&concurrent_files, 7, LUME_TTY_FLUSH, &concurrent_tty) == -LUME_EAGAIN);
+    assert(!lume_vfs_close(&concurrent_files, concurrent_tty.fd));
+    assert(!lume_vfs_close(&concurrent_files, concurrent_tty.other));
+    struct lume_tty_request other = {.version = LUME_TTY_VERSION, .bytes = sizeof(other)};
+    assert(!lume_tty_call(&concurrent_files, 7, LUME_TTY_CREATE, &other));
+    assert(((struct tty_end *)descriptors[other.fd].context)->terminal != copy_terminal);
+    assert(!lume_vfs_close(&concurrent_files, other.fd));
+    assert(!lume_vfs_close(&concurrent_files, other.other));
+}
+
+static void raw_ring_cases(void)
+{
+    concurrent_tty =
+        (struct lume_tty_request){.version = LUME_TTY_VERSION, .bytes = sizeof(concurrent_tty)};
+    assert(!lume_tty_call(&concurrent_files, 7, LUME_TTY_CREATE, &concurrent_tty));
+    struct tty_end *master = descriptors[concurrent_tty.fd].context;
+    struct tty_end *slave = descriptors[concurrent_tty.other].context;
+    copy_terminal = master->terminal;
+    copy_terminal->termios = (struct lume_termios){.characters = {[6] = 1}};
+    unsigned char source[4096], result[4096];
+    for (unsigned i = 0; i < sizeof(source); ++i)
+        source[i] = (unsigned char)(i * 37 + 3);
+    assert(tty_write(master, source, sizeof(source)) == sizeof(source));
+    assert(tty_read(slave, result, 3000) == 3000 && !memcmp(source, result, 3000));
+    assert(tty_write(master, source, 3000) == 3000);
+    assert(tty_read(slave, result, sizeof(result)) == sizeof(result));
+    assert(!memcmp(result, source + 3000, 1096));
+    assert(!memcmp(result + 1096, source, 3000));
+    copy_hook = close_during_copy;
+    assert(tty_write(slave, source, sizeof(source)) == sizeof(source));
+    assert(!copy_hook && !copy_terminal->copying);
+}
+
 int main(void)
 {
     struct lume_files files = {0};
@@ -172,5 +228,6 @@ int main(void)
         assert(!lume_vfs_close(&files, slave));
         r.value = 0;
     }
-    puts("PASS PTY canonical editing, EOF, raw bytes, signals, geometry, hangup and reuse");
+    raw_ring_cases();
+    puts("PASS PTY canonical editing, raw rings, concurrent close, geometry, hangup and reuse");
 }

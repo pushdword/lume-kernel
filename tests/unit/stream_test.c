@@ -84,6 +84,21 @@ static unsigned shutdowns;
 static unsigned pauses;
 static bool send_ready_on_pause;
 static bool write_failure;
+static bool exit_during_copy;
+
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    if (exit_during_copy && bytes >= 4096)
+    {
+        exit_during_copy = false;
+        lume_stream_release(2);
+        bool retained = false;
+        for (unsigned i = 0; i < 64; ++i)
+            retained |= receive_allocations[i].memory != NULL;
+        assert(retained && lume_stream_busy());
+    }
+    memcpy(destination, source, bytes);
+}
 
 uint64_t lume_counter_read(void)
 {
@@ -337,6 +352,7 @@ static void chained_ring(void)
     request.count = 1;
     assert(!lume_stream_call(2, LUME_STREAM_RECEIVE, &request));
     lume_stream_release(2);
+    lume_stream_reap();
 }
 
 int main(void)
@@ -417,6 +433,7 @@ int main(void)
     r.count = 12;
     assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == 12);
     lume_stream_release(2);
+    lume_stream_reap();
     assert(lume_stream_call(2, LUME_STREAM_CLOSE, &r) == -LUME_EBADF);
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == 0 && r.handle != first);
     r.count = 1;
@@ -453,6 +470,7 @@ int main(void)
     r.count = 1;
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 0);
     lume_stream_release(2);
+    lume_stream_reap();
     assert(lume_stream_call(2, LUME_STREAM_LISTEN, &r) == 0);
     unsigned listener = r.handle;
     assert(lume_stream_call(2, LUME_STREAM_ACCEPT, &r) == -LUME_EAGAIN);
@@ -486,6 +504,7 @@ int main(void)
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
     assert(lume_stream_call(3, LUME_STREAM_CLOSE, &r) == -LUME_EBADF);
     lume_stream_release(2);
+    lume_stream_reap();
     r.port = 8095;
     assert(lume_stream_call(2, LUME_DATAGRAM_CONNECT, &r) == 0);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
@@ -515,6 +534,7 @@ int main(void)
     r.count = 1200;
     assert(lume_stream_call(2, LUME_STREAM_SEND, &r) == 1200);
     lume_stream_release(2);
+    lume_stream_reap();
     assert(lume_stream_call(2, LUME_DATAGRAM_LISTEN, &r) == 0);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == 0);
     udp_callback(udp_context, &udp, &b, &peer, 8095);
@@ -527,6 +547,7 @@ int main(void)
     r.count = sizeof(r.data);
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == -LUME_EAGAIN);
     lume_stream_release(2);
+    lume_stream_reap();
     assert(lume_stream_call(0, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
     r.version = 0;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
@@ -536,12 +557,29 @@ int main(void)
         .version = LUME_IO_VERSION, .port = 8095, .address = {127, 0, 0, 1}};
     assert(!lume_stream_call(2, LUME_STREAM_CONNECT, &r));
     lume_stream_release(2);
+    lume_stream_reap();
     r.address[0] = 172;
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == -LUME_EINVAL);
     memset(r.address, 0, sizeof(r.address));
     assert(!lume_stream_call(2, LUME_STREAM_LISTEN, &r));
     lume_stream_release(2);
+    lume_stream_reap();
     netif_default = &interface;
+    r = (struct lume_stream_request){
+        .version = LUME_IO_VERSION, .port = 8095, .address = {127, 0, 0, 1}};
+    assert(!lume_stream_call(2, LUME_STREAM_CONNECT, &r));
+    unsigned char large[8192];
+    memset(large, 0x51, sizeof(large));
+    struct pbuf retained = {.payload = large, .len = sizeof(large), .tot_len = sizeof(large)};
+    exit_during_copy = true;
+    assert(pcb.recv(pcb.callback_arg, &pcb, &retained, ERR_OK) == ERR_OK);
+    assert(!exit_during_copy && lume_stream_busy());
+    r.count = sizeof(r.data);
+    assert(lume_stream_nowait(2, LUME_STREAM_RECEIVE, &r) == -LUME_EBADF);
+    lume_stream_reap();
+    assert(!lume_stream_busy());
+    for (unsigned i = 0; i < 64; ++i)
+        assert(!receive_allocations[i].memory);
     puts(
         "PASS TCP ownership, backpressure, EOF, reset, async connect, half-close, listener, pure poll, ACK wake and bounded UDP queues");
 }

@@ -7,6 +7,7 @@
 #ifndef LUME_SCHEDULER_H
 #define LUME_SCHEDULER_H
 #include <stdint.h>
+#include <stdbool.h>
 #include "scheduler_config.h"
 #if defined(__clang__)
 #define SCHED_FAST static inline __attribute__((always_inline))
@@ -123,51 +124,76 @@ static void sched_wake(struct sched_policy *s, unsigned slot, uint32_t unit, uns
     /* Only terminal input starts a burst. Burst handling retains the task's service debt. */
 }
 
-static int sched_pick_mask(const struct sched_policy *s, unsigned core, const unsigned *state,
-                           const uint64_t *excluded, uint32_t unit)
+static int sched_choose_ready(const struct sched_policy *s, unsigned core, const uint64_t *ready,
+                              bool affinity, uint64_t ceiling)
 {
-    uint64_t mask[SCHED_MASK_WORDS];
-    for (unsigned word = 0; word < SCHED_MASK_WORDS; ++word)
-        mask[word] = excluded[word];
-    unsigned skip = s->cpu[core].yielded;
-    if (skip < SCHED_TASKS)
-    {
-        for (unsigned i = 0; i < SCHED_TASKS; i++)
-            if (i != skip && state[i] == 1u && !(mask[i / 64u] & (UINT64_C(1) << (i % 64u))))
-            {
-                mask[skip / 64u] |= UINT64_C(1) << (skip % 64u);
-                break;
-            }
-    }
+    unsigned start = (s->cursor[core] + 1) % SCHED_TASKS;
     int best = -1;
-    for (unsigned n = 1; n <= SCHED_TASKS; n++)
+    for (unsigned range = 0; range < 2; ++range)
     {
-        unsigned i = (s->cursor[core] + n) % SCHED_TASKS;
-        if (state[i] != 1u || (mask[i / 64u] & (UINT64_C(1) << (i % 64u))))
-            continue;
-        if (best < 0 || !LUME_SCHED_FAIR || s->task[i].service < s->task[best].service)
+        unsigned first = range ? 0 : start, end = range ? start : SCHED_TASKS;
+        for (unsigned word = first / 64u; first < end && word <= (end - 1) / 64u; ++word)
         {
-            best = (int)i;
-            if (!LUME_SCHED_FAIR)
-                break;
-        }
-    }
-    /* Affinity provides a bounded preference and must not leave a CPU idle. */
-    if (LUME_SCHED_FAIR && best >= 0 && s->task[best].last_core != core)
-    {
-        uint64_t ceiling = s->task[best].service + unit * 2u;
-        for (unsigned n = 1; n <= SCHED_TASKS; n++)
-        {
-            unsigned i = (s->cursor[core] + n) % SCHED_TASKS;
-            if (state[i] == 1u && !(mask[i / 64u] & (UINT64_C(1) << (i % 64u))) &&
-                s->task[i].last_core == core && s->task[i].service <= ceiling)
+            uint64_t bits = ready[word];
+            if (word == first / 64u)
+                bits &= UINT64_MAX << (first % 64u);
+            if (word == (end - 1) / 64u && end % 64u)
+                bits &= (UINT64_C(1) << (end % 64u)) - 1;
+            while (bits)
             {
-                best = (int)i;
-                break;
+                unsigned i = word * 64u + (unsigned)__builtin_ctzll(bits);
+                bits &= bits - 1;
+                if (affinity)
+                {
+                    if (s->task[i].last_core == core && s->task[i].service <= ceiling)
+                        return (int)i;
+                }
+                else if (best < 0 || !LUME_SCHED_FAIR || s->task[i].service < s->task[best].service)
+                {
+                    best = (int)i;
+                    if (!LUME_SCHED_FAIR)
+                        return best;
+                }
             }
         }
     }
     return best;
+}
+
+static int sched_pick_ready(const struct sched_policy *s, unsigned core, const uint64_t *ready,
+                            const uint64_t *excluded, uint32_t unit)
+{
+    uint64_t eligible[SCHED_MASK_WORDS];
+    unsigned skip = s->cpu[core].yielded;
+    bool other = false;
+    for (unsigned word = 0; word < SCHED_MASK_WORDS; ++word)
+    {
+        eligible[word] = ready[word] & ~excluded[word];
+        uint64_t alternatives = eligible[word];
+        if (skip < SCHED_TASKS && word == skip / 64u)
+            alternatives &= ~(UINT64_C(1) << (skip % 64u));
+        other |= alternatives != 0;
+    }
+    if (other && skip < SCHED_TASKS)
+        eligible[skip / 64u] &= ~(UINT64_C(1) << (skip % 64u));
+    int best = sched_choose_ready(s, core, eligible, false, 0);
+    if (LUME_SCHED_FAIR && best >= 0 && s->task[best].last_core != core)
+    {
+        int local = sched_choose_ready(s, core, eligible, true, s->task[best].service + unit * 2u);
+        if (local >= 0)
+            best = local;
+    }
+    return best;
+}
+
+static int sched_pick_mask(const struct sched_policy *s, unsigned core, const unsigned *state,
+                           const uint64_t *excluded, uint32_t unit)
+{
+    uint64_t ready[SCHED_MASK_WORDS] = {0};
+    for (unsigned i = 0; i < SCHED_TASKS; ++i)
+        if (state[i] == 1u)
+            ready[i / 64u] |= UINT64_C(1) << (i % 64u);
+    return sched_pick_ready(s, core, ready, excluded, unit);
 }
 
 SCHED_FAST int sched_pick(const struct sched_policy *s, unsigned core, const unsigned *state,

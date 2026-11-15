@@ -1298,7 +1298,7 @@ void lume_vm_poll_background(void)
     if (retired_threads)
         (void)lume_work_submit(&thread_reap_work);
     for (struct vm_object *object = file_cache; object; object = object->file_next)
-        if (object->loading && !object->io_running && !object->file_work.queued)
+        if (object->loading && !object->io_running && !lume_work_queued(&object->file_work))
             (void)lume_work_submit(&object->file_work);
 }
 

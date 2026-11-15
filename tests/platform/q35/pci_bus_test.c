@@ -18,6 +18,21 @@ static uint32_t selected;
 static unsigned probes, starts, stops;
 static int stop_error;
 
+uint64_t lume_irq_save(void)
+{
+    return 0;
+}
+
+void lume_irq_restore(uint64_t flags)
+{
+    assert(!flags);
+}
+
+void lume_worker_device(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
 const struct lume_acpi *lume_q35_acpi(void)
 {
     return NULL;

@@ -56,7 +56,7 @@ static void drop_buffer(struct render_buffer *buffer)
 static void poll_buffers(void)
 {
     for (struct render_buffer *buffer = render_buffers; buffer; buffer = buffer->next)
-        if (!buffer->references && !buffer->working && !buffer->reap.queued &&
+        if (!buffer->references && !buffer->working && !lume_work_queued(&buffer->reap) &&
             (!buffer->owner->device->failed || reset_acknowledged(buffer->owner)))
             (void)lume_work_submit(&buffer->reap);
 }
@@ -96,7 +96,7 @@ static void reap_buffer(void *context)
     lume_kernel_free(buffer);
     --owner->anchors;
     if (!owner->anchors && !owner->references && !owner->working && !owner->context &&
-        !owner->resources && !owner->jobs && !owner->reap.queued)
+        !owner->resources && !owner->jobs && !lume_work_queued(&owner->reap))
         release_file(owner);
 }
 

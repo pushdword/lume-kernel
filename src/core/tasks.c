@@ -486,10 +486,15 @@ static bool child_running;
 static int pick_task(void)
 {
     uint64_t excluded[SCHED_MASK_WORDS] = {lume_cpu_index() ? (1u | 1u << 2) : 0};
+    uint64_t ready[SCHED_MASK_WORDS] = {0};
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
-        if (states[i] && process_stopped[thread_slots[i].process] &&
-            !process_exiting[thread_slots[i].process])
-            excluded[i / 64u] |= UINT64_C(1) << (i % 64u);
+        if (states[i] == 1)
+        {
+            ready[i / 64u] |= UINT64_C(1) << (i % 64u);
+            if (process_stopped[thread_slots[i].process] &&
+                !process_exiting[thread_slots[i].process])
+                excluded[i / 64u] |= UINT64_C(1) << (i % 64u);
+        }
     bool timed = false;
     uint64_t at = 0;
     for (unsigned i = 0; public_mode && i <= LUME_WORK_DOMAINS; ++i)
@@ -509,7 +514,7 @@ static int pick_task(void)
                 return (int)task;
         }
     }
-    return sched_pick_mask(&policy, lume_cpu_index(), states, excluded, unit);
+    return sched_pick_ready(&policy, lume_cpu_index(), ready, excluded, unit);
 }
 
 static uint32_t now(void);

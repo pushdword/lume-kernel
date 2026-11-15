@@ -224,6 +224,7 @@ void lume_net_poll(void)
     if (polling)
         return;
     polling = true;
+    lume_stream_reap();
     lume_socket_reap();
     lume_datagram_reap();
     if (!started && !lume_net_start())
@@ -288,6 +289,7 @@ void lume_net_poll(void)
                 netif_set_default(&adapters[i].ip);
                 break;
             }
+    lume_worker_checkpoint(0);
     sys_check_timeouts();
     netif_poll_all();
     for (unsigned i = 0; i < adapter_count; ++i)

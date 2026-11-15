@@ -36,7 +36,7 @@ static struct local_pair *pair_allocate(void)
     for (unsigned i = 0; i < PAIRS; ++i)
     {
         struct local_pair *pair = local_pairs + i;
-        if (pair->open[0] || pair->open[1] || pair->allocating)
+        if (pair->open[0] || pair->open[1] || pair->allocating || pair->active)
             continue;
         pair->allocating = true;
         unsigned char *first = lume_kernel_allocate(LOCAL_BYTES);

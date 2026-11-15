@@ -1446,6 +1446,26 @@ static void independent_resources(void)
     assert(executed[1] == 1 && !lume_worker_busy());
 }
 
+static void descriptor_control_isolation(void)
+{
+    reset();
+    worker_blocked[LUME_WORK_GENERAL] = true;
+    enqueue_domain(0, LUME_WORK_GENERAL);
+    kernel_step();
+    process_owner[1] = 0;
+    enqueue_domain(1, LUME_WORK_CONTROL);
+    task_mutation[1] = true;
+    enqueue_domain(2, LUME_WORK_CONTROL);
+    task_mutation[2] = true;
+    kernel_step();
+    assert(!executed[0] && !executed[1] && executed[2] == 1);
+    assert(kernel_lanes[LUME_WORK_CONTROL].queue.queued[1]);
+    worker_blocked[LUME_WORK_GENERAL] = false;
+    for (unsigned i = 0; i < 3; ++i)
+        kernel_step();
+    assert(executed[0] == 1 && executed[1] == 1 && !lume_worker_busy());
+}
+
 static void render_wait_keeps_display_progress(void)
 {
     reset();
@@ -2187,6 +2207,7 @@ int main(void)
     bounded_resource_turn();
     blocked_worker_keeps_root();
     independent_resources();
+    descriptor_control_isolation();
     high_process_admission();
     denied_worker_call();
     local_messages_during_loading();
