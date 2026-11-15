@@ -1825,6 +1825,7 @@ static bool kernel_render_available(void)
 }
 
 #include "query_calls.h"
+#include "descriptor_calls.h"
 
 bool lume_task_sandbox_ready(unsigned pid)
 {
@@ -1942,6 +1943,8 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         }
     }
     if (public_mode && svc && !process_exiting[process] && kernel_query_call(frame, process))
+        return frame;
+    if (public_mode && svc && !process_exiting[process] && kernel_descriptor_call(frame, process))
         return frame;
     bool console_call = false, pipe_call = false;
     bool independent =

@@ -733,6 +733,53 @@ void *lume_kernel_allocate(size_t bytes)
 #include "io_calls.h"
 #include "pipe_fast.h"
 
+static unsigned metadata_attempts, metadata_records;
+
+bool lume_user_buffer_resident(unsigned pid, uint64_t pointer, size_t bytes, bool write,
+                               uint64_t physical[2])
+{
+    assert(pid == process_slot(current_task) + 1 && pointer &&
+           bytes == sizeof(struct lume_fd_request));
+    (void)write;
+    (void)physical;
+    return resident_ready;
+}
+
+bool lume_vfs_metadata_close(struct lume_files *files, uint64_t fd, unsigned pid, int64_t *result)
+{
+    (void)files;
+    (void)fd;
+    (void)pid;
+    (void)result;
+    assert(false);
+    return false;
+}
+
+bool lume_vfs_metadata_dup2(struct lume_files *files, uint64_t from, uint64_t to, unsigned pid,
+                            int64_t *result)
+{
+    (void)from;
+    return lume_vfs_metadata_close(files, to, pid, result);
+}
+
+bool lume_vfs_metadata_fd(struct lume_files *files, unsigned operation,
+                          struct lume_fd_request *request, unsigned pid, int64_t *result)
+{
+    assert(files == &tasks[process_slot(current_task)].files &&
+           pid == process_slot(current_task) + 1 && operation == LUME_FD_DUP && request->fd == 7);
+    ++metadata_attempts;
+    *result = 19;
+    return true;
+}
+
+static void kernel_record_call(const struct lume_context *frame, unsigned task)
+{
+    assert(task == current_task && frame->x[8] == LUME_SYS_FD);
+    ++metadata_records;
+}
+
+#include "descriptor_calls.h"
+
 static bool kernel_cleanup_ready(unsigned task)
 {
     return kernel_system_cleanup_ready(task);
@@ -1450,6 +1497,38 @@ static void independent_resources(void)
     assert(executed[0] == 1 && !executed[1]);
     kernel_step();
     assert(executed[1] == 1 && !lume_worker_busy());
+}
+
+static void resident_descriptor_isolation(void)
+{
+    reset();
+    metadata_attempts = metadata_records = 0;
+    worker_blocked[LUME_WORK_CONTROL] = true;
+    enqueue_domain(0, LUME_WORK_CONTROL);
+    task_mutation[0] = true;
+    kernel_step();
+    assert(lume_worker_busy_on(LUME_WORK_CONTROL) && !executed[0]);
+    current_task = 1;
+    struct lume_fd_request request = {.version = 1, .bytes = sizeof(request), .fd = 7};
+    struct lume_context frame = {.x = {LUME_FD_DUP, (uintptr_t)&request, sizeof(request)}};
+    frame.x[8] = LUME_SYS_FD;
+    unsigned old_submissions = submissions, old_resumes = resumes, old_checks = storage_checks;
+    assert(kernel_descriptor_call(&frame, 1) && frame.x[0] == 19 && metadata_attempts == 1);
+    assert(metadata_records == 1 && lume_worker_busy_on(LUME_WORK_CONTROL) && !executed[0]);
+    assert(submissions == old_submissions && resumes == old_resumes &&
+           storage_checks == old_checks);
+    frame.x[0] = LUME_FD_DUP;
+    process_owner[1] = 0;
+    assert(!kernel_descriptor_call(&frame, 0) && metadata_attempts == 1);
+    process_owner[1] = 1;
+    struct io_ticket grant = {.task = 2, .generation = 1};
+    kernel_control_queue.generation[2] = 1;
+    io_queue_grant(&kernel_control_queue, grant);
+    assert(!kernel_descriptor_call(&frame, 1) && metadata_attempts == 1);
+    io_queue_cancel(&kernel_control_queue, 2);
+    worker_blocked[LUME_WORK_CONTROL] = false;
+    kernel_step();
+    assert(executed[0] && !lume_worker_busy());
 }
 
 static void descriptor_control_isolation(void)
@@ -2214,6 +2293,7 @@ int main(void)
     blocked_worker_keeps_root();
     independent_resources();
     descriptor_control_isolation();
+    resident_descriptor_isolation();
     high_process_admission();
     denied_worker_call();
     local_messages_during_loading();

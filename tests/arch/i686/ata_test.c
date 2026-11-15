@@ -54,7 +54,7 @@ int lume_irq_unregister(unsigned irq, void *context)
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes && bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
+    assert(bytes == 512);
     ++checkpoints;
     if (check_reentry)
         check_operation();
@@ -344,15 +344,15 @@ int main(void)
     unsigned in_before = input_bursts, out_before = output_bursts;
     unsigned checkpoints_before = checkpoints;
     assert(registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 31, large + 1));
-    assert(output_bursts == out_before + 2 && checkpoints == checkpoints_before + 2);
+    assert(output_bursts == out_before + 31 && checkpoints == checkpoints_before + 31);
     assert(registered->lume_sd_read_blocks(LUME_PC_DATA_FIRST, 31, copy + 1));
-    assert(input_bursts == in_before + 2 && checkpoints == checkpoints_before + 4);
+    assert(input_bursts == in_before + 31 && checkpoints == checkpoints_before + 62);
     assert(!memcmp(large + 1, copy + 1, 31 * 512));
     out_before = output_bursts;
     previous_flushes = flushes;
     fail_after = completed_sectors + 16;
     assert(!registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 31, large + 1));
-    assert(output_bursts == out_before + 1 && flushes == previous_flushes && dirty && failed);
+    assert(output_bursts == out_before + 16 && flushes == previous_flushes && dirty && failed);
     fail_after = pending_sectors = phase = 0;
     dirty = error_status = failed = false;
     unsigned invalid[] = {0, 0x10, 0x103, 0x120};

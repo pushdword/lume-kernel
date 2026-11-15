@@ -26,7 +26,9 @@ unsigned lume_worker_current(void);
 uint64_t lume_worker_lock_wait_on(unsigned slot);
 /* Compute callbacks use pinned RAM and cache operations with IRQs masked. The worker keeps
  * subsystem ownership while releasing the scheduler lock. Callbacks must not allocate,
- * access device registers, invoke kernel services or suspend. Calls outside a worker run inline. */
+ * access device registers, invoke services requiring the scheduler lock or suspend. Releasing
+ * unpublished allocations through independent allocator locks is permitted. Calls outside a
+ * worker run inline. */
 void lume_worker_compute(void (*run)(void *), void *context);
 /* Device callbacks access resident registers belonging to the active subsystem.
  * They release the scheduler lock and retain subsystem admission. They must not

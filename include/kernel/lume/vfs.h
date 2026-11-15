@@ -101,6 +101,12 @@ int64_t lume_vfs_posix_lock(struct lume_files *, unsigned, bool, struct lume_fil
 int64_t lume_vfs_process_close(struct lume_files *, uint64_t, unsigned);
 int64_t lume_vfs_process_dup2(struct lume_files *, uint64_t, uint64_t, unsigned);
 int64_t lume_vfs_process_fd_call(struct lume_files *, unsigned, struct lume_fd_request *, unsigned);
+/* Metadata attempts require caller serialization through completion. A false result
+ * leaves descriptors unchanged. Successful attempts do not allocate or call providers. */
+bool lume_vfs_metadata_close(struct lume_files *, uint64_t, unsigned, int64_t *);
+bool lume_vfs_metadata_dup2(struct lume_files *, uint64_t, uint64_t, unsigned, int64_t *);
+bool lume_vfs_metadata_fd(struct lume_files *, unsigned, struct lume_fd_request *, unsigned,
+                          int64_t *);
 void lume_vfs_process_exec(struct lume_files *, unsigned);
 void lume_vfs_process_release(unsigned);
 int64_t lume_vfs_stat(struct lume_files *, uint64_t fd, struct lume_stat *);

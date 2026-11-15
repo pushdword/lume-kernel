@@ -423,7 +423,7 @@ $(OUT)/tests/io-classify$(HOSTEXE): tests/unit/io_classify_test.c src/core/io_cl
 check-io-calls: $(OUT)/tests/io-calls$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/io-calls$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AARCH64=1
-$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/pipe_fast.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h include/kernel/lume/vm.h
+$(OUT)/tests/io-calls$(HOSTEXE): tests/unit/io_calls_test.c src/core/io_calls.h src/core/descriptor_calls.h src/core/pipe_fast.h src/core/io_queue.h src/core/io_domains.h src/core/io_dispatch.h src/core/stream_calls.h src/core/netctl_calls.h src/core/dns_calls.h src/core/scheduler_config.h include/kernel/lume/task_limits.h include/kernel/lume/net.h include/kernel/lume/wireless.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 $(OUT)/tests/io-calls$(HOSTEXE): TEST_CPPFLAGS += -Isrc/core
@@ -479,7 +479,9 @@ $(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/contex
 $(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel "$<" -o "$@"
-$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 $(OUT)/tests/poll$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
@@ -503,7 +505,7 @@ $(OUT)/tests/wifi-scan$(HOSTEXE): tests/unit/wifi_scan_test.c drivers/net/cyw434
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service stream,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service stream poll,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
@@ -1074,3 +1076,17 @@ $(OUT)/tests/task-state$(HOSTEXE): tests/unit/task_state_test.c src/core/task_st
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Isrc/core "$<" -o "$@"
 check-poll-events: $(OUT)/tests/poll$(HOSTEXE)
 	env "$<"
+
+.PHONY: check-descriptor-calls
+check-descriptor-calls: $(OUT)/tests/descriptor-calls$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/descriptor-calls$(HOSTEXE): tests/unit/descriptor_calls_test.c src/core/descriptor_calls.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+
+.PHONY: check-vfs-metadata
+check-vfs-metadata: $(OUT)/tests/vfs-metadata$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/vfs-metadata$(HOSTEXE): tests/unit/vfs_metadata_test.c src/fs/vfs/vfs.c tests/fixtures/vfs_unrestricted_services.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_COMPUTE_PROVIDED=1 -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"

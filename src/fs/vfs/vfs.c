@@ -1436,6 +1436,13 @@ void lume_files_move(struct lume_files *out, struct lume_files *in)
 #endif
 }
 
+#if LUME_FILES_DYNAMIC
+static void release_descriptor_table(void *table)
+{
+    lume_kernel_free(table);
+}
+#endif
+
 void lume_files_release(struct lume_files *f)
 {
     struct lume_directory_authorities *authorities = f->directory_authorities;
@@ -1476,7 +1483,7 @@ void lume_files_release(struct lume_files *f)
     lume_poll_sources_retire_range(f->fd, sizeof(*f->fd) * LUME_FD_MAX);
     struct lume_fd *table = f->fd;
     f->fd = NULL;
-    lume_kernel_free(table);
+    lume_worker_compute(release_descriptor_table, table);
 #endif
 }
 

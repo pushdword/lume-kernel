@@ -92,4 +92,58 @@ void lume_vfs_process_release(unsigned pid)
 {
     process_locks_drop(pid, -1);
 }
+
+bool lume_vfs_metadata_close(struct lume_files *files, uint64_t fd, unsigned pid, int64_t *result)
+{
+    struct open_file *description = descriptor(files, fd);
+    if (!description || description->references < 2)
+        return false;
+    *result = lume_vfs_process_close(files, fd, pid);
+    return true;
+}
+
+static bool metadata_replacement(struct lume_files *files, uint64_t from, uint64_t to)
+{
+    if (!descriptor(files, from) || to >= LUME_FD_MAX)
+        return false;
+    struct open_file *target = descriptor(files, to);
+    return from == to || !target || target->references > 1;
+}
+
+bool lume_vfs_metadata_dup2(struct lume_files *files, uint64_t from, uint64_t to, unsigned pid,
+                            int64_t *result)
+{
+    if (!metadata_replacement(files, from, to))
+        return false;
+    *result = lume_vfs_process_dup2(files, from, to, pid);
+    return true;
+}
+
+bool lume_vfs_metadata_fd(struct lume_files *files, unsigned operation,
+                          struct lume_fd_request *request, unsigned pid, int64_t *result)
+{
+#if LUME_FILES_DYNAMIC
+    if (!files->fd)
+        return false;
+#endif
+    switch (operation)
+    {
+    case LUME_FD_GETFD:
+    case LUME_FD_SETFD:
+    case LUME_FD_GETFL:
+    case LUME_FD_SETFL:
+    case LUME_FD_GETMODE:
+    case LUME_FD_SETMODE:
+    case LUME_FD_DUP:
+        break;
+    case LUME_FD_DUP2:
+        if (!metadata_replacement(files, (uint64_t)request->fd, (uint64_t)request->other))
+            return false;
+        break;
+    default:
+        return false;
+    }
+    *result = lume_vfs_process_fd_call(files, operation, request, pid);
+    return true;
+}
 #endif

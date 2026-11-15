@@ -102,14 +102,17 @@ static bool read_blocks_owned(uint64_t sector, unsigned count, void *buffer)
         unsigned part = count - block;
         if (part > multiple_sectors)
             part = multiple_sectors;
-        lume_ins16(DATA, out, part * 256);
-        out += part * 512;
+        for (unsigned sector = 0; sector < part; ++sector)
+        {
+            lume_ins16(DATA, out, 256);
+            out += 512;
+            lume_worker_checkpoint(512);
+        }
         block += part;
         delay();
         if (!wait_status(block < count))
             return false;
         reads += part;
-        lume_worker_checkpoint(part * 512);
     }
     return true;
 }
@@ -128,13 +131,16 @@ static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buff
         unsigned part = count - block;
         if (part > multiple_sectors)
             part = multiple_sectors;
-        lume_outs16(DATA, in, part * 256);
-        in += part * 512;
+        for (unsigned sector = 0; sector < part; ++sector)
+        {
+            lume_outs16(DATA, in, 256);
+            in += 512;
+            lume_worker_checkpoint(512);
+        }
         block += part;
         delay();
         if (!wait_status(block < count))
             return false;
-        lume_worker_checkpoint(part * 512);
     }
     writes += count;
     return true;

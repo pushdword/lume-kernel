@@ -81,10 +81,7 @@ static struct lume_work thread_reap_work = {.run = reap_threads, .domain = LUME_
 
 static void *allocate(size_t size)
 {
-    void *memory = lume_kernel_allocate(size);
-    if (memory)
-        memset(memory, 0, size);
-    return memory;
+    return lume_kernel_allocate(size);
 }
 
 static uint64_t rounded(uint64_t bytes)

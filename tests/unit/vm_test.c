@@ -70,7 +70,7 @@ void *lume_kernel_allocate(size_t size)
         return NULL;
     if (metadata_budget > 0)
         --metadata_budget;
-    void *value = malloc(size);
+    void *value = calloc(1, size);
     if (value)
     {
         ++metadata_live;

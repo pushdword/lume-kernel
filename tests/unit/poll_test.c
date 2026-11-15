@@ -355,6 +355,50 @@ static void pipe_pool_test(void)
     }
 }
 
+static void resident_metadata_test(void)
+{
+    struct lume_files files;
+    lume_files_init(&files);
+    struct lume_fd_request pipe = pipe_create(&files);
+    struct lume_fd_request request = {
+        .version = LUME_FD_VERSION, .bytes = sizeof(request), .fd = pipe.fd};
+    int64_t result = -1;
+    T(lume_vfs_metadata_fd(&files, LUME_FD_DUP, &request, 1, &result) && result >= 0);
+    int copy = (int)result;
+    T(!lume_vfs_metadata_close(&files, pipe.other, 1, &result));
+    T(lume_vfs_write(&files, pipe.other, "x", 1) == 1);
+    char byte;
+    T(lume_vfs_read(&files, copy, &byte, 1) == 1 && byte == 'x');
+    request.fd = copy;
+    request.flags = LUME_FD_NONBLOCK;
+    T(lume_vfs_metadata_fd(&files, LUME_FD_SETFL, &request, 1, &result) && !result);
+    request.fd = pipe.fd;
+    request.flags = 0;
+    T(lume_vfs_metadata_fd(&files, LUME_FD_GETFL, &request, 1, &result) &&
+      result == LUME_FD_NONBLOCK);
+    request.fd = copy;
+    request.flags = LUME_FD_CLOEXEC;
+    T(lume_vfs_metadata_fd(&files, LUME_FD_SETFD, &request, 1, &result) && !result);
+    request.fd = pipe.fd;
+    request.flags = 0;
+    T(lume_vfs_metadata_fd(&files, LUME_FD_GETFD, &request, 1, &result) && !result);
+    T(lume_vfs_metadata_close(&files, copy, 1, &result) && !result);
+    T(!lume_vfs_metadata_close(&files, pipe.fd, 1, &result));
+    T(!lume_vfs_metadata_dup2(&files, pipe.fd, pipe.other, 1, &result));
+    T(lume_vfs_write(&files, pipe.other, "y", 1) == 1);
+    T(lume_vfs_read(&files, pipe.fd, &byte, 1) == 1 && byte == 'y');
+    T(lume_vfs_metadata_dup2(&files, pipe.fd, copy, 1, &result) && result == copy);
+    struct lume_socket_request pair = pair_create(&files);
+    T(!lume_vfs_metadata_dup2(&files, pipe.fd, pair.fd, 1, &result));
+    request.fd = pipe.fd;
+    request.other = pair.fd;
+    T(!lume_vfs_metadata_fd(&files, LUME_FD_DUP2, &request, 1, &result));
+    T(lume_vfs_write(&files, pair.other, "z", 1) == 1);
+    T(lume_vfs_read(&files, pair.fd, &byte, 1) == 1 && byte == 'z');
+    T(!lume_vfs_metadata_fd(&files, LUME_FD_PIPE, &request, 1, &result));
+    lume_files_release(&files);
+}
+
 int main(void)
 {
     struct lume_files files, clone;
@@ -633,6 +677,7 @@ int main(void)
     credentials_test();
     pipe_pool_test();
     high_waiters_test();
+    resident_metadata_test();
     printf(
         "PASS_POLL checks=%u object isolation, aliases, fork, generations, teardown and cancel\n",
         checks);

@@ -56,10 +56,12 @@ void lume_fail(const char *message)
     abort();
 }
 
+#ifndef LUME_VFS_HOST_COMPUTE_PROVIDED
 void lume_worker_compute(void (*run)(void *), void *context)
 {
     run(context);
 }
+#endif
 
 void lume_worker_copy(void *destination, const void *source, size_t bytes)
 {
