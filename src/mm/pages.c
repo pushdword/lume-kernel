@@ -21,6 +21,83 @@ static uint64_t total_count;
 static uint64_t region_cursor[16], region_pages;
 static unsigned region_count, next_region;
 
+#define PAGE_PIN_BUCKETS 1024u
+#define PAGE_PIN_LIMIT 256u
+_Static_assert(PAGE_PIN_LIMIT >= LUME_WORKER_LIMIT * 17u, "concurrent user copy page capacity");
+
+static struct page_pin
+{
+    uint64_t page;
+    uint16_t references, next;
+    bool deferred;
+} pins[PAGE_PIN_LIMIT + 1];
+
+static uint16_t pin_buckets[PAGE_PIN_BUCKETS], pin_free;
+
+static void pins_start(void)
+{
+    for (unsigned i = 0; i < PAGE_PIN_BUCKETS; ++i)
+        pin_buckets[i] = 0;
+    for (unsigned i = 1; i <= PAGE_PIN_LIMIT; ++i)
+        pins[i] = (struct page_pin){.next = i < PAGE_PIN_LIMIT ? i + 1 : 0};
+    pin_free = 1;
+}
+
+static uint16_t *pin_find(uint64_t page)
+{
+    uint16_t *link = &pin_buckets[(page / 4096u) % PAGE_PIN_BUCKETS];
+    while (*link && pins[*link].page != page)
+        link = &pins[*link].next;
+    return link;
+}
+
+bool lume_page_pin(uint64_t page)
+{
+    if (!page || (page & 4095u))
+        return false;
+    uint64_t index = page / 4096u, mask = UINT64_C(1) << (index & 63);
+    /* Reserved mappings cannot be returned to this allocator. */
+    if (page >= PHYSICAL_LIMIT || !(managed[index / 64] & mask))
+        return true;
+    if (!(used[index / 64] & mask))
+        return false;
+    uint16_t *link = pin_find(page);
+    if (*link)
+    {
+        struct page_pin *pin = &pins[*link];
+        if (pin->deferred || pin->references == UINT16_MAX)
+            return false;
+        ++pin->references;
+        return true;
+    }
+    if (!pin_free)
+        return false;
+    uint16_t slot = pin_free;
+    pin_free = pins[slot].next;
+    pins[slot] = (struct page_pin){.page = page, .references = 1};
+    *link = slot;
+    return true;
+}
+
+void lume_page_unpin(uint64_t page)
+{
+    uint16_t *link = pin_find(page), slot = *link;
+    if (!slot)
+        return;
+    struct page_pin *pin = &pins[slot];
+    if (--pin->references)
+        return;
+    if (pin->deferred)
+    {
+        uint64_t index = page / 4096u;
+        used[index / 64] &= ~(UINT64_C(1) << (index & 63));
+        ++free_count;
+    }
+    *link = pin->next;
+    pin->next = pin_free;
+    pin_free = slot;
+}
+
 static bool overlaps(uint64_t a, uint64_t size, uint64_t b, uint64_t bytes)
 {
     return a < b + bytes && b < a + size;
@@ -35,6 +112,7 @@ void lume_pages_start(const struct lume_fdt *fdt, uint64_t dtb, uint64_t image_s
     free_count = 0;
     cursor = 0;
     span_cursor = 1;
+    pins_start();
     for (unsigned i = 0; i < MAX_PAGES / 64; ++i)
     {
         used[i] = UINT64_MAX;
@@ -332,6 +410,14 @@ bool lume_page_free(uint64_t page)
     uint64_t p = page / 4096, mask = UINT64_C(1) << (p & 63);
     if (!(managed[p / 64] & mask) || !(used[p / 64] & mask))
         return false;
+    uint16_t slot = *pin_find(page);
+    if (slot)
+    {
+        if (pins[slot].deferred)
+            return false;
+        pins[slot].deferred = true;
+        return true;
+    }
     used[p / 64] &= ~mask;
     ++free_count;
     return true;

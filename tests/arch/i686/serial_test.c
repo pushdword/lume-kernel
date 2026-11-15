@@ -33,7 +33,8 @@ void lume_out8(uint16_t port, uint8_t value)
     assert((port == 0x3fa && value == 7) || (port == 0x3f9 && value == 5));
 }
 
-int lume_irq_register(unsigned irq, unsigned trigger, lume_irq_handler callback, void *context)
+int lume_irq_register_async(unsigned irq, unsigned trigger, lume_irq_handler callback,
+                            void *context)
 {
     assert(irq == 36 && trigger == LUME_IRQ_EDGE && !context);
     handler = callback;

@@ -1,5 +1,6 @@
 #include "lume/vfs.h"
 #include "lume/external_file.h"
+#include "lume/worker.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +17,14 @@ static unsigned opens, closes, live, path_reads, path_writes, handle_reads, hand
 static unsigned syncs, resizes;
 static int open_error, close_error, read_error, write_error, resize_error, sync_error;
 static unsigned short_write;
+static unsigned checkpoint_calls;
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(!bytes);
+    ++checkpoint_calls;
+}
+
 static unsigned char data[256];
 
 static struct handle
@@ -302,12 +311,43 @@ static void deferred_cleanup(void)
     lume_files_release(&files);
 }
 
+static void deferred_descriptors(void)
+{
+    lume_vfs_init(NULL, 0);
+    assert(lume_vfs_mount_storage(&operations));
+    struct lume_files files;
+    assert(lume_files_init(&files));
+    lume_vfs_reap_start();
+    int source = (int)lume_vfs_open(&files, "/data/file", LUME_O_RDONLY);
+    int target = (int)lume_vfs_open(&files, "/data/file", LUME_O_RDONLY);
+    assert(source >= 3 && target > source && live == 2);
+    unsigned before = closes;
+    assert(lume_vfs_dup2(&files, source, target) == target);
+    assert(closes == before && live == 2 && lume_vfs_reap_pending());
+    assert(lume_vfs_reap(1) == 1 && live == 1);
+    unsigned checkpoints_before = checkpoint_calls;
+    lume_files_release(&files);
+    assert(checkpoint_calls == checkpoints_before);
+    assert(live == 1 && closes == before + 1 && lume_vfs_reap_pending());
+    assert(lume_vfs_reap(1) == 1 && !live && !lume_vfs_reap_pending());
+    assert(lume_files_init(&files));
+    source = (int)lume_vfs_open(&files, "/data/file", LUME_O_RDONLY);
+    assert(source >= 3 && live == 1);
+    for (unsigned fd = 20; fd < 36; ++fd)
+        assert(lume_vfs_dup2(&files, source, fd) == fd);
+    checkpoints_before = checkpoint_calls;
+    lume_files_release(&files);
+    assert(checkpoint_calls == checkpoints_before + 1 && live == 1);
+    assert(lume_vfs_reap(1) == 1 && !live);
+}
+
 int main(void)
 {
     lifetime();
     errors();
     fallback_and_reset();
     deferred_cleanup();
+    deferred_descriptors();
     puts("PASS_STORAGE_HANDLES lifetime, offsets, rights, errors, fallback and reset");
     return 0;
 }

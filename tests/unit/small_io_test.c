@@ -220,6 +220,73 @@ static void admitted_vectors(void)
     shared_cleanup();
 }
 
+static int retained_pipe_reading, retained_pipe_writing;
+static unsigned retained_pipe_action, retained_pipe_mutations;
+static unsigned char retained_pipe_data[16384], retained_pipe_output[16384];
+
+static void mutate_retained_pipe(void)
+{
+    CHECK(!locked && workers[LUME_WORK_STORAGE].computing);
+    cpu_index = 1;
+    lume_smp_lock();
+    unsigned char byte = 0;
+    CHECK(lume_vfs_pipe_accept(&files[0], retained_pipe_reading, 1, false) == -LUME_EAGAIN);
+    CHECK(lume_vfs_pipe_accept(&files[0], retained_pipe_writing, 1, true) == -LUME_EAGAIN);
+    CHECK(lume_vfs_read(&files[0], retained_pipe_reading, &byte, 1) == -LUME_EAGAIN);
+    CHECK(lume_vfs_write(&files[0], retained_pipe_writing, &byte, 1) == -LUME_EAGAIN);
+    CHECK(lume_vfs_close(&files[0], retained_pipe_writing) == 0);
+    if (retained_pipe_action == 1)
+        CHECK(lume_vfs_close(&files[0], retained_pipe_reading) == 0);
+    lume_smp_unlock();
+    cpu_index = 0;
+    ++retained_pipe_mutations;
+}
+
+static void retained_pipe_job(void *context)
+{
+    (void)context;
+    copy_mutation = mutate_retained_pipe;
+    if (!retained_pipe_action)
+        CHECK(lume_vfs_write(&files[0], retained_pipe_writing, retained_pipe_data,
+                             sizeof(retained_pipe_data)) == sizeof(retained_pipe_data));
+    else if (retained_pipe_action == 1)
+        CHECK(lume_vfs_read(&files[0], retained_pipe_reading, retained_pipe_output,
+                            sizeof(retained_pipe_output)) == sizeof(retained_pipe_output));
+    else
+        lume_vfs_pipe_grow(&files[0], retained_pipe_writing, 65536);
+    CHECK(!copy_mutation);
+}
+
+static void retained_pipe_copies(void)
+{
+    for (unsigned i = 0; i < sizeof(retained_pipe_data); ++i)
+        retained_pipe_data[i] = (unsigned char)(i * 37u);
+    for (retained_pipe_action = 0; retained_pipe_action < 3; ++retained_pipe_action)
+    {
+        struct lume_fd_request pipe = {.version = LUME_FD_VERSION, .bytes = sizeof(pipe)};
+        CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &pipe) == 0);
+        retained_pipe_reading = pipe.fd;
+        retained_pipe_writing = pipe.other;
+        lume_vfs_pipe_grow(&files[0], pipe.other, sizeof(retained_pipe_data));
+        if (retained_pipe_action)
+            CHECK(lume_vfs_write(&files[0], pipe.other, retained_pipe_data,
+                                 sizeof(retained_pipe_data)) == sizeof(retained_pipe_data));
+        memset(retained_pipe_output, 0, sizeof(retained_pipe_output));
+        CHECK(lume_worker_submit_on(LUME_WORK_STORAGE, retained_pipe_job, NULL));
+        CHECK(lume_worker_resume_on(LUME_WORK_STORAGE));
+        CHECK(!lume_worker_busy_on(LUME_WORK_STORAGE));
+        if (retained_pipe_action != 1)
+        {
+            CHECK(lume_vfs_read(&files[0], pipe.fd, retained_pipe_output,
+                                sizeof(retained_pipe_output)) == sizeof(retained_pipe_output));
+            CHECK(lume_vfs_read(&files[0], pipe.fd, retained_pipe_output, 1) == 0);
+            CHECK(lume_vfs_close(&files[0], pipe.fd) == 0);
+        }
+        CHECK(!memcmp(retained_pipe_output, retained_pipe_data, sizeof(retained_pipe_data)));
+    }
+    CHECK(retained_pipe_mutations == 3);
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -303,10 +370,15 @@ int main(void)
     shared_cleanup();
     resident_pipes();
     admitted_vectors();
+    retained_pipe_copies();
     for (unsigned i = 0; i < 3; ++i)
         lume_files_release(&files[i]);
+    lume_vfs_init(NULL, 0);
     while (retired)
         reap(NULL);
+    if (frame_live != initial_frames || allocation_live != baseline_metadata)
+        fprintf(stderr, "SMALL_IO_LIVE frames=%u expected=%u metadata=%u expected=%u\n", frame_live,
+                initial_frames, allocation_live, baseline_metadata);
     CHECK(frame_live == initial_frames && allocation_live == baseline_metadata);
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
         release_fiber(&workers[i].fiber);

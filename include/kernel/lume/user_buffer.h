@@ -14,12 +14,13 @@ struct lume_user_buffer_token
     uint64_t first, bytes, root;
     uint64_t physical[LUME_USER_BUFFER_PAGES];
     unsigned owner, pages;
+    uint32_t copying;
     bool write, valid, registered;
 };
 
-/* The scheduler lock protects token registration and every final copy. Preparation
- * may resolve faults before it registers the completed destination identity.
- * Release a registered token before preparing it again. */
+/* The scheduler lock protects registration and identity validation. Large worker
+ * copies pin physical aliases until completion. Invalidators never wait for a copy.
+ * Retired frames become reusable after the final pin. Release before token reuse. */
 /* Output tokens also permit capturing input from the same retained identity.
  * Input-only tokens never permit a write. Resource exhaustion returns ENOMEM. */
 int lume_user_buffer_acquire(struct lume_user_buffer_token *, unsigned, uint64_t, size_t, bool);

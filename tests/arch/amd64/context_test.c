@@ -15,10 +15,41 @@ void lume_syscall_entry(void)
 static bool held;
 static unsigned locks, unlocks, flushes, eois, pic, activity_calls, ticks, devices, faults;
 static struct lume_context replacement;
+static bool async_irq;
+static unsigned async_calls;
 
 unsigned lume_cpu_index(void)
 {
     return 0;
+}
+
+unsigned lume_cpu_count(void)
+{
+    return 4;
+}
+
+uint64_t lume_clock_read(void)
+{
+    return 0;
+}
+
+bool lume_task_pipe_try(unsigned task, uint64_t fd, uint64_t address, uint64_t bytes, bool writing,
+                        int64_t *result)
+{
+    (void)task;
+    (void)fd;
+    (void)address;
+    (void)bytes;
+    (void)writing;
+    (void)result;
+    return false;
+}
+
+bool lume_task_pipe_terminal_request(unsigned task, uint64_t address)
+{
+    (void)task;
+    (void)address;
+    return false;
 }
 
 bool lume_smp_owned(void)
@@ -66,6 +97,15 @@ bool lume_irq_dispatch(unsigned vector)
 {
     assert(held && vector >= 32 && vector < 48);
     ++pic;
+    return true;
+}
+
+bool lume_irq_dispatch_async(unsigned vector)
+{
+    assert(!held && vector >= 32 && vector < 48);
+    if (!async_irq)
+        return false;
+    ++async_calls;
     return true;
 }
 
@@ -142,6 +182,8 @@ _Noreturn void lume_fail(const char *why)
 static void reset(void)
 {
     held = false;
+    async_irq = false;
+    async_calls = 0;
     locks = unlocks = flushes = eois = pic = activity_calls = ticks = devices = faults = 0;
 }
 
@@ -191,6 +233,10 @@ int main(void)
     reset();
     assert(lume_amd64_exception(&frame, LUME_APIC_WAKE, 0) == &frame);
     assert(devices == 1 && eois == 1 && activity_calls == 1 && !faults);
+    reset();
+    async_irq = true;
+    assert(lume_amd64_exception(&frame, 46, 0) == &frame);
+    assert(async_calls == 1 && !pic && !eois && devices == 1 && locks == 1 && unlocks == 1);
     puts(
         "AMD64_CONTEXT_PASS raw TLB acknowledgements, held-lock entry, invalid user contexts and IRQ completion");
     return 0;

@@ -12,6 +12,8 @@ enum lume_work_domain
     LUME_WORK_DISPLAY,
     LUME_WORK_USB,
     LUME_WORK_RENDER,
+    LUME_WORK_MEMORY,
+    LUME_WORK_DEVICE,
     LUME_WORK_DOMAINS
 };
 

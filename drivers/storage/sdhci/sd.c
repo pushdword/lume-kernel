@@ -10,6 +10,7 @@
 #include "lume/device.h"
 #include "lume/block.h"
 #include "lume/irq.h"
+#include "lume/irq_async.h"
 #include "lume/abi.h"
 #include "lume/worker.h"
 #ifndef LUME_SD_POLL
@@ -58,7 +59,7 @@ static void irq_handler(unsigned irq, void *context)
         __atomic_store_n(&retune_requested, true, __ATOMIC_RELEASE);
     __atomic_fetch_or(&pending, status, __ATOMIC_RELEASE);
     wr(0x30, status);
-    ++interrupts;
+    __atomic_fetch_add(&interrupts, 1, __ATOMIC_RELAXED);
 }
 
 bool lume_sd_configure(uint64_t base, uint64_t size, uint32_t irq)
@@ -519,7 +520,7 @@ static int probe(struct lume_device *d)
     if (!lume_irq_available())
         return -LUME_EIO;
     __atomic_store_n(&pending, 0, __ATOMIC_RELEASE);
-    interrupts = 0;
+    __atomic_store_n(&interrupts, 0, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -539,8 +540,8 @@ static int start(struct lume_device *d)
     block.sectors = capacity;
     if (resources[1].base && !LUME_SD_POLL)
     {
-        int result =
-            lume_irq_register((unsigned)resources[1].base, LUME_IRQ_LEVEL, irq_handler, &device);
+        int result = lume_irq_register_async((unsigned)resources[1].base, LUME_IRQ_LEVEL,
+                                             irq_handler, &device);
         if (result)
             return result;
         irq_registered = true;
@@ -774,7 +775,7 @@ void lume_sd_stats(void)
     lume_value("SD_WRITTEN_SECTORS", writes);
     lume_value("SD_ERRORS", errors);
     lume_value("SD_REJECTED_WRITES", rejected);
-    lume_value("SD_IRQ_HANDLED", interrupts);
+    lume_value("SD_IRQ_HANDLED", __atomic_load_n(&interrupts, __ATOMIC_RELAXED));
     lume_value("SD_BUS_HZ", bus_hz);
     lume_value("SD_SIGNAL_MV", voltage_1v8 ? 1800 : 3300);
     lume_worker_stats();

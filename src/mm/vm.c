@@ -76,8 +76,8 @@ static bool changing[LUME_TASK_LIMIT];
 static void reap(void *);
 static void reap_threads(void *);
 static struct vm_area *retired_threads, *retired_threads_tail;
-static struct lume_work reap_work = {.run = reap, .domain = LUME_WORK_GENERAL};
-static struct lume_work thread_reap_work = {.run = reap_threads, .domain = LUME_WORK_GENERAL};
+static struct lume_work reap_work = {.run = reap, .domain = LUME_WORK_MEMORY};
+static struct lume_work thread_reap_work = {.run = reap_threads, .domain = LUME_WORK_MEMORY};
 
 static void *allocate(size_t size)
 {

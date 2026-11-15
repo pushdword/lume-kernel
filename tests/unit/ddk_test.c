@@ -208,7 +208,7 @@ int main(void)
     T(rectangle == 120);
     struct lume_wait_queue wait = {0};
     T(lume_wait_subscribe(&wait, 0) && lume_wait_subscribe(&wait, 63));
-    T(!lume_wait_take(&wait, 0) && !lume_wait_subscribe(&wait, 64));
+    T(!lume_wait_take(&wait, 0) && !lume_wait_subscribe(&wait, LUME_WAIT_TASK_LIMIT));
     lume_wait_wake(&wait);
     T(lume_wait_take(&wait, 63) && !lume_wait_take(&wait, 63));
     lume_wait_cancel(&wait, 0);

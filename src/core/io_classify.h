@@ -9,6 +9,7 @@
 #include "lume/signal.h"
 #include "lume/vm.h"
 #include "lume/realtime_abi.h"
+#include "fd.h"
 
 #define KERNEL_IO_EXCLUSIVE LUME_WORK_DOMAINS
 
@@ -61,6 +62,8 @@ static bool kernel_call_mutates(const struct lume_context *frame)
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_RESOURCE_EXPORT ||
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_EXPORT ||
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_IMPORT;
+    case LUME_SYS_VM:
+        return LUME_CONTEXT_REG(frame, 0) != LUME_VM_INFO;
     case LUME_SYS_CREDENTIAL:
         return LUME_CONTEXT_REG(frame, 0) != LUME_CREDENTIAL_GET &&
                LUME_CONTEXT_REG(frame, 0) != LUME_CREDENTIAL_LIMIT_GET;
@@ -76,7 +79,7 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
     uint64_t action = LUME_CONTEXT_REG(frame, 0);
     if (process_exiting[process])
-        return KERNEL_IO_EXCLUSIVE;
+        return process ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
     if (kernel_local_control_call(frame))
         return LUME_WORK_GENERAL;
     switch (number)
@@ -86,10 +89,13 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_CLOSE:
         if (action < LUME_FD_MAX && lume_socket_network_io(files, (unsigned)action))
             return LUME_WORK_NETWORK;
-        if (number == LUME_SYS_CLOSE && !lume_vfs_storage_io(files, action) &&
-            !lume_vfs_pipe_io(files, action))
-            return KERNEL_IO_EXCLUSIVE;
+        if (number == LUME_SYS_CLOSE && !lume_vfs_storage_io(files, action))
+            return LUME_WORK_GENERAL;
         return LUME_WORK_STORAGE;
+    case LUME_SYS_DUP2:
+        return LUME_WORK_GENERAL;
+    case LUME_SYS_FD:
+        return action == LUME_FD_SPAWN ? LUME_WORK_STORAGE : LUME_WORK_GENERAL;
     case LUME_SYS_RUN:
     case LUME_SYS_RUN_ENV:
     case LUME_SYS_RUN_FDS:
@@ -140,15 +146,47 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_TTY:
     case LUME_SYS_PROCESS:
     case LUME_SYS_EXEPATH:
+    case LUME_SYS_SIGNAL:
+    case LUME_SYS_CREDENTIAL:
+    case LUME_SYS_REALTIME:
+    case LUME_SYS_CAP_DROP:
+    case LUME_SYS_SANDBOX:
+    case LUME_SYS_TERMINAL:
+    case LUME_SYS_SUPERVISE:
         return LUME_WORK_GENERAL;
     case LUME_SYS_THREAD:
-        return action == LUME_THREAD_CREATE ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
-    case LUME_SYS_REALTIME:
-        return action == LUME_REALTIME_GET ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
-    case LUME_SYS_CREDENTIAL:
-        return kernel_call_mutates(frame) ? KERNEL_IO_EXCLUSIVE : LUME_WORK_GENERAL;
+        return action == LUME_THREAD_CREATE || action == LUME_THREAD_EXIT ? LUME_WORK_GENERAL
+                                                                          : KERNEL_IO_EXCLUSIVE;
+    case LUME_SYS_EXIT:
+        return process ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE;
     default:
         return KERNEL_IO_EXCLUSIVE;
+    }
+}
+
+static bool kernel_metadata_call(unsigned task, const struct lume_context *frame)
+{
+    uint64_t number = LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER);
+    uint64_t action = LUME_CONTEXT_REG(frame, 0);
+    if (number == LUME_SYS_DUP2)
+        return true;
+    if (number == LUME_SYS_CLOSE)
+        return lume_vfs_pipe_io(&tasks[process_slot(task)].files, action);
+    if (number != LUME_SYS_FD)
+        return false;
+    switch (action)
+    {
+    case LUME_FD_DUP:
+    case LUME_FD_DUP2:
+    case LUME_FD_GETFD:
+    case LUME_FD_SETFD:
+    case LUME_FD_GETFL:
+    case LUME_FD_SETFL:
+    case LUME_FD_GETMODE:
+    case LUME_FD_SETMODE:
+        return true;
+    default:
+        return false;
     }
 }
 #endif

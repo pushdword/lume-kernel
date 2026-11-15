@@ -3,6 +3,7 @@
 #include "lume/mmu.h"
 #include "lume/vm.h"
 #include "lume/smp.h"
+#include "lume/worker.h"
 #include <string.h>
 
 static struct lume_user_buffer_token *tokens;
@@ -101,6 +102,7 @@ int lume_user_buffer_acquire(struct lume_user_buffer_token *token, unsigned pid,
     }
     if (token_count == LUME_TASK_LIMIT)
         return -LUME_ENOMEM;
+    token->copying = 0;
     token->valid = token->registered = true;
     token->next = tokens;
     tokens = token;
@@ -142,8 +144,7 @@ bool lume_user_buffer_check(const struct lume_user_buffer_token *token, size_t o
 static void copy_checked(const struct lume_user_buffer_token *token, size_t offset, void *buffer,
                          size_t bytes, bool to_user)
 {
-    /* The complete range is checked before any byte is copied. Physical aliases
-     * cannot fault and no callback or allocator runs before this copy completes. */
+    /* Pinned physical aliases survive concurrent unmapping and frame retirement. */
     size_t remaining = bytes;
     size_t done = 0;
     unsigned page = (unsigned)(((token->first & 4095u) + offset) / 4096u);
@@ -165,13 +166,58 @@ static void copy_checked(const struct lume_user_buffer_token *token, size_t offs
     }
 }
 
+struct buffer_copy
+{
+    struct lume_user_buffer_token *token;
+    void *buffer;
+    size_t offset, bytes, pitch;
+    unsigned rows;
+    bool to_user;
+};
+
+static void copy_retained(void *context)
+{
+    struct buffer_copy *copy = context;
+    for (unsigned row = 0; row < copy->rows; ++row)
+        copy_checked(copy->token, copy->offset + (size_t)row * copy->pitch,
+                     (unsigned char *)copy->buffer + (size_t)row * copy->bytes, copy->bytes,
+                     copy->to_user);
+    __atomic_store_n(&copy->token->copying, 0, __ATOMIC_RELEASE);
+}
+
+static bool copy_range(struct buffer_copy *copy, bool *unlocked)
+{
+    *unlocked = copy->bytes * copy->rows >= 8192 && lume_cpu_count() > 1 &&
+                lume_worker_current() < LUME_WORKER_LIMIT;
+    if (*unlocked)
+        for (unsigned i = 0; i < copy->token->pages; ++i)
+            if (!lume_page_pin(copy->token->physical[i]))
+            {
+                while (i)
+                    lume_page_unpin(copy->token->physical[--i]);
+                return false;
+            }
+    __atomic_store_n(&copy->token->copying, 1, __ATOMIC_RELEASE);
+    if (*unlocked)
+    {
+        lume_worker_compute(copy_retained, copy);
+        for (unsigned i = 0; i < copy->token->pages; ++i)
+            lume_page_unpin(copy->token->physical[i]);
+    }
+    else
+        copy_retained(copy);
+    return true;
+}
+
 bool lume_user_buffer_copy_at(struct lume_user_buffer_token *token, size_t offset, void *buffer,
                               size_t bytes, bool to_user)
 {
     if (!lume_user_buffer_check(token, offset, bytes, to_user))
         return false;
-    copy_checked(token, offset, buffer, bytes, to_user);
-    return true;
+    struct buffer_copy copy = {token, buffer, offset, bytes, bytes, 1, to_user};
+    bool unlocked;
+    return copy_range(&copy, &unlocked) &&
+           (!unlocked || lume_user_buffer_check(token, offset, bytes, to_user));
 }
 
 bool lume_user_buffer_copy_strided(struct lume_user_buffer_token *token, void *buffer,
@@ -185,13 +231,12 @@ bool lume_user_buffer_copy_strided(struct lume_user_buffer_token *token, void *b
         return false;
     if (pitch == row_bytes)
     {
-        copy_checked(token, 0, buffer, span, false);
-        return true;
+        return lume_user_buffer_copy_at(token, 0, buffer, span, false);
     }
-    for (unsigned row = 0; row < rows; ++row)
-        copy_checked(token, (size_t)row * pitch, (unsigned char *)buffer + (size_t)row * row_bytes,
-                     row_bytes, false);
-    return true;
+    struct buffer_copy copy = {token, buffer, 0, row_bytes, pitch, rows, false};
+    bool unlocked;
+    return copy_range(&copy, &unlocked) &&
+           (!unlocked || lume_user_buffer_check(token, 0, span, false));
 }
 
 bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *buffer, size_t bytes,
@@ -204,6 +249,8 @@ void lume_user_buffer_release(struct lume_user_buffer_token *token)
 {
     if (!token->registered)
         return;
+    if (__atomic_load_n(&token->copying, __ATOMIC_ACQUIRE))
+        lume_fail("user buffer copy ownership");
     struct lume_user_buffer_token **position = &tokens;
     while (*position && *position != token)
         position = &(*position)->next;
@@ -215,6 +262,11 @@ void lume_user_buffer_release(struct lume_user_buffer_token *token)
     token->next = NULL;
 }
 
+static void invalidate(struct lume_user_buffer_token *token)
+{
+    token->valid = false;
+}
+
 void lume_user_buffer_invalidate(unsigned owner, uint64_t first, uint64_t bytes)
 {
     if (!bytes)
@@ -223,12 +275,12 @@ void lume_user_buffer_invalidate(unsigned owner, uint64_t first, uint64_t bytes)
         if (token->owner == owner && token->bytes &&
             (first <= token->first ? token->first - first < bytes
                                    : first - token->first < token->bytes))
-            token->valid = false;
+            invalidate(token);
 }
 
 void lume_user_buffer_invalidate_root(unsigned owner)
 {
     for (struct lume_user_buffer_token *token = tokens; token; token = token->next)
         if (token->owner == owner)
-            token->valid = false;
+            invalidate(token);
 }

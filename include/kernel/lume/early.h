@@ -74,6 +74,10 @@ uint64_t lume_pages_alloc_span_uninitialized(unsigned count);
 uint64_t lume_page_alloc_uninitialized(uint64_t minimum);
 uint64_t lume_pages_total(void);
 bool lume_page_free(uint64_t page);
+/* The scheduler lock protects page references. A pinned free is deferred until
+ * the final reference is released. Reserved pages remain permanently owned. */
+bool lume_page_pin(uint64_t page);
+void lume_page_unpin(uint64_t page);
 uint64_t lume_pages_free(void);
 unsigned lume_program_staging_pages(void);
 bool lume_pages_check(void);

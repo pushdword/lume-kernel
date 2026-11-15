@@ -7,6 +7,7 @@
 #include "lume/worker.h"
 #include "lume/abi.h"
 #include "lume/irq.h"
+#include "lume/irq_async.h"
 #define DATA 0x1f0
 #define CONTROL 0x3f6
 static uint64_t capacity, allowed_first, allowed_count;
@@ -302,7 +303,7 @@ static int register_owned(void)
     if (!result)
     {
         if (!interrupt_mode && lume_irq_available() &&
-            !lume_irq_register(46, LUME_IRQ_EDGE, interrupt, NULL))
+            !lume_irq_register_async(46, LUME_IRQ_EDGE, interrupt, NULL))
         {
             if (!lume_irq_enable(46, true))
                 interrupt_mode = true;

@@ -47,6 +47,7 @@ static struct
 } local;
 
 static uint64_t wake_at[LUME_TASK_LIMIT], clock_ms, root;
+static unsigned root_switches;
 static bool kernel_wait[LUME_TASK_LIMIT], process_exiting[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
@@ -343,7 +344,9 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
         LUME_CONTEXT_REG(frame, 0) == LUME_VM_MAP && kernel_vm_storage[task] &&
         !process_exiting[process_slot(task)])
         return LUME_WORK_STORAGE;
-    return process_exiting[process_slot(task)] ? KERNEL_IO_EXCLUSIVE : task_domain[task];
+    return process_exiting[process_slot(task)]
+               ? process_slot(task) ? LUME_WORK_GENERAL : KERNEL_IO_EXCLUSIVE
+               : task_domain[task];
 }
 
 static bool kernel_call_mutates(const struct lume_context *frame)
@@ -387,6 +390,7 @@ static bool lume_mmu_root_active(uint64_t value)
 
 static void lume_mmu_switch(uint64_t value)
 {
+    ++root_switches;
     root = value;
 }
 
@@ -420,6 +424,11 @@ bool lume_worker_resume(void)
 bool lume_worker_busy_on(unsigned slot)
 {
     return slot < LUME_WORK_DOMAINS && worker_functions[slot] != NULL;
+}
+
+bool lume_worker_runnable_on(unsigned slot)
+{
+    return lume_worker_busy_on(slot) && !worker_blocked[slot];
 }
 
 uint64_t lume_worker_lock_wait_on(unsigned slot)
@@ -504,6 +513,13 @@ static void sched_charge(unsigned *scheduler, unsigned cpu, uint64_t tick)
 {
     assert(scheduler == &policy && cpu == 2 && tick == clock_ms);
     ++charges;
+}
+
+static void sched_work(unsigned *scheduler, unsigned cpu, unsigned owner, uint32_t tick,
+                       uint32_t elapsed)
+{
+    assert(scheduler == &policy && cpu == 2 && owner <= LUME_TASK_LIMIT && tick == clock_ms);
+    (void)elapsed;
 }
 
 static struct lume_context *wait_ready_task(void)
@@ -712,6 +728,11 @@ void *lume_kernel_allocate(size_t bytes)
 #include "io_calls.h"
 #include "pipe_fast.h"
 
+static bool kernel_cleanup_ready(unsigned task)
+{
+    return kernel_system_cleanup_ready(task);
+}
+
 static void reset(void)
 {
     remote_task = LUME_TASK_LIMIT;
@@ -841,9 +862,8 @@ static void cancellation_and_exit(void)
     wake_at[1] = UINT64_MAX;
     kernel_step();
     assert(!executed[0] && !executed[1] && states[1] == 1 && !kernel_wait[1]);
-    assert(kernel_control_queue.granted && kernel_control_queue.grant.task == 1 &&
-           wake_count[1] == 1);
-    assert(io_queue_claim(&kernel_control_queue, 1, clock_ms));
+    assert(kernel_queue.granted && kernel_queue.grant.task == 1 && wake_count[1] == 1);
+    assert(io_queue_claim(&kernel_queue, 1, clock_ms));
     kernel_step_admit(false);
     assert(!lume_worker_busy());
     kernel_cancel(1);
@@ -915,6 +935,7 @@ static void filesystem_pending(void)
     current_task = pipe_process = 1;
     root = 2;
     states[1] = 2;
+    charges = 0;
 }
 
 static void assert_filesystem_pending(const struct io_queue *queue,
@@ -1370,13 +1391,27 @@ static void bounded_resource_turn(void)
     worker_cost_ms = 1;
     for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
         enqueue_domain(i, i);
+    for (unsigned turn = 0; turn < LUME_WORK_DOMAINS; ++turn)
+    {
+        kernel_step();
+        for (unsigned i = 0; i < LUME_WORK_DOMAINS; ++i)
+            assert(executed[i] == (i <= turn));
+        assert(resumes == turn + 1);
+    }
+    assert(!lume_worker_busy());
+}
+
+static void blocked_worker_keeps_root(void)
+{
+    reset();
+    unsigned before = root_switches;
+    worker_blocked[LUME_WORK_STORAGE] = true;
+    enqueue_domain(0, LUME_WORK_STORAGE);
     kernel_step();
-    assert(executed[0] == 1 && executed[1] == 1 && !executed[2] && !executed[3]);
-    assert(kernel_lane_cursor == 2 && resumes == 2);
+    assert(!executed[0] && !resumes && root_switches == before && root == 4);
+    worker_blocked[LUME_WORK_STORAGE] = false;
     kernel_step();
-    assert(executed[2] == 1 && executed[3] == 1 && !executed[4] && lume_worker_busy());
-    kernel_step();
-    assert(executed[4] == 1 && !lume_worker_busy());
+    assert(executed[0] == 1 && resumes == 1 && root_switches > before && root == 4);
 }
 
 static void independent_resources(void)
@@ -2101,8 +2136,46 @@ static void mapping_during_child_loading(void)
     }
 }
 
+static void process_cleanup_isolation(void)
+{
+    reset();
+    counter_step = 0;
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_exiting[1] = true;
+    assert(kernel_process_cleanup_ready(1));
+    assert(!kernel_control_queue.count && !kernel_regular_draining());
+    assert(kernel_close_ready(1));
+    assert(files_released[1] == 1 && !kernel_exclusive_active());
+    assert(lume_worker_busy_on(LUME_WORK_NETWORK) && !executed[0]);
+    enqueue_domain(2, LUME_WORK_DISPLAY);
+    kernel_step();
+    assert(executed[2] == 1 && !executed[0]);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+
+    reset();
+    counter_step = 0;
+    process_owner[0] = 2;
+    worker_blocked[LUME_WORK_NETWORK] = true;
+    enqueue_domain(0, LUME_WORK_NETWORK);
+    kernel_step();
+    process_exiting[2] = true;
+    assert(!kernel_process_cleanup_ready(2));
+    enqueue_domain(1, LUME_WORK_DISPLAY);
+    kernel_step();
+    assert(executed[1] == 1 && !executed[0] && states[2] == 4);
+    assert(!kernel_regular_draining() && !kernel_control_queue.count);
+    worker_blocked[LUME_WORK_NETWORK] = false;
+    kernel_step();
+    kernel_step();
+    assert(executed[0] == 1 && states[2] == 1 && kernel_process_cleanup_ready(2));
+}
+
 int main(void)
 {
+    process_cleanup_isolation();
     mapping_during_child_loading();
     mapping_storage_redirect();
     render_wait_keeps_display_progress();
@@ -2112,6 +2185,7 @@ int main(void)
     scan_parking();
     stream_parking();
     bounded_resource_turn();
+    blocked_worker_keeps_root();
     independent_resources();
     high_process_admission();
     denied_worker_call();

@@ -308,7 +308,7 @@ bool lume_irq_available(void)
     return true;
 }
 
-int lume_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
+int lume_irq_register_async(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
 {
     (void)irq;
     (void)trigger;

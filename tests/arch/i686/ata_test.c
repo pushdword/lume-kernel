@@ -32,7 +32,7 @@ bool lume_irq_available(void)
     return irq_available;
 }
 
-int lume_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
+int lume_irq_register_async(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
 {
     assert(irq == 46 && trigger == LUME_IRQ_EDGE && !context && !irq_callback);
     irq_callback = handler;

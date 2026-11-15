@@ -7,6 +7,7 @@
 #include <malloc.h>
 #endif
 
+#ifndef LUME_VFS_HOST_ALLOCATOR_PROVIDED
 void *lume_kernel_allocate(size_t bytes)
 {
     return calloc(1, bytes);
@@ -16,6 +17,7 @@ void lume_kernel_free(void *memory)
 {
     free(memory);
 }
+#endif
 
 uint64_t lume_page_alloc(uint64_t minimum)
 {

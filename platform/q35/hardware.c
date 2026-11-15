@@ -95,26 +95,34 @@ static void poll_hardware(void *context)
     (void)context;
     if (!active)
         return;
-    lume_usb_poll();
-    uint64_t now = lume_clock_millis();
-    if (now >= next_scan)
-    {
-        next_scan = now + 1000;
-        (void)lume_q35_pci_rescan();
-    }
+    (void)lume_q35_pci_rescan();
 }
-static struct lume_work hardware_work = {.run = poll_hardware};
+static struct lume_work hardware_work = {.run = poll_hardware, .domain = LUME_WORK_DEVICE};
+
+static void poll_usb(void *context)
+{
+    (void)context;
+    if (active)
+        lume_usb_poll();
+}
+static struct lume_work usb_work = {.run = poll_usb, .domain = LUME_WORK_USB};
 
 void lume_q35_hardware_tick(void)
 {
     if (active)
-        (void)lume_work_submit(&hardware_work);
+    {
+        (void)lume_work_submit(&usb_work);
+        uint64_t now = lume_clock_millis();
+        if (now >= next_scan && !lume_work_submit(&hardware_work))
+            next_scan = now + 1000;
+    }
 }
 
 void lume_q35_hardware_stop(void)
 {
     active = false;
     (void)lume_work_cancel(&hardware_work);
+    (void)lume_work_cancel(&usb_work);
 }
 
 static int rescan(void)

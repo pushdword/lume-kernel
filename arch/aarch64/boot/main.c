@@ -9,6 +9,7 @@
 #include "lume/watchdog.h"
 #include "lume/heap.h"
 #include "lume/irq.h"
+#include "lume/irq_async.h"
 #include "lume/dma.h"
 #include "lume/boot.h"
 #include "lume/device.h"
@@ -81,7 +82,7 @@ _Noreturn void lume_fail(const char *why)
 }
 
 static struct lume_context *exception_dispatch(struct lume_context *frame, uint64_t vector,
-                                               unsigned irq_token)
+                                               unsigned irq_token, bool irq_dispatched)
 {
     uint64_t esr, elr, far;
     bool el2 = lume_current_el() == 2;
@@ -107,7 +108,7 @@ static struct lume_context *exception_dispatch(struct lume_context *frame, uint6
             return lume_tasks_device_irq(frame);
         }
         unsigned activity = lume_activity_enter(LUME_ACTIVITY_IRQ);
-        bool handled = lume_irq_dispatch(token);
+        bool handled = irq_dispatched || lume_irq_dispatch(token);
         lume_activity_leave(activity);
         if (!handled)
             return frame;
@@ -155,6 +156,13 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
     }
     if (user)
         lume_task_trap_enter(lume_counter_read());
+    bool irq_dispatched = false;
+    if (translated && (vector == 5 || vector == 9))
+    {
+        if (irq_token == UINT32_MAX)
+            irq_token = lume_irq_ack();
+        irq_dispatched = lume_irq_dispatch_async(irq_token);
+    }
     /* Translation gives the kernel lock Normal memory attributes. Early
      * exceptions must run before atomic accesses to that storage are valid. */
     bool acquire = translated && !lume_smp_owned();
@@ -162,9 +170,10 @@ struct lume_context *lume_exception(struct lume_context *frame, uint64_t vector)
         lume_smp_lock();
     if (user)
         lume_task_account_enter(frame);
-    struct lume_context *result = user && lume_cpu_index() && !lume_tasks_active()
-                                      ? NULL
-                                      : exception_dispatch(frame, vector, irq_token);
+    struct lume_context *result =
+        user && lume_cpu_index() && !lume_tasks_active()
+            ? NULL
+            : exception_dispatch(frame, vector, irq_token, irq_dispatched);
     if (user)
     {
         result = lume_tasks_deliver_signals(result);

@@ -305,7 +305,8 @@ static int start(struct lume_hardware *hardware, void *context)
     atomic_init(&hdmi->hpd_events, 0);
     atomic_init(&hdmi->hpd_work_error, 0);
     atomic_init(&hdmi->stopping, false);
-    hdmi->hpd_work = (struct lume_work){.run = process_hpd, .context = hdmi};
+    hdmi->hpd_work =
+        (struct lume_work){.run = process_hpd, .context = hdmi, .domain = LUME_WORK_DISPLAY};
     memset(hdmi->hpd_batches, 0, sizeof(hdmi->hpd_batches));
     hdmi->initialized = true;
     int result = lume_resource_claim(hdmi, &hdmi->hdmi, 1);

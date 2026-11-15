@@ -100,6 +100,7 @@ static void reset(void)
     memset(region, 0xa5, REGION_BYTES);
     free_count = total_count = cursor = 0;
     span_cursor = 1;
+    pins_start();
     checkpoints = search_checkpoints = zero_checkpoints = computations = 0;
     expected_first = expected_count = zeroed = computed_bytes = 0;
     search_budget = NULL;
@@ -330,6 +331,43 @@ static void map_region(void)
     region_page = (uintptr_t)region / 4096;
 }
 
+static void pin_lifetime(void)
+{
+    reset();
+    release_run(region_page, PAGE_PIN_LIMIT + 1);
+    uint64_t physical = lume_page_alloc_uninitialized(region_page * 4096);
+    uint64_t before = free_count;
+    assert(lume_page_pin(physical) && lume_page_pin(physical));
+    assert(lume_page_free(physical) && free_count == before);
+    assert(!lume_page_free(physical) && !lume_page_pin(physical));
+    assert(occupied(physical / 4096));
+    lume_page_unpin(physical);
+    assert(free_count == before && occupied(physical / 4096));
+    lume_page_unpin(physical);
+    assert(free_count == before + 1 && !occupied(physical / 4096));
+    assert(!lume_page_pin(physical));
+    assert(lume_page_pin(PHYSICAL_LIMIT) && !lume_page_pin(0));
+    assert(!lume_page_pin(physical + 1));
+    lume_page_unpin(PHYSICAL_LIMIT);
+    uint64_t allocated[PAGE_PIN_LIMIT + 1];
+    for (unsigned i = 0; i <= PAGE_PIN_LIMIT; ++i)
+    {
+        allocated[i] = lume_page_alloc_uninitialized(region_page * 4096);
+        assert(allocated[i]);
+        assert(lume_page_pin(allocated[i]) == (i < PAGE_PIN_LIMIT));
+    }
+    lume_page_unpin(allocated[0]);
+    assert(lume_page_pin(allocated[PAGE_PIN_LIMIT]));
+    for (unsigned i = 0; i <= PAGE_PIN_LIMIT; ++i)
+    {
+        if (i)
+            lume_page_unpin(allocated[i]);
+        assert(lume_page_free(allocated[i]));
+    }
+    assert(free_count == PAGE_PIN_LIMIT + 1);
+    ++cases;
+}
+
 int main(void)
 {
     map_region();
@@ -337,6 +375,7 @@ int main(void)
     cursor_and_wrap();
     checkpoints_and_collision();
     zero_free_and_failures();
+    pin_lifetime();
 #ifdef _WIN32
     assert(VirtualFree(region, 0, MEM_RELEASE));
 #else

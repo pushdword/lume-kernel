@@ -405,6 +405,8 @@ check-ip4-route: $(OUT)/tests/ip4-route$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs-storage-handles$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1
+$(OUT)/tests/vfs-storage-handles$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ffunicode.c
 $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
@@ -601,6 +603,13 @@ $(OUT)/tests/module-services$(HOSTEXE): tests/unit/module_services_test.c src/mo
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
 
 .PHONY: check-irq-domain check-pi5-fdt-irq
+.PHONY: check-irq-async
+check-irq-async: $(OUT)/tests/irq-async$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/irq-async$(HOSTEXE): tests/unit/irq_async_test.c src/device/irq.c include/kernel/lume/irq_async.h include/ddk/lume/irq.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+check: check-irq-async
 check-irq-domain: $(OUT)/tests/irq-domain$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/irq-domain$(HOSTEXE): tests/unit/irq_domain_test.c src/device/irq.c src/device/irq_domain.c

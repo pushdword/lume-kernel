@@ -789,7 +789,7 @@ static struct lume_context *finish_program(unsigned status)
         sched_charge(&policy, lume_cpu_index(), now());
         return wait_ready_task();
     }
-    if (!kernel_cleanup_ready(task))
+    if (!kernel_process_cleanup_ready(task))
     {
         sched_charge(&policy, lume_cpu_index(), now());
         return wait_ready_task();
@@ -1965,7 +1965,13 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     if (public_mode && !pipe_call)
     {
         bool admitted = kernel_claim(task);
-        kernel_step_admit(!admitted);
+        bool metadata =
+            svc && !process_exiting[process] && kernel_metadata_call(task, frame) &&
+            !lume_vm_file_pointer(process, LUME_CONTEXT_REG(frame, 1)) &&
+            kernel_request_ready(kernel_call_domain(task, frame), task, frame, admitted);
+        /* Local descriptor metadata does not service unrelated device queues. */
+        if (!metadata)
+            kernel_step_admit(!admitted);
         if (svc && !process_exiting[process] && kernel_gpu_backpressure(frame))
             return frame;
         console_call = svc && kernel_console_call(frame);
@@ -2261,7 +2267,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
             if (LUME_CONTEXT_REG(frame, 0) && shell_script)
                 lume_fail("public shell exit status");
             tasks[task].context = *frame;
-            if (!kernel_cleanup_ready(task))
+            if (!kernel_system_cleanup_ready(task))
             {
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
                 sched_charge(&policy, lume_cpu_index(), now());

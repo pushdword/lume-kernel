@@ -131,7 +131,7 @@ bool lume_worker_runnable(void)
 {
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
     {
-        struct worker_state *state = workers + i;
+        const struct worker_state *state = workers + i;
         if (!state->function || state->running)
             continue;
         if (!state->waiting || condition_ready(state) ||
@@ -139,6 +139,20 @@ bool lume_worker_runnable(void)
             return true;
     }
     return false;
+}
+
+bool lume_worker_runnable_on(unsigned slot)
+{
+    if (slot >= LUME_WORKER_LIMIT)
+        return false;
+    const struct worker_state *state = workers + slot;
+    if (!state->function || state->running)
+        return false;
+    if (state->handoff_pending && lume_smp_owned() && lume_cpu_index() == state->handoff_cpu &&
+        lume_smp_lock_turn() == state->handoff_turn)
+        return false;
+    return !state->waiting || condition_ready(state) ||
+           (int64_t)(lume_counter_read() - state->until) >= 0;
 }
 
 bool lume_worker_busy_on(unsigned slot)
@@ -158,18 +172,10 @@ uint64_t lume_worker_lock_wait_on(unsigned slot)
 
 bool lume_worker_resume_on(unsigned slot)
 {
-    if (!lume_worker_busy_on(slot) || workers[slot].running || active)
+    if (!lume_worker_runnable_on(slot) || active)
         return false;
     struct worker_state *state = workers + slot;
-    if (state->handoff_pending && lume_smp_owned() && lume_cpu_index() == state->handoff_cpu &&
-        lume_smp_lock_turn() == state->handoff_turn)
-        return false;
     active = state;
-    if (state->waiting && !condition_ready(state) && !expired())
-    {
-        active = NULL;
-        return false;
-    }
     state->waiting = state->handoff_pending = false;
     state->running = true;
     state->remaining = LUME_WORKER_SLICE_BYTES;

@@ -117,6 +117,7 @@ static uint64_t lume_counter_frequency(void)
 static bool locked = true;
 static uint64_t turn;
 static unsigned cpu_index;
+static void (*copy_mutation)(void);
 
 unsigned lume_cpu_index(void)
 {
@@ -139,6 +140,12 @@ void lume_smp_unlock(void)
 {
     CHECK(locked);
     locked = false;
+    if (copy_mutation)
+    {
+        void (*mutate)(void) = copy_mutation;
+        copy_mutation = NULL;
+        mutate();
+    }
 }
 
 bool lume_smp_owned(void)
@@ -240,6 +247,8 @@ void lume_kernel_free(void *pointer)
 }
 
 static uint64_t frames[2048];
+static unsigned frame_pins[2048];
+static bool frame_deferred[2048];
 
 static bool kernel_buffer(const void *pointer, size_t bytes)
 {
@@ -337,6 +346,13 @@ bool lume_page_free(uint64_t physical)
     for (unsigned i = 0; i < 2048; ++i)
         if (frames[i] == physical)
         {
+            if (frame_pins[i])
+            {
+                CHECK(!frame_deferred[i]);
+                frame_deferred[i] = true;
+                return true;
+            }
+            frame_deferred[i] = false;
             frames[i] = 0;
             --frame_live;
             for (unsigned span = 0; span < 64; ++span)
@@ -370,6 +386,35 @@ bool lume_page_free(uint64_t physical)
             return true;
         }
     return false;
+}
+
+bool lume_page_pin(uint64_t physical)
+{
+    if (physical == ((uintptr_t)&wire & ~UINT64_C(4095)))
+        return true;
+    for (unsigned i = 0; i < 2048; ++i)
+        if (frames[i] == physical)
+        {
+            CHECK(!frame_deferred[i]);
+            ++frame_pins[i];
+            return true;
+        }
+    return false;
+}
+
+void lume_page_unpin(uint64_t physical)
+{
+    if (physical == ((uintptr_t)&wire & ~UINT64_C(4095)))
+        return;
+    for (unsigned i = 0; i < 2048; ++i)
+        if (frames[i] == physical)
+        {
+            CHECK(frame_pins[i]);
+            if (!--frame_pins[i] && frame_deferred[i])
+                CHECK(lume_page_free(physical));
+            return;
+        }
+    abort();
 }
 
 uint64_t lume_pages_alloc_span(unsigned count)
@@ -875,6 +920,69 @@ static void request_capture_cases(void)
     CHECK(frame_live == baseline_frames);
 }
 
+static uint64_t copy_address, copy_physical;
+static unsigned copy_mutations;
+
+static void unmap_during_copy(void)
+{
+    CHECK(!locked && workers[LUME_WORK_STORAGE].computing);
+    cpu_index = 1;
+    lume_smp_lock();
+    CHECK(vm(0, LUME_VM_UNMAP, copy_address, 8192, 0, 0, -1) == 0);
+    while (retired)
+        reap(NULL);
+    CHECK(*(unsigned char *)(uintptr_t)copy_physical == 0x37);
+    CHECK(vm(0, LUME_VM_MAP, copy_address, 8192, 3,
+             LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS | LUME_MAP_FIXED, -1) == (int64_t)copy_address);
+    CHECK(lume_user_buffer(copy_address, 8192, true));
+    uint64_t replacement;
+    CHECK(lume_mmu_translate(2, copy_address, true, true, false, &replacement));
+    CHECK(replacement != copy_physical && !*(unsigned char *)(uintptr_t)replacement);
+    lume_smp_unlock();
+    cpu_index = 0;
+    ++copy_mutations;
+}
+
+static void retained_copy(void *context)
+{
+    bool to_user = *(bool *)context;
+    unsigned char data[8192];
+    memset(data, 0x71, sizeof(data));
+    struct lume_user_buffer_token token;
+    CHECK(lume_user_buffer_prepare(&token, 1, copy_address, sizeof(data), true));
+    copy_physical = token.physical[0];
+    memset((void *)(uintptr_t)copy_physical, 0x37, 4096);
+    copy_mutation = unmap_during_copy;
+    CHECK(!lume_user_buffer_copy(&token, data, sizeof(data), to_user));
+    CHECK(!copy_mutation && locked);
+    if (!to_user)
+        CHECK(data[0] == 0x37);
+    uint64_t replacement;
+    CHECK(lume_mmu_translate(2, copy_address, true, true, false, &replacement));
+    CHECK(!*(unsigned char *)(uintptr_t)replacement);
+    lume_user_buffer_release(&token);
+}
+
+static void retained_copy_cases(void)
+{
+    active_root = 2;
+    copy_address =
+        (uint64_t)vm(0, LUME_VM_MAP, 0, 8192, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(copy_address >= LUME_VM_BASE && lume_user_buffer(copy_address, 8192, true));
+    for (unsigned direction = 0; direction < 2; ++direction)
+    {
+        bool to_user = direction != 0;
+        CHECK(lume_worker_submit_on(LUME_WORK_STORAGE, retained_copy, &to_user));
+        CHECK(lume_worker_resume_on(LUME_WORK_STORAGE));
+        CHECK(!lume_worker_busy_on(LUME_WORK_STORAGE));
+    }
+    CHECK(copy_mutations == 2);
+    CHECK(vm(0, LUME_VM_UNMAP, copy_address, 8192, 0, 0, -1) == 0);
+    while (retired)
+        reap(NULL);
+    CHECK(frame_live == baseline_frames);
+}
+
 static void identity_cases(void)
 {
     unsigned char data[8192] = {0};
@@ -1004,6 +1112,7 @@ int main(int argc, char **argv)
     replacement_cases();
     result_cases();
     identity_cases();
+    retained_copy_cases();
     request_capture_cases();
     release_and_bounds_cases();
     for (unsigned i = 0; i < 3; ++i)

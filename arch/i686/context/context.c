@@ -3,6 +3,7 @@
 #include "lume/heap.h"
 #include "lume/counter.h"
 #include "lume/irq.h"
+#include "lume/irq_async.h"
 #include "lume/mmu.h"
 #include "lume/abi.h"
 #include "lume/thread.h"
@@ -164,6 +165,7 @@ struct lume_context *lume_i686_exception(struct lume_context *frame, uint32_t ve
         lume_fail("fatal processor exception");
     if (user)
         lume_task_trap_enter(lume_counter_read());
+    bool irq_dispatched = vector >= 32 && vector < 48 && lume_irq_dispatch_async(vector);
     bool acquire = !lume_smp_owned();
     if (acquire)
         lume_smp_lock();
@@ -172,7 +174,8 @@ struct lume_context *lume_i686_exception(struct lume_context *frame, uint32_t ve
     struct lume_context *next = frame;
     if (vector >= 32 && vector < 48)
     {
-        (void)lume_irq_dispatch(vector);
+        if (!irq_dispatched)
+            (void)lume_irq_dispatch(vector);
         next = vector == 32 ? lume_tasks_irq(frame) : lume_tasks_device_irq(frame);
     }
     else if (user && lume_tasks_active())

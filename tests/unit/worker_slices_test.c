@@ -390,6 +390,7 @@ static void compute_fairness(void)
     T(lume_worker_resume() && phase == 1 && lume_worker_busy());
     T(!lume_worker_resume());
     T(lume_worker_runnable());
+    T(!lume_worker_runnable_on(0) && !lume_worker_runnable_on(LUME_WORKER_LIMIT));
     lume_smp_unlock();
     lume_smp_lock();
     contended = false;

@@ -56,13 +56,31 @@ static void check(unsigned number, uint64_t action, unsigned domain, bool mutati
 
 int main(void)
 {
+    for (unsigned action = LUME_FD_INFO; action <= LUME_FD_EVENTFD; ++action)
+    {
+        struct lume_context frame = {.x = {action}};
+        frame.x[8] = LUME_SYS_FD;
+        bool metadata = action == LUME_FD_DUP || action == LUME_FD_DUP2 ||
+                        (action >= LUME_FD_GETFD && action <= LUME_FD_SETFL) ||
+                        action == LUME_FD_GETMODE || action == LUME_FD_SETMODE;
+        assert(kernel_metadata_call(1, &frame) == metadata);
+    }
+    struct lume_context closing = {.x = {5}};
+    closing.x[8] = LUME_SYS_CLOSE;
+    assert(kernel_metadata_call(1, &closing));
+    closing.x[0] = 3;
+    assert(!kernel_metadata_call(1, &closing));
     check(LUME_SYS_READ, 3, LUME_WORK_STORAGE, false);
     check(LUME_SYS_FILE_IO, 0, LUME_WORK_STORAGE, false);
     check(LUME_SYS_WRITE, 7, LUME_WORK_NETWORK, false);
     check(LUME_SYS_CLOSE, 7, LUME_WORK_NETWORK, true);
     check(LUME_SYS_CLOSE, 3, LUME_WORK_STORAGE, true);
-    check(LUME_SYS_CLOSE, 5, LUME_WORK_STORAGE, true);
-    check(LUME_SYS_CLOSE, UINT64_MAX, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_CLOSE, 5, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_CLOSE, UINT64_MAX, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_DUP2, 3, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_FD, LUME_FD_DUP2, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_FD, LUME_FD_PIPE, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_FD, LUME_FD_SPAWN, LUME_WORK_STORAGE, true);
     check(LUME_SYS_GRAPHICS, LUME_GRAPHICS_QUERY, LUME_WORK_DISPLAY, false);
     check(LUME_SYS_GRAPHICS, LUME_GRAPHICS_PRESENT, LUME_WORK_DISPLAY, false);
     check(LUME_SYS_GRAPHICS, LUME_GRAPHICS_ACQUIRE, LUME_WORK_DISPLAY, true);
@@ -90,27 +108,31 @@ int main(void)
     check(LUME_SYS_THREAD, LUME_THREAD_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_THREAD, LUME_THREAD_WAKE, LUME_WORK_GENERAL, false);
     check(LUME_SYS_THREAD, LUME_THREAD_CREATE, LUME_WORK_GENERAL, true);
-    check(LUME_SYS_THREAD, LUME_THREAD_EXIT, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_THREAD, LUME_THREAD_EXIT, LUME_WORK_GENERAL, true);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_MASK, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_TRY_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_SIGNAL, LUME_SIGNAL_WAIT, LUME_WORK_GENERAL, false);
     check(LUME_SYS_VM, LUME_VM_MAP, LUME_WORK_GENERAL, true);
     kernel_vm_storage[1] = true;
     check(LUME_SYS_VM, LUME_VM_MAP, LUME_WORK_STORAGE, true);
-    check(LUME_SYS_VM, LUME_VM_INFO, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_VM, LUME_VM_INFO, LUME_WORK_GENERAL, false);
     kernel_vm_storage[1] = false;
     check(LUME_SYS_BRK, 0, LUME_WORK_GENERAL, false);
     check(LUME_SYS_BRK, 4096, LUME_WORK_GENERAL, true);
     check(LUME_SYS_MEMORY, 0, LUME_WORK_GENERAL, false);
     check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_GET, LUME_WORK_GENERAL, false);
     check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_LIMIT_GET, LUME_WORK_GENERAL, false);
-    check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_UID, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_CREDENTIAL, LUME_CREDENTIAL_UID, LUME_WORK_GENERAL, true);
     check(LUME_SYS_PROCESS, UINT64_MAX, LUME_WORK_GENERAL, false);
     check(LUME_SYS_EXEPATH, UINT64_MAX, LUME_WORK_GENERAL, false);
     check(LUME_SYS_REALTIME, LUME_REALTIME_GET, LUME_WORK_GENERAL, false);
-    check(LUME_SYS_REALTIME, LUME_REALTIME_SET, KERNEL_IO_EXCLUSIVE, true);
-    check(LUME_SYS_REALTIME, UINT64_MAX, KERNEL_IO_EXCLUSIVE, true);
-    check(LUME_SYS_REALTIME, UINT64_C(1) << 32, KERNEL_IO_EXCLUSIVE, true);
+    check(LUME_SYS_REALTIME, LUME_REALTIME_SET, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_REALTIME, UINT64_MAX, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_REALTIME, UINT64_C(1) << 32, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_SIGNAL, LUME_SIGNAL_SEND, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_CAP_DROP, 0, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_SANDBOX, 0, LUME_WORK_GENERAL, true);
+    check(LUME_SYS_SUPERVISE, 0, LUME_WORK_GENERAL, true);
     const unsigned queries[] = {LUME_SYS_PROCESS, LUME_SYS_EXEPATH, LUME_SYS_REALTIME};
     for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i)
     {
