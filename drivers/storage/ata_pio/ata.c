@@ -6,6 +6,7 @@
 #include "lume/sd.h"
 #include "lume/worker.h"
 #include "lume/abi.h"
+#include "lume/irq.h"
 #define DATA 0x1f0
 #define CONTROL 0x3f6
 static uint64_t capacity, allowed_first, allowed_count;
@@ -14,8 +15,18 @@ static bool failed;
 static bool flush_supported;
 static bool dirty;
 static unsigned multiple_sectors = 1;
+static volatile uint32_t interrupt_pending;
+static bool interrupt_mode;
 /* Controller ownership covers PIO, worker suspension and the final cache flush. */
 static bool operating;
+
+static void interrupt(unsigned irq, void *context)
+{
+    (void)irq;
+    (void)context;
+    (void)lume_in8(DATA + 7);
+    __atomic_store_n(&interrupt_pending, 1, __ATOMIC_RELEASE);
+}
 
 static void delay(void)
 {
@@ -31,6 +42,8 @@ static bool wait_status(bool data)
     uint64_t deadline = start + timeout;
     for (unsigned i = 0; i < 10000000; ++i)
     {
+        if (interrupt_mode)
+            __atomic_store_n(&interrupt_pending, 0, __ATOMIC_RELEASE);
         uint8_t status = lume_in8(CONTROL);
         if (!status || status == 0xff)
             break;
@@ -49,7 +62,9 @@ static bool wait_status(bool data)
             uint64_t next = now + frequency / 1000 + (frequency % 1000 != 0);
             if ((int64_t)(next - deadline) > 0)
                 next = deadline;
-            if (lume_worker_pause(next))
+            bool suspended = interrupt_mode ? lume_worker_wait_bits(&interrupt_pending, 1, next)
+                                            : lume_worker_pause(next);
+            if (suspended)
                 continue;
         }
         lume_cpu_relax();
@@ -246,6 +261,7 @@ static void stats(void)
     lume_value("ATA_PIO_WRITES", writes);
     lume_value("ATA_PIO_FAILURES", failures);
     lume_value("ATA_PIO_MULTIPLE_SECTORS", multiple_sectors);
+    lume_value("ATA_PIO_IRQ", interrupt_mode);
 }
 
 static int register_owned(void)
@@ -284,7 +300,18 @@ static int register_owned(void)
         allow_boot, stats,     read_blocks, write_blocks, write_deferred, sync_device};
     int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
+    {
+        if (!interrupt_mode && lume_irq_available() &&
+            !lume_irq_register(46, LUME_IRQ_EDGE, interrupt, NULL))
+        {
+            if (!lume_irq_enable(46, true))
+                interrupt_mode = true;
+            else
+                (void)lume_irq_unregister(46, NULL);
+        }
+        lume_out8(CONTROL, interrupt_mode ? 0 : 2);
         stats();
+    }
     return result;
 }
 

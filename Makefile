@@ -637,7 +637,7 @@ $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/de
 .PHONY: check-ata-pio
 check-ata-pio: $(OUT)/tests/ata-pio$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c include/kernel/lume/platform_driver.h
+$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c include/kernel/lume/platform_driver.h include/kernel/lume/worker.h include/ddk/lume/irq.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
 check: check-ata-pio

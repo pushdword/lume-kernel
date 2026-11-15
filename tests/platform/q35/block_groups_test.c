@@ -158,6 +158,11 @@ void lume_worker_checkpoint(unsigned bytes)
     checkpoints += bytes / 512;
 }
 
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    memcpy(destination, source, bytes);
+}
+
 void lume_value(const char *name, uint64_t value)
 {
     assert(name && value == capacity);

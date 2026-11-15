@@ -58,3 +58,8 @@ void lume_worker_compute(void (*run)(void *), void *context)
 {
     run(context);
 }
+
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    memcpy(destination, source, bytes);
+}

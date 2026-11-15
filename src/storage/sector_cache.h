@@ -169,7 +169,7 @@ static bool cache_read(uint64_t sector, unsigned count, unsigned char *out, uint
                 cache_set(line->valid, j);
             i = last;
         }
-        memcpy(out, line->data + offset * 512u, group * 512u);
+        lume_worker_copy(out, line->data + offset * 512u, group * 512u);
         lume_worker_checkpoint(group * 512u);
         sector += group;
         count -= group;
@@ -205,7 +205,7 @@ static bool cache_write(uint64_t sector, unsigned count, const unsigned char *da
         unsigned group = SECTOR_CACHE_SECTORS - offset;
         if (group > count)
             group = count;
-        memcpy(line->data + offset * 512u, data, group * 512u);
+        lume_worker_copy(line->data + offset * 512u, data, group * 512u);
         for (unsigned i = offset; i < offset + group; ++i)
         {
             cache_set(line->valid, i);

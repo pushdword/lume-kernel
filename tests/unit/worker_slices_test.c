@@ -348,7 +348,7 @@ static void compute_sample(void *context)
 static void timed_compute_job(void *context)
 {
     (void)context;
-    struct compute_sample sample = {1999, false};
+    struct compute_sample sample = {499, false};
     phase = 1;
     lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES - 1);
     lume_worker_compute(compute_sample, &sample);
@@ -712,6 +712,30 @@ static void independent_waits(void)
     T(!lume_worker_busy() && jobs == 3);
 }
 
+static void copy_job(void *context)
+{
+    (void)context;
+    unsigned char source[8192], destination[8192];
+    memset(source, 0x6b, sizeof(source));
+    uint64_t before = lock_turn;
+    lume_worker_copy(destination, source, sizeof(source));
+    T(lock_owned && lock_turn == before + 1);
+    T(!memcmp(source, destination, sizeof(source)));
+    before = lock_turn;
+    lume_worker_copy(destination, source, 17);
+    T(lock_owned && lock_turn == before);
+}
+
+static void copy_ownership(void)
+{
+    test_cpu = 0;
+    lume_smp_lock();
+    lume_worker_start();
+    T(lume_worker_submit(copy_job, NULL));
+    T(lume_worker_resume() && !lume_worker_busy());
+    lume_smp_unlock();
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -725,10 +749,10 @@ int main(void)
     lume_worker_checkpoint(UINT_MAX);
     T(!counter_reads && !contention_reads);
     byte_slices();
-    time_slices(1000000, 100, 1999, 1);
-    time_slices(1000000, UINT64_MAX - 1000, 1999, 1);
-    time_slices(501, 0, 1, 1);
-    time_slices(UINT64_MAX, 0, UINT64_MAX / 500, 1);
+    time_slices(1000000, 100, 499, 1);
+    time_slices(1000000, UINT64_MAX - 100, 499, 1);
+    time_slices(501, 0, 0, 1);
+    time_slices(UINT64_MAX, 0, UINT64_MAX / 2000, 1);
     frequency = 0;
     byte_slices();
     waits_and_slices();
@@ -747,6 +771,7 @@ int main(void)
     profiling_across_suspension();
     compute_fairness();
     independent_waits();
+    copy_ownership();
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
         release_fiber(&workers[i].fiber);
 #ifdef _WIN32

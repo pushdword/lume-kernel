@@ -52,6 +52,28 @@ static void sched_init(struct sched_policy *s, uint32_t now)
     }
 }
 
+SCHED_FAST void sched_service(struct sched_policy *s, unsigned slot, uint32_t ticks)
+{
+    if (slot >= SCHED_TASKS)
+        return;
+    struct sched_task *t = s->task + slot;
+    t->service += ticks;
+    t->used = UINT32_MAX - t->used < ticks ? UINT32_MAX : t->used + ticks;
+}
+
+SCHED_FAST void sched_exclude(struct sched_policy *s, unsigned core, uint32_t now, uint64_t delay)
+{
+    uint32_t elapsed = now - s->cpu[core].last;
+    s->cpu[core].last += delay > elapsed ? elapsed : (uint32_t)delay;
+}
+
+SCHED_FAST void sched_work(struct sched_policy *s, unsigned core, unsigned owner, uint32_t now,
+                           uint32_t ticks)
+{
+    s->cpu[core].last = now;
+    sched_service(s, owner, ticks);
+}
+
 SCHED_FAST void sched_charge(struct sched_policy *s, unsigned core, uint32_t now)
 {
     struct sched_cpu *c = s->cpu + core;
@@ -65,8 +87,7 @@ SCHED_FAST void sched_charge(struct sched_policy *s, unsigned core, uint32_t now
         c->owner = -1;
         return;
     } /* Reused slot, different process. */
-    t->service += ticks;
-    t->used = UINT32_MAX - t->used < ticks ? UINT32_MAX : t->used + ticks;
+    sched_service(s, (unsigned)c->owner, ticks);
 }
 
 /* Only READY and RUNNING tasks advance the placement floor. Blocked tasks cannot delay it, and
@@ -191,6 +212,6 @@ static int sched_outranks(const struct sched_policy *s, unsigned candidate, unsi
         return 1;
     if (!LUME_SCHED_FAIR)
         return 0;
-    return s->task[candidate].service + unit * 5u < s->task[running].service;
+    return s->task[candidate].service + unit < s->task[running].service;
 }
 #endif

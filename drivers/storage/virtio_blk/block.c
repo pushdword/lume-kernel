@@ -61,7 +61,7 @@ static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count
     request->active = true;
     request->done = request->success = false;
     if (type == 1)
-        memcpy(request->data, buffer, bytes);
+        lume_worker_copy(request->data, buffer, bytes);
     queue.descriptors[head] = (struct lume_virtio_desc){(uintptr_t)&request->header, 16, 1,
                                                         (uint16_t)(head + (type == 4 ? 2 : 1))};
     queue.descriptors[head + 1] = (struct lume_virtio_desc){
@@ -139,8 +139,8 @@ static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffe
             if (part > request_sectors)
                 part = request_sectors;
             if (success && type == 0)
-                memcpy((unsigned char *)buffer + (size_t)first * 512u, requests[i].data,
-                       part * 512u);
+                lume_worker_copy((unsigned char *)buffer + (size_t)first * 512u, requests[i].data,
+                                 part * 512u);
             if (requests[i].done)
                 requests[i].active = false;
             first += part;
@@ -170,7 +170,8 @@ static bool cached_read(uint64_t sector, unsigned count, void *buffer)
     if (read_cache_count >= count && sector >= read_cache_first &&
         sector - read_cache_first <= read_cache_count - count)
     {
-        memcpy(buffer, read_cache + (size_t)(sector - read_cache_first) * 512u, count * 512u);
+        lume_worker_copy(buffer, read_cache + (size_t)(sector - read_cache_first) * 512u,
+                         count * 512u);
         return true;
     }
     if (count >= 32)
@@ -187,7 +188,7 @@ static bool cached_read(uint64_t sector, unsigned count, void *buffer)
     {
         read_cache_first = first;
         read_cache_count = sectors;
-        memcpy(buffer, read_cache + (size_t)(sector - first) * 512u, count * 512u);
+        lume_worker_copy(buffer, read_cache + (size_t)(sector - first) * 512u, count * 512u);
         return true;
     }
     /* A failed speculative read must not hide a readable requested range. */

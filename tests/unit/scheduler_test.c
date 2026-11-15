@@ -87,6 +87,36 @@ static void yield_once(void)
     assert(sched_pick(&policy, 0, states, 0, 1000) == 0);
 }
 
+static void worker_service(void)
+{
+    struct sched_policy policy;
+    sched_init(&policy, UINT32_MAX - 99);
+    sched_new(&policy, 0, 1);
+    sched_new(&policy, 1, 2);
+    sched_enter(&policy, 0, 0, UINT32_MAX - 99, 1000, LUME_SCHED_QUANTUM);
+    sched_exclude(&policy, 0, 100, 150);
+    sched_charge(&policy, 0, 100);
+    assert(policy.task[0].service == 50);
+    sched_work(&policy, 0, 1, 10100, 2000);
+    assert(policy.task[0].service == 50 && policy.task[1].service == 2000);
+    sched_charge(&policy, 0, 10200);
+    assert(policy.task[0].service == 150);
+    sched_work(&policy, 0, SCHED_TASKS, 20200, 10000);
+    sched_charge(&policy, 0, 20300);
+    assert(policy.task[0].service == 250 && policy.task[1].service == 2000);
+    sched_exclude(&policy, 0, 20400, UINT64_MAX);
+    sched_charge(&policy, 0, 20400);
+    assert(policy.task[0].service == 250);
+    policy.task[1].used = UINT32_MAX - 1;
+    sched_work(&policy, 0, 1, 20500, 100);
+    assert(policy.task[1].used == UINT32_MAX && policy.task[1].service == 2100);
+    policy.task[0].service = 4000;
+    policy.task[1].service = 3000;
+    assert(!sched_outranks(&policy, 1, 0, 1000));
+    policy.task[0].service = 4001;
+    assert(sched_outranks(&policy, 1, 0, 1000));
+}
+
 int main(void)
 {
     struct sched_policy policy;
@@ -99,6 +129,7 @@ int main(void)
     fair_service(1000);
     fair_service(62500);
     yield_once();
+    worker_service();
     printf("PASS_SCHEDULER cpus=%u quantum_ms=%u tick_ms=%u fairness/wake/reuse/counter-wrap\n",
            SCHED_CPUS, LUME_SCHED_QUANTUM, SCHED_TICK_MS);
 }

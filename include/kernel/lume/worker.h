@@ -27,10 +27,13 @@ uint64_t lume_worker_lock_wait_on(unsigned slot);
  * subsystem ownership while releasing the scheduler lock. Callbacks must not allocate,
  * access device registers, invoke kernel services or suspend. Calls outside a worker run inline. */
 void lume_worker_compute(void (*run)(void *), void *context);
+/* Large copies release the scheduler lock on SMP. The resource owner must keep both
+ * ranges mapped and resident until the copy returns. Small copies run inline. */
+void lume_worker_copy(void *destination, const void *source, size_t bytes);
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline);
 bool lume_worker_pause(uint64_t deadline);
 bool lume_worker_pause_ms(unsigned milliseconds);
-/* Checkpoints charge processed bytes and yield after 64 KiB or 2 ms of running time.
+/* Checkpoints charge processed bytes and yield after 64 KiB or 500 us of running time.
  * A CPU waiting for the kernel lock also causes a yield at the next checkpoint.
  * A contended yield resumes after another lock acquisition or on another CPU.
  * Zero bytes checks time and contention. Calls outside the running worker have no effect.

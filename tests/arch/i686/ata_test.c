@@ -6,6 +6,7 @@
 #include "lume/platform_driver.h"
 #include "lume/storage.h"
 #include "lume/sd.h"
+#include "lume/irq.h"
 #define LUME_Q35_H
 #define LUME_COUNTER_H
 #define LUME_ARCH_CPU_H
@@ -22,6 +23,34 @@ static void check_operation(void);
 static const struct lume_platform_sd_ops *registered;
 static unsigned checkpoints;
 static unsigned input_bursts, output_bursts;
+static bool irq_available, deliver_irq;
+static unsigned irq_waits, irq_completions;
+static lume_irq_handler irq_callback;
+
+bool lume_irq_available(void)
+{
+    return irq_available;
+}
+
+int lume_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
+{
+    assert(irq == 46 && trigger == LUME_IRQ_EDGE && !context && !irq_callback);
+    irq_callback = handler;
+    return 0;
+}
+
+int lume_irq_enable(unsigned irq, bool enable)
+{
+    assert(irq == 46 && enable && irq_callback);
+    return 0;
+}
+
+int lume_irq_unregister(unsigned irq, void *context)
+{
+    assert(irq == 46 && !context);
+    irq_callback = NULL;
+    return 0;
+}
 
 void lume_worker_checkpoint(unsigned bytes)
 {
@@ -53,6 +82,21 @@ bool lume_worker_pause(uint64_t deadline)
     ticks = deadline;
     ++pauses;
     return true;
+}
+
+bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
+{
+    assert(irq_callback && mask == 1 && !*value);
+    ++irq_waits;
+    if (deliver_irq && busy_until > ticks && busy_until <= deadline)
+    {
+        ticks = busy_until;
+        irq_callback(46, NULL);
+        assert(*value == 1);
+        ++irq_completions;
+        return true;
+    }
+    return lume_worker_pause(deadline);
 }
 
 void lume_cpu_relax(void)
@@ -95,7 +139,7 @@ void lume_out8(uint16_t port, uint8_t value)
 {
     if (port == 0x3f6)
     {
-        assert(value == 2);
+        assert(value == 0 || value == 2);
         return;
     }
     assert(port >= 0x1f0 && port <= 0x1f7);
@@ -320,6 +364,18 @@ int main(void)
     identity[47] = 0x10;
     identity[59] = 0x110;
     assert(!lume_pc_ide_register() && multiple_sectors == 1);
+    irq_available = deliver_irq = true;
+    assert(!lume_pc_ide_register() && interrupt_mode && irq_callback);
+    tick_step = 1;
+    ticks = busy_until = 0;
+    command_delay = sector_delay = 1500;
+    cooperative = check_reentry = true;
+    assert(registered->lume_sd_read_blocks(LUME_PC_DATA_FIRST, 2, group));
+    assert(irq_waits && irq_completions && !failed && !operating);
+    unsigned previous_waits = irq_waits;
+    deliver_irq = false;
+    assert(registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 2, group));
+    assert(irq_waits > previous_waits && !failed && !operating);
     puts("PASS ATA PIO, cooperative deadline, controller ownership, bounds, flush and failure");
     return 0;
 }

@@ -253,6 +253,7 @@ void lume_task_account_enter(const struct lume_context *frame)
     }
     account_running = false;
     uint64_t waited = lume_smp_wait_ticks();
+    sched_exclude(&policy, lume_cpu_index(), (uint32_t)at, waited);
     local.lock += waited;
     lock_ticks[current_task] += waited;
     local.kernel += at - entered - waited;
@@ -1051,6 +1052,7 @@ static struct lume_context *select_task(unsigned next)
 static struct lume_context *wait_ready_task(void)
 {
     extern void lume_net_poll_background(void);
+    sched_enter(&policy, lume_cpu_index(), -1, now(), unit, LUME_SCHED_QUANTUM);
     (void)account_switch(LUME_TASK_LIMIT);
     current_task = LUME_TASK_LIMIT;
     task_query_publish(NULL);
@@ -1753,7 +1755,9 @@ static struct lume_context *task_interrupt(struct lume_context *frame, bool time
     if (public_mode && process_exiting[process_slot(current_task)])
         return thread_slots[current_task].thread ? thread_finish(0)
                                                  : finish_program(process_status[current_task]);
-    kernel_step();
+    /* Device completions must return to runnable users before another I/O slice. */
+    if (timer)
+        kernel_step();
     extern void lume_net_poll_background(void);
     if (timer && !lume_cpu_index() && !lume_worker_busy())
         lume_net_poll_background();

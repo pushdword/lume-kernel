@@ -4,6 +4,7 @@
 #include "lume/counter.h"
 #include "lume/smp.h"
 #include "lume/activity.h"
+#include <string.h>
 
 #define STACK_CANARY UINT64_C(0x6b65726e656c7370)
 extern uint64_t __worker_stack[], __worker_top[];
@@ -28,6 +29,12 @@ static uint64_t jobs, resumes, waits, timeouts, yields, overlaps, maximum_ticks;
 static uint64_t slice_ticks;
 static unsigned peak;
 static bool initialized;
+
+static bool condition_ready(const struct worker_state *state)
+{
+    return state->condition &&
+           (__atomic_load_n(state->condition, __ATOMIC_ACQUIRE) & state->wanted);
+}
 
 static bool expired(void)
 {
@@ -79,7 +86,7 @@ void lume_worker_start(void)
     }
     jobs = resumes = waits = timeouts = yields = overlaps = maximum_ticks = peak = 0;
     uint64_t frequency = lume_counter_frequency();
-    slice_ticks = frequency / 500 + (frequency % 500 != 0);
+    slice_ticks = frequency / 2000 + (frequency % 2000 != 0);
     for (unsigned i = 0; i < LUME_CPU_LIMIT; ++i)
         active_cpus[i] = NULL;
     initialized = true;
@@ -127,7 +134,7 @@ bool lume_worker_runnable(void)
         struct worker_state *state = workers + i;
         if (!state->function || state->running)
             continue;
-        if (!state->waiting || (state->condition && (*state->condition & state->wanted)) ||
+        if (!state->waiting || condition_ready(state) ||
             (int64_t)(lume_counter_read() - state->until) >= 0)
             return true;
     }
@@ -158,7 +165,7 @@ bool lume_worker_resume_on(unsigned slot)
         lume_smp_lock_turn() == state->handoff_turn)
         return false;
     active = state;
-    if (state->waiting && !(state->condition && (*state->condition & state->wanted)) && !expired())
+    if (state->waiting && !condition_ready(state) && !expired())
     {
         active = NULL;
         return false;
@@ -212,6 +219,28 @@ void lume_worker_compute(void (*run)(void *), void *context)
     state->computing = false;
 }
 
+struct worker_copy
+{
+    void *destination;
+    const void *source;
+    size_t bytes;
+};
+
+static void copy_memory(void *context)
+{
+    struct worker_copy *copy = context;
+    memcpy(copy->destination, copy->source, copy->bytes);
+}
+
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    struct worker_copy copy = {destination, source, bytes};
+    if (bytes >= 4096 && active && lume_cpu_count() > 1)
+        lume_worker_compute(copy_memory, &copy);
+    else
+        copy_memory(&copy);
+}
+
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
 {
     if (!active)
@@ -222,12 +251,12 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
     state->condition = value;
     state->wanted = mask;
     state->until = deadline;
-    if (!(state->condition && (*state->condition & state->wanted)) && !expired())
+    if (!condition_ready(state) && !expired())
     {
         state->waiting = true;
         ++waits;
         suspend();
-        if (expired() && !(state->condition && (*state->condition & state->wanted)))
+        if (expired() && !condition_ready(state))
             ++timeouts;
     }
     state->condition = 0;

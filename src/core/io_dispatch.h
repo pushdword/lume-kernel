@@ -496,7 +496,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
     unsigned turns = selected_domain < LUME_WORK_DOMAINS ? 1 : LUME_WORK_DOMAINS;
     uint64_t started = lume_counter_read();
     uint64_t frequency = lume_counter_frequency();
-    uint64_t budget = frequency / 500 + (frequency % 500 != 0);
+    uint64_t budget = frequency / 2000 + (frequency % 2000 != 0);
     for (unsigned n = 0; n < turns; ++n)
     {
         unsigned domain = (cursor + n) % LUME_WORK_DOMAINS;
@@ -516,6 +516,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         if (change_root)
             lume_mmu_switch(worker_root);
         uint64_t began = counter();
+        sched_charge(&policy, lume_cpu_index(), (uint32_t)began);
         local.worker_slot = domain;
         local.worker_owner = owner;
         local.worker_started = began;
@@ -527,6 +528,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
         bool resumed = lume_worker_resume_on(domain);
         uint64_t elapsed = counter() - began;
         uint64_t waited = lume_worker_lock_wait_on(domain) - local.worker_lock_before;
+        sched_work(&policy, lume_cpu_index(), owner, now(), (uint32_t)(elapsed - waited));
         local.worker_running = false;
         local.lock += waited;
         total_kernel_ticks += elapsed - waited;
