@@ -68,6 +68,7 @@ int main(void)
     {
         unsigned state[SCHED_TASKS];
         uint64_t ready[SCHED_MASK_WORDS] = {0}, excluded[SCHED_MASK_WORDS] = {0};
+        uint64_t runnable[SCHED_MASK_WORDS] = {0};
         for (unsigned i = 0; i < SCHED_TASKS; ++i)
         {
             state[i] = (random_next() >> 24) % 5;
@@ -75,6 +76,8 @@ int main(void)
             policy.task[i].last_core = random_next() % SCHED_CPUS;
             if (state[i] == 1u)
                 ready[i / 64u] |= UINT64_C(1) << (i % 64u);
+            if (state[i] == 1u || state[i] == 2u)
+                runnable[i / 64u] |= UINT64_C(1) << (i % 64u);
             if ((random_next() >> 24) % 4 == 0)
                 excluded[i / 64u] |= UINT64_C(1) << (i % 64u);
         }
@@ -84,6 +87,10 @@ int main(void)
         int expected = reference_pick(&policy, core, state, excluded, 1000);
         assert(sched_pick_ready(&policy, core, ready, excluded, 1000) == expected);
         assert(sched_pick_mask(&policy, core, state, excluded, 1000) == expected);
+        struct sched_policy reference = policy;
+        sched_floor(&reference, state);
+        sched_floor_runnable(&policy, runnable);
+        assert(reference.floor == policy.floor);
     }
     puts("PASS_SCHEDULER_READY decisions=24000 slots=256 affinity,fairness,yield,exclusions,wrap");
     return 0;

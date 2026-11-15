@@ -155,6 +155,7 @@ static void kernel_call(void *context)
         lane->result = permission;
         return;
     }
+    uint64_t began = fd_timing.enabled ? lume_counter_read() : 0;
     lane->result =
         LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_FORK
             ? fork_program(&tasks[task].context)
@@ -174,6 +175,7 @@ static void kernel_call(void *context)
            LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_NET_DNS)
             ? dns_attempt(task)
             : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
+    kernel_fd_timing_complete(task, false, began);
 }
 
 static void kernel_work(void *context)

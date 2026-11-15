@@ -6,6 +6,7 @@
 
 /* Task state and its indices change together under the scheduler lock. */
 static uint64_t task_ready[TASK_STATE_WORDS], task_sleeping[TASK_STATE_WORDS];
+static uint64_t task_runnable[TASK_STATE_WORDS];
 
 static void task_state_set(unsigned task, unsigned state)
 {
@@ -13,6 +14,7 @@ static void task_state_set(unsigned task, unsigned state)
     unsigned word = task / 64u;
     task_ready[word] = (task_ready[word] & ~bit) | (state == 1 ? bit : 0);
     task_sleeping[word] = (task_sleeping[word] & ~bit) | (state == 4 ? bit : 0);
+    task_runnable[word] = (task_runnable[word] & ~bit) | (state == 1 || state == 2 ? bit : 0);
     states[task] = state;
 }
 

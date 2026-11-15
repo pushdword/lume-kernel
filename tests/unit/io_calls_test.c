@@ -730,6 +730,19 @@ void *lume_kernel_allocate(size_t bytes)
 #include "stream_calls.h"
 #include "netctl_calls.h"
 #include "dns_calls.h"
+
+static struct
+{
+    bool enabled;
+} fd_timing;
+
+static void kernel_fd_timing_complete(unsigned task, bool inlined, uint64_t began)
+{
+    (void)task;
+    (void)inlined;
+    (void)began;
+}
+
 #include "io_calls.h"
 #include "pipe_fast.h"
 
@@ -776,6 +789,13 @@ static void kernel_record_call(const struct lume_context *frame, unsigned task)
 {
     assert(task == current_task && frame->x[8] == LUME_SYS_FD);
     ++metadata_records;
+}
+
+#include "lume/fd_timing.h"
+
+static void kernel_fd_timing_reason(unsigned reason)
+{
+    assert(reason < LUME_FD_TIMING_REASONS);
 }
 
 #include "descriptor_calls.h"
@@ -1525,6 +1545,12 @@ static void resident_descriptor_isolation(void)
     kernel_control_queue.generation[2] = 1;
     io_queue_grant(&kernel_control_queue, grant);
     assert(!kernel_descriptor_call(&frame, 1) && metadata_attempts == 1);
+    io_queue_cancel(&kernel_control_queue, 2);
+    assert(io_queue_push(&kernel_control_queue, 2, true));
+    assert(kernel_regular_draining());
+    assert(kernel_descriptor_call(&frame, 1) && frame.x[0] == 19 && metadata_attempts == 2);
+    assert(kernel_control_queue.count == 1 && !executed[0] && !executed[2]);
+    assert(submissions == old_submissions && resumes == old_resumes);
     io_queue_cancel(&kernel_control_queue, 2);
     worker_blocked[LUME_WORK_CONTROL] = false;
     kernel_step();

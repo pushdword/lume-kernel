@@ -18,6 +18,8 @@ bool lume_heap_clone(unsigned, unsigned);
 void lume_heap_swap(unsigned, unsigned);
 void lume_heap_snapshot(unsigned, struct lume_memory_snapshot *);
 #include "perf.h"
+#include "lume/fd_timing.h"
+int lume_task_fd_timing(unsigned, unsigned, struct lume_fd_timing_snapshot *);
 int lume_task_info(unsigned, struct lume_task_info *);
 void lume_task_telemetry(unsigned, struct lume_perf_snapshot *);
 int lume_task_telemetry_page(struct lume_perf_task_page *);

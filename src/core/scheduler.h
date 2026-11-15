@@ -104,6 +104,24 @@ static void sched_floor(struct sched_policy *s, const unsigned *state)
         s->floor = minimum;
 }
 
+static void sched_floor_runnable(struct sched_policy *s, const uint64_t *runnable)
+{
+    uint64_t minimum = UINT64_MAX;
+    for (unsigned word = 0; word < (SCHED_TASKS + 63u) / 64u; ++word)
+    {
+        uint64_t bits = runnable[word];
+        while (bits)
+        {
+            unsigned slot = word * 64u + (unsigned)__builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (slot < SCHED_TASKS && s->task[slot].service < minimum)
+                minimum = s->task[slot].service;
+        }
+    }
+    if (minimum != UINT64_MAX && minimum > s->floor)
+        s->floor = minimum;
+}
+
 static void sched_new(struct sched_policy *s, unsigned slot, uint32_t pid)
 {
     s->task[slot] = (struct sched_task){.service = s->floor, .pid = pid, .last_core = SCHED_CPUS};

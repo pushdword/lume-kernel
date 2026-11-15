@@ -370,6 +370,14 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_task_executable(a ? (unsigned)a : pid, (void *)(uintptr_t)b, capacity);
     }
     case LUME_SYS_TELEMETRY:
+        if (n >= LUME_FD_TIMING_READ && n <= LUME_FD_TIMING_STOP)
+        {
+            if (b != sizeof(struct lume_fd_timing_snapshot))
+                return -LUME_EINVAL;
+            if (!lume_user_buffer(a, b, true))
+                return -LUME_EFAULT;
+            return lume_task_fd_timing(pid, (unsigned)n, (void *)(uintptr_t)a);
+        }
         if (n == LUME_PERF_TASK_PAGE)
         {
             if (b != sizeof(struct lume_perf_task_page))

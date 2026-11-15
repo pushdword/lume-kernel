@@ -15,10 +15,14 @@ int main(void)
         task_state_set(random % LUME_TASK_LIMIT, (random >> 16) % 6);
         unsigned ready = task_state_next(task_ready, 0);
         unsigned sleeping = task_state_next(task_sleeping, 0);
+        unsigned runnable = task_state_next(task_runnable, 0);
         for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         {
             assert((ready == i) == (states[i] == 1));
             assert((sleeping == i) == (states[i] == 4));
+            assert((runnable == i) == (states[i] == 1 || states[i] == 2));
+            if (runnable == i)
+                runnable = task_state_next(task_runnable, i + 1);
             if (ready == i)
             {
                 ready = task_state_next(task_ready, i + 1);
@@ -27,7 +31,8 @@ int main(void)
             if (sleeping == i)
                 sleeping = task_state_next(task_sleeping, i + 1);
         }
-        assert(ready == LUME_TASK_LIMIT && sleeping == LUME_TASK_LIMIT);
+        assert(ready == LUME_TASK_LIMIT && sleeping == LUME_TASK_LIMIT &&
+               runnable == LUME_TASK_LIMIT);
     }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         task_state_set(i, 0);

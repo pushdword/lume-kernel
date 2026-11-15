@@ -94,6 +94,7 @@ static bool active;
 static bool elf_mode;
 static bool public_mode, shell_script;
 static uint64_t shell_calls;
+#include "fd_timing.h"
 static struct lume_elf_image images[LUME_TASK_LIMIT];
 static uint64_t wake_at[LUME_TASK_LIMIT];
 static bool vm_fault_wait[LUME_TASK_LIMIT], vm_fault_ready[LUME_TASK_LIMIT];
@@ -266,6 +267,8 @@ void lume_task_account_enter(const struct lume_context *frame)
 
 void lume_task_account_leave(const struct lume_context *frame)
 {
+    if (frame)
+        kernel_fd_timing_return(current_task);
     if (!account_inside)
     {
         task_query_publish(frame);
@@ -608,6 +611,9 @@ static int64_t kernel_thread_create(struct lume_context *);
 
 static void detach_program(unsigned task)
 {
+    fd_timings[task].active = false;
+    if (fd_timing.pid == task + 1)
+        fd_timing.enabled = 0;
     vm_fault_wait[task] = vm_fault_ready[task] = false;
     signal_wait_cancel(task);
     extern void lume_graphics_release(unsigned);
@@ -1789,7 +1795,7 @@ static struct lume_context *task_interrupt(struct lume_context *frame, bool time
     }
 #endif
     sched_charge(&policy, lume_cpu_index(), now());
-    sched_floor(&policy, states);
+    sched_floor_runnable(&policy, task_runnable);
     int candidate = pick_task();
     if (candidate >= 0 && (sched_expired(&policy, lume_cpu_index(), unit, LUME_SCHED_QUANTUM) ||
                            sched_outranks(&policy, (unsigned)candidate, lume_cpu_index(), unit)))
@@ -1944,8 +1950,16 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
     }
     if (public_mode && svc && !process_exiting[process] && kernel_query_call(frame, process))
         return frame;
-    if (public_mode && svc && !process_exiting[process] && kernel_descriptor_call(frame, process))
-        return frame;
+    if (public_mode && svc && !process_exiting[process])
+    {
+        kernel_fd_timing_enter(frame, process);
+        uint64_t began = fd_timing.enabled ? lume_counter_read() : 0;
+        if (kernel_descriptor_call(frame, process))
+        {
+            kernel_fd_timing_complete(task, true, began);
+            return frame;
+        }
+    }
     bool console_call = false, pipe_call = false;
     bool independent =
         svc && (LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_ABI ||

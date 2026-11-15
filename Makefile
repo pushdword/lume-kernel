@@ -1078,6 +1078,13 @@ check-poll-events: $(OUT)/tests/poll$(HOSTEXE)
 	env "$<"
 
 .PHONY: check-descriptor-calls
+.PHONY: check-fd-timing
+check-fd-timing: $(OUT)/tests/fd-timing$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/fd-timing$(HOSTEXE): tests/unit/fd_timing_test.c src/core/fd_timing.h include/uapi/lume/fd_timing.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Isrc/core "$<" -o "$@"
+
 check-descriptor-calls: $(OUT)/tests/descriptor-calls$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/descriptor-calls$(HOSTEXE): tests/unit/descriptor_calls_test.c src/core/descriptor_calls.h

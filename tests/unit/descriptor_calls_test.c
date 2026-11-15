@@ -1,6 +1,7 @@
 #include "lume/abi.h"
 #include "lume/vfs.h"
 #include "lume/user_buffer.h"
+#include "lume/fd_timing.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,13 @@ static struct
 
 static unsigned current_task = 1, records, progress, attempts, copies;
 static bool exclusive, draining, conflict, resident = true, accept = true;
+static unsigned reasons[LUME_FD_TIMING_REASONS];
+
+static void kernel_fd_timing_reason(unsigned reason)
+{
+    assert(reason < LUME_FD_TIMING_REASONS);
+    ++reasons[reason];
+}
 
 static bool kernel_inline_available(void)
 {
@@ -106,9 +114,6 @@ int main(void)
     exclusive = true;
     unchanged(frame);
     exclusive = false;
-    draining = true;
-    unchanged(frame);
-    draining = false;
     conflict = true;
     unchanged(frame);
     conflict = false;
@@ -133,6 +138,15 @@ int main(void)
     assert(attempts == 1);
     assert(kernel_descriptor_call(&frame, 1));
     assert(frame.x[0] == 19 && request.other == 19 && records == 1 && progress == 1);
+    assert(!reasons[LUME_FD_TIMING_DRAIN]);
+    for (unsigned reason = 0; reason < LUME_FD_TIMING_REASONS; ++reason)
+        if (reason != LUME_FD_TIMING_DRAIN)
+            assert(reasons[reason] == (reason == LUME_FD_TIMING_REQUEST ? 2u : 1u));
+    draining = true;
+    frame.x[0] = LUME_FD_DUP;
+    assert(kernel_regular_draining());
+    assert(kernel_descriptor_call(&frame, 1));
+    assert(frame.x[0] == 19 && records == 2 && progress == 2);
     puts(
         "DESCRIPTOR_CALLS_PASS resident snapshot, process conflicts, exclusive drain and fallback");
     return 0;
