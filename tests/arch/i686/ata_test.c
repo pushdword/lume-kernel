@@ -5,6 +5,7 @@
 #include <string.h>
 #include "lume/platform_driver.h"
 #include "lume/storage.h"
+#include "lume/sd.h"
 #define LUME_Q35_H
 #define LUME_COUNTER_H
 #define LUME_ARCH_CPU_H
@@ -20,10 +21,11 @@ static bool cooperative, check_reentry;
 static void check_operation(void);
 static const struct lume_platform_sd_ops *registered;
 static unsigned checkpoints;
+static unsigned input_bursts, output_bursts;
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes == 512);
+    assert(bytes && bytes <= LUME_SD_MAX_SECTORS * 512 && !(bytes % 512));
     ++checkpoints;
     if (check_reentry)
         check_operation();
@@ -108,9 +110,9 @@ void lume_out8(uint16_t port, uint8_t value)
     pending_sectors = value == 0xec ? 1 : registers[2];
     if (value == 0xec)
         phase = 1;
-    else if (value == 0x20)
+    else if (value == 0x20 || value == 0xc4)
         phase = 2;
-    else if (value == 0x30)
+    else if (value == 0x30 || value == 0xc5)
         phase = 3;
     else
     {
@@ -137,6 +139,29 @@ void lume_out16(uint16_t port, uint16_t value)
     }
 }
 
+void lume_ins16(uint16_t port, void *buffer, unsigned words)
+{
+    ++input_bursts;
+    unsigned char *bytes = buffer;
+    while (words--)
+    {
+        uint16_t value = lume_in16(port);
+        *bytes++ = (unsigned char)value;
+        *bytes++ = (unsigned char)(value >> 8);
+    }
+}
+
+void lume_outs16(uint16_t port, const void *buffer, unsigned words)
+{
+    ++output_bursts;
+    const unsigned char *bytes = buffer;
+    while (words--)
+    {
+        lume_out16(port, (uint16_t)bytes[0] | (uint16_t)bytes[1] << 8);
+        bytes += 2;
+    }
+}
+
 int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
 {
     assert(kind == LUME_PLATFORM_SD && bytes == sizeof(*registered));
@@ -154,6 +179,7 @@ static void check_operation(void)
     assert(!read_blocks(0, 1, buffer));
     assert(!write_blocks(allowed_first, 1, buffer));
     assert(!stop() && !start(1000000));
+    assert(!sync_device());
     assert(!allow(allowed_first, allowed_count));
     assert(lume_pc_ide_register() == -LUME_EBUSY);
     assert(commands == before && operating);
@@ -249,6 +275,51 @@ int main(void)
     assert(!registered->lume_sd_read(LUME_PC_DATA_FIRST, output));
     assert(ticks >= 2000000 && ticks <= 2000002 && pauses >= 1990 && relaxations < 100);
     assert(commands == before && failures == previous_failures + 1 && failed && !operating);
+    cooperative = check_reentry = busy = failed = error_status = false;
+    allowed_count = 0;
+    identity[82] = 0x20;
+    identity[83] = 0x5000;
+    assert(!lume_pc_ide_register());
+    assert(registered->lume_sd_allow_volume(LUME_PC_DATA_FIRST, total - LUME_PC_DATA_FIRST));
+    previous_flushes = flushes;
+    assert(registered->lume_sd_write_deferred(LUME_PC_DATA_FIRST, 1, input));
+    assert(registered->lume_sd_write_deferred(LUME_PC_DATA_FIRST + 1, 1, input));
+    assert(dirty && flushes == previous_flushes);
+    assert(registered->lume_sd_sync() && !dirty && flushes == previous_flushes + 1);
+    assert(registered->lume_sd_sync() && flushes == previous_flushes + 1);
+    assert(registered->lume_sd_write_deferred(LUME_PC_DATA_FIRST, 1, input));
+    flush_error = true;
+    assert(!registered->lume_sd_sync() && dirty && failed && !operating);
+    flush_error = error_status = failed = false;
+    assert(registered->lume_sd_sync() && !dirty);
+    allowed_count = 0;
+    identity[47] = 0x8010;
+    identity[59] = 0x110;
+    assert(!lume_pc_ide_register() && multiple_sectors == 16);
+    assert(registered->lume_sd_allow_volume(LUME_PC_DATA_FIRST, total - LUME_PC_DATA_FIRST));
+    unsigned in_before = input_bursts, out_before = output_bursts;
+    unsigned checkpoints_before = checkpoints;
+    assert(registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 31, large + 1));
+    assert(output_bursts == out_before + 2 && checkpoints == checkpoints_before + 2);
+    assert(registered->lume_sd_read_blocks(LUME_PC_DATA_FIRST, 31, copy + 1));
+    assert(input_bursts == in_before + 2 && checkpoints == checkpoints_before + 4);
+    assert(!memcmp(large + 1, copy + 1, 31 * 512));
+    out_before = output_bursts;
+    previous_flushes = flushes;
+    fail_after = completed_sectors + 16;
+    assert(!registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 31, large + 1));
+    assert(output_bursts == out_before + 1 && flushes == previous_flushes && dirty && failed);
+    fail_after = pending_sectors = phase = 0;
+    dirty = error_status = failed = false;
+    unsigned invalid[] = {0, 0x10, 0x103, 0x120};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+    {
+        identity[59] = (uint16_t)invalid[i];
+        assert(!lume_pc_ide_register() && multiple_sectors == 1);
+    }
+    identity[47] = 0x10;
+    identity[59] = 0x110;
+    assert(!lume_pc_ide_register() && multiple_sectors == 1);
     puts("PASS ATA PIO, cooperative deadline, controller ownership, bounds, flush and failure");
     return 0;
 }

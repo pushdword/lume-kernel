@@ -23,6 +23,18 @@ static inline uint32_t lume_in32(uint16_t port)
     return value;
 }
 
+static inline void lume_ins16(uint16_t port, void *buffer, unsigned words)
+{
+    size_t count = words;
+    __asm__ volatile("rep insw" : "+D"(buffer), "+c"(count) : "d"(port) : "memory");
+}
+
+static inline void lume_outs16(uint16_t port, const void *buffer, unsigned words)
+{
+    size_t count = words;
+    __asm__ volatile("rep outsw" : "+S"(buffer), "+c"(count) : "d"(port) : "memory");
+}
+
 static inline void lume_out8(uint16_t port, uint8_t value)
 {
     __asm__ volatile("outb %0, %w1" : : "a"(value), "Nd"(port) : "memory");

@@ -634,6 +634,13 @@ $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/de
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Itests/fixtures/uart_host $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 
 .PHONY: check-virtio-block-groups
+.PHONY: check-ata-pio
+check-ata-pio: $(OUT)/tests/ata-pio$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c include/kernel/lume/platform_driver.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+check: check-ata-pio
 check-virtio-block-groups: $(OUT)/tests/virtio-block-groups$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c include/kernel/lume/platform_driver.h include/kernel/lume/sd.h

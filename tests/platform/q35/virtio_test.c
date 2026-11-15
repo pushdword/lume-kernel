@@ -9,7 +9,7 @@
 #include "../../../platform/q35/virtio.c"
 
 static unsigned char *arena;
-static unsigned allocated, released, queue_size = 32, notification;
+static unsigned allocated, released, queue_size = 32, notification, notifications;
 static uint32_t features = 0x55, negotiated, pfn, command;
 static uint8_t status;
 static bool reset_failure, allocation_failure, high_allocation;
@@ -105,7 +105,10 @@ void lume_out16(uint16_t port, uint16_t value)
 {
     assert(port == 0xc00e || port == 0xc010);
     if (port == 0xc010)
+    {
         notification = value + 1;
+        ++notifications;
+    }
 }
 
 void lume_out32(uint16_t port, uint32_t value)
@@ -148,6 +151,19 @@ int main(void)
     assert(status == 7);
     lume_virtio_submit(&queue, 2);
     assert(queue.available[1] == 1 && queue.available[2] == 2 && notification == 1);
+    unsigned heads[] = {3, 6, 9};
+    unsigned previous_notifications = notifications;
+    lume_virtio_submit_batch(&queue, heads, 3);
+    assert(queue.available[1] == 4 && queue.available[3] == 3 && queue.available[5] == 9);
+    assert(notifications == previous_notifications + 1);
+    queue.used[0] = 1;
+    lume_virtio_submit_batch(&queue, heads, 3);
+    assert(queue.available[1] == 7 && notifications == previous_notifications + 1);
+    queue.used[0] = 0;
+    queue.available[1] = UINT16_MAX;
+    lume_virtio_submit_batch(&queue, heads, 3);
+    assert(queue.available[1] == 2 && queue.available[33] == 3 && queue.available[2] == 6 &&
+           queue.available[3] == 9);
     unsigned id, bytes;
     assert(!lume_virtio_take(&queue, &id, &bytes));
     ((struct lume_virtio_used *)queue.elements)[0] = (struct lume_virtio_used){0, 513};

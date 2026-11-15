@@ -12,6 +12,8 @@ static uint64_t capacity, allowed_first, allowed_count;
 static uint64_t reads, writes, failures;
 static bool failed;
 static bool flush_supported;
+static bool dirty;
+static unsigned multiple_sectors = 1;
 /* Controller ownership covers PIO, worker suspension and the final cache flush. */
 static bool operating;
 
@@ -76,23 +78,22 @@ static bool select_sectors(uint64_t sector, unsigned count, uint8_t command)
 
 static bool read_blocks_owned(uint64_t sector, unsigned count, void *buffer)
 {
-    if (!buffer || !select_sectors(sector, count, 0x20))
+    if (!buffer || !select_sectors(sector, count, multiple_sectors > 1 ? 0xc4 : 0x20))
         return false;
     unsigned char *out = buffer;
-    for (unsigned block = 0; block < count; ++block)
+    for (unsigned block = 0; block < count;)
     {
-        for (unsigned i = 0; i < 256; ++i)
-        {
-            uint16_t value = lume_in16(DATA);
-            out[i * 2] = (unsigned char)value;
-            out[i * 2 + 1] = (unsigned char)(value >> 8);
-        }
-        out += 512;
+        unsigned part = count - block;
+        if (part > multiple_sectors)
+            part = multiple_sectors;
+        lume_ins16(DATA, out, part * 256);
+        out += part * 512;
+        block += part;
         delay();
-        if (!wait_status(block + 1 < count))
+        if (!wait_status(block < count))
             return false;
-        ++reads;
-        lume_worker_checkpoint(512);
+        reads += part;
+        lume_worker_checkpoint(part * 512);
     }
     return true;
 }
@@ -101,27 +102,44 @@ static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buff
 {
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || !allowed_count ||
         sector < allowed_first || sector - allowed_first >= allowed_count ||
-        count > allowed_count - (sector - allowed_first) || !select_sectors(sector, count, 0x30))
+        count > allowed_count - (sector - allowed_first) ||
+        !select_sectors(sector, count, multiple_sectors > 1 ? 0xc5 : 0x30))
         return false;
     const unsigned char *in = buffer;
-    for (unsigned block = 0; block < count; ++block)
+    dirty = true;
+    for (unsigned block = 0; block < count;)
     {
-        for (unsigned i = 0; i < 256; ++i)
-            lume_out16(DATA, (uint16_t)in[i * 2] | (uint16_t)in[i * 2 + 1] << 8);
-        in += 512;
+        unsigned part = count - block;
+        if (part > multiple_sectors)
+            part = multiple_sectors;
+        lume_outs16(DATA, in, part * 256);
+        in += part * 512;
+        block += part;
         delay();
-        if (!wait_status(block + 1 < count))
+        if (!wait_status(block < count))
             return false;
-        lume_worker_checkpoint(512);
+        lume_worker_checkpoint(part * 512);
     }
+    writes += count;
+    return true;
+}
+
+static bool flush_owned(void)
+{
+    if (failed)
+        return false;
+    if (!dirty)
+        return true;
     if (flush_supported)
     {
+        if (!wait_status(false))
+            return false;
         lume_out8(DATA + 7, 0xe7);
         delay();
         if (!wait_status(false))
             return false;
     }
-    writes += count;
+    dirty = false;
     return true;
 }
 
@@ -140,7 +158,27 @@ static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
     if (operating)
         return false;
     operating = true;
+    bool result = write_blocks_owned(sector, count, buffer) && flush_owned();
+    operating = false;
+    return result;
+}
+
+static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
+{
+    if (operating)
+        return false;
+    operating = true;
     bool result = write_blocks_owned(sector, count, buffer);
+    operating = false;
+    return result;
+}
+
+static bool sync_device(void)
+{
+    if (operating)
+        return false;
+    operating = true;
+    bool result = flush_owned();
     operating = false;
     return result;
 }
@@ -174,7 +212,7 @@ static bool stop(void)
     if (operating)
         return false;
     operating = true;
-    bool result = !failed && wait_status(false);
+    bool result = flush_owned() && wait_status(false);
     operating = false;
     return result;
 }
@@ -207,6 +245,7 @@ static void stats(void)
     lume_value("ATA_PIO_READS", reads);
     lume_value("ATA_PIO_WRITES", writes);
     lume_value("ATA_PIO_FAILURES", failures);
+    lume_value("ATA_PIO_MULTIPLE_SECTORS", multiple_sectors);
 }
 
 static int register_owned(void)
@@ -223,8 +262,7 @@ static int register_owned(void)
     if (!wait_status(true) || lume_in8(DATA + 4) || lume_in8(DATA + 5))
         return -5;
     uint16_t identify[256];
-    for (unsigned i = 0; i < 256; ++i)
-        identify[i] = lume_in16(DATA);
+    lume_ins16(DATA, identify, 256);
     delay();
     if (!wait_status(false) || !(identify[49] & 0x200))
         return -5;
@@ -234,9 +272,16 @@ static int register_owned(void)
     capacity = (uint64_t)identify[60] | (uint64_t)identify[61] << 16;
     if (!capacity || capacity > UINT64_C(0x10000000))
         return -5;
+    multiple_sectors = 1;
+    unsigned maximum = identify[47] & 0xff;
+    unsigned current = identify[59] & 0xff;
+    if ((identify[47] >> 8) == 0x80 && (identify[59] & 0x100) && maximum && current &&
+        !(maximum & (maximum - 1)) && !(current & (current - 1)) && current <= maximum &&
+        current <= LUME_SD_MAX_SECTORS)
+        multiple_sectors = current;
     static const struct lume_platform_sd_ops operations = {
-        start, configure,  stop,  read_sector, write_sector, sectors,
-        allow, allow_boot, stats, read_blocks, write_blocks};
+        start,      configure, stop,        read_sector,  write_sector,   sectors,    allow,
+        allow_boot, stats,     read_blocks, write_blocks, write_deferred, sync_device};
     int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
         stats();

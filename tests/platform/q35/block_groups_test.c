@@ -39,19 +39,20 @@ static struct lume_virtio_desc descriptors[32];
 static unsigned char card[512][512], durable[sizeof(card)];
 static unsigned pending[32], pending_count, peak, submits, flushes, checkpoints, released;
 static unsigned queue_count = 32;
+static unsigned maximum_segment = 16384, segment_count = 1, notifications;
 static bool registered, short_read, bad_id, hold, fail_flush, reset_ack = true;
 static bool fail_read_group;
 
 uint32_t lume_in32(uint16_t port)
 {
-    assert(port == 20 || port == 24);
-    return port == 20 ? 512 : 0;
+    assert(port == 20 || port == 24 || port == 28 || port == 32);
+    return port == 20 ? 512 : port == 28 ? maximum_segment : port == 32 ? segment_count : 0;
 }
 
 bool lume_virtio_open(struct lume_virtio *value, uint32_t pci, uint16_t product, uint32_t features)
 {
     assert(value == &device && pci == 0x1800 && product == 0x1001);
-    *value = (struct lume_virtio){.features = features & (1u << 9)};
+    *value = (struct lume_virtio){.features = features & ((1u << 1) | (1u << 2) | (1u << 9))};
     return true;
 }
 
@@ -88,6 +89,14 @@ void lume_virtio_submit(struct lume_virtqueue *q, unsigned head)
     if (pending_count > peak)
         peak = pending_count;
     ++submits;
+}
+
+void lume_virtio_submit_batch(struct lume_virtqueue *q, const unsigned *heads, unsigned count)
+{
+    assert(count && count <= request_limit && !pending_count);
+    ++notifications;
+    for (unsigned i = 0; i < count; ++i)
+        lume_virtio_submit(q, heads[i]);
 }
 
 bool lume_virtio_take(struct lume_virtqueue *q, unsigned *id, unsigned *written)
@@ -188,6 +197,7 @@ int main(void)
     assert(!read_blocks(16, 0, output) && !write_blocks(16, 1, NULL) && !submits);
     assert(write_blocks(16, 128, input + 1));
     assert(peak == 4 && submits == 5 && flushes == 1 && !dirty && !pending_count);
+    assert(notifications == 2 && request_sectors == 32);
     assert(!memcmp(durable + 16 * 512, input + 1, 65536));
     memset(output, 0, sizeof(output));
     assert(read_blocks(16, 128, output + 1) && !memcmp(input + 1, output + 1, 65536));
@@ -225,7 +235,7 @@ int main(void)
     fail_read_group = true;
     before = submits;
     assert(read_sector(400, output) && !memcmp(output, card[400], 512));
-    assert(submits == before + READ_CACHE_SECTORS / BLOCK_REQUEST_SECTORS + 1 && !device.failed);
+    assert(submits == before + READ_CACHE_SECTORS / request_sectors + 1 && !device.failed);
     fail_read_group = false;
     capacity = 509;
     assert(read_sector(508, output) && !memcmp(output, card[508], 512));
@@ -233,7 +243,7 @@ int main(void)
     assert(!read_sector(509, output) && !read_sector(508, NULL) && submits == before);
     capacity = 512;
     bad_id = true;
-    assert(!read_blocks(16, 128, output) && device.failed && pending_count);
+    assert(!read_blocks(16, 128, output) && device.failed && requests[0].active);
     before = submits;
     assert(!read_blocks(16, 1, output) && submits == before);
     reset_ack = false;
@@ -249,6 +259,27 @@ int main(void)
     assert(!read_blocks(16, 1, output) && device.failed && requests[0].active);
     hold = false;
     assert(!module_stop(NULL, &binding) && released == 2);
+    maximum_segment = 0;
+    queue_count = 32;
+    submits = notifications = peak = 0;
+    assert(!module_start(NULL, &binding) && allow(16, 256) && request_sectors == 128);
+    assert(write_blocks(16, 128, input + 1));
+    assert(peak == 1 && submits == 2 && notifications == 2);
+    assert(!memcmp(durable + 16 * 512, input + 1, 65536));
+    assert(read_blocks(16, 128, output + 1) && !memcmp(input + 1, output + 1, 65536));
+    assert(!read_cache_count && !module_stop(NULL, &binding));
+    maximum_segment = 511;
+    assert(module_start(NULL, &binding) == -LUME_EIO);
+    assert(!module_stop(NULL, &binding));
+    maximum_segment = 512;
+    submits = notifications = 0;
+    assert(!module_start(NULL, &binding) && allow(16, 256) && request_sectors == 1);
+    assert(write_blocks(16, 128, input + 1));
+    assert(submits == 129 && notifications == 33);
+    assert(!module_stop(NULL, &binding));
+    segment_count = 0;
+    assert(module_start(NULL, &binding) == -LUME_EIO);
+    assert(!module_stop(NULL, &binding));
     puts(
         "VIRTIO_BLOCK_PIPELINE_PASS: Pending requests, reverse completions, bounds, durable flush, timeout and DMA retention");
     return 0;

@@ -72,12 +72,21 @@ void lume_virtio_fail(struct lume_virtio *device)
 
 void lume_virtio_submit(struct lume_virtqueue *q, unsigned descriptor)
 {
+    lume_virtio_submit_batch(q, &descriptor, 1);
+}
+
+void lume_virtio_submit_batch(struct lume_virtqueue *q, const unsigned *descriptors, unsigned count)
+{
+    if (!count)
+        return;
     uint16_t next = q->available[1];
-    q->available[2 + next % q->count] = (uint16_t)descriptor;
+    for (unsigned i = 0; i < count; ++i)
+        q->available[2 + (uint16_t)(next + i) % q->count] = (uint16_t)descriptors[i];
     lume_dma_write_complete();
-    q->available[1] = next + 1;
+    q->available[1] = (uint16_t)(next + count);
     lume_memory_complete();
-    lume_out16(q->port + 16, q->number);
+    if (!(q->used[0] & 1))
+        lume_out16(q->port + 16, q->number);
 }
 
 bool lume_virtio_take(struct lume_virtqueue *q, unsigned *id, unsigned *bytes)

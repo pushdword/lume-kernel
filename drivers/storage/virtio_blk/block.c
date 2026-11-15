@@ -15,10 +15,11 @@ static struct lume_virtqueue queue;
 static uint64_t capacity, allowed_first, allowed_count;
 
 #define BLOCK_REQUESTS 4u
-#define BLOCK_REQUEST_SECTORS 32u
+#define BLOCK_REQUEST_SECTORS LUME_SD_MAX_SECTORS
 #define READ_CACHE_SECTORS 128u
 
 static unsigned char read_cache[READ_CACHE_SECTORS * 512u];
+static _Alignas(16) unsigned char request_data[LUME_SD_MAX_SECTORS * 512u];
 static uint64_t read_cache_first;
 static unsigned read_cache_count;
 
@@ -36,14 +37,16 @@ static struct block_request
         uint64_t sector;
     } header;
 
-    _Alignas(16) unsigned char data[BLOCK_REQUEST_SECTORS * 512];
+    unsigned char *data;
     volatile unsigned char status;
     unsigned expected;
     bool active, done, success;
 } requests[BLOCK_REQUESTS];
 
 static unsigned request_limit;
+static unsigned request_sectors;
 static bool transferring, dirty;
+static uint64_t submitted_requests;
 
 static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count,
                    const void *buffer)
@@ -52,6 +55,7 @@ static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count
     unsigned head = slot * 3u, bytes = count * 512u;
     request->header.type = type;
     request->header.sector = sector;
+    request->data = request_data + (size_t)slot * request_sectors * 512u;
     request->status = 0xff;
     request->expected = type == 0 ? bytes + 1 : 1;
     request->active = true;
@@ -63,7 +67,7 @@ static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count
     queue.descriptors[head + 1] = (struct lume_virtio_desc){
         (uintptr_t)request->data, bytes, type == 0 ? 3 : 1, (uint16_t)(head + 2)};
     queue.descriptors[head + 2] = (struct lume_virtio_desc){(uintptr_t)&request->status, 1, 2, 0};
-    lume_virtio_submit(&queue, head);
+    ++submitted_requests;
 }
 
 static bool complete(unsigned count)
@@ -104,7 +108,7 @@ static bool complete(unsigned count)
 
 static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffer)
 {
-    if (device.failed || !capacity || !request_limit || transferring ||
+    if (device.failed || !capacity || !request_limit || !request_sectors || transferring ||
         (type != 4 && (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
                        count > capacity - sector)))
         return false;
@@ -116,21 +120,24 @@ static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffe
     do
     {
         unsigned pending = 0, submitted = first;
+        unsigned heads[BLOCK_REQUESTS];
         do
         {
             unsigned part = count - submitted;
-            if (part > BLOCK_REQUEST_SECTORS)
-                part = BLOCK_REQUEST_SECTORS;
+            if (part > request_sectors)
+                part = request_sectors;
+            heads[pending] = pending * 3u;
             submit(pending++, type, sector + submitted, part,
                    buffer ? (const unsigned char *)buffer + (size_t)submitted * 512u : NULL);
             submitted += part;
         } while (pending < request_limit && submitted < count);
+        lume_virtio_submit_batch(&queue, heads, pending);
         success = complete(pending);
         for (unsigned i = 0; i < pending; ++i)
         {
             unsigned part = count - first;
-            if (part > BLOCK_REQUEST_SECTORS)
-                part = BLOCK_REQUEST_SECTORS;
+            if (part > request_sectors)
+                part = request_sectors;
             if (success && type == 0)
                 memcpy((unsigned char *)buffer + (size_t)first * 512u, requests[i].data,
                        part * 512u);
@@ -166,6 +173,8 @@ static bool cached_read(uint64_t sector, unsigned count, void *buffer)
         memcpy(buffer, read_cache + (size_t)(sector - read_cache_first) * 512u, count * 512u);
         return true;
     }
+    if (count >= 32)
+        return transfer(0, sector, count, buffer);
     /* Metadata and executable-page reads share a bounded window. Writes invalidate it
      * before submission, including writes that later fail. */
     read_cache_count = 0;
@@ -273,6 +282,8 @@ static bool stop(void)
 static void stats(void)
 {
     lume_value("VIRTIO_BLOCK_SECTORS", capacity);
+    lume_value("VIRTIO_BLOCK_REQUEST_SECTORS", request_sectors);
+    lume_value("VIRTIO_BLOCK_REQUESTS", submitted_requests);
 }
 
 static const struct lume_platform_sd_ops operations = {
@@ -287,12 +298,24 @@ static int module_start(struct lume_hardware *hardware, void *context)
     int result = q35_module_pci(hardware, 0x1af4, 0x1001, &pci);
     if (result)
         return result;
-    if (!lume_virtio_open(&device, pci, 0x1001, (1u << 5) | (1u << 9)) ||
+    if (!lume_virtio_open(&device, pci, 0x1001, (1u << 1) | (1u << 2) | (1u << 5) | (1u << 9)) ||
         !lume_virtio_queue(&device, 0, &queue) || queue.count < 3)
         return -LUME_EIO;
     request_limit = queue.count / 3u;
     if (request_limit > BLOCK_REQUESTS)
         request_limit = BLOCK_REQUESTS;
+    request_sectors = BLOCK_REQUEST_SECTORS;
+    if (device.features & (1u << 1))
+    {
+        unsigned maximum = lume_in32(device.port + 28);
+        if (maximum && maximum < 512)
+            return -LUME_EIO;
+        if (maximum && maximum / 512 < request_sectors)
+            request_sectors = maximum / 512;
+    }
+    if ((device.features & (1u << 2)) && !lume_in32(device.port + 32))
+        return -LUME_EIO;
+    submitted_requests = 0;
     capacity = (uint64_t)lume_in32(device.port + 20) | (uint64_t)lume_in32(device.port + 24) << 32;
     if (!capacity)
         return -LUME_EIO;
@@ -326,6 +349,7 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     memset(&device, 0, sizeof(device));
     capacity = allowed_first = allowed_count = 0;
     request_limit = 0;
+    request_sectors = 0;
     dirty = transferring = false;
     return 0;
 }
