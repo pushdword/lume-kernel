@@ -211,8 +211,8 @@ int lume_module_unregister_group(struct lume_devfs_group *group)
     return result;
 }
 
-int lume_module_irq_domain_register(uint32_t id, unsigned lines,
-                                    const struct lume_irq_domain_ops *ops, void *context)
+static int register_domain(uint32_t id, unsigned lines, const struct lume_irq_domain_ops *ops,
+                           void *context, bool asynchronous)
 {
     if (!id || !lines || lines > LUME_IRQ_DOMAIN_LINES || !ops || !ops->configure || !ops->enable)
         return -LUME_EINVAL;
@@ -226,12 +226,25 @@ int lume_module_irq_domain_register(uint32_t id, unsigned lines,
         if (!result && copy.acknowledge)
             result = domain_callback(r->owner, (uintptr_t)copy.acknowledge);
         if (!result)
-            result = lume_irq_domain_register(id, lines, &copy, context);
+            result = asynchronous ? lume_irq_domain_register_async(id, lines, &copy, context)
+                                  : lume_irq_domain_register(id, lines, &copy, context);
         if (result)
             release(r);
     }
     lume_irq_restore(flags);
     return result;
+}
+
+int lume_module_irq_domain_register(uint32_t id, unsigned lines,
+                                    const struct lume_irq_domain_ops *ops, void *context)
+{
+    return register_domain(id, lines, ops, context, false);
+}
+
+int lume_module_irq_domain_register_async(uint32_t id, unsigned lines,
+                                          const struct lume_irq_domain_ops *ops, void *context)
+{
+    return register_domain(id, lines, ops, context, true);
 }
 
 int lume_module_irq_domain_unregister(uint32_t id, void *context)

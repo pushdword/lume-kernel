@@ -8,7 +8,8 @@ static void wake_tasks(void)
     poll_console_pump();
     extern bool lume_console_ready(void);
     uint64_t at = lume_clock_monotonic();
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+    for (unsigned i = task_state_next(task_sleeping, 0); i < LUME_TASK_LIMIT;
+         i = task_state_next(task_sleeping, i + 1))
         if (states[i] == 4)
         {
             if (kernel_wait[i])
@@ -18,7 +19,7 @@ static void wake_tasks(void)
                 if (!vm_fault_ready[i] && !thread_deadline_expired(i, at))
                     continue;
                 vm_fault_wait[i] = vm_fault_ready[i] = false;
-                states[i] = 1;
+                task_state_set(i, 1);
                 sched_wake(&policy, i, unit, 0);
                 continue;
             }
@@ -36,7 +37,7 @@ static void wake_tasks(void)
             {
                 if (poll_wake(i, at))
                 {
-                    states[i] = 1;
+                    task_state_set(i, 1);
                     sched_wake(&policy, i, unit, 0);
                 }
                 continue;
@@ -62,7 +63,7 @@ static void wake_tasks(void)
             pipe_wait[i] = false;
             kernel_wait[i] = false;
             input_wait[i] = false;
-            states[i] = 1;
+            task_state_set(i, 1);
             sched_wake(&policy, i, unit, 0);
         }
 }

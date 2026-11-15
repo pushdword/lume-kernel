@@ -60,7 +60,7 @@ static bool signal_wake_waiter(unsigned owner)
             continue;
         waiting->wait_mask = 0;
         LUME_CONTEXT_REG(&tasks[task].context, 0) = request.number;
-        states[task] = 1;
+        task_state_set(task, 1);
         sched_wake(&policy, task, unit, 0);
         return true;
     }
@@ -139,7 +139,7 @@ static void signal_queue(unsigned owner, unsigned number)
              (stream_interrupt(owner) || netctl_interrupt(owner) || dns_interrupt(owner)))
     {
         LUME_CONTEXT_REG(&tasks[owner].context, 0) = (uint64_t)-4;
-        states[owner] = 1;
+        task_state_set(owner, 1);
         sched_wake(&policy, owner, unit, 0);
     }
     else if (!(s->mask & (1u << number)) && !kernel_wait[owner] &&
@@ -148,7 +148,7 @@ static void signal_queue(unsigned owner, unsigned number)
     {
         if (stopping && poll_waits && poll_waits[owner].active)
         {
-            states[owner] = 1;
+            task_state_set(owner, 1);
             sched_wake(&policy, owner, unit, 0);
             lume_smp_wake();
             return;
@@ -172,7 +172,7 @@ static void signal_queue(unsigned owner, unsigned number)
         futex_address[owner] = 0;
         if (!restart)
             LUME_CONTEXT_REG(&tasks[owner].context, 0) = (uint64_t)-4;
-        states[owner] = 1;
+        task_state_set(owner, 1);
         sched_wake(&policy, owner, unit, 0);
     }
     lume_smp_wake();
@@ -381,7 +381,7 @@ static struct lume_context *signal_wait_call(struct lume_context *frame, unsigne
     /* Pending selection and registration execute under the scheduler lock. */
     waiting->wait_mask = (uint32_t)selected;
     tasks[current_task].context = *frame;
-    states[current_task] = 4;
+    task_state_set(current_task, 4);
     wake_at[current_task] = UINT64_MAX;
     sched_charge(&policy, lume_cpu_index(), now());
     return wait_ready_task();
@@ -403,7 +403,7 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
     if (process_stopped[owner])
     {
         tasks[current_task].context = *frame;
-        states[current_task] = 1;
+        task_state_set(current_task, 1);
         sched_charge(&policy, lume_cpu_index(), now());
         return lume_tasks_deliver_signals(wait_ready_task());
     }
@@ -432,7 +432,7 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
                 stop_signals[owner] = number;
                 child_state_event(owner, LUME_WAIT_STOPPED);
                 tasks[current_task].context = *frame;
-                states[current_task] = 1;
+                task_state_set(current_task, 1);
                 sched_charge(&policy, lume_cpu_index(), now());
                 return lume_tasks_deliver_signals(wait_ready_task());
             }

@@ -1,6 +1,7 @@
 #include "lume/thread.h"
 #include "lume/virtio_gpu_device.h"
 #include "lume/render_device.h"
+#include "lume/irq_async.h"
 
 bool lume_task_storage_context(void)
 {
@@ -271,7 +272,7 @@ static void kernel_memory_waiters(void)
                 LUME_CONTEXT_PC(frame) -= LUME_SYSCALL_INSTRUCTION_BYTES;
             kernel_retry_launch[task] = false;
             kernel_wait[task] = false;
-            states[task] = 1;
+            task_state_set(task, 1);
             sched_wake(&policy, task, unit, 0);
             lume_smp_wake();
         }
@@ -340,7 +341,7 @@ static bool kernel_admit_queue(unsigned domain)
             io_queue_grant(queue, ticket);
             kernel_retry_launch[task] = false;
             kernel_wait[task] = false;
-            states[task] = 1;
+            task_state_set(task, 1);
             sched_wake(&policy, task, unit, 0);
         }
         else
@@ -437,6 +438,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
 {
     if (!public_mode)
         return;
+    lume_irq_domain_poll();
     lume_net_poll_background();
     lume_storage_poll_background();
     lume_vm_poll_background();
@@ -582,7 +584,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             {
                 kernel_socket_network[owner] = true;
                 kernel_wait[owner] = true;
-                states[owner] = 4;
+                task_state_set(owner, 4);
                 lane->result = 0;
                 if (!kernel_enqueue(owner, LUME_WORK_NETWORK, false))
                     lume_fail("socket resource requeue");
@@ -594,7 +596,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             {
                 kernel_vm_storage[owner] = true;
                 kernel_wait[owner] = true;
-                states[owner] = 4;
+                task_state_set(owner, 4);
                 lane->result = 0;
                 if (!kernel_enqueue(owner, LUME_WORK_STORAGE, false))
                     lume_fail("mapping resource requeue");
@@ -605,7 +607,7 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                 kernel_vm_storage[owner] = mapping_storage;
                 kernel_retry_launch[owner] = lane->launch;
                 kernel_wait[owner] = true;
-                states[owner] = 4;
+                task_state_set(owner, 4);
                 lane->result = 0;
                 if (!kernel_enqueue(owner, LUME_WORK_STORAGE, false))
                     lume_fail("storage resource requeue");
@@ -617,28 +619,28 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                     (uint64_t)(cancelled || process_exiting[process_slot(owner)] ? -LUME_EINTR
                                                                                  : -LUME_EIO);
                 lane->result = 0;
-                states[owner] = 1;
+                task_state_set(owner, 1);
                 sched_wake(&policy, owner, unit, 0);
             }
             else if (reclaim)
             {
-                states[owner] = 1;
+                task_state_set(owner, 1);
                 sched_wake(&policy, owner, unit, 0);
             }
             else if (lane->launch && lane->result >= 0 &&
                      LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_RUN)
-                states[owner] = 3;
+                task_state_set(owner, 3);
             else if (!lane->launch &&
                      ((stream_waits[owner].active && stream_waits[owner].pending) ||
                       (netctl_waits[owner].active && netctl_waits[owner].pending) ||
                       (dns_waits[owner].active && dns_waits[owner].pending)))
-                states[owner] = 4;
+                task_state_set(owner, 4);
             else if (lane->launch || !kernel_pipe_block(owner, frame, lane->result))
             {
                 kernel_socket_network[owner] = false;
                 if (!context_replaced[owner])
                     LUME_CONTEXT_REG(frame, 0) = (uint64_t)lane->result;
-                states[owner] = 1;
+                task_state_set(owner, 1);
                 sched_wake(&policy, owner, unit, 0);
             }
             lume_watchdog_progress();
@@ -678,7 +680,7 @@ static bool kernel_system_cleanup_ready(unsigned task)
         !kernel_enqueue(task, KERNEL_IO_EXCLUSIVE, true))
         lume_fail("process cleanup admission");
     kernel_wait[task] = true;
-    states[task] = 4;
+    task_state_set(task, 4);
     return false;
 }
 
@@ -695,7 +697,7 @@ static bool kernel_process_cleanup_ready(unsigned task)
         !kernel_enqueue(task, LUME_WORK_GENERAL, true))
         lume_fail("process cleanup admission");
     kernel_wait[task] = true;
-    states[task] = 4;
+    task_state_set(task, 4);
     return false;
 }
 
@@ -721,7 +723,7 @@ static bool kernel_close_ready(unsigned task)
     lane->child_snapshot_ready = false;
     lane->deferred_turn = true;
     kernel_wait[task] = true;
-    states[task] = 4;
+    task_state_set(task, 4);
     wake_at[task] = UINT64_MAX;
     if (!lume_worker_submit_on(LUME_WORK_GENERAL, kernel_close_files, (void *)(uintptr_t)task))
         lume_fail("process file close submission");

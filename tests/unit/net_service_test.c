@@ -75,6 +75,19 @@ bool lume_stream_needs_poll(void)
     return active_stream;
 }
 
+void lume_stream_reap(void)
+{
+}
+
+bool lume_icmp_reap_pending(void)
+{
+    return false;
+}
+
+void lume_icmp_reap(void)
+{
+}
+
 bool lume_icmp_busy(void)
 {
     return false;
@@ -116,8 +129,8 @@ _Noreturn void lume_fail(const char *message)
 
 void lume_worker_checkpoint(unsigned bytes)
 {
-    assert(bytes == 60);
-    ++checkpoints;
+    assert(bytes == 60 || !bytes);
+    checkpoints += bytes != 0;
     if (nested_notification)
     {
         nested_notification = false;

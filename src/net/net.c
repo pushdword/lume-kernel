@@ -203,7 +203,7 @@ static struct lume_work service_work = {.run = network_service, .domain = LUME_W
 void lume_net_poll_background(void)
 {
     if (!lume_netif_count() && !lume_stream_busy() && !lume_datagram_busy() &&
-        !lume_datagram_reap_pending() && !lume_socket_reap_pending())
+        !lume_datagram_reap_pending() && !lume_socket_reap_pending() && !lume_icmp_reap_pending())
         return;
     uint64_t now = lume_clock_monotonic();
     uint64_t interval = tx_waiting || lume_stream_needs_poll() || now < traffic_until ? 1 : 10;
@@ -225,6 +225,7 @@ void lume_net_poll(void)
         return;
     polling = true;
     lume_stream_reap();
+    lume_icmp_reap();
     lume_socket_reap();
     lume_datagram_reap();
     if (!started && !lume_net_start())

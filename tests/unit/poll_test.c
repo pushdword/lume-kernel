@@ -1,4 +1,5 @@
 #include "lume/poll.h"
+#include "lume/sandbox_policy.h"
 #include "lume/socket_file.h"
 #include "lume/datagram.h"
 #include "lume/io.h"
@@ -6,6 +7,44 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+int lume_sandbox_open(struct lume_files *files, const char *path, uint64_t flags)
+{
+    assert(files->identity.sandbox_profile == LUME_SANDBOX_NONE);
+    (void)path;
+    (void)flags;
+    return 0;
+}
+
+int lume_sandbox_path(struct lume_files *files, const char *path)
+{
+    return lume_sandbox_open(files, path, 0);
+}
+
+bool lume_tty_slave_output(struct lume_files *files, unsigned fd)
+{
+    (void)files;
+    (void)fd;
+    return false;
+}
+
+int lume_stream_socket_error(unsigned owner, unsigned handle, unsigned *error, bool *pending)
+{
+    (void)owner;
+    (void)handle;
+    *error = 0;
+    *pending = false;
+    return 0;
+}
+
+int64_t lume_datagram_message_buffer(struct lume_files *files, unsigned operation, int fd,
+                                     struct lume_socket_message *message,
+                                     struct lume_socket_request *metadata,
+                                     struct lume_socket_buffer *buffer)
+{
+    (void)buffer;
+    return lume_datagram_message(files, operation, fd, message, metadata);
+}
 
 static unsigned checks, wakes, console_polls;
 static bool console_input;
@@ -152,11 +191,12 @@ static void high_waiters_test(void)
 {
     struct lume_wait_queue queue = {0};
     T(lume_wait_subscribe(&queue, 0) && lume_wait_subscribe(&queue, 32));
-    T(lume_wait_subscribe(&queue, 63) && !lume_wait_subscribe(&queue, 64));
+    T(lume_wait_subscribe(&queue, LUME_WAIT_TASK_LIMIT - 1) &&
+      !lume_wait_subscribe(&queue, LUME_WAIT_TASK_LIMIT));
     lume_wait_wake(&queue);
     lume_wait_cancel(&queue, 32);
-    T(lume_wait_take(&queue, 63) && lume_wait_take(&queue, 0));
-    T(!lume_wait_take(&queue, 32) && !lume_wait_take(&queue, 64));
+    T(lume_wait_take(&queue, LUME_WAIT_TASK_LIMIT - 1) && lume_wait_take(&queue, 0));
+    T(!lume_wait_take(&queue, 32) && !lume_wait_take(&queue, LUME_WAIT_TASK_LIMIT));
     T(!queue.ready && !queue.waiting);
     struct lume_files files;
     lume_files_init(&files);
@@ -379,7 +419,8 @@ int main(void)
     T(lume_vfs_poll_take(11) && !lume_vfs_poll_take(8));
     T(lume_vfs_poll_check(&files, &output) == 1 && output.records[0].revents == LUME_POLLOUT);
     lume_vfs_poll_cancel(11);
-    T(lume_vfs_read(&files, a.fd, bytes, sizeof(bytes)) > 0);
+    if (sizeof(bytes) > LUME_PIPE_ATOMIC)
+        T(lume_vfs_read(&files, a.fd, bytes, sizeof(bytes)) == sizeof(bytes) - LUME_PIPE_ATOMIC);
     input = watch(&files, a.fd, 0, 7);
     T(!lume_vfs_poll_check(&files, &input));
     T(!lume_vfs_close(&files, a.other) && !lume_vfs_pipe_io(&files, a.other));

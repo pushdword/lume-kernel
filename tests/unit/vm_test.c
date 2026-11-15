@@ -145,6 +145,14 @@ int lume_vfs_object_retain(int fd)
     return 0;
 }
 
+void *lume_kernel_allocate_private(size_t size)
+{
+    void *memory = lume_kernel_allocate(size);
+    if (memory)
+        memset(memory, 0, size);
+    return memory;
+}
+
 void lume_kernel_free(void *value)
 {
     if (value)

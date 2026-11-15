@@ -129,7 +129,11 @@ int main(void)
     ++milliseconds;
     assert(lume_icmp_call(1, LUME_ICMP_ECHO_POLL, &r) == LUME_STREAM_ERROR);
     lume_icmp_release(1);
-    assert(removed == 2);
+    assert(removed == 1 && lume_icmp_reap_pending() && lume_icmp_busy());
+    assert(lume_icmp_call(1, LUME_ICMP_ECHO_POLL, &r) == -LUME_ENOENT);
+    assert(!pcbs[0].recv(pcbs[0].recv_arg, &pcbs[0], &incoming, &source));
+    lume_icmp_reap();
+    assert(removed == 2 && !lume_icmp_reap_pending() && !lume_icmp_busy());
     r = request();
     allocation_fail = true;
     assert(lume_icmp_call(1, LUME_ICMP_ECHO_START, &r) == -LUME_ENOMEM);
@@ -148,10 +152,12 @@ int main(void)
     }
     assert(lume_icmp_call(5, LUME_ICMP_ECHO_START, &r) == -LUME_ENOMEM);
     lume_icmp_release(2);
+    lume_icmp_reap();
     r = request();
     assert(!lume_icmp_call(5, LUME_ICMP_ECHO_START, &r));
     for (unsigned i = 1; i <= 5; ++i)
         lume_icmp_release(i);
+    lume_icmp_reap();
     for (unsigned i = 0; i < 4; ++i)
         assert(!used[i]);
     r = request();

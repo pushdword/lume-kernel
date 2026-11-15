@@ -479,7 +479,8 @@ $(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/contex
 $(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel "$<" -o "$@"
-$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/poll$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
 $(OUT)/tests/heap$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
@@ -612,7 +613,7 @@ $(OUT)/tests/irq-async$(HOSTEXE): tests/unit/irq_async_test.c src/device/irq.c i
 check: check-irq-async
 check-irq-domain: $(OUT)/tests/irq-domain$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/irq-domain$(HOSTEXE): tests/unit/irq_domain_test.c src/device/irq.c src/device/irq_domain.c
+$(OUT)/tests/irq-domain$(HOSTEXE): tests/unit/irq_domain_test.c src/device/irq.c src/device/irq_domain.c src/core/work.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(if $(filter Windows_NT,$(OS)),,-pthread) $^ -o "$@"
 check-pi5-fdt-irq: $(OUT)/tests/pi5-fdt-irq$(HOSTEXE)
@@ -1052,3 +1053,24 @@ check-smp-wake: $(OUT)/tests/smp-wake$(HOSTEXE)
 $(OUT)/tests/smp-wake$(HOSTEXE): tests/unit/smp_wake_test.c src/core/smp_wake.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG "$<" -o "$@"
+
+.PHONY: check-brcm-l2 check-kernel-memory
+check-brcm-l2: $(OUT)/tests/brcm-l2$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/brcm-l2$(HOSTEXE): tests/unit/brcm_l2_module_test.c src/device/irq.c src/device/irq_domain.c src/core/work.c drivers/irq/brcm_l2/module.c tests/fixtures/module_host/lume/module_build.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Itests/fixtures/module_host $(filter-out drivers/irq/brcm_l2/module.c,$(filter %.c,$^)) -o "$@"
+check-kernel-memory: $(OUT)/tests/kernel-memory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/kernel-memory$(HOSTEXE): tests/unit/kernel_memory_test.c src/mm/kernel_memory.c include/kernel/lume/kernel_memory.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(if $(filter Windows_NT,$(OS)),,-pthread) $(filter %.c,$^) -o "$@"
+
+.PHONY: check-task-state check-poll-events
+check-task-state: $(OUT)/tests/task-state$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/task-state$(HOSTEXE): tests/unit/task_state_test.c src/core/task_state.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Isrc/core "$<" -o "$@"
+check-poll-events: $(OUT)/tests/poll$(HOSTEXE)
+	env "$<"

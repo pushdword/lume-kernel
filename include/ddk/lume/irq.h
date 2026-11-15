@@ -45,6 +45,12 @@ struct lume_irq_domain_ops
  * Mutating a domain during one of its callbacks returns EBUSY. Handlers cannot block. */
 int lume_irq_domain_register(uint32_t id, unsigned lines, const struct lume_irq_domain_ops *,
                              void *context);
+/* Async providers use resident MMIO callbacks without kernel services. Defer
+ * acknowledges a line before the scheduler lock and coalesces delivery to the
+ * interrupt worker. Provider and handler storage remains retained until release. */
+int lume_irq_domain_register_async(uint32_t id, unsigned lines, const struct lume_irq_domain_ops *,
+                                   void *context);
+bool lume_irq_domain_defer(uint32_t id, unsigned irq);
 int lume_irq_domain_unregister(uint32_t id, void *context);
 bool lume_irq_domain_available(uint32_t id);
 int lume_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler,

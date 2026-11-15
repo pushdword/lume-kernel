@@ -29,6 +29,7 @@ KERNEL_C_aarch64 := \
     platform/raspberrypi5/hardware_platform.c \
     platform/raspberrypi5/firmware.c \
     src/mm/heap.c \
+    src/mm/kernel_memory.c \
     src/mm/vm.c \
     src/mm/user_buffer.c \
     drivers/input/usb_hid/hid_keyboard.c \

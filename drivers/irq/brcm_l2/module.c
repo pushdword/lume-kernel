@@ -107,7 +107,7 @@ static void receive(unsigned irq, void *context)
     {
         unsigned line = (unsigned)__builtin_ctz(pending);
         pending &= pending - 1;
-        (void)lume_irq_domain_dispatch(l2->domain, line);
+        (void)lume_irq_domain_defer(l2->domain, line);
     }
 }
 
@@ -167,12 +167,12 @@ static int start(struct lume_hardware *hardware, void *context)
     l2->mask_saved = true;
     /* Pending events remain latched until their lines are dispatched. */
     lume_mmio_write32_sync(base + L2_MASK_SET, UINT32_MAX);
-    int result = lume_irq_domain_register(l2->domain, L2_LINES, &domain_ops, l2);
+    int result = lume_irq_domain_register_async(l2->domain, L2_LINES, &domain_ops, l2);
     if (!result)
     {
         l2->domain_registered = true;
-        result =
-            lume_irq_register((unsigned)l2->parent_irq.base, l2->parent_irq.flags, receive, l2);
+        result = lume_irq_register_async((unsigned)l2->parent_irq.base, l2->parent_irq.flags,
+                                         receive, l2);
     }
     if (!result)
     {

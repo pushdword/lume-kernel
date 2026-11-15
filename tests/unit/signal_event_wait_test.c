@@ -37,7 +37,7 @@ static void prepare_waiter(unsigned task)
     thread_slots[task].process = 0;
     signals[0].mask = wanted | (UINT32_C(1) << 12);
     signal_thread_initialize(task, 0);
-    states[task] = 2;
+    task_state_set(task, 2);
     current_task = task;
 }
 
@@ -114,7 +114,7 @@ static void validation_and_cancellation(void)
     frame = wait_frame(wanted);
     assert(signal_dispatch_call(&frame, 0) == &suspended);
     signal_thread_reset(1);
-    states[1] = 0;
+    task_state_set(1, 0);
     signal_queue(0, 10);
     assert(signals[0].pending == wanted && !signal_wait_active(1) && !wakes);
     prepare_waiter(1);
@@ -167,7 +167,7 @@ static void ignored_and_interrupting_signals(void)
 static void page_fault_registers(void)
 {
     reset();
-    states[1] = 4;
+    task_state_set(1, 4);
     for (unsigned i = 0; i < 31; ++i)
         tasks[1].context.x[i] = UINT64_C(0x47101234) + i;
     tasks[1].context.pc = 0x12340;
@@ -186,7 +186,7 @@ static void page_fault_registers(void)
 static void page_fault_signal_delivery(void)
 {
     reset();
-    states[0] = 4;
+    task_state_set(0, 4);
     signals[0].action[10].handler = 0x8000;
     for (unsigned i = 0; i < 31; ++i)
         tasks[0].context.x[i] = UINT64_C(0x49205678) + i;

@@ -35,6 +35,7 @@ static struct
 
 static unsigned current_task, kernel_deferred, policy, unit = 1;
 static unsigned states[LUME_TASK_LIMIT], executed[LUME_TASK_LIMIT], wake_count[LUME_TASK_LIMIT];
+#include "task_state.h"
 static unsigned process_owner[LUME_TASK_LIMIT];
 static uint64_t total_kernel_ticks, kernel_ticks[LUME_TASK_LIMIT], account_start;
 static uint64_t lock_ticks[LUME_TASK_LIMIT];
@@ -685,6 +686,10 @@ void lume_net_poll_background(void)
     ++network_checks;
 }
 
+void lume_irq_domain_poll(void)
+{
+}
+
 void lume_storage_poll_background(void)
 {
     ++storage_checks;
@@ -750,7 +755,8 @@ static void reset(void)
     memset(files_released, 0, sizeof(files_released));
     memset(poll_releases, 0, sizeof(poll_releases));
     memset(tasks, 0, sizeof(tasks));
-    memset(states, 0, sizeof(states));
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        task_state_set(i, 0);
     memset(kernel_wait, 0, sizeof(kernel_wait));
     memset(process_exiting, 0, sizeof(process_exiting));
     memset(executed, 0, sizeof(executed));
@@ -818,7 +824,7 @@ static void enqueue(unsigned task, bool replay)
 {
     assert(io_queue_push(&kernel_queue, task, replay));
     kernel_wait[task] = true;
-    states[task] = 4;
+    task_state_set(task, 4);
     tasks[task].context.x[0] = 3;
     tasks[task].context.x[8] = LUME_SYS_READ;
     tasks[task].context.pc = 100;
@@ -934,7 +940,7 @@ static void filesystem_pending(void)
     assert(submissions == 1 && resumes == 1 && !executed[0]);
     current_task = pipe_process = 1;
     root = 2;
-    states[1] = 2;
+    task_state_set(1, 2);
     charges = 0;
 }
 
@@ -997,12 +1003,12 @@ static void directed_pipe_wake(void)
     for (unsigned i = 0; i < sizeof(peers) / sizeof(peers[0]); ++i)
     {
         unsigned task = peers[i];
-        states[task] = 4;
+        task_state_set(task, 4);
         pipe_wait[task] = true;
         pipe_queues[task] = &pipe_peer_queue;
         assert(lume_wait_subscribe(&pipe_peer_queue, task));
     }
-    states[17] = 4;
+    task_state_set(17, 4);
     pipe_wait[17] = true;
     pipe_queues[17] = &pipe_queue;
     assert(lume_wait_subscribe(&pipe_peer_queue, 17));
@@ -1028,7 +1034,7 @@ static void completed_pipe_read_wake(void)
         remote_task = 3;
         current_task = 1;
         pipe_locked = true;
-        states[3] = 4;
+        task_state_set(3, 4);
         pipe_wait[3] = true;
         pipe_queues[3] = &pipe_peer_queue;
         tasks[3].context = pipe_frame(false);
@@ -1051,7 +1057,7 @@ static void completed_pipe_read_wake(void)
             resident_ready = false;
         if (mode == 9)
         {
-            states[65] = 4;
+            task_state_set(65, 4);
             pipe_wait[65] = true;
             pipe_queues[65] = &pipe_peer_queue;
             assert(lume_wait_subscribe(&pipe_peer_queue, 65));
@@ -1109,7 +1115,7 @@ static void inline_pipe_wait_and_replay(void)
                 block_pipe = false;
                 override_result = true;
                 inline_result = 12;
-                states[1] = 2;
+                task_state_set(1, 2);
                 pipe_wait[1] = false;
                 tasks[1].context.pc += LUME_SYSCALL_INSTRUCTION_BYTES;
                 assert(kernel_pipe_result(&tasks[1].context) == &tasks[1].context);
@@ -1137,8 +1143,8 @@ static void pipe_ready_handoff(void)
     reset();
     current_task = pipe_process = 1;
     root = 2;
-    states[1] = 2;
-    states[3] = 1;
+    task_state_set(1, 2);
+    task_state_set(3, 1);
     handoff_task = 3;
     struct lume_context call = pipe_frame(false);
     inline_frame = &call;
@@ -1155,8 +1161,8 @@ static void pipe_ready_handoff(void)
     reset();
     current_task = pipe_process = 1;
     root = 2;
-    states[1] = 2;
-    states[3] = 1;
+    task_state_set(1, 2);
+    task_state_set(3, 1);
     handoff_task = 3;
     assert(io_queue_push(&kernel_control_queue, 0, false));
     call = pipe_frame(false);
@@ -1170,7 +1176,7 @@ static void terminal_pipe_query(void)
 {
     reset();
     current_task = pipe_process = 3;
-    states[3] = 2;
+    task_state_set(3, 2);
     assert(lume_task_pipe_terminal_query(3, 3));
     assert(!pipe_locked && !resident_calls && !charges && !selections && !clock_reads);
     assert(!lume_task_pipe_terminal_query(3, 4));
@@ -1201,10 +1207,10 @@ static void terminal_pipe_query(void)
     active = false;
     assert(!lume_task_pipe_terminal_query(3, 3));
     active = true;
-    states[3] = 1;
+    task_state_set(3, 1);
     assert(!lume_task_pipe_terminal_query(3, 3));
     assert(!pipe_locked && !resident_calls && !charges && !selections && !clock_reads);
-    states[3] = 2;
+    task_state_set(3, 2);
     resident_ready = true;
     assert(lume_task_pipe_terminal_request(3, 0x123000));
     assert(resident_calls == 1 && !pipe_locked);
@@ -1226,9 +1232,9 @@ static void resident_pipe_completion(void)
 {
     reset();
     current_task = pipe_process = 3;
-    states[3] = 2;
+    task_state_set(3, 2);
     expect_writing = true;
-    states[65] = 4;
+    task_state_set(65, 4);
     pipe_wait[65] = true;
     pipe_queues[65] = &pipe_peer_queue;
     assert(lume_wait_subscribe(&pipe_peer_queue, 65));
@@ -1289,7 +1295,7 @@ static void captured_resident_pipe(void)
     reset();
     current_task = pipe_process = 1;
     root = 2;
-    states[1] = 2;
+    task_state_set(1, 2);
     pipe_locked = true;
     struct lume_context call = pipe_frame(false);
     call.x[1] = 0x123000;
@@ -1305,7 +1311,7 @@ static void captured_resident_pipe(void)
     reset();
     current_task = pipe_process = 1;
     root = 2;
-    states[1] = 2;
+    task_state_set(1, 2);
     pipe_locked = true;
     call = pipe_frame(false);
     call.x[1] = 0x123000;
@@ -1333,7 +1339,7 @@ static void final_close_wait(void)
     reset();
     current_task = 0;
     root = 1;
-    states[1] = 2;
+    task_state_set(1, 2);
     process_exiting[1] = true;
     suspended_once = true;
     assert(!kernel_close_ready(1));
@@ -1372,7 +1378,7 @@ static void enqueue_domain(unsigned task, unsigned domain)
     tasks[task].context.x[8] = LUME_SYS_READ;
     assert(kernel_enqueue(task, domain, false));
     kernel_wait[task] = true;
-    states[task] = 4;
+    task_state_set(task, 4);
 }
 
 static void bounded_resource_turn(void)
@@ -1741,7 +1747,7 @@ static void begin_stream(struct lume_stream_request *request, unsigned operation
     tasks[0].context =
         (struct lume_context){.x = {operation, (uintptr_t)request, sizeof(*request)}, .pc = 0x2004};
     tasks[0].context.x[8] = LUME_SYS_STREAM;
-    states[0] = 4;
+    task_state_set(0, 4);
     kernel_wait[0] = true;
     task_domain[0] = LUME_WORK_NETWORK;
     struct kernel_io_lane *lane = &kernel_lanes[LUME_WORK_NETWORK];
@@ -1761,7 +1767,7 @@ static void stream_parking(void)
     assert(states[0] == 4 && stream_waits[0].pending && stream_waits[0].ready);
     assert(stream_connects == 1 && !request.handle && tasks[0].context.pc == 0x2004);
     uint64_t deadline = stream_waits[0].deadline;
-    states[1] = 4;
+    task_state_set(1, 4);
     kernel_wait[1] = true;
     tasks[1].context.x[8] = LUME_SYS_WRITE;
     assert(io_queue_push(&kernel_queue, 1, false));
@@ -1825,7 +1831,7 @@ static void begin_scan(struct lume_net_control *request)
     tasks[0].context.x[8] = LUME_SYS_NETCTL;
     task_domain[0] = LUME_WORK_NETWORK;
     kernel_wait[0] = true;
-    states[0] = 4;
+    task_state_set(0, 4);
     kernel_lanes[LUME_WORK_NETWORK].owner = 0;
     assert(lume_worker_submit_on(LUME_WORK_NETWORK, kernel_call, &kernel_lanes[LUME_WORK_NETWORK]));
     kernel_step();
@@ -1958,7 +1964,7 @@ static void begin_legacy_call(unsigned operation, struct lume_net_request *reque
     tasks[0].context.x[8] = LUME_SYS_NET;
     task_domain[0] = LUME_WORK_NETWORK;
     kernel_wait[0] = true;
-    states[0] = 4;
+    task_state_set(0, 4);
     kernel_lanes[LUME_WORK_NETWORK].owner = 0;
     assert(lume_worker_submit_on(LUME_WORK_NETWORK, kernel_call, &kernel_lanes[LUME_WORK_NETWORK]));
     kernel_step();

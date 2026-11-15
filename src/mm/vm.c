@@ -141,7 +141,7 @@ static struct vm_object *new_object(uint64_t bytes, bool persistent)
     if (serial >= UINT64_MAX - UINT64_C(0x40000000))
         return NULL;
     uint64_t identity = UINT64_C(0x40000000) + ++serial;
-    struct vm_object *object = allocate(sizeof(*object));
+    struct vm_object *object = lume_kernel_allocate_private(sizeof(*object));
     if (object)
     {
         object->bytes = bytes;

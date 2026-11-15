@@ -9,6 +9,19 @@
 static unsigned allocations, owner_references, starts, stops;
 static int probe_error, start_error, stop_error;
 static bool fail_allocate;
+static uint32_t binding_id;
+static const struct lume_driver driver;
+
+static void check_binding(void)
+{
+    if (!binding_id)
+        return;
+    assert(lume_hardware_unbind(binding_id) == -LUME_EBUSY);
+    assert(lume_hardware_remove(binding_id) == -LUME_EBUSY);
+    assert(lume_hardware_reference(binding_id) == -LUME_EBUSY);
+    assert(lume_driver_unregister(&driver) == -LUME_EBUSY);
+}
+
 static unsigned rescans, ejections;
 
 static int rescan_bus(void)
@@ -31,6 +44,7 @@ struct instance
 
 static void *allocate(size_t bytes)
 {
+    check_binding();
     if (fail_allocate)
         return NULL;
     void *data = malloc(bytes);
@@ -48,6 +62,7 @@ static void release_memory(void *data)
 
 static int validate(const struct lume_resource *resource)
 {
+    check_binding();
     return resource->kind == LUME_RESOURCE_IRQ && resource->domain == 99 ? -LUME_ENOSYS : 0;
 }
 
@@ -179,7 +194,9 @@ int main(void)
     assert(lume_driver_find("registers") == &driver);
     assert(lume_hardware_bind(disabled, &driver) == -LUME_EACCES);
     assert(lume_hardware_bind(unsupported, &driver) == -LUME_ENOSYS);
+    binding_id = a;
     assert(!lume_hardware_bind(a, &driver));
+    binding_id = 0;
     struct lume_hardware_request request = {
         .version = LUME_HARDWARE_VERSION, .operation = LUME_HARDWARE_GET, .id = a};
     assert(!lume_hardware_control(&request, false, false) && request.info.id == a);

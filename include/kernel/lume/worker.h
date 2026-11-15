@@ -8,7 +8,7 @@
  * checkpoints require the scheduler lock and masked subsystem IRQs. Resident raw RX may remain
  * enabled. Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
-#define LUME_WORKER_LIMIT 9u
+#define LUME_WORKER_LIMIT 10u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);

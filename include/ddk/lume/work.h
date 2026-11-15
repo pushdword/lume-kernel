@@ -15,6 +15,7 @@ enum lume_work_domain
     LUME_WORK_MEMORY,
     LUME_WORK_DEVICE,
     LUME_WORK_CONTROL,
+    LUME_WORK_INTERRUPT,
     LUME_WORK_DOMAINS
 };
 

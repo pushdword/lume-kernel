@@ -1,5 +1,7 @@
 #include "lume/irq.h"
 #include "lume/abi.h"
+#include "lume/irq_async.h"
+#include "lume/work.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +14,12 @@
 static _Thread_local unsigned depth;
 static unsigned root_configured, root_eoi, root_calls;
 static bool root_enabled;
+static bool deferred_dispatch;
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(!bytes && !depth);
+}
 
 uint64_t lume_irq_save(void)
 {
@@ -131,16 +139,28 @@ static void *dispatch_thread(void *context)
 #endif
 {
     struct backend *backend = context;
-    assert(lume_irq_domain_dispatch(backend->id, 1));
+    if (deferred_dispatch)
+    {
+        lume_irq_domain_poll();
+        assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1);
+    }
+    else
+        assert(lume_irq_domain_dispatch(backend->id, 1));
     assert(!depth);
     return 0;
 }
 
-static void concurrent_dispatch(struct backend *backend, const struct lume_irq_domain_ops *ops)
+static void concurrent_dispatch(struct backend *backend, const struct lume_irq_domain_ops *ops,
+                                bool deferred)
 {
-    assert(!lume_irq_domain_register(backend->id, 32, ops, backend));
+    deferred_dispatch = deferred;
+    dispatch_started = dispatch_finish = 0;
+    assert(!(deferred ? lume_irq_domain_register_async(backend->id, 32, ops, backend)
+                      : lume_irq_domain_register(backend->id, 32, ops, backend)));
     assert(!lume_irq_domain_request(backend->id, 1, LUME_IRQ_EDGE, blocking_handler, backend));
     assert(!lume_irq_domain_enable(backend->id, 1, true));
+    if (deferred)
+        assert(lume_irq_domain_defer(backend->id, 1));
 #ifdef _WIN32
     HANDLE thread = CreateThread(NULL, 0, dispatch_thread, backend, 0, NULL);
     assert(thread);
@@ -156,6 +176,8 @@ static void concurrent_dispatch(struct backend *backend, const struct lume_irq_d
     assert(lume_irq_domain_enable(backend->id, 1, false) == -LUME_EBUSY);
     struct lume_irq_info info;
     assert(!lume_irq_domain_info(backend->id, 1, &info) && info.handled == 1);
+    if (deferred)
+        assert(lume_irq_domain_defer(backend->id, 1));
     __atomic_store_n(&dispatch_finish, 1, __ATOMIC_RELEASE);
 #ifdef _WIN32
     assert(WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0);
@@ -257,8 +279,24 @@ int main(void)
     assert(!lume_irq_domain_info(27, 1, &info));
     assert(!info.handled && !info.stray && !info.registered);
     assert(!lume_irq_domain_unregister(27, &first));
+    ops.acknowledge = acknowledge;
     first.reenter = false;
-    concurrent_dispatch(&first, &ops);
+    concurrent_dispatch(&first, &ops, false);
+    concurrent_dispatch(&first, &ops, true);
+    assert(!lume_irq_domain_register_async(27, 32, &ops, &first));
+    assert(!lume_irq_domain_request(27, 1, LUME_IRQ_EDGE, handler, &first));
+    assert(!lume_irq_domain_enable(27, 1, true));
+    unsigned before = first.calls;
+    assert(lume_irq_domain_defer(27, 1) && first.calls == before);
+    assert(lume_irq_domain_defer(27, 1) && first.calls == before);
+    lume_irq_domain_poll();
+    assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1 && first.calls == before + 1);
+    assert(lume_irq_domain_defer(27, 1));
+    lume_irq_domain_poll();
+    assert(!lume_irq_domain_release(27, 1, &first));
+    assert(!lume_irq_domain_unregister(27, &first));
+    (void)lume_work_drain_on(LUME_WORK_INTERRUPT, 1);
+    assert(first.calls == before + 1);
     assert(!depth);
     puts("IRQ_DOMAIN_PASS isolation, lifecycle, concurrency, callbacks and primary compatibility");
     return 0;

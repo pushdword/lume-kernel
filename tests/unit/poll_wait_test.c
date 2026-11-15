@@ -38,6 +38,7 @@ static struct
 } thread_slots[LUME_TASK_LIMIT];
 static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
 static unsigned states[LUME_TASK_LIMIT], parents[LUME_TASK_LIMIT], exit_signals[LUME_TASK_LIMIT];
+#include "task_state.h"
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT], kernel_wait[LUME_TASK_LIMIT];
 static unsigned wait_target[LUME_TASK_LIMIT];
 static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
@@ -409,7 +410,8 @@ static void reset(void)
     memset(signals, 0, sizeof(signals));
     memset(thread_slots, 0, sizeof(thread_slots));
     memset(poll_waits, 0, sizeof(poll_waits));
-    memset(states, 0, sizeof(states));
+    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+        task_state_set(i, 0);
     memset(pipe_wait, 0, sizeof(pipe_wait));
     memset(kernel_wait, 0, sizeof(kernel_wait));
     memset(futex_address, 0, sizeof(futex_address));
@@ -440,7 +442,7 @@ static void reset(void)
     signal_when_waiting = expected_exit_status = exit_requests = 0;
     generation = 1;
     ipis = 0;
-    states[0] = 2;
+    task_state_set(0, 2);
     signal_inherit(0, 0, false);
 }
 
@@ -556,7 +558,7 @@ static void check_signals(void)
     assert(poll_call(&frame) == &suspended && !poll_wake(0, 100));
     poll_cancel(0);
     signals[0].pending = signals[0].mask = 0;
-    states[0] = 2;
+    task_state_set(0, 2);
     signal_queue(0, 10);
     frame = frame_for(&request);
     assert(poll_call(&frame) == &frame && (int64_t)frame.x[0] == -4);
@@ -580,7 +582,7 @@ static void check_signals(void)
     assert(poll_call(&frame) == &suspended);
     poll_event(3);
     assert(poll_wake(0, 100));
-    states[0] = 1;
+    task_state_set(0, 1);
     signal_queue(0, 10);
     frame = tasks[0].context;
     assert(lume_tasks_deliver_signals(&frame) == &frame && frame.pc == 0x2000);
@@ -636,7 +638,7 @@ static void check_futex_signal(void)
         signals[0].action[10].handler = 0x2000;
         signals[0].action[10].restorer = 0x3000;
         signals[0].action[10].flags = restart ? 1u << 3 : 0;
-        states[0] = 4;
+        task_state_set(0, 4);
         futex_address[0] = 0x4000;
         signals[0].mask = 1u << 10;
         signal_queue(0, 10);
@@ -650,7 +652,7 @@ static void check_futex_signal(void)
         frame.x[0] = LUME_SIGNAL_RETURN;
         frame.x[1] = frame.x[2] = 0;
         assert(signal_call(&frame, 0) == -4 && !futex_address[0]);
-        states[0] = 4;
+        task_state_set(0, 4);
         pipe_wait[0] = true;
         pipe_queues[0] = &queue;
         assert(lume_wait_subscribe(&queue, 0));
@@ -780,7 +782,7 @@ static void check_copyout_owner(void)
     for (unsigned task = 0; task < 2; ++task)
     {
         current_task = task;
-        states[task] = 2;
+        task_state_set(task, 2);
         requests[task] = (struct lume_poll_request){.version = LUME_POLL_VERSION,
                                                     .bytes = sizeof(requests[task]),
                                                     .buffer = (uintptr_t)&records[task],
@@ -813,7 +815,7 @@ static void check_targeted_wakes(void)
     for (unsigned task = 0; task < 2; ++task)
     {
         current_task = task;
-        states[task] = 2;
+        task_state_set(task, 2);
         requests[task] = (struct lume_poll_request){.version = LUME_POLL_VERSION,
                                                     .bytes = sizeof(requests[task]),
                                                     .buffer = (uintptr_t)&records[task],
@@ -962,7 +964,7 @@ static void check_service_waits(void)
     assert(sequence > 0 && service_wait_wake(2, 101) && states[2] == 1);
     assert(tasks[2].context.x[0] == 1 && !service_waits[2].active);
     current_task = 0;
-    states[0] = 2;
+    task_state_set(0, 2);
     wait.sequence = (uint64_t)sequence;
     frame = service_frame(&wait);
     assert(service_request(&frame, false) == &suspended && service_waits[0].deadline == 200);

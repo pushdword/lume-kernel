@@ -61,7 +61,7 @@ static void thread_drop(unsigned task)
     thread_pages[task] = 0;
     signal_thread_reset(task);
     lume_mmu_release_user(task);
-    states[task] = 0;
+    task_state_set(task, 0);
     lume_wait_cancel(pipe_queues[task], task);
     pipe_queues[task] = 0;
     pipe_wait[task] = input_wait[task] = kernel_wait[task] = false;
@@ -88,7 +88,7 @@ static struct lume_context *thread_finish(uint64_t result)
         thread_slots[task].result = result;
         thread_slots[task].exited = true;
         process_status[task] = 0;
-        states[task] = 4;
+        task_state_set(task, 4);
         wake_at[task] = UINT64_MAX;
     }
     else
@@ -96,13 +96,13 @@ static struct lume_context *thread_finish(uint64_t result)
         thread_drop(task);
         thread_slots[task].result = result;
         thread_slots[task].exited = true;
-        states[task] = thread_slots[task].detached || process_exiting[owner] ? 0 : 5;
+        task_state_set(task, thread_slots[task].detached || process_exiting[owner] ? 0 : 5);
     }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         if (thread_waiting[i] == tid)
         {
             thread_waiting[i] = 0;
-            states[i] = 1;
+            task_state_set(i, 1);
             sched_wake(&policy, i, unit, 0);
         }
     bool remaining = false;
@@ -112,7 +112,7 @@ static struct lume_context *thread_finish(uint64_t result)
     if (!remaining && states[owner] != 2 && (main_thread_done[owner] || process_exiting[owner]) &&
         !kernel_task_active(owner))
     {
-        states[owner] = 1;
+        task_state_set(owner, 1);
         sched_wake(&policy, owner, unit, 0);
     }
     lume_smp_wake();
@@ -130,7 +130,7 @@ static struct lume_context *process_terminate(unsigned status)
     thread_waiting[owner] = futex_address[owner] = 0;
     if (states[owner] != 2 && !kernel_task_active(owner))
     {
-        states[owner] = 1;
+        task_state_set(owner, 1);
         sched_wake(&policy, owner, unit, 0);
     }
     return thread_finish(0);
@@ -183,7 +183,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
     if (task == LUME_TASK_LIMIT || process_exiting[owner] || main_thread_done[owner])
         return -LUME_EAGAIN;
     thread_new(thread_slots, task, owner, true);
-    states[task] = 4;
+    task_state_set(task, 4);
     kernel_wait[task] = true;
     wake_at[task] = UINT64_MAX;
     kernel_socket_network[task] = false;
@@ -277,7 +277,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
         task_names[task][i] = name[i];
     signal_thread_initialize(task, current_task);
     kernel_wait[task] = false;
-    states[task] = 1;
+    task_state_set(task, 1);
     sched_new(&policy, task, (unsigned)tid);
     sched_wake(&policy, task, unit, 0);
     lume_smp_wake();
@@ -337,7 +337,7 @@ static struct lume_context *thread_call(struct lume_context *frame)
             {
                 t->detached = true;
                 if (t->exited && target != owner)
-                    states[target] = 0;
+                    task_state_set(target, 0);
             }
             else if (!result && t->exited)
             {
@@ -345,7 +345,7 @@ static struct lume_context *thread_call(struct lume_context *frame)
                 if (target == owner)
                     t->detached = true;
                 else
-                    states[target] = 0;
+                    task_state_set(target, 0);
             }
             else if (!result)
             {
@@ -353,7 +353,7 @@ static struct lume_context *thread_call(struct lume_context *frame)
                 thread_waiting[task] = r.tid;
                 tasks[task].context = *frame;
                 LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
-                states[task] = 4;
+                task_state_set(task, 4);
                 wake_at[task] = UINT64_MAX;
                 sched_charge(&policy, lume_cpu_index(), now());
                 return wait_ready_task();

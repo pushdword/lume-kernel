@@ -48,7 +48,8 @@ static void poll_console_pump(void)
         (void)kernel_console_ready();
         return;
     }
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+    for (unsigned i = task_state_next(task_sleeping, 0); i < LUME_TASK_LIMIT;
+         i = task_state_next(task_sleeping, i + 1))
         if (states[i] == 4 && poll_wait_active(i) &&
             lume_vfs_poll_console(&tasks[process_slot(i)].files, &poll_waits[i].watch))
         {
@@ -183,7 +184,7 @@ static struct lume_context *poll_call(struct lume_context *frame)
         return poll_result(frame, ready);
     tasks[task].context = *frame;
     LUME_CONTEXT_PC(&tasks[task].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
-    states[task] = 4;
+    task_state_set(task, 4);
     sched_charge(&policy, lume_cpu_index(), now());
     return wait_ready_task();
 }

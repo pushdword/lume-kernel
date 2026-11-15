@@ -73,7 +73,7 @@ static void kernel_pipe_wake(struct lume_wait_queue *queue)
                 kernel_pipe_read_complete(task, queue);
             pipe_queues[task] = NULL;
             pipe_wait[task] = input_wait[task] = kernel_wait[task] = false;
-            states[task] = 1;
+            task_state_set(task, 1);
             sched_wake(&policy, task, unit, 0);
             woken = true;
         }
@@ -100,7 +100,7 @@ static bool kernel_pipe_block(unsigned task, struct lume_context *frame, int64_t
         lume_fail("pipe wait registration");
     kernel_wait[task] = input_wait[task] = false;
     wake_at[task] = UINT64_MAX;
-    states[task] = 4;
+    task_state_set(task, 4);
     return true;
 }
 

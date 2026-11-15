@@ -32,7 +32,7 @@ static struct lume_context *thread_word_call(struct lume_context *frame, unsigne
                 futex_address[i] = 0;
                 thread_shared_keys[i] = (struct lume_vm_word_key){0};
                 thread_realtime_wait[i] = false;
-                states[i] = 1;
+                task_state_set(i, 1);
                 LUME_CONTEXT_REG(&tasks[i].context, 0) = 0;
                 sched_wake(&policy, i, unit, 0);
                 ++result;
@@ -59,7 +59,7 @@ static struct lume_context *thread_word_call(struct lume_context *frame, unsigne
             thread_realtime_deadline[task] = r.timeout_ms;
             thread_realtime_wait[task] = true;
             tasks[task].context = *frame;
-            states[task] = 4;
+            task_state_set(task, 4);
             wake_at[task] = UINT64_MAX;
             sched_charge(&policy, lume_cpu_index(), now());
             return wait_ready_task();
@@ -76,7 +76,7 @@ static struct lume_context *thread_word_call(struct lume_context *frame, unsigne
             thread_shared_keys[task] = key;
             thread_realtime_wait[task] = false;
             tasks[task].context = *frame;
-            states[task] = 4;
+            task_state_set(task, 4);
             wake_at[task] = r.timeout_ms == UINT64_MAX ? UINT64_MAX : monotonic + r.timeout_ms;
             sched_charge(&policy, lume_cpu_index(), now());
             return wait_ready_task();

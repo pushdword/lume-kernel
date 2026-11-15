@@ -391,39 +391,41 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
         return -LUME_ENOSYS;
     if (!lume_driver_matches(driver, id))
         return -LUME_ENOENT;
+    h->busy = true;
+    h->driver = driver;
+    int result = driver->owner_get ? driver->owner_get(driver->owner) : 0;
+    if (result)
+    {
+        h->driver = NULL;
+        h->busy = false;
+        return result;
+    }
     unsigned claim_count = 0;
+    bool claimed = false;
     for (unsigned i = 0; i < h->info.resource_count; ++i)
     {
         const struct lume_resource *resource = h->resources + i;
         if (driver->resource_kinds && !(driver->resource_kinds & (1u << resource->kind)))
             continue;
-        int result = services->validate_resource(resource);
+        result = services->validate_resource(resource);
         if (result)
-            return result;
+            goto fail;
         h->claimed[claim_count++] = *resource;
     }
-    int result = lume_resource_claim(h, h->claimed, claim_count);
+    result = lume_resource_claim(h, h->claimed, claim_count);
     if (result)
-        return result;
-    if (driver->owner_get && (result = driver->owner_get(driver->owner)) != 0)
-    {
-        (void)lume_resource_release(h);
-        return result;
-    }
+        goto fail;
+    claimed = true;
     if (driver->context_bytes)
     {
         h->context = services->allocate(driver->context_bytes);
         if (!h->context)
         {
-            (void)lume_resource_release(h);
-            if (driver->owner_put)
-                driver->owner_put(driver->owner);
-            return -LUME_ENOMEM;
+            result = -LUME_ENOMEM;
+            goto fail;
         }
         memset(h->context, 0, driver->context_bytes);
     }
-    h->driver = driver;
-    h->busy = true;
     memcpy(h->info.driver, driver->name, strlen(driver->name) + 1);
     result = driver->ops->probe ? driver->ops->probe(h, h->context) : 0;
     if (!result && driver->ops->start)
@@ -445,6 +447,15 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
     h->info.error = 0;
     h->busy = false;
     return 0;
+
+fail:
+    if (claimed)
+        (void)lume_resource_release(h);
+    h->driver = NULL;
+    if (driver->owner_put)
+        driver->owner_put(driver->owner);
+    h->busy = false;
+    return result;
 }
 
 int lume_hardware_unbind(uint32_t id)

@@ -33,7 +33,7 @@ static bool service_wait_wake(unsigned task, uint64_t at)
         return true;
     service_wait_cancel(task);
     LUME_CONTEXT_REG(&tasks[task].context, 0) = (uint64_t)result;
-    states[task] = 1;
+    task_state_set(task, 1);
     sched_wake(&policy, task, unit, 0);
     return true;
 }
@@ -107,7 +107,7 @@ static struct lume_context *service_request(struct lume_context *frame, bool sup
         goto done;
     }
     tasks[task].context = *frame;
-    states[task] = 4;
+    task_state_set(task, 4);
     sched_charge(&policy, lume_cpu_index(), now());
     return wait_ready_task();
 

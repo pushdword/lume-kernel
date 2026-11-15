@@ -12,7 +12,7 @@ struct echo
     unsigned owner, handle;
     uint32_t started;
     uint16_t sequence;
-    bool received;
+    bool received, closing;
 };
 static struct echo echoes[4];
 static unsigned next_handle;
@@ -37,12 +37,29 @@ void lume_icmp_release(unsigned owner)
 {
     for (unsigned i = 0; i < 4; ++i)
         if (echoes[i].owner == owner)
+            echoes[i].closing = true;
+}
+
+bool lume_icmp_reap_pending(void)
+{
+    for (unsigned i = 0; i < 4; ++i)
+        if (echoes[i].closing)
+            return true;
+    return false;
+}
+
+void lume_icmp_reap(void)
+{
+    for (unsigned i = 0; i < 4; ++i)
+        if (echoes[i].closing)
             close_echo(&echoes[i]);
 }
 
 static u8_t reply(void *context, struct raw_pcb *pcb, struct pbuf *packet, const ip_addr_t *from)
 {
     struct echo *echo = context;
+    if (echo->closing)
+        return 0;
     (void)pcb;
     unsigned char bytes[60];
     unsigned count = pbuf_copy_partial(packet, bytes, sizeof(bytes), 0);
@@ -122,7 +139,7 @@ int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *requ
     for (unsigned i = 0; i < 4; ++i)
     {
         struct echo *echo = &echoes[i];
-        if (echo->owner != owner || echo->handle != request->handle)
+        if (echo->owner != owner || echo->handle != request->handle || echo->closing)
             continue;
         if (op == LUME_ICMP_ECHO_CLOSE)
         {

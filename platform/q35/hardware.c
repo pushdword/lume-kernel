@@ -12,51 +12,6 @@
 #include "lume/modules.h"
 #include <string.h>
 
-struct allocation
-{
-    uint64_t pages, magic;
-};
-
-#define ALLOCATION_MAGIC UINT64_C(0x4c554d45414c4c4f)
-
-void *lume_kernel_allocate(size_t bytes)
-{
-    if (!bytes || bytes > 16u * 1024u * 1024u)
-        return NULL;
-    unsigned pages = (unsigned)((bytes + sizeof(struct allocation) + 4095) / 4096);
-    uint64_t physical = pages == 1 ? lume_page_alloc(0) : lume_pages_alloc_span(pages);
-    if (!physical)
-        return NULL;
-    struct allocation *header = (void *)(uintptr_t)physical;
-    *header = (struct allocation){pages, ALLOCATION_MAGIC};
-    return header + 1;
-}
-
-void lume_kernel_free(void *memory)
-{
-    if (!memory)
-        return;
-    struct allocation *header = (struct allocation *)memory - 1;
-    if (header->magic != ALLOCATION_MAGIC || !header->pages || header->pages > 4097 ||
-        ((uintptr_t)header & 4095))
-        lume_fail("invalid kernel allocation");
-    uint64_t pages = header->pages;
-    header->magic = 0;
-    for (uint64_t i = 0; i < pages; ++i)
-        if (!lume_page_free((uintptr_t)header + i * 4096))
-            lume_fail("kernel allocation release");
-}
-
-uint64_t lume_kernel_allocation_pages(const void *memory)
-{
-    if (!memory)
-        return 0;
-    const struct allocation *header = (const struct allocation *)memory - 1;
-    if (header->magic != ALLOCATION_MAGIC)
-        lume_fail("invalid kernel allocation query");
-    return header->pages;
-}
-
 static int validate_resource(const struct lume_resource *resource)
 {
     if (resource->kind == LUME_RESOURCE_IOPORT)

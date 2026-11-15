@@ -32,7 +32,10 @@ void lume_stream_release(unsigned);
  * protocol state and receive buffers after any active callback or copy returns. */
 void lume_stream_reap(void);
 int lume_icmp_call(unsigned, unsigned, struct lume_stream_request *);
+/* Release invalidates ownership. NETWORK reclaims raw protocol state. */
 void lume_icmp_release(unsigned);
+bool lume_icmp_reap_pending(void);
+void lume_icmp_reap(void);
 bool lume_icmp_busy(void);
 int64_t lume_net_control(unsigned, struct lume_net_control *);
 int64_t lume_net_control_progress(unsigned, unsigned, struct lume_net_control *, bool, bool *);

@@ -27,7 +27,7 @@ static unsigned char ram_data[RAM_FILES][CAPACITY];
 static bool ram_used[RAM_FILES];
 static uint64_t descriptor_sequence;
 static uint64_t poll_source_sequence;
-static uint64_t poll_pending[LUME_POLL_WORDS];
+static uint64_t poll_pending[LUME_POLL_WORDS], poll_subscribed[LUME_POLL_WORDS];
 static struct lume_poll_source console_source;
 
 struct poll_link
@@ -105,6 +105,7 @@ void lume_vfs_poll_cancel(unsigned task)
         }
     }
     poll_subscriptions[task].count = 0;
+    poll_subscribed[word] &= ~bit;
     poll_pending[word] &= ~bit;
 }
 
@@ -138,26 +139,34 @@ void lume_poll_sources_retire_range(const void *allocation, size_t bytes)
         return;
     uintptr_t end = first + bytes;
     bool changed = false;
-    for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
+    for (unsigned word = 0; word < LUME_POLL_WORDS; ++word)
     {
-        unsigned word = task / 64u;
-        uint64_t bit = UINT64_C(1) << (task % 64u);
-        unsigned index = 0;
-        while (index < poll_subscriptions[task].count)
+        uint64_t tasks = poll_subscribed[word];
+        while (tasks)
         {
-            struct poll_link *link = &poll_subscriptions[task].links[index];
-            uintptr_t address = (uintptr_t)link->source;
-            if (address < first || address >= end)
+            unsigned slot = (unsigned)__builtin_ctzll(tasks);
+            uint64_t bit = UINT64_C(1) << slot;
+            unsigned task = word * 64u + slot;
+            tasks &= tasks - 1;
+            unsigned index = 0;
+            while (index < poll_subscriptions[task].count)
             {
-                ++index;
-                continue;
+                struct poll_link *link = &poll_subscriptions[task].links[index];
+                uintptr_t address = (uintptr_t)link->source;
+                if (address < first || address >= end)
+                {
+                    ++index;
+                    continue;
+                }
+                uint64_t *waiting =
+                    word ? &link->source->waiting_more[word - 1] : &link->source->waiting;
+                *waiting &= ~bit;
+                changed |= (poll_pending[word] & bit) == 0;
+                poll_pending[word] |= bit;
+                *link = poll_subscriptions[task].links[--poll_subscriptions[task].count];
             }
-            uint64_t *waiting =
-                word ? &link->source->waiting_more[word - 1] : &link->source->waiting;
-            *waiting &= ~bit;
-            changed |= (poll_pending[word] & bit) == 0;
-            poll_pending[word] |= bit;
-            *link = poll_subscriptions[task].links[--poll_subscriptions[task].count];
+            if (!poll_subscriptions[task].count)
+                poll_subscribed[word] &= ~bit;
         }
     }
     if (changed)
@@ -190,6 +199,7 @@ static bool poll_subscribe_source(unsigned task, struct lume_poll_source *source
     poll_subscriptions[task].links[count].source = source;
     poll_subscriptions[task].links[count].generation = source->generation;
     ++poll_subscriptions[task].count;
+    poll_subscribed[word] |= bit;
     *waiting |= bit;
     return true;
 }
@@ -1126,6 +1136,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
     for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
         lume_vfs_poll_release(task);
     memset(poll_pending, 0, sizeof(poll_pending));
+    memset(poll_subscribed, 0, sizeof(poll_subscribed));
     memset(poll_subscriptions, 0, sizeof(poll_subscriptions));
     console_source = (struct lume_poll_source){0};
     lume_poll_source_reset(&console_source);

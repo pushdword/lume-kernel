@@ -1,4 +1,6 @@
 #include "lume/module.h"
+#include "lume/irq_async.h"
+#include "lume/work.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +13,18 @@ static void lume_mmio_write32_sync(uintptr_t, uint32_t);
 static uintptr_t register_base = UINT64_C(0x107d510600);
 static uint32_t cpu_mask, pending;
 static unsigned writes, completions, delivered[L2_LINES], depth;
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(!bytes && !depth);
+}
+
+static void drain_interrupts(void)
+{
+    lume_irq_domain_poll();
+    (void)lume_work_drain_on(LUME_WORK_INTERRUPT, 1);
+}
+
 static int parent_error;
 static bool parent_enabled, retrigger;
 
@@ -231,16 +245,22 @@ int main(void)
     assert(cpu_mask == enabled_mask && parent_enabled && context.domain_registered);
 
     pending |= UINT32_C(1) << 31;
-    assert(lume_irq_dispatch(271));
+    assert(lume_irq_dispatch_async(271));
+    assert(!delivered[1] && !delivered[31] && !pending);
+    drain_interrupts();
     assert(delivered[1] == 1 && delivered[31] == 1 && !pending && completions == 1);
     retrigger = true;
     pending = UINT32_C(1) << 1;
-    assert(lume_irq_dispatch(271) && delivered[1] == 2 && pending == 2);
-    assert(lume_irq_dispatch(271) && delivered[1] == 3 && !pending);
+    assert(lume_irq_dispatch_async(271) && delivered[1] == 1 && !pending);
+    drain_interrupts();
+    assert(delivered[1] == 2 && pending == 2);
+    assert(lume_irq_dispatch_async(271) && delivered[1] == 2 && !pending);
+    drain_interrupts();
+    assert(delivered[1] == 3 && !pending);
 
     pending = UINT32_C(1) << 6;
     cpu_mask &= ~pending;
-    assert(lume_irq_dispatch(271) && !pending && (cpu_mask & (UINT32_C(1) << 6)));
+    assert(lume_irq_dispatch_async(271) && !pending && (cpu_mask & (UINT32_C(1) << 6)));
     struct lume_irq_info info;
     assert(!lume_irq_domain_info(27, 6, &info) && info.stray == 1);
     assert(!lume_irq_domain_release(27, 1, delivered));

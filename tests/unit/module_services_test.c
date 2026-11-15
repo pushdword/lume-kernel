@@ -10,6 +10,11 @@ static bool network_busy, repeat;
 static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
 static bool async_probe;
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(!bytes);
+}
 static struct lume_block block;
 static struct lume_devfs_group attribute_group;
 static struct lume_work work;
@@ -149,6 +154,19 @@ static void domain_services(void)
     assert(!lume_module_irq_domain_release(37, 1, &references) && references == 2);
     assert(!lume_module_irq_domain_unregister(27, &work) && references == 1);
     assert(!lume_module_irq_domain_unregister(37, &work) && !references);
+
+    assert(!lume_module_irq_domain_register_async(27, 32, &domain_ops, &work));
+    assert(references == 1);
+    assert(!lume_module_irq_domain_request(27, 1, LUME_IRQ_EDGE, domain_handler, &references));
+    assert(references == 2 && !lume_irq_domain_enable(27, 1, true));
+    assert(lume_irq_domain_defer(27, 1) && references == 2);
+    lume_irq_domain_poll();
+    assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1 && references == 2);
+    assert(lume_irq_domain_defer(27, 1));
+    lume_irq_domain_poll();
+    assert(!lume_module_irq_domain_release(27, 1, &references) && references == 1);
+    assert(!lume_module_irq_domain_unregister(27, &work) && !references);
+    (void)lume_work_drain_on(LUME_WORK_INTERRUPT, 1);
 
     assert(!lume_module_irq_domain_request(0, 42, LUME_IRQ_LEVEL, interrupt, &references));
     assert(references == 1);
