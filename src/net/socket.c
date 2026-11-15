@@ -22,6 +22,7 @@
 #endif
 #define SOCKETS LUME_NET_SOCKET_LIMIT
 #define RIGHTS 8u
+#define TCP_BUCKETS 64u
 
 _Static_assert((LOCAL_BYTES & (LOCAL_BYTES - 1)) == 0, "local socket ring size");
 
@@ -34,7 +35,7 @@ static struct tcp_file
 {
     struct lume_poll_source source;
     bool used, listening, shutdown, closing;
-    unsigned owner, handle, local_port, peer_port, options;
+    unsigned owner, handle, local_port, peer_port, options, notify_next;
     unsigned char local[4], peer[4];
     unsigned char *buffered;
     unsigned buffered_first, buffered_count;
@@ -42,12 +43,40 @@ static struct tcp_file
 
 static unsigned owner_sequence;
 static unsigned tcp_reap_cursor;
+static unsigned tcp_buckets[TCP_BUCKETS];
+
+static unsigned tcp_bucket(unsigned owner)
+{
+    return (owner ^ (owner >> 16)) & (TCP_BUCKETS - 1);
+}
+
+static void tcp_index_add(struct tcp_file *file)
+{
+    unsigned bucket = tcp_bucket(file->owner);
+    file->notify_next = tcp_buckets[bucket];
+    tcp_buckets[bucket] = (unsigned)(file - tcp_files) + 1;
+}
+
+static void tcp_index_remove(struct tcp_file *file)
+{
+    unsigned *link = &tcp_buckets[tcp_bucket(file->owner)];
+    unsigned index = (unsigned)(file - tcp_files) + 1;
+    while (*link && *link != index)
+        link = &tcp_files[*link - 1].notify_next;
+    if (*link)
+        *link = file->notify_next;
+    file->notify_next = 0;
+}
 
 void lume_socket_stream_notify(unsigned owner, unsigned handle)
 {
-    for (unsigned i = 0; i < SOCKETS; ++i)
-        if (tcp_files[i].used && tcp_files[i].owner == owner && tcp_files[i].handle == handle)
-            lume_poll_source_notify(&tcp_files[i].source);
+    for (unsigned entry = tcp_buckets[tcp_bucket(owner)]; entry;
+         entry = tcp_files[entry - 1].notify_next)
+    {
+        struct tcp_file *file = tcp_files + entry - 1;
+        if (file->owner == owner && file->handle == handle)
+            lume_poll_source_notify(&file->source);
+    }
 }
 
 static struct lume_poll_source *tcp_source(void *context)
@@ -150,6 +179,7 @@ void lume_socket_reap(void)
             (void)stream(file, LUME_STREAM_CLOSE, &request);
         }
         lume_kernel_free(file->buffered);
+        tcp_index_remove(file);
         memset(file, 0, sizeof(*file));
         return;
     }
@@ -733,6 +763,7 @@ static struct tcp_file *allocate_tcp(void)
             if (owner_sequence == 0x3fffffff)
                 return 0;
             tcp_files[i] = (struct tcp_file){.used = true, .owner = 0x40000000u | ++owner_sequence};
+            tcp_index_add(&tcp_files[i]);
             lume_poll_source_reset(&tcp_files[i].source);
             return &tcp_files[i];
         }
@@ -994,7 +1025,9 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
             tcp_close(child);
             return result;
         }
+        tcp_index_remove(child);
         child->owner = file->owner;
+        tcp_index_add(child);
         child->options = file->options;
         child->handle = request.handle;
         child->peer_port = request.port;

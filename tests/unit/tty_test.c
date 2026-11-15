@@ -12,6 +12,19 @@ static struct
 
 static unsigned last_signal, last_group, signal_count;
 static void (*copy_hook)(void);
+static unsigned computes;
+
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    ++computes;
+    if (copy_hook)
+    {
+        void (*hook)(void) = copy_hook;
+        copy_hook = NULL;
+        hook();
+    }
+    run(context);
+}
 
 void lume_worker_copy(void *destination, const void *source, size_t bytes)
 {
@@ -156,6 +169,32 @@ static void raw_ring_cases(void)
     assert(!copy_hook && !copy_terminal->copying);
 }
 
+static void output_ring_cases(void)
+{
+    concurrent_tty =
+        (struct lume_tty_request){.version = LUME_TTY_VERSION, .bytes = sizeof(concurrent_tty)};
+    assert(!lume_tty_call(&concurrent_files, 7, LUME_TTY_CREATE, &concurrent_tty));
+    struct tty_end *master = descriptors[concurrent_tty.fd].context;
+    struct tty_end *slave = descriptors[concurrent_tty.other].context;
+    copy_terminal = master->terminal;
+    unsigned char source[4096], result[4096];
+    memset(source, '\n', sizeof(source));
+    unsigned before = computes;
+    assert(tty_write(slave, source, sizeof(source)) == 2048 && computes == before + 1);
+    assert(tty_read(master, result, sizeof(result)) == sizeof(result));
+    for (unsigned i = 0; i < sizeof(result); i += 2)
+        assert(result[i] == '\r' && result[i + 1] == '\n');
+    copy_terminal->output.count = 4095;
+    assert(tty_write(slave, "\n", 1) == -LUME_EAGAIN && copy_terminal->output.count == 4095);
+    assert(tty_write(slave, "x", 1) == 1 && copy_terminal->output.count == 4096);
+    copy_terminal->output = (struct tty_ring){.first = 4095};
+    assert(tty_write(slave, "\nA\n", 3) == 3);
+    assert(tty_read(master, result, sizeof(result)) == 5 && !memcmp(result, "\r\nA\r\n", 5));
+    copy_hook = close_during_copy;
+    assert(tty_write(slave, source, 512) == 512);
+    assert(!copy_hook && !copy_terminal->copying);
+}
+
 int main(void)
 {
     struct lume_files files = {0};
@@ -229,5 +268,6 @@ int main(void)
         r.value = 0;
     }
     raw_ring_cases();
+    output_ring_cases();
     puts("PASS PTY canonical editing, raw rings, concurrent close, geometry, hangup and reuse");
 }

@@ -169,54 +169,57 @@ static void drop(struct vm_object *object)
     (void)lume_work_submit(&reap_work);
 }
 
-/* Closed descriptors only retire objects. Reference transfer never suspends. */
+struct retired_chunk
+{
+    struct vm_chunk *chunk;
+    uint64_t freed;
+};
+
+static void release_chunk(void *context)
+{
+    struct retired_chunk *retired = context;
+    for (unsigned i = 0; i < 512; ++i)
+        if (retired->chunk->pages[i])
+        {
+            if (!lume_page_free(retired->chunk->pages[i]))
+                lume_fail("virtual memory frame release");
+            ++retired->freed;
+        }
+    lume_kernel_free(retired->chunk);
+}
+
+/* Retired objects and detached chunks have no live mappings or readers. Their
+ * allocators retain independent frame and metadata protection during release. */
 static void reap(void *unused)
 {
     (void)unused;
-    unsigned budget = 16;
+    unsigned budget = 2;
     while (retired && budget)
     {
         struct vm_object *object = retired;
-        bool empty = true;
+        retired = object->next;
+        object->next = NULL;
         for (unsigned bucket = 0; bucket < HASH && budget; ++bucket)
             while (object->chunks[bucket] && budget)
             {
                 struct vm_chunk *entry = object->chunks[bucket];
-                for (unsigned i = 0; i < 512 && budget; ++i)
-                    if (entry->pages[i])
-                    {
-                        if (!lume_page_free(entry->pages[i]))
-                            lume_fail("virtual memory frame release");
-                        entry->pages[i] = 0;
-                        if (object->cached)
-                            --cached_pages;
-                        --budget;
-                    }
-                bool live = false;
-                for (unsigned i = 0; i < 512; ++i)
-                    live |= entry->pages[i] != 0;
-                if (live)
-                {
-                    empty = false;
-                    break;
-                }
-                if (budget < 2)
-                {
-                    empty = false;
-                    budget = 0;
-                    break;
-                }
                 object->chunks[bucket] = entry->next;
+                uint64_t metadata_pages = lume_kernel_allocation_pages(entry);
+                struct retired_chunk release = {.chunk = entry};
+                lume_worker_compute(release_chunk, &release);
                 if (object->cached)
-                    cached_pages -= lume_kernel_allocation_pages(entry);
-                lume_kernel_free(entry);
-                budget -= 2;
+                    cached_pages -= metadata_pages + release.freed;
+                --budget;
             }
+        bool empty = true;
         for (unsigned bucket = 0; bucket < HASH; ++bucket)
             empty &= object->chunks[bucket] == NULL;
-        if (!empty || !budget)
+        if (!empty)
+        {
+            object->next = retired;
+            retired = object;
             break;
-        retired = object->next;
+        }
         struct vm_object *backing = object->backing;
         if (object->file)
             lume_vfs_drop(object->file - 1);
@@ -225,7 +228,9 @@ static void reap(void *unused)
         lume_kernel_free(object);
         if (backing)
             drop(backing);
-        --budget;
+        if (budget)
+            --budget;
+        lume_worker_checkpoint(0);
     }
     if (retired)
         (void)lume_work_submit(&reap_work);

@@ -134,6 +134,34 @@ static const struct lume_driver driver = {
     .owner_put = owner_put,
 };
 
+extern void (*lume_hardware_compute_hook)(void);
+static uint32_t topology_root, topology_child;
+
+static void add_during_state(void)
+{
+    assert(lume_hardware_remove(topology_root) == -LUME_EBUSY);
+    struct lume_hardware_description child = {.origin = LUME_HARDWARE_BOARD,
+                                              .name = "late-child",
+                                              .path = "/topology/late",
+                                              .parent = topology_root};
+    assert(!lume_hardware_add(&child, &topology_child));
+}
+
+static void topology_cases(void)
+{
+    struct lume_hardware_description root = {
+        .origin = LUME_HARDWARE_BOARD, .name = "topology", .path = "/topology"};
+    assert(!lume_hardware_add(&root, &topology_root));
+    lume_hardware_compute_hook = add_during_state;
+    assert(!lume_hardware_state(topology_root, LUME_HARDWARE_ABSENT, -LUME_ENOENT));
+    struct lume_hardware_info info;
+    assert(!lume_hardware_compute_hook);
+    assert(!lume_hardware_get(topology_child, &info) && info.state == LUME_HARDWARE_ABSENT);
+    assert(info.error == -LUME_ENOENT);
+    assert(!lume_hardware_remove(topology_child));
+    assert(!lume_hardware_remove(topology_root));
+}
+
 int main(void)
 {
     assert(lume_hardware_rescan() == -LUME_ENOSYS);
@@ -286,6 +314,7 @@ int main(void)
     assert(!lume_hardware_remove(unsupported));
     assert(!lume_hardware_count() && !allocations && !owner_references);
     assert(!lume_resource_claim_count() && starts && stops);
+    topology_cases();
     puts("HARDWARE_PASS multiple devices, drivers, lifecycle, diagnostics and shared claims");
     return 0;
 }

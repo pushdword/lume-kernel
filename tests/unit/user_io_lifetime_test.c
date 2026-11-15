@@ -229,6 +229,11 @@ void *lume_kernel_allocate(size_t bytes)
     abort();
 }
 
+void *lume_kernel_allocate_private(size_t bytes)
+{
+    return lume_kernel_allocate(bytes);
+}
+
 void lume_kernel_free(void *pointer)
 {
     if (!pointer)

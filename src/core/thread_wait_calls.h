@@ -21,6 +21,8 @@ static struct lume_context *thread_word_call(struct lume_context *frame, unsigne
     if (op == LUME_THREAD_WAKE || op == LUME_THREAD_WAKE_SHARED)
     {
         result = 0;
+        unsigned flexible = 0;
+        bool boot_cpu = false;
         for (unsigned i = 0; i < LUME_TASK_LIMIT && (uint64_t)result < r.value; ++i)
         {
             bool matches = shared ? thread_shared_keys[i].object == key.object &&
@@ -36,10 +38,16 @@ static struct lume_context *thread_word_call(struct lume_context *frame, unsigne
                 LUME_CONTEXT_REG(&tasks[i].context, 0) = 0;
                 sched_wake(&policy, i, unit, 0);
                 ++result;
+                if (i == 0 || i == 2)
+                    boot_cpu = true;
+                else
+                    ++flexible;
             }
         }
-        if (result > 0)
-            lume_smp_wake();
+        if (boot_cpu)
+            lume_smp_wake_count(1, 1);
+        if (flexible)
+            lume_smp_wake_count(flexible, UINT32_MAX);
     }
     else if (__atomic_load_n((const uint32_t *)(uintptr_t)r.address, __ATOMIC_ACQUIRE) !=
              (uint32_t)r.value)

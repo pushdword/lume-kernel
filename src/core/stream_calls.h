@@ -11,6 +11,8 @@ static struct stream_wait_state
     bool active, pending, ready, started;
 } *stream_waits;
 
+static uint64_t stream_active[(LUME_TASK_LIMIT + 63u) / 64u];
+
 static bool stream_waits_start(void)
 {
     if (!stream_waits)
@@ -18,6 +20,7 @@ static bool stream_waits_start(void)
     if (!stream_waits)
         return false;
     memset(stream_waits, 0, sizeof(*stream_waits) * LUME_TASK_LIMIT);
+    memset(stream_active, 0, sizeof(stream_active));
     return true;
 }
 
@@ -58,6 +61,7 @@ static void stream_cancel(unsigned task)
         wait->retire_handle = wait->request.handle;
     }
     wait->active = wait->pending = wait->ready = wait->started = false;
+    stream_active[task / 64u] &= ~(UINT64_C(1) << (task % 64u));
 }
 
 static bool stream_interrupt(unsigned task)
@@ -72,18 +76,33 @@ void lume_tasks_stream_notify(unsigned owner, unsigned handle)
 {
     if (!stream_waits)
         return;
-    bool changed = false;
-    for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+    unsigned flexible = 0;
+    bool boot_cpu = false;
+    for (unsigned word = 0; word < (LUME_TASK_LIMIT + 63u) / 64u; ++word)
     {
-        struct stream_wait_state *wait = &stream_waits[i];
-        if (wait->active && wait->owner == owner && wait->request.handle == handle)
+        uint64_t bits = stream_active[word];
+        while (bits)
         {
-            changed |= !wait->ready;
-            wait->ready = true;
+            unsigned i = word * 64u + (unsigned)__builtin_ctzll(bits);
+            bits &= bits - 1;
+            struct stream_wait_state *wait = &stream_waits[i];
+            if (wait->active && wait->owner == owner && wait->request.handle == handle)
+            {
+                if (!wait->ready)
+                {
+                    if (i == 0 || i == 2)
+                        boot_cpu = true;
+                    else
+                        ++flexible;
+                }
+                wait->ready = true;
+            }
         }
     }
-    if (changed)
-        lume_smp_wake();
+    if (boot_cpu)
+        lume_smp_wake_count(1, 1);
+    if (flexible)
+        lume_smp_wake_count(flexible, UINT32_MAX);
 }
 
 static int64_t stream_attempt(unsigned task)
@@ -113,6 +132,7 @@ static int64_t stream_attempt(unsigned task)
                                        .operation = operation,
                                        .active = true};
         memcpy(&wait->request, (const void *)(uintptr_t)pointer, sizeof(wait->request));
+        stream_active[task / 64u] |= UINT64_C(1) << (task % 64u);
     }
     wait->pending = wait->ready = false;
     int64_t result;
@@ -144,7 +164,10 @@ static int64_t stream_attempt(unsigned task)
     if (result < 0)
         stream_cancel(task);
     else
+    {
         wait->active = wait->started = false;
+        stream_active[task / 64u] &= ~(UINT64_C(1) << (task % 64u));
+    }
     stream_reap();
     return result;
 }

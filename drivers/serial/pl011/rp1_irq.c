@@ -51,7 +51,7 @@ bool lume_uart_irq_start(void)
         lume_mmio_write32_sync(PCIE + 0x18, saved_bus);
         return false;
     }
-    if (lume_irq_register(UART_PARENT, LUME_IRQ_LEVEL, receive, &started))
+    if (lume_irq_register_async(UART_PARENT, LUME_IRQ_LEVEL, receive, &started))
     {
         lume_mmio_write32_sync(PCIE + 0x9000, saved_index);
         lume_mmio_write32_sync(PCIE + 0x18, saved_bus);

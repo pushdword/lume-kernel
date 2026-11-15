@@ -22,6 +22,8 @@ uint64_t lume_smp_wait_ticks(void);
 uint64_t lume_smp_wait_total(void);
 uint64_t lume_smp_wait_start(unsigned);
 void lume_smp_wake(void);
+/* Notify at most count idle CPUs from allowed. Pending notifications coalesce. */
+void lume_smp_wake_count(unsigned count, unsigned allowed);
 void lume_smp_idle_begin(void);
 void lume_smp_idle_end(void);
 void lume_smp_quiesce(void);

@@ -23,6 +23,7 @@ static struct pbuf network_packets[2];
 static unsigned char network_data[8192];
 static unsigned network_sends, network_reads, packet_allocations, packet_frees;
 static unsigned network_pauses;
+static unsigned network_owner;
 static bool packet_live;
 static bool oversized_receive;
 static bool oversized_send;
@@ -184,9 +185,15 @@ err_t udp_sendto(struct udp_pcb *pcb, struct pbuf *packet, const ip_addr_t *addr
 
 int lume_stream_nowait(unsigned owner, unsigned op, struct lume_stream_request *request)
 {
-    CHECK(owner && request && request->handle == 42);
+    CHECK(owner && request);
     if (op == LUME_STREAM_CLOSE)
         return 0;
+    CHECK(request->handle == 42);
+    if (op == LUME_STREAM_ACCEPT)
+    {
+        request->handle = 43;
+        return 0;
+    }
     CHECK(op == LUME_STREAM_SEND || op == LUME_STREAM_RECEIVE);
     CHECK((uintptr_t)request->data != destination && request->count <= LUME_IO_BYTES);
     if (op == LUME_STREAM_SEND)
@@ -212,7 +219,9 @@ int lume_stream_nowait(unsigned owner, unsigned op, struct lume_stream_request *
 int lume_stream_socket_create(unsigned owner, unsigned op, struct lume_stream_request *request,
                               unsigned options)
 {
-    CHECK(owner && op == LUME_STREAM_CONNECT_ASYNC && request && !options);
+    CHECK(owner && (op == LUME_STREAM_CONNECT_ASYNC || op == LUME_STREAM_LISTEN) && request &&
+          !options);
+    network_owner = owner;
     request->handle = 42;
     return 0;
 }
@@ -338,6 +347,47 @@ static void expect_network_destination(unsigned char value)
         for (unsigned i = 0; i < 4096; ++i)
             CHECK(((unsigned char *)(uintptr_t)physical)[i] == value);
     }
+}
+
+static void notification_cases(void)
+{
+    struct lume_socket_request request = {
+        .version = LUME_SOCKET_VERSION, .bytes = sizeof(request), .family = 2, .type = 1};
+    CHECK(!lume_socket_call(&files[0], LUME_SOCKET_CREATE, &request));
+    int listener = request.fd;
+    CHECK(!lume_socket_call(&files[0], LUME_SOCKET_LISTEN, &request));
+    unsigned owner = network_owner;
+    CHECK(!lume_socket_call(&files[0], LUME_SOCKET_ACCEPT, &request));
+    int child = request.other;
+    struct lume_poll_watch first = {.count = 1,
+                                    .records = {{.fd = listener, .events = LUME_POLLIN}}};
+    struct lume_poll_watch last = {.count = 1, .records = {{.fd = child, .events = LUME_POLLIN}}};
+    lume_vfs_poll_prepare(&files[0], &first);
+    lume_vfs_poll_prepare(&files[0], &last);
+    CHECK(lume_vfs_poll_subscribe(&files[0], &first, 7));
+    CHECK(lume_vfs_poll_subscribe(&files[0], &last, 8));
+    lume_socket_stream_notify(owner, 44);
+    CHECK(!lume_vfs_poll_take(7) && !lume_vfs_poll_take(8));
+    lume_socket_stream_notify(owner, 42);
+    CHECK(lume_vfs_poll_take(7) && !lume_vfs_poll_take(8));
+    lume_socket_stream_notify(owner, 43);
+    CHECK(!lume_vfs_poll_take(7) && lume_vfs_poll_take(8));
+    CHECK(!lume_vfs_close(&files[0], (unsigned)child));
+    lume_socket_reap();
+    int replacement = make_socket(1);
+    first.records[0].fd = replacement;
+    lume_vfs_poll_prepare(&files[0], &first);
+    CHECK(lume_vfs_poll_subscribe(&files[0], &first, 7));
+    lume_socket_stream_notify(owner, 43);
+    CHECK(!lume_vfs_poll_take(7));
+    lume_socket_stream_notify(network_owner, 42);
+    CHECK(lume_vfs_poll_take(7));
+    lume_vfs_poll_release(7);
+    lume_vfs_poll_release(8);
+    CHECK(!lume_vfs_close(&files[0], (unsigned)replacement));
+    CHECK(!lume_vfs_close(&files[0], (unsigned)listener));
+    while (lume_socket_reap_pending())
+        lume_socket_reap();
 }
 
 static void tcp_cases(void)
@@ -520,6 +570,7 @@ int main(void)
     network_interface.flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
     network_interface.mtu = 9000;
     IP_ADDR4(&network_interface.ip_addr, 10, 0, 0, 1);
+    notification_cases();
     tcp_cases();
     udp_cases();
     CHECK(packet_allocations == packet_frees && !packet_live);

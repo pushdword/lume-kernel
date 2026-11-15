@@ -16,6 +16,9 @@ static unsigned image_protect_calls;
 static int metadata_budget = -1, physical_budget = -1;
 static int mapping_budget = -1;
 static void (*allocation_pause)(void);
+static void (*compute_pause)(void);
+static bool computing;
+static unsigned unlocked_frame_frees;
 static bool writer_view[LUME_TASK_LIMIT];
 static uint64_t root_offset[LUME_TASK_LIMIT];
 
@@ -224,6 +227,7 @@ uint64_t lume_pages_alloc_span(unsigned count)
 
 bool lume_page_free(uint64_t physical)
 {
+    unlocked_frame_frees += computing;
     for (unsigned i = 0; i < 4096; ++i)
         if (mappings[i].live)
             CHECK(mappings[i].physical != physical);
@@ -392,7 +396,16 @@ void lume_worker_checkpoint(unsigned bytes)
 
 void lume_worker_compute(void (*run)(void *), void *context)
 {
+    CHECK(!computing);
+    computing = true;
+    if (compute_pause)
+    {
+        void (*hook)(void) = compute_pause;
+        compute_pause = NULL;
+        hook();
+    }
     run(context);
+    computing = false;
 }
 
 bool lume_worker_pause_ms(unsigned ms)
@@ -613,8 +626,33 @@ static void stable_size_cases(void)
     clean();
 }
 
+static struct vm_object *concurrent_retired;
+
+static void retire_during_release(void)
+{
+    CHECK(!retired);
+    drop(concurrent_retired);
+}
+
+static void retirement_cases(void)
+{
+    struct vm_object *first = new_object(PAGE, false);
+    concurrent_retired = new_object(PAGE, false);
+    CHECK(first && concurrent_retired);
+    CHECK(get_page(first, 0) && get_page(concurrent_retired, 0));
+    drop(first);
+    compute_pause = retire_during_release;
+    unsigned before = unlocked_frame_frees;
+    reap(NULL);
+    CHECK(!compute_pause && retired == concurrent_retired);
+    drain();
+    CHECK(unlocked_frame_frees == before + 2);
+    clean();
+}
+
 int main(void)
 {
+    retirement_cases();
     stable_size_cases();
     dma_pin_cases();
     buffer_transaction_cases();

@@ -495,6 +495,11 @@ void lume_smp_wake(void)
 {
 }
 
+void lume_smp_wake_count(unsigned count, unsigned allowed)
+{
+    assert(count && allowed);
+}
+
 static void lume_watchdog_progress(void)
 {
     ++progress;

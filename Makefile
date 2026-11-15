@@ -556,6 +556,7 @@ $(OUT)/tests/display.elf: tests/arch/aarch64/display_test.c drivers/display/rp1_
 endif
 
 .PHONY: check-hardware
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),hardware fdt-inventory fdt-pcie q35-bus hardware-polling boot-fdt)): tests/fixtures/hardware_worker_host.c
 check-hardware: $(OUT)/tests/hardware$(HOSTEXE)
 	env "$(OUT)/tests/hardware$(HOSTEXE)"
 $(OUT)/tests/hardware$(HOSTEXE): tests/unit/hardware_test.c src/device/hardware.c src/device/hardware_control.c src/device/resource.c src/device/device.c

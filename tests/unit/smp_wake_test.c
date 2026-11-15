@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 static unsigned cpu, cpus = 4, notifications, notified;
 
@@ -72,6 +73,26 @@ int main(void)
     lume_smp_wake();
     lume_smp_idle_end();
     assert(notifications == 10004);
+    cpus = 4;
+    idle_cpus = 15;
+    wake_pending = 0;
+    notified = 0;
+    lume_smp_wake_count(1, 15);
+    assert(__builtin_popcount(notified) == 1 && !(notified & 1));
+    lume_smp_wake_count(1, 15);
+    assert(__builtin_popcount(notified) == 2);
+    lume_smp_wake_count(4, 15);
+    assert(notified == 14 && wake_pending == 14);
+    unsigned before = notifications;
+    lume_smp_wake_count(1, 1);
+    lume_smp_wake_count(0, 15);
+    assert(notifications == before);
+    cpu = 2;
+    lume_smp_idle_end();
+    lume_smp_idle_begin();
+    cpu = 0;
+    lume_smp_wake_count(1, 4);
+    assert(notifications == before + 1 && wake_pending == 14);
     puts("SMP wake: busy CPUs, coalescing, repeated idle intervals and uniprocessor PASS");
     return 0;
 }

@@ -1,5 +1,6 @@
 #include "lume/hardware.h"
 #include "lume/abi.h"
+#include "lume/worker.h"
 #include <string.h>
 
 struct lume_hardware
@@ -19,6 +20,7 @@ static struct lume_hardware hardware[LUME_HARDWARE_LIMIT];
 static const struct lume_driver *drivers[LUME_DRIVER_LIMIT];
 static const struct lume_hardware_services *services;
 static uint32_t next_id = 1;
+static uint64_t topology_epoch;
 static const struct lume_hardware_bus_ops *bus_ops;
 
 int lume_hardware_bus_services(const struct lume_hardware_bus_ops *ops)
@@ -123,6 +125,7 @@ int lume_hardware_add(const struct lume_hardware_description *d, uint32_t *id)
     memset(slot, 0, sizeof(*slot));
     slot->info.version = LUME_HARDWARE_VERSION;
     slot->info.id = next_id++;
+    ++topology_epoch;
     slot->info.parent = d->parent;
     slot->info.origin = d->origin;
     slot->info.state = d->state;
@@ -158,7 +161,44 @@ int lume_hardware_remove(uint32_t id)
         if (hardware[i].info.id && hardware[i].info.parent == id)
             return -LUME_EBUSY;
     memset(h, 0, sizeof(*h));
+    ++topology_epoch;
     return 0;
+}
+
+struct absent_snapshot
+{
+    uint32_t ids[LUME_HARDWARE_LIMIT], parents[LUME_HARDWARE_LIMIT];
+    bool absent[LUME_HARDWARE_LIMIT];
+};
+
+static void prepare_absent(void *context)
+{
+    struct absent_snapshot *snapshot = context;
+    unsigned parents[LUME_HARDWARE_LIMIT];
+    for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+    {
+        parents[i] = LUME_HARDWARE_LIMIT;
+        if (snapshot->ids[i] && snapshot->parents[i])
+            for (unsigned j = 0; j < LUME_HARDWARE_LIMIT; ++j)
+                if (snapshot->ids[j] == snapshot->parents[i])
+                {
+                    parents[i] = j;
+                    break;
+                }
+    }
+    for (unsigned pass = 0; pass < LUME_HARDWARE_LIMIT; ++pass)
+    {
+        bool changed = false;
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            if (parents[i] < LUME_HARDWARE_LIMIT && !snapshot->absent[i] &&
+                snapshot->absent[parents[i]])
+            {
+                snapshot->absent[i] = true;
+                changed = true;
+            }
+        if (!changed)
+            break;
+    }
 }
 
 int lume_hardware_state(uint32_t id, unsigned state, int error)
@@ -168,29 +208,51 @@ int lume_hardware_state(uint32_t id, unsigned state, int error)
         return -LUME_ENOENT;
     if (state > LUME_HARDWARE_FAILED || h->busy)
         return -LUME_EINVAL;
-    h->info.state = state;
-    h->info.error = error;
-    h->absent = state == LUME_HARDWARE_ABSENT;
-    if (h->absent)
-        for (unsigned pass = 0; pass < LUME_HARDWARE_LIMIT; ++pass)
+    if (state != LUME_HARDWARE_ABSENT)
+    {
+        h->info.state = state;
+        h->info.error = error;
+        h->absent = false;
+        ++topology_epoch;
+        return 0;
+    }
+    h->busy = true;
+    int result = -LUME_EBUSY;
+    for (unsigned attempt = 0; attempt < 3; ++attempt)
+    {
+        uint64_t epoch = topology_epoch;
+        struct absent_snapshot snapshot;
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
         {
-            bool changed = false;
-            for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            snapshot.ids[i] = hardware[i].info.id;
+            snapshot.parents[i] = hardware[i].info.parent;
+            snapshot.absent[i] = hardware[i].absent;
+        }
+        snapshot.absent[h - hardware] = true;
+        lume_worker_compute(prepare_absent, &snapshot);
+        if (epoch != topology_epoch)
+            continue;
+        bool busy = false;
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            busy |= hardware[i].info.id && snapshot.absent[i] && !hardware[i].absent &&
+                    &hardware[i] != h && hardware[i].busy;
+        if (busy)
+            break;
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            if (hardware[i].info.id && snapshot.absent[i] &&
+                (!hardware[i].absent || &hardware[i] == h))
             {
                 struct lume_hardware *child = hardware + i;
-                struct lume_hardware *parent = find(child->info.parent);
-                if (child->info.id && !child->absent && parent && parent->absent)
-                {
-                    child->absent = true;
-                    child->info.state = LUME_HARDWARE_ABSENT;
-                    child->info.error = error;
-                    changed = true;
-                }
+                child->absent = true;
+                child->info.state = LUME_HARDWARE_ABSENT;
+                child->info.error = error;
             }
-            if (!changed)
-                break;
-        }
-    return 0;
+        ++topology_epoch;
+        result = 0;
+        break;
+    }
+    h->busy = false;
+    return result;
 }
 
 unsigned lume_hardware_count(void)

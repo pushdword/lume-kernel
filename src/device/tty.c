@@ -164,6 +164,51 @@ static void echo_byte(struct pseudo_terminal *terminal, unsigned char byte)
     ring_put(&terminal->output, byte);
 }
 
+struct tty_output
+{
+    struct tty_ring *ring;
+    const unsigned char *source;
+    unsigned start, room, bytes, flags, consumed, produced;
+};
+
+static void prepare_output(void *context)
+{
+    struct tty_output *output = context;
+    while (output->consumed < output->bytes)
+    {
+        unsigned char byte = output->source[output->consumed];
+        bool newline = byte == '\n' && (output->flags & (LUME_TTY_OPOST | LUME_TTY_ONLCR)) ==
+                                           (LUME_TTY_OPOST | LUME_TTY_ONLCR);
+        unsigned needed = newline ? 2 : 1;
+        if (needed > output->room - output->produced)
+            break;
+        if (newline)
+            output->ring->data[(output->start + output->produced++) % TTY_BYTES] = '\r';
+        output->ring->data[(output->start + output->produced++) % TTY_BYTES] = byte;
+        ++output->consumed;
+    }
+}
+
+static int64_t tty_output_write(struct pseudo_terminal *terminal, const void *data, uint64_t bytes)
+{
+    struct tty_output output = {.ring = &terminal->output,
+                                .source = data,
+                                .start =
+                                    (terminal->output.first + terminal->output.count) % TTY_BYTES,
+                                .room = TTY_BYTES - terminal->output.count,
+                                .bytes = bytes > TTY_BYTES ? TTY_BYTES : (unsigned)bytes,
+                                .flags = terminal->termios.output};
+    terminal->copying = true;
+    if (output.bytes >= 256 && output.room >= 256)
+        lume_worker_compute(prepare_output, &output);
+    else
+        prepare_output(&output);
+    terminal->output.count += output.produced;
+    terminal->copying = false;
+    tty_notify(terminal);
+    return output.consumed ? (int64_t)output.consumed : -LUME_EAGAIN;
+}
+
 static int64_t tty_write(void *context, const void *data, uint64_t bytes)
 {
     struct tty_end *end = context;
@@ -191,19 +236,13 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
         tty_notify(terminal);
         return count;
     }
+    if (end->side)
+        return tty_output_write(terminal, data, bytes);
     unsigned done = 0;
     const unsigned char *source = data;
     while (done < bytes && done < TTY_BYTES)
     {
         unsigned char byte = source[done];
-        if (end->side)
-        {
-            if (terminal->output.count + 2 > TTY_BYTES)
-                break;
-            echo_byte(terminal, byte);
-            ++done;
-            continue;
-        }
         if (terminal->termios.input & LUME_TTY_ISTRIP)
             byte &= 127;
         if (byte == '\r' && (terminal->termios.input & LUME_TTY_IGNCR))

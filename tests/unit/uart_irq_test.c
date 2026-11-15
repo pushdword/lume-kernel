@@ -63,7 +63,7 @@ bool lume_irq_available(void)
     return available;
 }
 
-int lume_irq_register(unsigned n, unsigned trigger, lume_irq_handler fn, void *context)
+int lume_irq_register_async(unsigned n, unsigned trigger, lume_irq_handler fn, void *context)
 {
     assert(n == 261 && trigger == LUME_IRQ_LEVEL);
     ++registered;
