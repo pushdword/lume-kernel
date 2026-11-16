@@ -866,6 +866,13 @@ check: check-usb-poll
 .PHONY: check-ticket-lock
 .PHONY: check-tlb-parallel
 .PHONY: check-thread-retire
+.PHONY: check-jit-scope
+check-jit-scope: $(OUT)/tests/jit-scope$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/jit-scope$(HOSTEXE): tests/unit/jit_scope_test.c src/core/jit_calls.h src/core/memory_wait.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check: check-jit-scope
 check-thread-retire: $(OUT)/tests/thread-retire$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/thread-retire$(HOSTEXE): tests/unit/thread_retire_test.c src/core/thread_release.h src/core/memory_wait.h include/kernel/lume/mmu_guard.h

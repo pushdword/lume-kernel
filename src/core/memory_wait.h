@@ -12,7 +12,7 @@ static void task_memory_wait(unsigned task)
 }
 
 /* Address-space ownership and waiter publication use scheduler serialization.
- * Final release wakes only retirements belonging to that address space. */
+ * Final release wakes tasks waiting for the matching address space. */
 void lume_task_memory_ready(unsigned owner)
 {
     unsigned flexible = 0;

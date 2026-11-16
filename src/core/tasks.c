@@ -1984,6 +1984,8 @@ static void report_program_fault(unsigned process, unsigned task, const struct l
 #endif
 }
 
+#include "jit_calls.h"
+
 struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, uint64_t far)
 {
     local.buffer_retry = false;
@@ -2007,20 +2009,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_VM &&
         (LUME_CONTEXT_REG(frame, 0) == LUME_VM_JIT_BEGIN ||
          LUME_CONTEXT_REG(frame, 0) == LUME_VM_JIT_END))
-    {
-        int64_t result = -LUME_EINVAL;
-        if (!LUME_CONTEXT_REG(frame, 1) && !LUME_CONTEXT_REG(frame, 2))
-        {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
-    defined(LUME_ARCH_I686)
-            result = lume_mmu_jit_scope(task, LUME_CONTEXT_REG(frame, 0) == LUME_VM_JIT_BEGIN);
-#else
-            result = -LUME_ENOSYS;
-#endif
-        }
-        LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
-        return frame;
-    }
+        return kernel_jit_scope(frame, task);
 #if defined(LUME_ARCH_AARCH64) || defined(__aarch64__)
     bool vm_abort =
         ((esr >> 26) == 0x20 || (esr >> 26) == 0x24) && (esr & 63) >= 4 && (esr & 63) <= 15;
