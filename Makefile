@@ -817,7 +817,7 @@ check: check-ready-state
 .PHONY: check-worker-slices
 check-worker-slices: $(OUT)/tests/worker-slices$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/worker.c src/core/worker_check.c src/core/work.c src/core/activity.c include/kernel/lume/worker.h include/kernel/lume/activity.h
+$(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/worker.c src/core/worker_check.c src/core/work.c src/core/activity.c src/core/timer_deadline.h include/kernel/lume/worker.h include/kernel/lume/activity.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/core/work.c -o "$@"
 check: check-worker-slices

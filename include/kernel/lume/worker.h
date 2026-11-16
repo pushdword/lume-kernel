@@ -47,6 +47,9 @@ void lume_worker_device(void (*run)(void *), void *context);
  * ranges mapped and resident until the copy returns. Small copies run inline. */
 void lume_worker_copy(void *destination, const void *source, size_t bytes);
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline);
+/* Published wait deadlines may shorten a timer interval. The caller supplies an
+ * upper bound in counter ticks. An expired wait remains visible until resumed. */
+uint64_t lume_worker_next_deadline(uint64_t latest);
 bool lume_worker_pause(uint64_t deadline);
 bool lume_worker_pause_ms(unsigned milliseconds);
 /* Checkpoints charge processed bytes and yield after 64 KiB or 500 us of running time.

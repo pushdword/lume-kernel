@@ -71,10 +71,48 @@ static bool cache_write_line(struct sector_cache_line *line)
     return true;
 }
 
+struct cache_write_order
+{
+    struct
+    {
+        uint64_t first;
+        unsigned line;
+    } entries[SECTOR_CACHE_LINES];
+
+    unsigned count;
+};
+
+static void cache_sort_writes(void *context)
+{
+    struct cache_write_order *order = context;
+    for (unsigned i = 1; i < order->count; ++i)
+    {
+        uint64_t first = order->entries[i].first;
+        unsigned line = order->entries[i].line, position = i;
+        while (position && order->entries[position - 1].first > first)
+        {
+            order->entries[position] = order->entries[position - 1];
+            --position;
+        }
+        order->entries[position].first = first;
+        order->entries[position].line = line;
+    }
+}
+
 static bool cache_sync(void)
 {
+    struct cache_write_order order;
+    order.count = 0;
     for (unsigned i = 0; i < SECTOR_CACHE_LINES; ++i)
-        if (!cache_write_line(sector_cache + i))
+        if (sector_cache[i].dirty[0] || sector_cache[i].dirty[1])
+        {
+            order.entries[order.count].first = sector_cache[i].first;
+            order.entries[order.count++].line = i;
+        }
+    if (order.count > 1)
+        lume_worker_compute(cache_sort_writes, &order);
+    for (unsigned i = 0; i < order.count; ++i)
+        if (!cache_write_line(sector_cache + order.entries[i].line))
             return false;
     if (!lume_sd_sync())
         return false;

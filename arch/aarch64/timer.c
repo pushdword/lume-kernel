@@ -4,6 +4,8 @@
 #include "lume/watchdog.h"
 #include "lume/irq.h"
 #include "lume/smp.h"
+#include "lume/worker.h"
+#include "timer_deadline.h"
 #include "scheduler_config.h"
 #define TIMER_IRQ 30u
 
@@ -62,6 +64,8 @@ void lume_timer_rearm(void)
     next_deadline += interval;
     if (next_deadline <= now)
         next_deadline = now + interval;
+    next_deadline =
+        timer_wait_deadline(now, next_deadline, normal_interval / 50 ? normal_interval / 50 : 1);
     __asm__ volatile("msr cntp_cval_el0, %0; isb" ::"r"(next_deadline) : "memory");
 }
 
@@ -71,7 +75,11 @@ void lume_timer_idle(bool idle)
     interval = idle && !lume_cpu_index() ? input_interval : normal_interval;
     if (!interval)
         interval = 1;
-    next_deadline = lume_counter_read() + interval;
+    uint64_t now = lume_counter_read(), target = now + interval;
+    if (!idle && (int64_t)(next_deadline - now) > 0 && (int64_t)(next_deadline - target) < 0)
+        target = next_deadline;
+    next_deadline =
+        timer_wait_deadline(now, target, normal_interval / 50 ? normal_interval / 50 : 1);
     __asm__ volatile("msr cntp_cval_el0, %0; isb" ::"r"(next_deadline) : "memory");
 }
 

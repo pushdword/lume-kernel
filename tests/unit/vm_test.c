@@ -614,6 +614,65 @@ static void file_mapping_cases(void);
 static void shared_word_cases(void);
 static int memory_file(void);
 
+static uint64_t group_base;
+
+static void remove_group_during_preparation(void)
+{
+    CHECK(!call(0, LUME_VM_UNMAP, group_base, 64 * PAGE, 0, 0, -1));
+}
+
+static void anonymous_group_cases(void)
+{
+    unsigned anonymous = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
+    uint64_t base = call(0, LUME_VM_MAP, 0, 64 * PAGE, 3, anonymous, -1);
+    CHECK((int64_t)base > 0 && !physical_live);
+    unsigned before = preparations;
+    CHECK(physical(0, base, true, false) && physical_live == 1 && mappings_live == 1);
+    CHECK(physical(0, base + PAGE, true, false) && physical_live == 9 && mappings_live == 9);
+    for (unsigned i = 2; i <= 8; ++i)
+    {
+        uint64_t frame = physical(0, base + i * PAGE, true, false);
+        for (unsigned byte = 0; byte < PAGE; ++byte)
+            CHECK(!((unsigned char *)(uintptr_t)frame)[byte]);
+    }
+    CHECK(preparations == before + 2 && physical_live == 9 && mappings_live == 9);
+    CHECK(!lume_vm_fault(0, base + 64 * PAGE, true, false));
+    clean();
+
+    base = call(0, LUME_VM_MAP, 0, 64 * PAGE, 3, anonymous, -1);
+    CHECK(physical(0, base, true, false));
+    physical_budget = 1;
+    CHECK(physical(0, base + PAGE, true, false) && physical_live == 2 && mappings_live == 2);
+    clean();
+
+    base = call(0, LUME_VM_MAP, 0, 65 * PAGE, 3, anonymous, -1);
+    CHECK(physical(0, base + 63 * PAGE, true, false));
+    CHECK(physical(0, base + 64 * PAGE, true, false));
+    CHECK(physical_live == 2 && mappings_live == 2);
+    clean();
+
+    base = group_base = call(0, LUME_VM_MAP, 0, 64 * PAGE, 3, anonymous, -1);
+    CHECK(physical(0, base, true, false));
+    preparation_pause = remove_group_during_preparation;
+    CHECK(!lume_vm_fault(0, base + PAGE, true, false));
+    CHECK(!preparation_pause && !mappings_live);
+    clean();
+
+    base = call(0, LUME_VM_MAP, 0, 64 * PAGE, 3, anonymous, -1);
+    CHECK(physical(0, base, true, false));
+    mapping_budget = 0;
+    CHECK(lume_vm_fault(0, base + PAGE, true, false) == -1);
+    CHECK(physical_live == 1 && mappings_live == 1);
+    clean();
+
+    base = call(0, LUME_VM_MAP, 0, 64 * PAGE, 3, anonymous, -1);
+    CHECK(physical(0, base, true, false));
+    mapping_budget = 1;
+    CHECK(lume_vm_fault(0, base + PAGE, true, false) == 1);
+    CHECK(physical_live == 2 && mappings_live == 2);
+    clean();
+}
+
 static void buffer_transaction_cases(void)
 {
     int fd = memory_file();
@@ -708,6 +767,7 @@ static void retirement_cases(void)
 
 int main(void)
 {
+    anonymous_group_cases();
     retirement_cases();
     stable_size_cases();
     dma_pin_cases();

@@ -21,7 +21,6 @@ static struct storage_file
     unsigned references;
     uint64_t identity, generation;
     uint64_t dirty_at;
-    size_t dirty_bytes;
     int write_error;
     bool dirty;
     bool retired;
@@ -56,7 +55,6 @@ static unsigned flush_cursor;
 static void flush_one(void *);
 static struct lume_work flush_work = {.run = flush_one, .domain = LUME_WORK_STORAGE};
 #define STORAGE_FLUSH_MS 1000u
-#define STORAGE_FLUSH_BYTES (1024u * 1024u)
 
 #include "sector_cache.h"
 
@@ -243,20 +241,18 @@ static int sync_file(struct storage_file *file)
     if (!result)
     {
         file->dirty = false;
-        file->dirty_bytes = 0;
     }
     flush_deadline();
     return file->write_error ? file->write_error : result;
 }
 
-static void dirty_file(struct storage_file *file, size_t bytes)
+static void dirty_file(struct storage_file *file)
 {
     if (!file->dirty)
     {
         file->dirty = true;
         file->dirty_at = lume_clock_monotonic();
     }
-    file->dirty_bytes += bytes;
     if (file->dirty_at + STORAGE_FLUSH_MS < next_flush_at)
         next_flush_at = file->dirty_at + STORAGE_FLUSH_MS;
 }
@@ -522,7 +518,7 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
     if (!bytes)
         return 0;
     content_changed(description->file);
-    dirty_file(description->file, bytes);
+    dirty_file(description->file);
     FIL *file = &description->file->file;
     FSIZE_t previous = f_size(file);
     FRESULT result;
@@ -556,9 +552,7 @@ static int write_handle(void *handle, uint64_t offset, const void *data, size_t 
         int restored = restore_file_size(description->file, previous);
         return restored ? restored : -LUME_ENOSPC;
     }
-    if (result == FR_OK &&
-        (description->file->dirty_bytes >= STORAGE_FLUSH_BYTES || count < bytes ||
-         lume_clock_monotonic() - description->file->dirty_at >= STORAGE_FLUSH_MS))
+    if (result == FR_OK && count < bytes)
     {
         int synced = sync_file(description->file);
         if (synced)
@@ -593,7 +587,7 @@ static int resize_handle(void *handle, uint64_t bytes)
             UINT take =
                 bytes - f_tell(file) > sizeof(zero) ? sizeof(zero) : (UINT)(bytes - f_tell(file));
             UINT done = 0;
-            dirty_file(description->file, take);
+            dirty_file(description->file);
             result = f_write(file, zero, take, &done);
             lume_worker_checkpoint(done);
             if (result == FR_OK && done != take)

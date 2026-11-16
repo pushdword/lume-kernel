@@ -19,6 +19,12 @@
 #define LUME_CPU_LIMIT 4u
 #define LUME_ARCH_FIBER_H
 #define LUME_EARLY_H
+
+static void lume_timer_idle(bool idle)
+{
+    assert(!idle);
+}
+
 #define LUME_COUNTER_H
 #define LUME_SMP_H
 static THREAD_LOCAL unsigned cpu_index;

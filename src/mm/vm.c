@@ -45,6 +45,7 @@ struct vm_object
 struct vm_area
 {
     uint64_t first, end, offset, generation, stable_end;
+    uint64_t fault_next;
     unsigned protection, maximum, thread, saved, owner;
     bool shared, retiring, jit, image;
     struct vm_object *object;
@@ -572,6 +573,8 @@ struct fault_preparation
 {
     struct vm_chunk *chunk;
     uint64_t frame, source, low, high;
+    uint64_t following[7];
+    unsigned following_count;
     bool metadata, contents, partial;
 };
 
@@ -588,6 +591,10 @@ static void prepare_fault(void *context)
         memcpy((void *)(uintptr_t)(prepared->frame + prepared->low),
                (const void *)(uintptr_t)(prepared->source + prepared->low),
                (size_t)(prepared->high - prepared->low));
+    if (prepared->frame)
+        for (unsigned i = 0; i < prepared->following_count; ++i)
+            if (!(prepared->following[i] = lume_page_alloc(0)))
+                break;
 }
 
 static int fault_owned(unsigned task, uint64_t address, bool write, bool execute)
@@ -613,6 +620,7 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
         return 0;
     uint64_t offset = area->offset + address - area->first;
     uint64_t page = offset / PAGE, position = page * PAGE;
+    uint64_t aligned = address & ~(PAGE - 1);
     if (page >= (object->bytes + PAGE - 1) / PAGE)
         return -1;
     uint64_t first = 0, end = 0, source_physical = 0, source_version = 0;
@@ -653,6 +661,21 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
     prepared.partial = partial;
     prepared.low = first > position ? first - position : 0;
     prepared.high = end - position < PAGE ? end - position : PAGE;
+    /* Sequential anonymous writes prepare a bounded group in one independent
+     * allocation interval. The group stays within one area and page table. */
+    if (write && !source && !owned && !area->shared && !area->jit && !object->persistent &&
+        area->end - area->first >= 64 * PAGE && area->fault_next == aligned)
+        while (prepared.following_count < 7)
+        {
+            unsigned next = (unsigned)(page % 512) + 1 + prepared.following_count;
+            uint64_t bytes = (uint64_t)(prepared.following_count + 1) * PAGE;
+            if (next >= 512 || bytes >= area->end - aligned ||
+                ((aligned + bytes) >> 21) != (aligned >> 21) ||
+                page + 1 + prepared.following_count >= (object->bytes + PAGE - 1) / PAGE ||
+                (entry && entry->pages[next]))
+                break;
+            ++prepared.following_count;
+        }
     if (prepared.contents && source_physical)
     {
         source_pinned = lume_page_pin(source_physical);
@@ -662,9 +685,11 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
             goto out;
         }
     }
-    if (prepared.metadata || prepared.contents)
+    bool prepared_work = prepared.metadata || prepared.contents;
+    if (prepared_work)
         lume_task_memory_prepare(prepare_fault, &prepared);
-    area = find_area(task, address);
+    if (prepared_work || source)
+        area = find_area(task, address);
     if (!area || area->generation != generation || area->object != object || area->retiring ||
         !(area->protection & required))
     {
@@ -776,11 +801,12 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
         if (backing)
             backing->code_ready[bit / 64] |= UINT64_C(1) << (bit % 64);
     }
-    uint64_t aligned = address & ~(PAGE - 1);
     if (lume_mmu_translate(root, aligned, false, false, false, &existing))
         if (!lume_mmu_unmap_user_batch(task, &aligned, 1))
             lume_fail("copy-on-write mapping replacement");
     bool mapped;
+    if (!source)
+        area->fault_next = aligned + PAGE;
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
     defined(LUME_ARCH_I686)
     if (area->jit)
@@ -793,6 +819,29 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
                                    private && (area->protection & LUME_PROT_WRITE),
                                    (area->protection & LUME_PROT_EXEC) != 0);
     result = mapped ? 1 : -1;
+    if (mapped && prepared.following_count)
+    {
+        struct vm_area *current = find_area(task, address);
+        if (current && current->generation == generation && current->object == object &&
+            !current->retiring && !changing[task] && !object->changing)
+        {
+            for (unsigned i = 0; i < prepared.following_count; ++i)
+                if (!entry->pages[slot + i + 1] && prepared.following[i])
+                {
+                    entry->pages[slot + i + 1] = prepared.following[i];
+                    prepared.following[i] = 0;
+                    uint64_t next = aligned + (uint64_t)(i + 1) * PAGE;
+                    if (!lume_mmu_map_user(task, next, entry->pages[slot + i + 1], true, false))
+                    {
+                        if (!lume_page_free(entry->pages[slot + i + 1]))
+                            lume_fail("virtual memory prepared frame release");
+                        entry->pages[slot + i + 1] = 0;
+                        break;
+                    }
+                    current->fault_next = next + PAGE;
+                }
+        }
+    }
     if (mapped && !private)
         file_map_around(task, area, page);
     if (!mapped && new_frame)
@@ -811,6 +860,9 @@ out:
         lume_page_unpin(source_physical);
     if (prepared.frame && !lume_page_free(prepared.frame))
         lume_fail("virtual memory prepared frame release");
+    for (unsigned i = 0; i < prepared.following_count; ++i)
+        if (prepared.following[i] && !lume_page_free(prepared.following[i]))
+            lume_fail("virtual memory prepared frame release");
     lume_kernel_free(prepared.chunk);
     drop(object);
     return result;

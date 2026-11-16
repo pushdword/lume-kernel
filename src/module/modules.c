@@ -185,6 +185,7 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_worker_copy)
     EXPORT(lume_worker_stats)
     EXPORT(lume_worker_wait_bits)
+    EXPORT(lume_worker_next_deadline)
     if (!strcmp(name, "lume_rp1_dma_domain"))
     {
         *address = (uintptr_t)&lume_rp1_dma_domain;

@@ -13,7 +13,7 @@ int main(void)
     assert(ops->open("/data/cache.bin", LUME_O_RDWR, &writer) == 0);
     assert(ops->open("/data/CACHE.BIN", LUME_O_RDONLY, &reader) == 0);
     unsigned before = writes;
-    for (unsigned i = 0; i < 64; ++i)
+    for (unsigned i = 0; i < 2048; ++i)
         assert(ops->write_handle(writer, i * sizeof(input), input, sizeof(input)) == sizeof(input));
     assert(writes == before);
     assert(ops->read_handle(reader, 0, output, sizeof(output)) == sizeof(output));
@@ -21,7 +21,11 @@ int main(void)
     fail_writes = true;
     assert(ops->sync_handle(writer) == -LUME_EIO);
     fail_writes = false;
+    sd_mock_track_order = sd_mock_write_ordered = true;
+    sd_mock_last_end = sd_mock_order_calls = 0;
     assert(disk_ioctl(0, CTRL_SYNC, NULL) == RES_OK);
+    assert(sd_mock_write_ordered && sd_mock_order_calls > 64);
+    sd_mock_track_order = false;
     assert(ops->close(reader) == -LUME_EIO);
     assert(ops->close(writer) == -LUME_EIO);
     assert(lume_storage_start() == ops);

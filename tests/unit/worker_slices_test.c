@@ -114,6 +114,11 @@ static uint64_t lume_counter_frequency(void)
 
 #define LUME_EARLY_H
 
+static void lume_timer_idle(bool idle)
+{
+    T(!idle);
+}
+
 static uint64_t lume_pages_alloc_span(unsigned count)
 {
     return (uintptr_t)calloc(count, 4096);
@@ -199,6 +204,22 @@ unsigned lume_cpu_count(void)
 
 #include "../../src/core/activity.c"
 #include "../../src/core/worker.c"
+#include "timer_deadline.h"
+
+static void deadline_cases(void)
+{
+    T(lume_worker_next_deadline(5000) == 5000);
+    __atomic_store_n(&wait_deadlines[0].until, 1000, __ATOMIC_RELEASE);
+    __atomic_store_n(&wait_deadlines[3].until, 2000, __ATOMIC_RELEASE);
+    T(timer_wait_deadline(100, 5000, 100) == 1000);
+    T(timer_wait_deadline(100, 500, 100) == 500);
+    T(timer_wait_deadline(1000, 5000, 100) == 1100);
+    __atomic_store_n(&wait_deadlines[0].until, 0, __ATOMIC_RELEASE);
+    T(timer_wait_deadline(100, 5000, 100) == 2000);
+    __atomic_store_n(&wait_deadlines[3].until, 0, __ATOMIC_RELEASE);
+    T(timer_wait_deadline(100, 5000, 100) == 5000);
+}
+
 #undef stack
 
 static void lume_counter_delay_us(uint64_t hz, unsigned us)
@@ -817,6 +838,7 @@ static void domain_suspension(void)
 
 int main(void)
 {
+    deadline_cases();
 #ifdef _WIN32
     T(ConvertThreadToFiber(NULL) != NULL);
 #endif

@@ -5,6 +5,9 @@
 
 static unsigned sd_mock_sync_calls;
 static bool sd_mock_sync_fail;
+static bool sd_mock_track_order, sd_mock_write_ordered;
+static uint64_t sd_mock_last_end;
+static unsigned sd_mock_order_calls;
 
 bool lume_sd_read_blocks(uint64_t sector, unsigned count, void *data)
 {
@@ -30,6 +33,12 @@ bool lume_sd_write_blocks(uint64_t sector, unsigned count, const void *data)
 
 bool lume_sd_write_deferred(uint64_t sector, unsigned count, const void *data)
 {
+    if (sd_mock_track_order)
+    {
+        sd_mock_write_ordered &= sector >= sd_mock_last_end;
+        sd_mock_last_end = sector + count;
+        ++sd_mock_order_calls;
+    }
     return lume_sd_write_blocks(sector, count, data);
 }
 

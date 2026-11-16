@@ -27,8 +27,25 @@ static struct worker_state *active_cpus[LUME_CPU_LIMIT];
 #define active active_cpus[lume_cpu_index()]
 static uint64_t jobs, resumes, waits, timeouts, yields, overlaps, maximum_ticks;
 static uint64_t slice_ticks;
+
+static struct
+{
+    _Alignas(64) uint64_t until;
+} wait_deadlines[LUME_WORKER_LIMIT];
+
 static unsigned peak;
 static bool initialized;
+
+uint64_t lume_worker_next_deadline(uint64_t latest)
+{
+    for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
+    {
+        uint64_t until = __atomic_load_n(&wait_deadlines[i].until, __ATOMIC_ACQUIRE);
+        if (until && (int64_t)(until - latest) < 0)
+            latest = until;
+    }
+    return latest;
+}
 
 static bool condition_ready(const struct worker_state *state)
 {
@@ -92,6 +109,7 @@ void lume_worker_start(void)
                           : (uintptr_t)__worker_top;
         bottom[0] = bottom[1] = STACK_CANARY;
         workers[i].function = NULL;
+        __atomic_store_n(&wait_deadlines[i].until, 0, __ATOMIC_RELEASE);
         workers[i].condition = NULL;
         workers[i].waiting = workers[i].handoff_pending = false;
         workers[i].running = workers[i].computing = false;
@@ -326,8 +344,11 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
     if (!condition_ready(state) && !expired())
     {
         state->waiting = true;
+        __atomic_store_n(&wait_deadlines[state - workers].until, deadline, __ATOMIC_RELEASE);
+        lume_timer_idle(false);
         __atomic_fetch_add(&waits, 1, __ATOMIC_RELAXED);
         suspend();
+        __atomic_store_n(&wait_deadlines[state - workers].until, 0, __ATOMIC_RELEASE);
         if (expired() && !condition_ready(state))
             __atomic_fetch_add(&timeouts, 1, __ATOMIC_RELAXED);
     }
