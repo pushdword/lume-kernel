@@ -319,8 +319,8 @@ static int start(struct lume_hardware *hardware, void *context)
     for (unsigned i = HDMI_IRQ_HPD_CONNECTED; i <= HDMI_IRQ_HPD_REMOVED; ++i)
     {
         const struct lume_resource *irq = &hdmi->irqs[i];
-        int result = lume_irq_domain_request(irq->domain, (unsigned)irq->base, irq->flags,
-                                             hpd_interrupt, hdmi);
+        int result = lume_irq_domain_request_async(irq->domain, (unsigned)irq->base, irq->flags,
+                                                   hpd_interrupt, hdmi);
         if (result)
             return result;
         hdmi->registered_irqs |= 1u << i;

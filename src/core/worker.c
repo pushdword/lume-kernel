@@ -21,7 +21,7 @@ static struct worker_state
     uint32_t wanted;
     uint64_t until, slice_started, handoff_turn, lock_wait;
     unsigned remaining, handoff_cpu, activity_saved;
-    bool handoff_pending, waiting, running, computing;
+    bool handoff_pending, waiting, running, computing, independent;
 } workers[LUME_WORKER_LIMIT];
 static struct worker_state *active_cpus[LUME_CPU_LIMIT];
 #define active active_cpus[lume_cpu_index()]
@@ -41,12 +41,26 @@ static bool expired(void)
     return (int64_t)(lume_counter_read() - active->until) >= 0;
 }
 
+static void scheduler_acquire(struct worker_state *state)
+{
+    uint64_t before = lume_smp_wait_total();
+    lume_smp_lock();
+    uint64_t waited = lume_smp_wait_total() - before;
+    state->lock_wait += waited;
+    state->slice_started += waited;
+}
+
 static void suspend(void)
 {
     struct worker_state *state = active;
+    bool independent = state->independent && !lume_smp_owned();
+    if (independent)
+        scheduler_acquire(state);
     active = NULL;
     lume_fiber_switch(&state->fiber, &state->caller);
     active = state;
+    if (independent)
+        lume_smp_unlock();
 }
 
 static _Noreturn void entry(void)
@@ -81,6 +95,7 @@ void lume_worker_start(void)
         workers[i].condition = NULL;
         workers[i].waiting = workers[i].handoff_pending = false;
         workers[i].running = workers[i].computing = false;
+        workers[i].independent = false;
         workers[i].lock_wait = 0;
         lume_fiber_init(&workers[i].fiber, top, entry);
     }
@@ -212,17 +227,58 @@ static void unlocked_callback(void (*run)(void *), void *context)
         run(context);
         return;
     }
-    if (!state->running || state->computing || !lume_smp_owned())
+    if (!state->running || state->computing || (!state->independent && !lume_smp_owned()))
         lume_fail("kernel compute context");
     state->computing = true;
-    uint64_t before = lume_smp_wait_total();
+    bool locked = lume_smp_owned();
+    if (locked)
+        lume_smp_unlock();
+    run(context);
+    if (locked)
+        scheduler_acquire(state);
+    state->computing = false;
+}
+
+bool lume_worker_independent(void)
+{
+    return active && active->independent && !lume_smp_owned();
+}
+
+void lume_worker_domain(void (*run)(void *), void *context)
+{
+    if (!run)
+        return;
+    struct worker_state *state = active;
+    if (state && state->computing)
+        lume_fail("kernel compute domain entry");
+    if (!state || lume_worker_independent())
+    {
+        run(context);
+        return;
+    }
+    if (!state->running || !lume_smp_owned())
+        lume_fail("kernel domain context");
+    bool previous = state->independent;
+    state->independent = true;
     lume_smp_unlock();
     run(context);
-    lume_smp_lock();
-    uint64_t waited = lume_smp_wait_total() - before;
-    state->lock_wait += waited;
-    state->slice_started += waited;
-    state->computing = false;
+    scheduler_acquire(state);
+    state->independent = previous;
+}
+
+void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    if (!run)
+        return;
+    struct worker_state *state = active;
+    bool independent = lume_worker_independent();
+    if (state && state->computing)
+        lume_fail("kernel compute scheduler entry");
+    if (independent)
+        scheduler_acquire(state);
+    run(context);
+    if (independent)
+        lume_smp_unlock();
 }
 
 void lume_worker_compute(void (*run)(void *), void *context)
@@ -270,10 +326,10 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
     if (!condition_ready(state) && !expired())
     {
         state->waiting = true;
-        ++waits;
+        __atomic_fetch_add(&waits, 1, __ATOMIC_RELAXED);
         suspend();
         if (expired() && !condition_ready(state))
-            ++timeouts;
+            __atomic_fetch_add(&timeouts, 1, __ATOMIC_RELAXED);
     }
     state->condition = 0;
     return true;
@@ -312,7 +368,7 @@ void lume_worker_checkpoint(unsigned bytes)
         state->handoff_turn = lume_smp_lock_turn();
         state->handoff_pending = true;
     }
-    ++yields;
+    __atomic_fetch_add(&yields, 1, __ATOMIC_RELAXED);
     suspend();
 }
 
@@ -320,9 +376,9 @@ void lume_worker_stats(void)
 {
     lume_value("KERNEL_WORKER_JOBS", jobs);
     lume_value("KERNEL_WORKER_RESUMES", resumes);
-    lume_value("KERNEL_WORKER_WAITS", waits);
-    lume_value("KERNEL_WORKER_TIMEOUTS", timeouts);
-    lume_value("KERNEL_WORKER_YIELDS", yields);
+    lume_value("KERNEL_WORKER_WAITS", __atomic_load_n(&waits, __ATOMIC_RELAXED));
+    lume_value("KERNEL_WORKER_TIMEOUTS", __atomic_load_n(&timeouts, __ATOMIC_RELAXED));
+    lume_value("KERNEL_WORKER_YIELDS", __atomic_load_n(&yields, __ATOMIC_RELAXED));
     lume_value("KERNEL_WORKER_PEAK", peak);
     lume_value("KERNEL_WORKER_OVERLAPS", overlaps);
     lume_value("KERNEL_WORKER_MAX_SLICE_TICKS", maximum_ticks);

@@ -126,8 +126,11 @@ static int acpi_inventory(uint32_t parent)
 
 int lume_q35_hardware_start(void)
 {
-    static const struct lume_hardware_services services = {lume_kernel_allocate, lume_kernel_free,
-                                                           validate_resource, dma_domain};
+    static const struct lume_hardware_services services = {.allocate = lume_kernel_allocate,
+                                                           .free = lume_kernel_free,
+                                                           .validate_resource = validate_resource,
+                                                           .dma_domain = dma_domain,
+                                                           .independent_memory = true};
     int result = lume_hardware_services(&services);
     if (result)
         return result;

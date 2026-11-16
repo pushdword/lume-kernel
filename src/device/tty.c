@@ -100,6 +100,8 @@ static unsigned tty_poll(void *context)
     struct tty_end *end = context;
     struct pseudo_terminal *terminal = end->terminal;
     bool peer = terminal->open[end->side ^ 1];
+    if (terminal->copying)
+        return peer ? 0 : LUME_POLLIN | LUME_POLLHUP;
     bool readable =
         !terminal->copying &&
         (end->side ? input_ready(terminal) : terminal->output.count && !terminal->stopped);
@@ -209,6 +211,17 @@ static int64_t tty_output_write(struct pseudo_terminal *terminal, const void *da
     return output.consumed ? (int64_t)output.consumed : -LUME_EAGAIN;
 }
 
+struct tty_input
+{
+    struct pseudo_terminal *terminal;
+    const unsigned char *source;
+    uint64_t bytes;
+    unsigned signals;
+    int64_t result;
+};
+
+static void prepare_input(void *context);
+
 static int64_t tty_write(void *context, const void *data, uint64_t bytes)
 {
     struct tty_end *end = context;
@@ -238,8 +251,31 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
     }
     if (end->side)
         return tty_output_write(terminal, data, bytes);
+    struct tty_input input = {.terminal = terminal, .source = data, .bytes = bytes};
+    unsigned session = terminal->session, group = terminal->group;
+    terminal->copying = true;
+    if (bytes >= 128)
+        lume_worker_compute(prepare_input, &input);
+    else
+        prepare_input(&input);
+    terminal->copying = false;
+    while (input.signals)
+    {
+        unsigned signal = (unsigned)__builtin_ctz(input.signals);
+        input.signals &= input.signals - 1;
+        lume_tasks_tty_signal(session, group, signal);
+    }
+    tty_notify(terminal);
+    return input.result;
+}
+
+static void prepare_input(void *context)
+{
+    struct tty_input *input = context;
+    struct pseudo_terminal *terminal = input->terminal;
+    const unsigned char *source = input->source;
+    uint64_t bytes = input->bytes;
     unsigned done = 0;
-    const unsigned char *source = data;
     while (done < bytes && done < TTY_BYTES)
     {
         unsigned char byte = source[done];
@@ -269,7 +305,7 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
                               : byte == terminal->termios.characters[1] ? 3
                                                                         : 18;
             terminal->line_bytes = 0;
-            lume_tasks_tty_signal(terminal->session, terminal->group, signal);
+            input->signals |= 1u << signal;
             ++done;
             continue;
         }
@@ -336,8 +372,7 @@ static int64_t tty_write(void *context, const void *data, uint64_t bytes)
         }
         ++done;
     }
-    tty_notify(terminal);
-    return done ? (int64_t)done : -LUME_EAGAIN;
+    input->result = done ? (int64_t)done : -LUME_EAGAIN;
 }
 
 static int64_t tty_stat(void *context, struct lume_stat *out)
@@ -612,6 +647,8 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
         tty_notify(terminal);
         return 0;
     case LUME_TTY_AVAILABLE:
+        if (terminal->copying)
+            return -LUME_EAGAIN;
         r->value = end->side ? terminal->input.count : terminal->output.count;
         return 0;
     default:

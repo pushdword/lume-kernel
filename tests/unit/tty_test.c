@@ -13,6 +13,7 @@ static struct
 static unsigned last_signal, last_group, signal_count;
 static void (*copy_hook)(void);
 static unsigned computes;
+static bool processing;
 
 void lume_worker_compute(void (*run)(void *), void *context)
 {
@@ -23,7 +24,10 @@ void lume_worker_compute(void (*run)(void *), void *context)
         copy_hook = NULL;
         hook();
     }
+    assert(!processing);
+    processing = true;
     run(context);
+    processing = false;
 }
 
 void lume_worker_copy(void *destination, const void *source, size_t bytes)
@@ -107,6 +111,7 @@ bool lume_tasks_tty_group_valid(unsigned pid, unsigned group)
 
 void lume_tasks_tty_signal(unsigned session, unsigned group, unsigned number)
 {
+    assert(!processing);
     if (session && group)
     {
         last_signal = number;
@@ -195,6 +200,34 @@ static void output_ring_cases(void)
     assert(!copy_hook && !copy_terminal->copying);
 }
 
+static void canonical_ring_cases(void)
+{
+    concurrent_tty =
+        (struct lume_tty_request){.version = LUME_TTY_VERSION, .bytes = sizeof(concurrent_tty)};
+    assert(!lume_tty_call(&concurrent_files, 7, LUME_TTY_CREATE, &concurrent_tty));
+    struct tty_end *master = descriptors[concurrent_tty.fd].context;
+    struct tty_end *slave = descriptors[concurrent_tty.other].context;
+    copy_terminal = master->terminal;
+    unsigned char source[512], result[512];
+    memset(source, 'a', sizeof(source));
+    source[511] = '\n';
+    unsigned before = computes;
+    assert(tty_write(master, source, sizeof(source)) == sizeof(source));
+    assert(computes == before + 1);
+    assert(tty_read(slave, result, sizeof(result)) == sizeof(result));
+    assert(!memcmp(source, result, sizeof(result)));
+    source[63] = 3;
+    unsigned signals = signal_count;
+    copy_terminal->session = copy_terminal->group = 7;
+    assert(tty_write(master, source, sizeof(source)) == sizeof(source));
+    assert(signal_count == signals + 1 && last_signal == 2);
+    assert(tty_read(slave, result, sizeof(result)) == 448);
+    assert(!memcmp(source + 64, result, 448));
+    copy_hook = close_during_copy;
+    assert(tty_write(master, source, sizeof(source)) == sizeof(source));
+    assert(!copy_hook && !copy_terminal->copying);
+}
+
 int main(void)
 {
     struct lume_files files = {0};
@@ -269,5 +302,6 @@ int main(void)
     }
     raw_ring_cases();
     output_ring_cases();
+    canonical_ring_cases();
     puts("PASS PTY canonical editing, raw rings, concurrent close, geometry, hangup and reuse");
 }

@@ -1,5 +1,6 @@
 #include "lume/early.h"
 #include "lume/net.h"
+#include "lume/owner_retirement.h"
 #include "lwip/raw.h"
 #include "lwip/icmp.h"
 #include "lwip/inet_chksum.h"
@@ -17,13 +18,12 @@ struct echo
 static struct echo echoes[4];
 static unsigned next_handle;
 static uint16_t next_sequence;
+static uint32_t live_echoes;
+static struct lume_owner_retirements retired_owners;
 
 bool lume_icmp_busy(void)
 {
-    for (unsigned i = 0; i < sizeof(echoes) / sizeof(echoes[0]); ++i)
-        if (echoes[i].owner)
-            return true;
-    return false;
+    return __atomic_load_n(&live_echoes, __ATOMIC_ACQUIRE) != 0;
 }
 
 static void close_echo(struct echo *echo)
@@ -31,34 +31,40 @@ static void close_echo(struct echo *echo)
     if (echo->pcb)
         raw_remove(echo->pcb);
     *echo = (struct echo){0};
+    __atomic_fetch_and(&live_echoes, ~(UINT32_C(1) << (echo - echoes)), __ATOMIC_RELEASE);
 }
 
 void lume_icmp_release(unsigned owner)
 {
-    for (unsigned i = 0; i < 4; ++i)
-        if (echoes[i].owner == owner)
-            echoes[i].closing = true;
+    (void)lume_owner_retire(&retired_owners, owner);
 }
 
 bool lume_icmp_reap_pending(void)
 {
-    for (unsigned i = 0; i < 4; ++i)
-        if (echoes[i].closing)
-            return true;
-    return false;
+    return lume_owner_retire_pending(&retired_owners);
 }
 
 void lume_icmp_reap(void)
 {
-    for (unsigned i = 0; i < 4; ++i)
-        if (echoes[i].closing)
-            close_echo(&echoes[i]);
+    for (unsigned word = 0; word < LUME_RETIREMENT_WORDS; ++word)
+    {
+        uint32_t owners = lume_owner_retire_take(&retired_owners, word);
+        if (!owners)
+            continue;
+        for (unsigned i = 0; i < 4; ++i)
+        {
+            unsigned owner = echoes[i].owner;
+            if (owner && (owner - 1) / 32u == word &&
+                (owners & (UINT32_C(1) << ((owner - 1) % 32u))))
+                close_echo(echoes + i);
+        }
+    }
 }
 
 static u8_t reply(void *context, struct raw_pcb *pcb, struct pbuf *packet, const ip_addr_t *from)
 {
     struct echo *echo = context;
-    if (echo->closing)
+    if (echo->closing || lume_owner_retired(&retired_owners, echo->owner))
         return 0;
     (void)pcb;
     unsigned char bytes[60];
@@ -83,6 +89,7 @@ int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *requ
         return -LUME_EINVAL;
     if (op == LUME_ICMP_ECHO_START)
     {
+        lume_icmp_reap();
         if (request->handle || !request->address[0] || request->address[0] >= 224 ||
             !netif_default || !netif_is_link_up(netif_default) ||
             ip4_addr_isany_val(*netif_ip4_addr(netif_default)))
@@ -112,6 +119,7 @@ int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *requ
                               .handle = next_handle,
                               .sequence = ++next_sequence,
                               .started = lume_clock_millis()};
+        __atomic_fetch_or(&live_echoes, UINT32_C(1) << (echo - echoes), __ATOMIC_RELEASE);
         IP_ADDR4(&echo->target, request->address[0], request->address[1], request->address[2],
                  request->address[3]);
         raw_recv(pcb, reply, echo);
@@ -139,7 +147,8 @@ int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *requ
     for (unsigned i = 0; i < 4; ++i)
     {
         struct echo *echo = &echoes[i];
-        if (echo->owner != owner || echo->handle != request->handle || echo->closing)
+        if (echo->owner != owner || echo->handle != request->handle || echo->closing ||
+            lume_owner_retired(&retired_owners, owner))
             continue;
         if (op == LUME_ICMP_ECHO_CLOSE)
         {
@@ -147,6 +156,9 @@ int lume_icmp_call(unsigned owner, unsigned op, struct lume_stream_request *requ
             return 0;
         }
         lume_net_poll();
+        if (echo->owner != owner || echo->handle != request->handle ||
+            lume_owner_retired(&retired_owners, owner))
+            return -LUME_ENOENT;
         return echo->received                                            ? LUME_STREAM_READABLE
                : (uint32_t)(lume_clock_millis() - echo->started) >= 5000 ? LUME_STREAM_ERROR
                                                                          : 0;

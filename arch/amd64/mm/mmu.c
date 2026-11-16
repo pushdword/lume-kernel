@@ -10,6 +10,7 @@
 #include "lume/heap.h"
 #include "lume/abi.h"
 #include <string.h>
+#include "lume/mmu_domain_begin.h"
 #define PRESENT UINT64_C(1)
 #define WRITE UINT64_C(2)
 #define USER UINT64_C(4)
@@ -35,6 +36,7 @@ struct sparse_table
     struct sparse_table *next;
 };
 static struct sparse_table *sparse[LUME_TASK_LIMIT];
+static void free_tables(struct sparse_table *);
 static _Alignas(4096) uint64_t trampoline_pages[512];
 static uint64_t module_base, module_end, module_first;
 extern unsigned char __image_start[], __text_end[], __readonly_end[], __image_end[];
@@ -297,28 +299,24 @@ void lume_mmu_release_user(unsigned task)
             task_root[task][view][i] = 0;
     }
     lume_arch_flush_user_tlb();
-    unsigned count = 0;
-    while (sparse[task])
-    {
-        struct sparse_table *entry = sparse[task];
-        sparse[task] = entry->next;
-        if (!lume_page_free((uintptr_t)entry->entries))
-            lume_fail("sparse page table release");
-        lume_kernel_free(entry);
-        if (++count % 16 == 0)
-            lume_worker_checkpoint(65536);
-    }
+    struct sparse_table *retired = sparse[task];
+    sparse[task] = NULL;
+    uint64_t frames[2 * USER_BLOCKS];
+    struct mmu_frame_batch batch = {.frames = frames};
     for (unsigned view = 0; view < 2; ++view)
         for (unsigned i = 0; i < USER_BLOCKS; ++i)
         {
-            if (task_pt[task][view][i] && !lume_page_free((uintptr_t)task_pt[task][view][i]))
-                lume_fail("user page table release");
+            if (task_pt[task][view][i])
+                frames[batch.count++] = (uintptr_t)task_pt[task][view][i];
             task_pt[task][view][i] = NULL;
         }
     memset(task_root[task], 0, sizeof(task_root[task]));
     memset(task_pdpt[task], 0, sizeof(task_pdpt[task]));
     memset(task_pd[task], 0, sizeof(task_pd[task]));
     memset(task_device_pdpt[task], 0, sizeof(task_device_pdpt[task]));
+    free_tables(retired);
+    if (batch.count)
+        lume_task_memory_prepare(mmu_release_frames, &batch);
 }
 
 static bool user_address(uint64_t va)
@@ -350,7 +348,7 @@ static uint64_t *entry(unsigned task, unsigned view, uint64_t va, bool create)
                 struct sparse_table *node = lume_kernel_allocate(sizeof(*node));
                 if (!node)
                     return NULL;
-                node->entries = (void *)(uintptr_t)lume_page_alloc(0);
+                node->entries = (void *)(uintptr_t)mmu_prepare_frame();
                 if (!node->entries)
                 {
                     lume_kernel_free(node);
@@ -371,7 +369,7 @@ static uint64_t *entry(unsigned task, unsigned view, uint64_t va, bool create)
     unsigned block = (unsigned)((va - LUME_USER_BASE) / BLOCK);
     if (!task_pt[task][view][block] && create)
     {
-        uint64_t page = lume_page_alloc(0);
+        uint64_t page = mmu_prepare_frame();
         if (!page)
             return NULL;
         task_pt[task][view][block] = (void *)(uintptr_t)page;
@@ -419,8 +417,10 @@ static void detach_empty(unsigned task, unsigned view, uint64_t va, struct spars
     }
 }
 
-static void free_tables(struct sparse_table *retired)
+static void free_tables_run(void *context)
 {
+    struct sparse_table *retired = context;
+    unsigned released = 0;
     while (retired)
     {
         struct sparse_table *node = retired;
@@ -428,7 +428,15 @@ static void free_tables(struct sparse_table *retired)
         if (!lume_page_free((uintptr_t)node->entries))
             lume_fail("sparse page table release");
         lume_kernel_free(node);
+        if (++released % 16 == 0)
+            lume_worker_checkpoint(65536);
     }
+}
+
+static void free_tables(struct sparse_table *retired)
+{
+    if (retired)
+        lume_task_memory_prepare(free_tables_run, retired);
 }
 
 static uint64_t detach_low_empty(unsigned task, unsigned view, uint64_t va)
@@ -735,3 +743,6 @@ bool lume_mmu_module_protect(uint64_t physical, size_t bytes, unsigned flags)
     lume_arch_flush_user_tlb();
     return true;
 }
+
+#define MMU_DOMAIN_OWNER owner
+#include "lume/mmu_domain_end.h"

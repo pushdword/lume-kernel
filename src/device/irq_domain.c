@@ -10,6 +10,7 @@ struct domain_line
     lume_irq_handler handler;
     void *context;
     struct lume_irq_info info;
+    bool independent;
 };
 
 struct irq_domain
@@ -135,11 +136,11 @@ bool lume_irq_domain_available(uint32_t id)
     return available;
 }
 
-int lume_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler handler,
-                            void *context)
+static int request_handler(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler handler,
+                           void *context, bool independent)
 {
     if (!id)
-        return lume_irq_register(irq, trigger, handler, context);
+        return independent ? -LUME_EINVAL : lume_irq_register(irq, trigger, handler, context);
     if (!handler || trigger > LUME_IRQ_EDGE || irq >= LUME_IRQ_DOMAIN_LINES)
         return -LUME_EINVAL;
     uint64_t flags = lume_irq_save();
@@ -160,12 +161,25 @@ int lume_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger, lume_ir
             line->handler = handler;
             line->context = context;
             line->info.registered = true;
+            line->independent = independent;
         }
         domain->busy = false;
     }
     lume_ticket_release(&domain_lock, ticket);
     lume_irq_restore(flags);
     return result;
+}
+
+int lume_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler handler,
+                            void *context)
+{
+    return request_handler(id, irq, trigger, handler, context, false);
+}
+
+int lume_irq_domain_request_async(uint32_t id, unsigned irq, unsigned trigger,
+                                  lume_irq_handler handler, void *context)
+{
+    return request_handler(id, irq, trigger, handler, context, true);
 }
 
 int lume_irq_domain_release(uint32_t id, unsigned irq, void *context)
@@ -324,6 +338,19 @@ bool lume_irq_domain_defer(uint32_t id, unsigned irq)
 }
 
 static void deliver_pending(void *context);
+
+struct handler_call
+{
+    lume_irq_handler handler;
+    unsigned irq;
+    void *context;
+};
+
+static void deliver_handler(void *context)
+{
+    struct handler_call *call = context;
+    call->handler(call->irq, call->context);
+}
 static struct lume_work interrupt_work = {.run = deliver_pending, .domain = LUME_WORK_INTERRUPT};
 
 void lume_irq_domain_poll(void)
@@ -359,11 +386,16 @@ static void deliver_pending(void *context)
         }
         lume_irq_handler handler = domain ? domain->slots[irq].handler : NULL;
         void *argument = domain ? domain->slots[irq].context : NULL;
+        bool independent = domain && domain->slots[irq].independent;
         lume_ticket_release(&domain_lock, ticket);
         lume_irq_restore(flags);
         if (!domain)
             break;
-        handler(irq, argument);
+        struct handler_call call = {handler, irq, argument};
+        if (independent)
+            lume_worker_domain(deliver_handler, &call);
+        else
+            deliver_handler(&call);
         flags = lume_irq_save();
         ticket = lock();
         domain->delivering = false;

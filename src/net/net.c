@@ -8,6 +8,7 @@
 #include "lume/activity.h"
 #include "lume/work.h"
 #include "lume/worker.h"
+#include "lume/owner_retirement.h"
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"
@@ -25,7 +26,7 @@ struct adapter
 {
     struct netif ip;
     struct lume_netif *device;
-    uint32_t last_address;
+    uint32_t last_address, index;
 };
 static struct adapter adapters[LUME_NET_INTERFACES];
 static unsigned adapter_count;
@@ -55,12 +56,24 @@ static struct adapter *find(uint32_t index)
     {
         if (!adapters[i].device)
             continue;
-        struct lume_netif_info n = {0};
-        lume_netif_info(adapters[i].device, &n);
-        if (n.ifindex == index)
+        if (adapters[i].index == index)
             return &adapters[i];
     }
     return 0;
+}
+
+struct network_transmit
+{
+    struct lume_netif *device;
+    const void *data;
+    size_t bytes;
+    bool sent;
+};
+
+static void transmit_frame(void *context)
+{
+    struct network_transmit *transmit = context;
+    transmit->sent = lume_netif_transmit(transmit->device, transmit->data, transmit->bytes);
 }
 
 static err_t output(struct netif *n, struct pbuf *p)
@@ -69,7 +82,9 @@ static err_t output(struct netif *n, struct pbuf *p)
         return ERR_BUF;
     if (pbuf_copy_partial(p, ethernet, p->tot_len, 0) != p->tot_len)
         return ERR_BUF;
-    return lume_netif_transmit(n->state, ethernet, p->tot_len) ? ERR_OK : ERR_IF;
+    struct network_transmit transmit = {n->state, ethernet, p->tot_len, false};
+    lume_worker_scheduler(transmit_frame, &transmit);
+    return transmit.sent ? ERR_OK : ERR_IF;
 }
 
 static err_t initialize(struct netif *n)
@@ -107,6 +122,7 @@ static bool attach(struct lume_netif *device)
             if (lume_netif_reference(device))
                 return false;
             a->device = device;
+            a->index = info.ifindex;
             if (!netif_add(&a->ip, 0, 0, 0, device, initialize, ethernet_input))
             {
                 a->device = NULL;
@@ -123,7 +139,7 @@ static bool attach(struct lume_netif *device)
     return false;
 }
 
-bool lume_net_start(void)
+static bool net_start_serialized(void)
 {
     if (started)
         return true;
@@ -165,15 +181,38 @@ failed:
     return false;
 }
 
+static void start_network(void *context)
+{
+    bool *started = context;
+    *started = net_start_serialized();
+}
+
+bool lume_net_start(void)
+{
+    bool ready = false;
+    lume_worker_scheduler(start_network, &ready);
+    return ready;
+}
+
+struct address_event
+{
+    uint32_t index, address;
+};
+
+static void publish_address(void *context)
+{
+    const struct address_event *event = context;
+    lume_net_event_emit(event->index, LUME_EVENT_IPV4, event->address != 0, 0, event->address);
+}
+
 static void changed(struct adapter *a)
 {
     const unsigned char *b = (const unsigned char *)&netif_ip4_addr(&a->ip)->addr;
     uint32_t address = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
     if (address != a->last_address)
     {
-        struct lume_netif_info n = {0};
-        lume_netif_info(a->device, &n);
-        lume_net_event_emit(n.ifindex, LUME_EVENT_IPV4, address != 0, 0, address);
+        struct address_event event = {a->index, address};
+        lume_worker_scheduler(publish_address, &event);
         a->last_address = address;
     }
 }
@@ -197,7 +236,88 @@ static uint64_t last_poll;
 static bool poll_valid;
 static bool repoll, tx_waiting;
 static uint64_t traffic_until;
+
+static struct
+{
+    uint64_t last_poll, traffic_until;
+    bool valid, repoll, tx_waiting;
+} published_poll;
+
+static void publish_poll(void *context)
+{
+    (void)context;
+    published_poll.last_poll = last_poll;
+    published_poll.traffic_until = traffic_until;
+    published_poll.valid = poll_valid;
+    published_poll.repoll = repoll;
+    published_poll.tx_waiting = tx_waiting;
+}
+
+static void attach_interfaces(void *context)
+{
+    (void)context;
+    for (unsigned i = 0; i < lume_netif_count(); ++i)
+        (void)attach(lume_netif_at(i));
+}
+
+enum adapter_operation
+{
+    ADAPTER_POLL,
+    ADAPTER_RECEIVE,
+    ADAPTER_ERROR,
+    ADAPTER_BUDGET,
+    ADAPTER_STATISTICS
+};
+
+struct adapter_call
+{
+    struct adapter *adapter;
+    enum adapter_operation operation;
+    struct lume_netif_info info;
+    struct lume_net_statistics statistics;
+    int received;
+};
+
+static void adapter_service(void *context)
+{
+    struct adapter_call *call = context;
+    struct lume_netif *device = call->adapter->device;
+    switch (call->operation)
+    {
+    case ADAPTER_POLL:
+        lume_netif_poll(device);
+        lume_netif_info(device, &call->info);
+        break;
+    case ADAPTER_RECEIVE:
+        call->received = lume_netif_receive(device, ethernet, sizeof(ethernet));
+        break;
+    case ADAPTER_ERROR:
+        lume_netif_rx_error(device);
+        break;
+    case ADAPTER_BUDGET:
+        lume_netif_account(device, LUME_NET_RX_BUDGET, 0);
+        break;
+    case ADAPTER_STATISTICS:
+        lume_netif_poll(device);
+        lume_netif_statistics(device, &call->statistics);
+        break;
+    }
+}
+
+static void service_adapter(struct adapter_call *call, enum adapter_operation operation)
+{
+    call->operation = operation;
+    lume_worker_scheduler(adapter_service, call);
+}
+
+static void reap_socket_files(void *context)
+{
+    (void)context;
+    lume_socket_reap();
+}
+
 static void network_service(void *);
+static void dns_collect_retired(void);
 static struct lume_work service_work = {.run = network_service, .domain = LUME_WORK_NETWORK};
 
 void lume_net_poll_background(void)
@@ -206,8 +326,12 @@ void lume_net_poll_background(void)
         !lume_datagram_reap_pending() && !lume_socket_reap_pending() && !lume_icmp_reap_pending())
         return;
     uint64_t now = lume_clock_monotonic();
-    uint64_t interval = tx_waiting || lume_stream_needs_poll() || now < traffic_until ? 1 : 10;
-    if (!poll_valid || repoll || now - last_poll >= interval)
+    uint64_t interval =
+        published_poll.tx_waiting || lume_stream_needs_poll() || now < published_poll.traffic_until
+            ? 1
+            : 10;
+    if (!published_poll.valid || published_poll.repoll ||
+        now - published_poll.last_poll >= interval)
         (void)lume_work_submit(&service_work);
 }
 
@@ -219,14 +343,16 @@ static void network_service(void *context)
         (void)lume_work_submit(&service_work);
 }
 
-void lume_net_poll(void)
+static void poll_network(void *context)
 {
+    (void)context;
     if (polling)
         return;
     polling = true;
+    dns_collect_retired();
     lume_stream_reap();
     lume_icmp_reap();
-    lume_socket_reap();
+    lume_worker_scheduler(reap_socket_files, NULL);
     lume_datagram_reap();
     if (!started && !lume_net_start())
     {
@@ -236,52 +362,50 @@ void lume_net_poll(void)
     repoll = tx_waiting = false;
     last_poll = lume_clock_monotonic();
     poll_valid = true;
+    lume_worker_scheduler(publish_poll, NULL);
     unsigned activity = lume_activity_enter(LUME_ACTIVITY_NETWORK);
-    for (unsigned i = 0; i < lume_netif_count(); ++i)
-        (void)attach(lume_netif_at(i));
+    lume_worker_scheduler(attach_interfaces, NULL);
     for (unsigned i = 0; i < adapter_count; ++i)
     {
         struct adapter *a = &adapters[i];
         if (!a->device)
             continue;
-        struct lume_netif_info info = {0};
-        lume_netif_poll(a->device);
-        lume_netif_info(a->device, &info);
-        bool link = (info.flags & LUME_IF_LINK) != 0;
+        struct adapter_call call = {.adapter = a};
+        service_adapter(&call, ADAPTER_POLL);
+        bool link = (call.info.flags & LUME_IF_LINK) != 0;
         if (link && !netif_is_link_up(&a->ip))
             netif_set_link_up(&a->ip);
         if (!link && netif_is_link_up(&a->ip))
-            lume_net_release(info.ifindex);
+            lume_net_release(call.info.ifindex);
         unsigned received = 0;
         for (; received < 8; ++received)
         {
-            int bytes = lume_netif_receive(a->device, ethernet, sizeof(ethernet));
+            service_adapter(&call, ADAPTER_RECEIVE);
+            int bytes = call.received;
             if (bytes <= 0)
                 break;
             struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)bytes, PBUF_POOL);
             if (!p)
             {
-                lume_netif_rx_error(a->device);
+                service_adapter(&call, ADAPTER_ERROR);
                 continue;
             }
             if (pbuf_take(p, ethernet, (u16_t)bytes) != ERR_OK || a->ip.input(p, &a->ip) != ERR_OK)
             {
                 pbuf_free(p);
-                lume_netif_rx_error(a->device);
+                service_adapter(&call, ADAPTER_ERROR);
             }
             lume_worker_checkpoint((unsigned)bytes);
         }
         if (received == 8)
         {
             repoll = true;
-            lume_netif_account(a->device, LUME_NET_RX_BUDGET, 0);
+            service_adapter(&call, ADAPTER_BUDGET);
         }
         if (received)
             traffic_until = lume_clock_monotonic() + 20;
-        lume_netif_poll(a->device);
-        struct lume_net_statistics statistics;
-        lume_netif_statistics(a->device, &statistics);
-        tx_waiting |= statistics.tx_depth != 0;
+        service_adapter(&call, ADAPTER_STATISTICS);
+        tx_waiting |= call.statistics.tx_depth != 0;
     }
     if (!netif_default || !netif_is_link_up(netif_default))
         for (unsigned i = 0; i < adapter_count; ++i)
@@ -296,8 +420,15 @@ void lume_net_poll(void)
     for (unsigned i = 0; i < adapter_count; ++i)
         if (adapters[i].device)
             changed(&adapters[i]);
+    lume_stream_publish();
     polling = false;
     lume_activity_leave(activity);
+}
+
+void lume_net_poll(void)
+{
+    lume_worker_domain(poll_network, NULL);
+    lume_worker_scheduler(publish_poll, NULL);
 }
 
 int lume_net_detach(uint32_t index)
@@ -399,6 +530,28 @@ static struct dns_lookup
 } dns_lookups[LUME_TASK_LIMIT + 1];
 
 static uintptr_t dns_generation;
+static struct lume_owner_retirements retired_dns;
+
+static void dns_notify(void *context)
+{
+    unsigned *owner = context;
+    lume_tasks_dns_notify(*owner);
+}
+
+static void dns_collect_retired(void)
+{
+    for (unsigned word = 0; word < LUME_RETIREMENT_WORDS; ++word)
+    {
+        uint32_t owners = lume_owner_retire_take(&retired_dns, word);
+        while (owners)
+        {
+            unsigned owner = word * 32u + (unsigned)__builtin_ctz(owners) + 1;
+            owners &= owners - 1;
+            if (owner <= LUME_TASK_LIMIT)
+                dns_lookups[owner] = (struct dns_lookup){0};
+        }
+    }
+}
 
 static void resolved(const char *name, const ip_addr_t *ip, void *arg)
 {
@@ -407,22 +560,25 @@ static void resolved(const char *name, const ip_addr_t *ip, void *arg)
     for (unsigned owner = 0; owner <= LUME_TASK_LIMIT; ++owner)
     {
         struct dns_lookup *lookup = &dns_lookups[owner];
-        if (!lookup->active || lookup->generation != generation)
+        if (!lookup->active || lookup->generation != generation ||
+            lume_owner_retired(&retired_dns, owner))
             continue;
         lookup->ok = ip != 0;
         if (ip)
             lookup->address = *ip;
         lookup->finished = true;
         if (owner)
-            lume_tasks_dns_notify(owner);
+            lume_worker_scheduler(dns_notify, &owner);
         return;
     }
 }
 
 void lume_net_resolve_cancel(unsigned owner)
 {
-    if (owner <= LUME_TASK_LIMIT)
-        dns_lookups[owner] = (struct dns_lookup){0};
+    if (owner)
+        (void)lume_owner_retire(&retired_dns, owner);
+    else
+        dns_lookups[0] = (struct dns_lookup){0};
 }
 
 int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char out[4], bool resumed,
@@ -433,6 +589,7 @@ int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char ou
     *pending = false;
     if (owner > LUME_TASK_LIMIT || !out)
         return -LUME_EINVAL;
+    dns_collect_retired();
     struct dns_lookup *lookup = &dns_lookups[owner];
     if (!resumed)
     {
@@ -459,6 +616,8 @@ int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char ou
     else if (!lookup->active)
         return -LUME_EIO;
     lume_net_poll();
+    if (!lookup->active || lume_owner_retired(&retired_dns, owner))
+        return -LUME_EIO;
     if (!lookup->finished)
     {
         *pending = true;

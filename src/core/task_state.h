@@ -16,6 +16,9 @@ static void task_state_set(unsigned task, unsigned state)
     task_sleeping[word] = (task_sleeping[word] & ~bit) | (state == 4 ? bit : 0);
     task_runnable[word] = (task_runnable[word] & ~bit) | (state == 1 || state == 2 ? bit : 0);
     states[task] = state;
+#ifdef TASK_STATE_CHANGED
+    TASK_STATE_CHANGED(task);
+#endif
 }
 
 static unsigned task_state_next(const uint64_t *index, unsigned first)

@@ -852,7 +852,9 @@ static void reset(void)
     compat_index = 7;
     compat_formats = compat_interfaces = 0;
     vm_storage_dependency = false;
-    memset(kernel_lanes, 0, sizeof(kernel_lanes));
+    static struct kernel_io_lane lane_storage[LUME_WORK_DOMAINS];
+    kernel_lanes = lane_storage;
+    memset(kernel_lanes, 0, sizeof(lane_storage));
     memset(worker_functions, 0, sizeof(worker_functions));
     memset(worker_arguments, 0, sizeof(worker_arguments));
     memset(worker_suspended, 0, sizeof(worker_suspended));

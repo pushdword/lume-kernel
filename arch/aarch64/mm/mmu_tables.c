@@ -7,6 +7,7 @@
 #include "lume/vm.h"
 #include "lume/abi.h"
 #include "lume/heap.h"
+#include "lume/mmu_domain_begin.h"
 
 #define PAGE UINT64_C(4096)
 #define BLOCK UINT64_C(0x200000)
@@ -38,6 +39,7 @@ static struct user_table *owned_tables[LUME_TASK_LIMIT];
 static unsigned shared_user[LUME_TASK_LIMIT];
 static unsigned user_asid[LUME_TASK_LIMIT];
 static uint64_t asid_used[2];
+static void free_tables(struct user_table *);
 
 static uint64_t table(const uint64_t *p)
 {
@@ -270,17 +272,9 @@ void lume_mmu_release_user(unsigned task)
         }
     if (detached)
         user_flush(task);
-    unsigned released = 0;
-    while (owned_tables[task])
-    {
-        struct user_table *node = owned_tables[task];
-        owned_tables[task] = node->next;
-        if (!lume_page_free((uintptr_t)node->entries))
-            lume_fail("user page table release");
-        lume_kernel_free(node);
-        if (++released % 16 == 0)
-            lume_worker_checkpoint(65536);
-    }
+    struct user_table *retired = owned_tables[task];
+    owned_tables[task] = NULL;
+    free_tables(retired);
     if (user_asid[task])
     {
         unsigned pair = (user_asid[task] - 1) / 2;
@@ -294,7 +288,7 @@ static uint64_t *user_allocate(unsigned task)
     struct user_table *node = lume_kernel_allocate(sizeof(*node));
     if (!node)
         return 0;
-    node->entries = (void *)(uintptr_t)lume_page_alloc(0);
+    node->entries = (void *)(uintptr_t)mmu_prepare_frame();
     if (!node->entries)
     {
         lume_kernel_free(node);
@@ -342,8 +336,10 @@ static void detach_empty(unsigned task, unsigned view, uint64_t va, struct user_
     }
 }
 
-static void free_tables(struct user_table *retired)
+static void free_tables_run(void *context)
 {
+    struct user_table *retired = context;
+    unsigned released = 0;
     while (retired)
     {
         struct user_table *node = retired;
@@ -351,7 +347,15 @@ static void free_tables(struct user_table *retired)
         if (!lume_page_free((uintptr_t)node->entries))
             lume_fail("user page table release");
         lume_kernel_free(node);
+        if (++released % 16 == 0)
+            lume_worker_checkpoint(65536);
     }
+}
+
+static void free_tables(struct user_table *retired)
+{
+    if (retired)
+        lume_task_memory_prepare(free_tables_run, retired);
 }
 
 static bool user_address(uint64_t va)
@@ -702,3 +706,6 @@ bool lume_mmu_module_protect(uint64_t physical, size_t bytes, unsigned flags)
     module_flush();
     return true;
 }
+
+#define MMU_DOMAIN_OWNER user_owner
+#include "lume/mmu_domain_end.h"

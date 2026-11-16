@@ -120,8 +120,10 @@ static const struct lume_hardware_ops operations = {
     .probe = probe, .start = start, .stop = stop, .read_register = read_register};
 static const struct lume_hardware_identity matches[] = {
     {.kind = LUME_HARDWARE_ID_BOARD, .value = "test,registers"}};
-static const struct lume_hardware_services services = {
-    .allocate = allocate, .free = release_memory, .validate_resource = validate};
+static const struct lume_hardware_services services = {.allocate = allocate,
+                                                       .free = release_memory,
+                                                       .validate_resource = validate,
+                                                       .independent_memory = true};
 static const struct lume_driver driver = {
     .version = LUME_DRIVER_VERSION,
     .name = "registers",

@@ -144,6 +144,9 @@ bool lume_vfs_pipe_io(struct lume_files *, uint64_t);
 int64_t lume_vfs_pipe_accept(struct lume_files *, uint64_t, uint64_t, bool);
 void lume_vfs_pipe_grow(struct lume_files *, uint64_t, uint64_t);
 bool lume_vfs_memory_io(struct lume_files *, uint64_t);
+/* Bounded memory queues retain their own transfer reservations. A stable lane
+ * separates unrelated queues from storage and limits concurrent staging memory. */
+unsigned lume_vfs_memory_lane(struct lume_files *, uint64_t);
 bool lume_vfs_console_io(struct lume_files *, uint64_t);
 bool lume_vfs_storage_io(struct lume_files *, uint64_t);
 struct lume_wait_queue;

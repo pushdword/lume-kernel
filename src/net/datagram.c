@@ -6,6 +6,7 @@
 #include "lume/net.h"
 #include "lume/net_limits.h"
 #include "lume/poll.h"
+#include "lume/worker.h"
 #include "lwip/ip.h"
 #include "lwip/udp.h"
 #include <string.h>
@@ -31,11 +32,84 @@ struct datagram_file
     struct udp_pcb *pcb;
     struct datagram_packet *first, *last;
     unsigned packets, charged, receive_budget, send_budget;
+    uint32_t readiness;
     bool used, connected, read_closed, write_closed, receive_tos, closing;
 };
 
 static struct datagram_file datagrams[LUME_NET_UDP_SOCKET_LIMIT];
+static uint32_t live_files[(LUME_NET_UDP_SOCKET_LIMIT + 31u) / 32u];
+static uint32_t closing_files[(LUME_NET_UDP_SOCKET_LIMIT + 31u) / 32u];
 static const struct lume_file_ops datagram_ops;
+
+static bool datagram_closing(const struct datagram_file *file)
+{
+    return __atomic_load_n(&file->closing, __ATOMIC_ACQUIRE);
+}
+
+struct datagram_descriptor
+{
+    struct lume_files *files;
+    struct datagram_file *file;
+    unsigned flags;
+    int result;
+};
+
+static void descriptor_service(void *context)
+{
+    struct datagram_descriptor *descriptor = context;
+    descriptor->result =
+        lume_vfs_attach(descriptor->files, &datagram_ops, descriptor->file, descriptor->flags);
+}
+
+static struct datagram_file *datagram_lookup(struct lume_files *files, unsigned fd, int *held)
+{
+    void *context = NULL;
+    *held = lume_vfs_borrow(files, fd, &datagram_ops, &context);
+    return *held < 0 ? NULL : context;
+}
+
+static int datagram_install(struct lume_files *files, struct datagram_file *file, unsigned flags)
+{
+    struct datagram_descriptor descriptor = {.files = files, .file = file, .flags = flags};
+    lume_worker_scheduler(descriptor_service, &descriptor);
+    return descriptor.result;
+}
+
+static void initialize_datagram(void *context)
+{
+    struct datagram_file *file = context;
+    *file = (struct datagram_file){.used = true,
+                                   .readiness = LUME_POLLOUT,
+                                   .receive_budget = DATAGRAM_BUFFER_DEFAULT,
+                                   .send_budget = DATAGRAM_BUFFER_DEFAULT};
+    lume_poll_source_reset(&file->source);
+    unsigned slot = (unsigned)(file - datagrams);
+    __atomic_fetch_or(live_files + slot / 32u, UINT32_C(1) << (slot % 32u), __ATOMIC_RELEASE);
+}
+
+static void retire_datagram(void *context)
+{
+    struct datagram_file *file = context;
+    unsigned slot = (unsigned)(file - datagrams);
+    memset(file, 0, sizeof(*file));
+    __atomic_fetch_and(live_files + slot / 32u, ~(UINT32_C(1) << (slot % 32u)), __ATOMIC_RELEASE);
+    __atomic_fetch_and(closing_files + slot / 32u, ~(UINT32_C(1) << (slot % 32u)),
+                       __ATOMIC_RELEASE);
+}
+
+static void notify_datagram(void *context)
+{
+    struct datagram_file *file = context;
+    lume_poll_source_notify(&file->source);
+}
+
+static void publish_datagram(struct datagram_file *file)
+{
+    unsigned flags = (file->first || file->read_closed ? LUME_POLLIN : 0) | LUME_POLLOUT |
+                     (file->read_closed && file->write_closed ? LUME_POLLHUP : 0);
+    __atomic_store_n(&file->readiness, flags, __ATOMIC_RELEASE);
+    lume_worker_scheduler(notify_datagram, file);
+}
 
 static int datagram_error(err_t error)
 {
@@ -82,7 +156,7 @@ static void receive_packet(void *context, struct udp_pcb *pcb, struct pbuf *p,
         return;
     unsigned bytes = p->tot_len;
     unsigned charge = sizeof(struct datagram_packet) + bytes;
-    if (!file->used || file->closing || file->pcb != pcb || file->read_closed ||
+    if (!file->used || datagram_closing(file) || file->pcb != pcb || file->read_closed ||
         bytes > LUME_SOCKET_DATAGRAM_MAX || file->packets >= DATAGRAM_PACKETS ||
         file->charged > file->receive_budget || charge > file->receive_budget - file->charged)
     {
@@ -96,7 +170,7 @@ static void receive_packet(void *context, struct udp_pcb *pcb, struct pbuf *p,
     unsigned char tos = header ? IPH_TOS(header) : 0;
     /* The NETWORK lane retains the PCB and IP input while allocation can yield. */
     struct datagram_packet *packet = lume_kernel_allocate(charge);
-    if (!packet || file->closing)
+    if (!packet || datagram_closing(file))
     {
         pbuf_free(p);
         if (packet)
@@ -123,7 +197,7 @@ static void receive_packet(void *context, struct udp_pcb *pcb, struct pbuf *p,
     file->last = packet;
     ++file->packets;
     file->charged += charge;
-    lume_poll_source_notify(&file->source);
+    publish_datagram(file);
 }
 
 static struct lume_poll_source *datagram_source(void *context)
@@ -134,16 +208,19 @@ static struct lume_poll_source *datagram_source(void *context)
 static unsigned datagram_poll(void *context)
 {
     struct datagram_file *file = context;
-    return (file->first || file->read_closed ? LUME_POLLIN : 0) | LUME_POLLOUT |
-           (file->read_closed && file->write_closed ? LUME_POLLHUP : 0);
+    return __atomic_load_n(&file->readiness, __ATOMIC_ACQUIRE) |
+           (datagram_closing(file) ? LUME_POLLHUP : 0);
 }
 
 static void datagram_close(void *context)
 {
     struct datagram_file *file = context;
     /* Dropping queued descriptor rights can run outside the NETWORK lane. */
-    file->closing = true;
-    lume_poll_source_notify(&file->source);
+    __atomic_store_n(&file->closing, true, __ATOMIC_RELEASE);
+    __atomic_fetch_or(&file->readiness, LUME_POLLHUP, __ATOMIC_RELEASE);
+    lume_worker_scheduler(notify_datagram, file);
+    unsigned slot = (unsigned)(file - datagrams);
+    __atomic_fetch_or(closing_files + slot / 32u, UINT32_C(1) << (slot % 32u), __ATOMIC_RELEASE);
 }
 
 static bool assigned_address(const ip_addr_t *address)
@@ -163,8 +240,11 @@ void lume_datagram_reap(void)
 {
     for (unsigned i = 0; i < LUME_NET_UDP_SOCKET_LIMIT; ++i)
     {
+        if (!(__atomic_load_n(closing_files + i / 32u, __ATOMIC_ACQUIRE) &
+              (UINT32_C(1) << (i % 32u))))
+            continue;
         struct datagram_file *file = datagrams + i;
-        if (!file->used || !file->closing)
+        if (!file->used || !datagram_closing(file))
             continue;
         if (file->pcb)
         {
@@ -173,7 +253,7 @@ void lume_datagram_reap(void)
             file->pcb = NULL;
         }
         clear_packets(file);
-        memset(file, 0, sizeof(*file));
+        lume_worker_scheduler(retire_datagram, file);
     }
 }
 
@@ -286,22 +366,48 @@ static int datagram_receive(struct datagram_file *file, void *buffer, unsigned c
         --file->packets;
         file->charged -= sizeof(*packet) + packet->bytes;
         lume_kernel_free(packet);
-        lume_poll_source_notify(&file->source);
+        publish_datagram(file);
     }
     return copied ? (int)bytes : -LUME_EFAULT;
 }
 
+struct datagram_io
+{
+    struct datagram_file *file;
+    void *output;
+    const void *input;
+    uint64_t bytes;
+    int64_t result;
+    bool write;
+};
+
+static void datagram_io(void *context)
+{
+    struct datagram_io *io = context;
+    if (io->write)
+        io->result = io->bytes > LUME_SOCKET_DATAGRAM_MAX
+                         ? -LUME_EMSGSIZE
+                         : datagram_send(io->file, io->input, (unsigned)io->bytes, NULL, 0, NULL);
+    else
+    {
+        unsigned capacity =
+            io->bytes > LUME_SOCKET_DATAGRAM_MAX ? LUME_SOCKET_DATAGRAM_MAX : (unsigned)io->bytes;
+        io->result = datagram_receive(io->file, io->output, capacity, false, NULL, NULL);
+    }
+}
+
 static int64_t datagram_read(void *context, void *buffer, uint64_t bytes)
 {
-    unsigned capacity = bytes > LUME_SOCKET_DATAGRAM_MAX ? LUME_SOCKET_DATAGRAM_MAX : bytes;
-    return datagram_receive(context, buffer, capacity, false, NULL, NULL);
+    struct datagram_io io = {.file = context, .output = buffer, .bytes = bytes};
+    lume_worker_domain(datagram_io, &io);
+    return io.result;
 }
 
 static int64_t datagram_write(void *context, const void *buffer, uint64_t bytes)
 {
-    if (bytes > LUME_SOCKET_DATAGRAM_MAX)
-        return -LUME_EMSGSIZE;
-    return datagram_send(context, buffer, (unsigned)bytes, NULL, 0, NULL);
+    struct datagram_io io = {.file = context, .input = buffer, .bytes = bytes, .write = true};
+    lume_worker_domain(datagram_io, &io);
+    return io.result;
 }
 
 static const struct lume_file_ops datagram_ops = {.kind = LUME_NODE_SOCKET,
@@ -319,16 +425,16 @@ bool lume_datagram_file(struct lume_files *files, unsigned fd)
 
 bool lume_datagram_busy(void)
 {
-    for (unsigned i = 0; i < LUME_NET_UDP_SOCKET_LIMIT; ++i)
-        if (datagrams[i].used)
+    for (unsigned i = 0; i < sizeof(live_files) / sizeof(live_files[0]); ++i)
+        if (__atomic_load_n(live_files + i, __ATOMIC_ACQUIRE))
             return true;
     return false;
 }
 
 bool lume_datagram_reap_pending(void)
 {
-    for (unsigned i = 0; i < LUME_NET_UDP_SOCKET_LIMIT; ++i)
-        if (datagrams[i].used && datagrams[i].closing)
+    for (unsigned i = 0; i < sizeof(closing_files) / sizeof(closing_files[0]); ++i)
+        if (__atomic_load_n(closing_files + i, __ATOMIC_ACQUIRE))
             return true;
     return false;
 }
@@ -400,9 +506,9 @@ static int datagram_option(struct datagram_file *file, struct lume_socket_reques
     return 0;
 }
 
-int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
-                                  struct lume_socket_request *r,
-                                  struct lume_socket_buffer *transfer)
+static int64_t datagram_call_owned(struct lume_files *files, unsigned operation,
+                                   struct lume_socket_request *r,
+                                   struct lume_socket_buffer *transfer, int *held)
 {
     if (operation == LUME_SOCKET_CREATE)
     {
@@ -420,10 +526,7 @@ int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
             }
         if (!file)
             return -LUME_ENOBUFS;
-        *file = (struct datagram_file){.used = true,
-                                       .receive_budget = DATAGRAM_BUFFER_DEFAULT,
-                                       .send_budget = DATAGRAM_BUFFER_DEFAULT};
-        lume_poll_source_reset(&file->source);
+        lume_worker_scheduler(initialize_datagram, file);
         file->pcb = udp_new();
         if (!file->pcb)
         {
@@ -431,7 +534,7 @@ int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
             return -LUME_ENOBUFS;
         }
         udp_recv(file->pcb, receive_packet, file);
-        int fd = lume_vfs_attach(files, &datagram_ops, file, r->flags);
+        int fd = datagram_install(files, file, r->flags);
         if (fd < 0)
         {
             datagram_close(file);
@@ -440,7 +543,7 @@ int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
         r->fd = fd;
         return 0;
     }
-    struct datagram_file *file = lume_vfs_external(files, (unsigned)r->fd, &datagram_ops);
+    struct datagram_file *file = datagram_lookup(files, (unsigned)r->fd, held);
     if (!file)
         return -LUME_ENOTSOCK;
     if (operation == LUME_SOCKET_OPTION)
@@ -526,7 +629,7 @@ int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
         }
         if (r->other != 0)
             file->write_closed = true;
-        lume_poll_source_notify(&file->source);
+        publish_datagram(file);
         return 0;
     }
     if (operation != LUME_SOCKET_SENDTO && operation != LUME_SOCKET_RECVFROM)
@@ -550,12 +653,12 @@ int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
                             (r->flags & LUME_SOCKET_DATAGRAM_PEEK) != 0, r, transfer);
 }
 
-int64_t lume_datagram_message_buffer(struct lume_files *files, unsigned operation, int fd,
-                                     struct lume_socket_message *message,
-                                     struct lume_socket_request *metadata,
-                                     struct lume_socket_buffer *transfer)
+static int64_t datagram_message_owned(struct lume_files *files, unsigned operation, int fd,
+                                      struct lume_socket_message *message,
+                                      struct lume_socket_request *metadata,
+                                      struct lume_socket_buffer *transfer, int *held)
 {
-    struct datagram_file *file = lume_vfs_external(files, (unsigned)fd, &datagram_ops);
+    struct datagram_file *file = datagram_lookup(files, (unsigned)fd, held);
     if (!file)
         return -LUME_ENOTSOCK;
     if (operation == LUME_SOCKET_SEND_MESSAGE && message->count > LUME_SOCKET_DATAGRAM_MAX)
@@ -585,6 +688,59 @@ int64_t lume_datagram_message_buffer(struct lume_files *files, unsigned operatio
         memcpy(metadata->address, result.address, sizeof(result.address));
     }
     return bytes;
+}
+
+struct datagram_request
+{
+    struct lume_files *files;
+    unsigned operation;
+    int fd;
+    struct lume_socket_request *request, *metadata;
+    struct lume_socket_message *message;
+    struct lume_socket_buffer *transfer;
+    int64_t result;
+    bool message_operation;
+};
+
+static void datagram_request(void *context)
+{
+    struct datagram_request *request = context;
+    int held = -1;
+    if (request->message_operation)
+        request->result =
+            datagram_message_owned(request->files, request->operation, request->fd,
+                                   request->message, request->metadata, request->transfer, &held);
+    else
+        request->result = datagram_call_owned(request->files, request->operation, request->request,
+                                              request->transfer, &held);
+    if (held >= 0)
+        lume_vfs_drop_independent(held);
+}
+
+int64_t lume_datagram_call_buffer(struct lume_files *files, unsigned operation,
+                                  struct lume_socket_request *request,
+                                  struct lume_socket_buffer *transfer)
+{
+    struct datagram_request call = {
+        .files = files, .operation = operation, .request = request, .transfer = transfer};
+    lume_worker_domain(datagram_request, &call);
+    return call.result;
+}
+
+int64_t lume_datagram_message_buffer(struct lume_files *files, unsigned operation, int fd,
+                                     struct lume_socket_message *message,
+                                     struct lume_socket_request *metadata,
+                                     struct lume_socket_buffer *transfer)
+{
+    struct datagram_request call = {.files = files,
+                                    .operation = operation,
+                                    .fd = fd,
+                                    .message = message,
+                                    .metadata = metadata,
+                                    .transfer = transfer,
+                                    .message_operation = true};
+    lume_worker_domain(datagram_request, &call);
+    return call.result;
 }
 
 int64_t lume_datagram_call(struct lume_files *files, unsigned operation,

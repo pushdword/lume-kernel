@@ -35,7 +35,7 @@ static struct tcp_file
 {
     struct lume_poll_source source;
     bool used, listening, shutdown, closing;
-    unsigned owner, handle, local_port, peer_port, options, notify_next;
+    unsigned owner, handle, local_port, peer_port, options, notify_next, active;
     unsigned char local[4], peer[4];
     unsigned char *buffered;
     unsigned buffered_first, buffered_count;
@@ -130,7 +130,10 @@ static int stream(struct tcp_file *file, unsigned operation, struct lume_stream_
 {
     request->version = LUME_IO_VERSION;
     request->handle = file->handle;
-    return lume_stream_nowait(file->owner, operation, request);
+    ++file->active;
+    int result = lume_stream_nowait(file->owner, operation, request);
+    --file->active;
+    return result;
 }
 
 static unsigned tcp_poll(void *context)
@@ -171,7 +174,7 @@ void lume_socket_reap(void)
         struct tcp_file *file = tcp_files + tcp_reap_cursor;
         if (++tcp_reap_cursor == SOCKETS)
             tcp_reap_cursor = 0;
-        if (!file->used || !file->closing)
+        if (!file->used || !file->closing || file->active)
             continue;
         if (file->handle)
         {
@@ -997,10 +1000,12 @@ int64_t lume_socket_call(struct lume_files *files, unsigned operation,
         request.port = operation == LUME_SOCKET_LISTEN ? file->local_port : r->port;
         memcpy(request.address, operation == LUME_SOCKET_LISTEN ? file->local : r->address, 4);
         request.version = LUME_IO_VERSION;
+        ++file->active;
         int result = lume_stream_socket_create(
             file->owner,
             operation == LUME_SOCKET_LISTEN ? LUME_STREAM_LISTEN : LUME_STREAM_CONNECT_ASYNC,
             &request, file->options);
+        --file->active;
         if (!result)
         {
             file->handle = request.handle;

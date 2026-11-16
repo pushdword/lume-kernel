@@ -4,11 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Workers preserve synchronous call stacks across device waits. Entry, resume, waits and
- * checkpoints require the scheduler lock and masked subsystem IRQs. Resident raw RX may remain
- * enabled. Resource queues own subsystem
+/* Workers preserve synchronous call stacks across device waits. Entry and resume require
+ * the scheduler lock and masked subsystem IRQs. Resident raw RX may remain enabled.
+ * Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
-#define LUME_WORKER_LIMIT 10u
+#define LUME_WORKER_LIMIT 14u
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);
@@ -24,6 +24,15 @@ bool lume_worker_busy_on(unsigned slot);
 bool lume_worker_resume_on(unsigned slot);
 unsigned lume_worker_current(void);
 uint64_t lume_worker_lock_wait_on(unsigned slot);
+/* Domain callbacks retain resource admission while running outside the scheduler lock.
+ * They may allocate through independent allocators, wait and yield. Shared state must have
+ * domain ownership or its own synchronization. Scheduler services use the explicit bridge.
+ * Nested calls restore the caller's execution mode. Calls outside a worker run inline. */
+void lume_worker_domain(void (*run)(void *), void *context);
+/* Scheduler callbacks publish short metadata changes. A callback may suspend, retaining
+ * the active domain. It must not wait for a resource held by a scheduler-lock waiter. */
+void lume_worker_scheduler(void (*run)(void *), void *context);
+bool lume_worker_independent(void);
 /* Compute callbacks use pinned RAM and cache operations with IRQs masked. The worker keeps
  * subsystem ownership while releasing the scheduler lock. Callbacks must not allocate,
  * access device registers, invoke services requiring the scheduler lock or suspend. Releasing

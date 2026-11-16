@@ -1,10 +1,12 @@
 #include "lume/modules.h"
 #include "lume/module.h"
 #include "lume/abi.h"
+#include "lume/ref_gate.h"
 #include <string.h>
 
 struct module
 {
+    struct lume_ref_gate gate;
     struct lume_module_elf image;
     struct lume_module_info info;
     struct lume_driver drivers[LUME_MODULE_DRIVERS];
@@ -12,10 +14,20 @@ struct module
     uint32_t devices[LUME_MODULE_DEVICES];
 };
 
-static struct module modules[LUME_MODULE_LIMIT];
+static struct module modules[LUME_MODULE_LIMIT] = {
+    [0 ... LUME_MODULE_LIMIT - 1] = {.gate = LUME_REF_GATE_INITIALIZER}};
 static const struct lume_module_linker *linker;
 static unsigned char kernel_build[LUME_MODULE_BUILD_BYTES];
 static uint32_t next_id = 1;
+
+static void clear_module(struct module *m)
+{
+    memset(&m->image, 0, sizeof(m->image));
+    memset(&m->info, 0, sizeof(m->info));
+    memset(m->drivers, 0, sizeof(m->drivers));
+    memset(m->ops, 0, sizeof(m->ops));
+    memset(m->devices, 0, sizeof(m->devices));
+}
 
 static bool readable(const struct module *m, const void *p, size_t bytes, size_t alignment)
 {
@@ -48,17 +60,13 @@ static bool callback(const struct module *m, uintptr_t p, bool required)
 static int owner_get(void *owner)
 {
     struct module *m = owner;
-    if (!m->info.id || m->info.references == UINT32_MAX)
-        return -LUME_EBUSY;
-    m->info.references++;
-    return 0;
+    return lume_ref_get(&m->gate) ? 0 : -LUME_EBUSY;
 }
 
 static void owner_put(void *owner)
 {
     struct module *m = owner;
-    if (m->info.references)
-        m->info.references--;
+    (void)lume_ref_put(&m->gate);
 }
 
 int lume_module_pin(uintptr_t address, void **owner)
@@ -66,14 +74,17 @@ int lume_module_pin(uintptr_t address, void **owner)
     if (!owner)
         return -LUME_EINVAL;
     for (unsigned i = 0; i < LUME_MODULE_LIMIT; ++i)
-        if (modules[i].info.id &&
-            lume_module_elf_contains(&modules[i].image, address, 4, LUME_MODULE_EXECUTE))
+    {
+        struct module *m = modules + i;
+        if (!lume_ref_get(&m->gate))
+            continue;
+        if (lume_module_elf_contains(&m->image, address, 4, LUME_MODULE_EXECUTE))
         {
-            int result = owner_get(modules + i);
-            if (!result)
-                *owner = modules + i;
-            return result;
+            *owner = m;
+            return 0;
         }
+        (void)lume_ref_put(&m->gate);
+    }
     return -LUME_ENOENT;
 }
 
@@ -192,7 +203,7 @@ int lume_module_load(const void *file, size_t bytes, struct lume_module_info *in
         }
     if (!m)
         return -LUME_ENOSPC;
-    memset(m, 0, sizeof(*m));
+    clear_module(m);
     int result = lume_module_elf_load(file, bytes, linker, &m->image);
     if (!result)
         result = validate(m, true);
@@ -201,6 +212,8 @@ int lume_module_load(const void *file, size_t bytes, struct lume_module_info *in
     {
         m->info.id = next_id++;
         m->info.bytes = m->image.memory.bytes;
+        if (!lume_ref_open(&m->gate))
+            return -LUME_EBUSY;
         for (size_t i = 0; i < d->driver_count && !result; ++i)
         {
             result = lume_driver_register(m->drivers + i);
@@ -233,13 +246,21 @@ int lume_module_load(const void *file, size_t bytes, struct lume_module_info *in
         int cleanup = remove_registrations(m);
         if (cleanup)
             return cleanup;
+        bool published = !lume_ref_closed(&m->gate);
+        if (published && !lume_ref_close(&m->gate))
+            return -LUME_EBUSY;
         cleanup = lume_module_elf_release(&m->image);
         if (cleanup)
+        {
+            if (published)
+                (void)lume_ref_open(&m->gate);
             return cleanup;
-        memset(m, 0, sizeof(*m));
+        }
+        clear_module(m);
         return result;
     }
     *info = m->info;
+    info->references = lume_ref_count(&m->gate);
     return 0;
 }
 
@@ -250,20 +271,25 @@ int lume_module_unload(uint32_t id)
         struct module *m = modules + i;
         if (!id || m->info.id != id)
             continue;
-        if (m->info.references)
+        if (!lume_ref_close(&m->gate))
             return -LUME_EBUSY;
         for (unsigned j = 0; j < m->info.devices; ++j)
         {
             struct lume_hardware_info info;
             int result = lume_hardware_get(m->devices[j], &info);
             if (result || info.references || info.driver[0])
+            {
+                (void)lume_ref_open(&m->gate);
                 return result ? result : -LUME_EBUSY;
+            }
         }
         int result = remove_registrations(m);
         if (!result)
             result = lume_module_elf_release(&m->image);
         if (!result)
-            memset(m, 0, sizeof(*m));
+            clear_module(m);
+        else
+            (void)lume_ref_open(&m->gate);
         return result;
     }
     return -LUME_ENOENT;
@@ -284,7 +310,7 @@ int lume_module_inspect(const void *file, size_t bytes, struct lume_module_info 
         }
     if (!m)
         return -LUME_ENOSPC;
-    memset(m, 0, sizeof(*m));
+    clear_module(m);
     int result = lume_module_elf_load(file, bytes, linker, &m->image);
     if (!result)
         result = validate(m, false);
@@ -298,7 +324,7 @@ int lume_module_inspect(const void *file, size_t bytes, struct lume_module_info 
     }
     int cleanup = lume_module_elf_release(&m->image);
     if (!cleanup)
-        memset(m, 0, sizeof(*m));
+        clear_module(m);
     return cleanup ? cleanup : result;
 }
 
@@ -310,6 +336,7 @@ int lume_module_info(unsigned index, struct lume_module_info *info)
         if (modules[i].info.id && !index--)
         {
             *info = modules[i].info;
+            info->references = lume_ref_count(&modules[i].gate);
             return 0;
         }
     return -LUME_ENOENT;

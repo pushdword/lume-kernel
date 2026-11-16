@@ -15,6 +15,14 @@ static _Thread_local unsigned depth;
 static unsigned root_configured, root_eoi, root_calls;
 static bool root_enabled;
 static bool deferred_dispatch;
+static unsigned independent_deliveries;
+
+void lume_worker_domain(void (*run)(void *), void *context)
+{
+    assert(!depth);
+    ++independent_deliveries;
+    run(context);
+}
 
 void lume_worker_checkpoint(unsigned bytes)
 {
@@ -284,13 +292,14 @@ int main(void)
     concurrent_dispatch(&first, &ops, false);
     concurrent_dispatch(&first, &ops, true);
     assert(!lume_irq_domain_register_async(27, 32, &ops, &first));
-    assert(!lume_irq_domain_request(27, 1, LUME_IRQ_EDGE, handler, &first));
+    assert(!lume_irq_domain_request_async(27, 1, LUME_IRQ_EDGE, handler, &first));
     assert(!lume_irq_domain_enable(27, 1, true));
     unsigned before = first.calls;
     assert(lume_irq_domain_defer(27, 1) && first.calls == before);
     assert(lume_irq_domain_defer(27, 1) && first.calls == before);
     lume_irq_domain_poll();
     assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1 && first.calls == before + 1);
+    assert(independent_deliveries == 1);
     assert(lume_irq_domain_defer(27, 1));
     lume_irq_domain_poll();
     assert(!lume_irq_domain_release(27, 1, &first));

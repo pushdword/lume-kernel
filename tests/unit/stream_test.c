@@ -77,7 +77,25 @@ static struct tcp_pcb pcb;
 static uint32_t milliseconds;
 static unsigned freed, acknowledged;
 static unsigned notifications;
+static bool independent_request;
 static unsigned notification_owner[256], notification_handle[256];
+
+void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    bool previous = independent_request;
+    independent_request = false;
+    run(context);
+    independent_request = previous;
+}
+
+void lume_worker_domain(void (*run)(void *), void *context)
+{
+    bool previous = independent_request;
+    independent_request = true;
+    run(context);
+    independent_request = previous;
+}
+
 static bool connect_ok = true;
 static tcp_accept_fn accept_callback;
 static unsigned shutdowns;
@@ -85,6 +103,7 @@ static unsigned pauses;
 static bool send_ready_on_pause;
 static bool write_failure;
 static bool exit_during_copy;
+static bool reap_during_copy;
 
 void lume_worker_copy(void *destination, const void *source, size_t bytes)
 {
@@ -92,6 +111,8 @@ void lume_worker_copy(void *destination, const void *source, size_t bytes)
     {
         exit_during_copy = false;
         lume_stream_release(2);
+        if (reap_during_copy)
+            lume_stream_reap();
         bool retained = false;
         for (unsigned i = 0; i < 64; ++i)
             retained |= receive_allocations[i].memory != NULL;
@@ -130,6 +151,7 @@ static unsigned char packet_data[4096];
 
 void lume_socket_stream_notify(unsigned owner, unsigned handle)
 {
+    assert(!independent_request);
     assert(notifications < 256);
     notification_owner[notifications] = owner;
     notification_handle[notifications++] = handle;
@@ -137,6 +159,7 @@ void lume_socket_stream_notify(unsigned owner, unsigned handle)
 
 void lume_tasks_stream_notify(unsigned owner, unsigned handle)
 {
+    assert(!independent_request);
     assert(owner && handle);
 }
 
@@ -277,6 +300,7 @@ void tcp_abort(struct tcp_pcb *p)
 
 err_t tcp_write(struct tcp_pcb *p, const void *data, u16_t count, u8_t flags)
 {
+    assert(independent_request);
     (void)p;
     assert(data && count && flags == TCP_WRITE_FLAG_COPY);
     return write_failure ? ERR_MEM : ERR_OK;
@@ -399,6 +423,14 @@ int main(void)
            notification_handle[notifications - 1] == r.handle);
     assert(lume_stream_call(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
     assert(milliseconds == before_poll);
+    assert(lume_stream_nowait(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    pcb.snd_buf = 0;
+    assert(lume_stream_nowait(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    assert(pcb.sent(pcb.callback_arg, &pcb, 64) == ERR_OK);
+    assert(!lume_stream_nowait(2, LUME_STREAM_POLL, &r));
+    pcb.snd_buf = 4096;
+    assert(pcb.sent(pcb.callback_arg, &pcb, 64) == ERR_OK);
+    assert(lume_stream_nowait(2, LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
     unsigned first = r.handle;
     assert(lume_stream_call(3, LUME_STREAM_RECEIVE, &r) == -LUME_EBADF);
     unsigned char data[6000];
@@ -572,6 +604,7 @@ int main(void)
     memset(large, 0x51, sizeof(large));
     struct pbuf retained = {.payload = large, .len = sizeof(large), .tot_len = sizeof(large)};
     exit_during_copy = true;
+    reap_during_copy = true;
     assert(pcb.recv(pcb.callback_arg, &pcb, &retained, ERR_OK) == ERR_OK);
     assert(!exit_during_copy && lume_stream_busy());
     r.count = sizeof(r.data);
@@ -580,6 +613,12 @@ int main(void)
     assert(!lume_stream_busy());
     for (unsigned i = 0; i < 64; ++i)
         assert(!receive_allocations[i].memory);
+    r = (struct lume_stream_request){
+        .version = LUME_IO_VERSION, .port = 8095, .address = {127, 0, 0, 1}};
+    assert(!lume_stream_call(UINT32_C(0x40000001), LUME_STREAM_CONNECT, &r));
+    assert(lume_stream_nowait(UINT32_C(0x40000001), LUME_STREAM_POLL, &r) == LUME_STREAM_WRITABLE);
+    assert(!lume_stream_call(UINT32_C(0x40000001), LUME_STREAM_CLOSE, &r));
+    assert(!lume_stream_busy());
     puts(
         "PASS TCP ownership, backpressure, EOF, reset, async connect, half-close, listener, pure poll, ACK wake and bounded UDP queues");
 }

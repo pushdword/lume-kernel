@@ -397,6 +397,14 @@ check-loopback: $(OUT)/tests/loopback$(HOSTEXE)
 $(OUT)/tests/net-service$(HOSTEXE): tests/unit/net_service_test.c src/net/net.c src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"
+
+.PHONY: check-dns-lifetime
+check-dns-lifetime: $(OUT)/tests/dns-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/dns-lifetime$(HOSTEXE): tests/unit/dns_lifetime_test.c tests/unit/net_service_test.c src/net/net.c src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $< src/net/netif.c src/net/route.c src/core/work.c $(HOST_LWIP_C) -o "$@"
+check: check-dns-lifetime
 $(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c include/kernel/lwipopts.h include/kernel/lume/lwip_hooks.h $(HOST_LWIP_C)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) -Ivendor/lwip/src/include tests/unit/ip4_route_test.c src/net/route.c $(HOST_LWIP_C) -o "$@"
@@ -404,6 +412,13 @@ $(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c in
 check-ip4-route: $(OUT)/tests/ip4-route$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+.PHONY: check-fd-parallel
+check-fd-parallel: $(OUT)/tests/fd-parallel$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/fd-parallel$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1
+$(OUT)/tests/fd-parallel$(HOSTEXE): tests/unit/fd_parallel_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/fs/vfs/fd_publication.h src/fs/vfs/open_files.h tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out tests/unit/vfs_test.c,$(filter %.c,$^)) -o "$@"
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ffunicode.c
@@ -464,7 +479,7 @@ check-i686-mmu: $(OUT)/tests/i686-mmu$(HOSTEXE)
 	env "$(OUT)/tests/i686-mmu$(HOSTEXE)"
 $(OUT)/tests/i686-mmu$(HOSTEXE): tests/arch/i686/mmu_test.c arch/i686/mm/mmu.c arch/i686/include/kernel/lume/paging.h tests/fixtures/i686_mmu/lume/paging.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 $(I686_MMU_HOST_FLAGS) -Itests/fixtures/i686_mmu -Iarch/i686/include/kernel -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_I686=1 $(I686_MMU_HOST_FLAGS) -Itests/fixtures/i686_mmu -Iarch/i686/include/kernel -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native "$<" tests/fixtures/mmu_worker_host.c -o "$@"
 .PHONY: check-i686-query
 check-i686-query: $(OUT)/tests/i686-query$(HOSTEXE) $(OUT)/tests/i686-context$(HOSTEXE) $(OUT)/tests/i686-fpu$(HOSTEXE)
 	env "$(OUT)/tests/i686-query$(HOSTEXE)"
@@ -531,9 +546,10 @@ $(OUT)/configuration: FORCE | $(OUT)
 $(OUT)/tests/user-stack$(HOSTEXE): tests/unit/user_stack_test.c src/mm/user_stack.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
-$(OUT)/tests/mmu$(HOSTEXE): tests/arch/aarch64/mmu_test.c arch/aarch64/mm/mmu_tables.c
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),mmu i686-mmu amd64-mmu-views)): tests/fixtures/mmu_worker_host.c include/kernel/lume/mmu_domain_begin.h include/kernel/lume/mmu_domain_end.h include/kernel/lume/mmu_guard.h
+$(OUT)/tests/mmu$(HOSTEXE): tests/arch/aarch64/mmu_test.c arch/aarch64/mm/mmu_tables.c tests/fixtures/mmu_worker_host.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) $^ -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 $(OUT)/tests/elf-load$(HOSTEXE): tests/unit/elf_load_test.c src/exec/elf.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
@@ -562,6 +578,13 @@ check-hardware: $(OUT)/tests/hardware$(HOSTEXE)
 $(OUT)/tests/hardware$(HOSTEXE): tests/unit/hardware_test.c src/device/hardware.c src/device/hardware_control.c src/device/resource.c src/device/device.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
+
+.PHONY: check-hardware-parallel
+check-hardware-parallel: $(OUT)/tests/hardware-parallel$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/hardware-parallel$(HOSTEXE): tests/unit/hardware_parallel_test.c tests/unit/hardware_test.c src/device/hardware.c src/device/hardware_control.c src/device/resource.c src/device/device.c tests/fixtures/hardware_worker_host.c include/kernel/lume/ref_gate.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out tests/unit/hardware_test.c,$(filter %.c,$^)) -o "$@"
 
 .PHONY: check-fdt-inventory
 check-fdt-inventory: $(OUT)/tests/fdt-inventory$(HOSTEXE)
@@ -680,7 +703,7 @@ check-amd64-mmu-views: $(OUT)/tests/amd64-mmu-views$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/amd64-mmu-views$(HOSTEXE): tests/arch/amd64/mmu_views_test.c arch/amd64/mm/mmu.c arch/amd64/mm/device_mapping.h include/kernel/lume/early.h include/kernel/lume/elf.h include/kernel/lume/vm.h include/kernel/lume/heap.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -flto -fwhole-program -ffunction-sections -fdata-sections $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" -Wl,--gc-sections -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -flto -fwhole-program -ffunction-sections -fdata-sections $(filter-out -Itests/platform/q35/include,$(Q35_TEST_CPPFLAGS)) "$<" tests/fixtures/mmu_worker_host.c -Wl,--gc-sections -o "$@"
 Q35_TEST_CPPFLAGS := -Itests/platform/q35/include -Iplatform/q35/include -Iarch/amd64/include/kernel $(filter-out -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel,$(TEST_CPPFLAGS))
 .PHONY: check-virtio-net check-v3d
 check: check-virtio-net check-v3d
@@ -775,6 +798,22 @@ $(OUT)/tests/scheduler-ready$(HOSTEXE): tests/unit/scheduler_ready_test.c src/co
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
 check: check-scheduler-ready
 
+.PHONY: check-ready-queue
+check-ready-queue: $(OUT)/tests/ready-queue$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/ready-queue$(HOSTEXE): tests/unit/ready_queue_test.c src/core/ready_queue.h src/core/scheduler.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+check: check-ready-queue
+
+.PHONY: check-ready-state
+check-ready-state: $(OUT)/tests/ready-state$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/ready-state$(HOSTEXE): tests/unit/ready_state_test.c src/core/ready_queue.h src/core/ready_state.h src/core/scheduler.h src/core/task_state.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+check: check-ready-state
+
 .PHONY: check-worker-slices
 check-worker-slices: $(OUT)/tests/worker-slices$(HOSTEXE)
 	env "$<"
@@ -782,6 +821,35 @@ $(OUT)/tests/worker-slices$(HOSTEXE): tests/unit/worker_slices_test.c src/core/w
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" src/core/work.c -o "$@"
 check: check-worker-slices
+
+.PHONY: check-worker-parallel
+check-worker-parallel: $(OUT)/tests/worker-parallel$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/worker-parallel$(HOSTEXE): tests/unit/worker_parallel_test.c src/core/worker.c src/core/activity.c include/kernel/lume/worker.h include/kernel/lume/activity.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@" $(if $(HOSTEXE),,-pthread)
+check: check-worker-parallel
+
+.PHONY: check-module-lifetime
+check-module-lifetime: $(OUT)/tests/module-lifetime$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/module-lifetime$(HOSTEXE): tests/unit/module_lifetime_test.c src/module/manager.c include/kernel/lume/ref_gate.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+check: check-module-lifetime
+
+.PHONY: check-module-work-parallel
+check-module-work-parallel: $(OUT)/tests/module-work-parallel$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/module-work-parallel$(HOSTEXE): tests/unit/module_work_parallel_test.c tests/unit/module_services_test.c src/module/module_services.c src/device/device.c src/device/resource.c src/device/irq.c src/device/irq_domain.c src/core/work.c
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out tests/unit/module_services_test.c,$(filter %.c,$^)) -o "$@" $(if $(HOSTEXE),,-pthread)
+check: check-module-work-parallel
+
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),module-services module-work-parallel irq-domain brcm-l2)): tests/fixtures/irq_worker_host.c
+
+$(OUT)/tests/worker-parallel$(HOSTEXE): src/core/scheduler.h src/core/ready_queue.h src/core/ready_state.h src/core/task_state.h
+$(OUT)/tests/worker-parallel$(HOSTEXE): include/kernel/lume/ref_gate.h
 
 .PHONY: check-io-domains
 check-io-domains: check-io-classify
@@ -796,6 +864,18 @@ $(OUT)/tests/usb-poll$(HOSTEXE): tests/unit/usb_poll_test.c drivers/usb/xhci/usb
 check: check-usb-poll
 
 .PHONY: check-ticket-lock
+.PHONY: check-tlb-parallel
+.PHONY: check-thread-retire
+check-thread-retire: $(OUT)/tests/thread-retire$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/thread-retire$(HOSTEXE): tests/unit/thread_retire_test.c src/core/thread_release.h src/core/memory_wait.h include/kernel/lume/mmu_guard.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+check-tlb-parallel: $(OUT)/tests/tlb-parallel$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/tlb-parallel$(HOSTEXE): tests/unit/tlb_parallel_test.c arch/amd64/tlb_sync.h include/kernel/lume/ticket_lock.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
 check-ticket-lock: $(OUT)/tests/ticket-lock$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/ticket-lock$(HOSTEXE): tests/unit/ticket_lock_test.c include/kernel/lume/ticket_lock.h

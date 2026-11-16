@@ -79,6 +79,8 @@ struct lume_hardware_services
     void (*free)(void *);
     int (*validate_resource)(const struct lume_resource *);
     int (*dma_domain)(uint32_t id, struct lume_dma_domain *);
+    /* Allocators with independent synchronization may run outside scheduler serialization. */
+    bool independent_memory;
 };
 
 struct lume_hardware_bus_ops
@@ -116,6 +118,8 @@ const struct lume_driver *lume_driver_at(unsigned index);
 bool lume_driver_matches(const struct lume_driver *, uint32_t id);
 int lume_hardware_bind(uint32_t id, const struct lume_driver *);
 int lume_hardware_unbind(uint32_t id);
+/* Reference admission and release use resident atomic gates. A successful reference
+ * keeps the association alive through removal. Lifecycle publication is serialized. */
 int lume_hardware_reference(uint32_t id);
 int lume_hardware_unreference(uint32_t id);
 int lume_hardware_read_register(uint32_t id, unsigned resource, uint64_t offset, unsigned width,

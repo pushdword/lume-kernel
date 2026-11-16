@@ -58,14 +58,14 @@ check-brcm-l2-module: $(OUT)/tests/brcm-l2-module$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/brcm-l2-module$(HOSTEXE): tests/unit/brcm_l2_module_test.c $(L2_MODULE_SOURCE) $(OUT)/ddk/include/lume/module_build.h src/device/irq.c src/device/irq_domain.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" src/device/irq.c src/device/irq_domain.c -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" src/device/irq.c src/device/irq_domain.c tests/fixtures/irq_worker_host.c -o "$@"
 
 .PHONY: check-bcm2712-hdmi-module
 check-bcm2712-hdmi-module: $(OUT)/tests/bcm2712-hdmi-module$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/bcm2712-hdmi-module$(HOSTEXE): tests/unit/bcm2712_hdmi_module_test.c $(HDMI_MODULE_SOURCE) $(OUT)/ddk/include/lume/module_build.h src/device/irq.c src/device/irq_domain.c src/device/resource.c src/core/work.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" src/device/irq.c src/device/irq_domain.c src/device/resource.c src/core/work.c -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" src/device/irq.c src/device/irq_domain.c src/device/resource.c src/core/work.c tests/fixtures/irq_worker_host.c -o "$@"
 
 .PHONY: check-pi5-firmware
 check-pi5-firmware: $(OUT)/tests/pi5-firmware$(HOSTEXE)
@@ -91,6 +91,8 @@ $(OUT)/tests/hdmi-console$(HOSTEXE): tests/unit/hdmi_console_test.c drivers/disp
 .PHONY: check-hdmi-platform
 check-hdmi-platform: check-bcm2712-hdmi-module check-brcm-l2-module check-pi5-firmware check-hdmi-framebuffer check-hdmi-console check-irq-domain check-pi5-fdt-irq $(OUT)/tests/mmu$(HOSTEXE)
 	env "$(OUT)/tests/mmu$(HOSTEXE)"
+
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),brcm-l2-module bcm2712-hdmi-module)): tests/fixtures/irq_worker_host.c
 
 $(OUT)/modules/rp1-cpufan.lkm: $(OUT)/lkm/obj/$(CPUFAN_MODULE_SOURCE).o
 	mkdir -p "$(@D)"

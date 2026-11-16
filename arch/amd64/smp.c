@@ -13,7 +13,6 @@ static unsigned apic_ids[LUME_CPU_LIMIT];
 static unsigned char cpu_indices[256];
 static bool auxiliary_index, started;
 static unsigned ready[LUME_CPU_LIMIT], stopped[LUME_CPU_LIMIT];
-static uint64_t tlb_generation, tlb_ack[LUME_CPU_LIMIT];
 
 static unsigned hardware_id(void)
 {
@@ -39,42 +38,18 @@ unsigned lume_cpu_count(void)
     return __atomic_load_n(&online, __ATOMIC_ACQUIRE);
 }
 
-void lume_smp_tlb_service(void)
+static void tlb_reload(void)
 {
-    /* A peer can request a flush while this CPU waits with interrupts masked. */
-    unsigned cpu = lume_cpu_index();
-    uint64_t generation = __atomic_load_n(&tlb_generation, __ATOMIC_ACQUIRE);
-    if (cpu < LUME_CPU_LIMIT && __atomic_load_n(&tlb_ack[cpu], __ATOMIC_RELAXED) != generation)
-    {
-        uint64_t root;
-        __asm__ volatile("movq %%cr3, %0\nmovq %0, %%cr3" : "=r"(root) : : "memory");
-        __atomic_store_n(&tlb_ack[cpu], generation, __ATOMIC_RELEASE);
-    }
-}
-
-void lume_smp_tlb_flush(void)
-{
-    unsigned cpu = lume_cpu_index(), count = lume_cpu_count();
     uint64_t root;
     __asm__ volatile("movq %%cr3, %0\nmovq %0, %%cr3" : "=r"(root) : : "memory");
-    if (count == 1)
-        return;
-    if (!lume_smp_owned())
-        lume_fail("TLB synchronization requires the kernel lock");
-    uint64_t generation = __atomic_add_fetch(&tlb_generation, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&tlb_ack[cpu], generation, __ATOMIC_RELEASE);
-    for (unsigned i = 0; i < count; ++i)
-        if (i != cpu)
-            lume_apic_send(apic_ids[i], LUME_APIC_TLB);
-    uint64_t began = lume_counter_read();
-    for (unsigned i = 0; i < count; ++i)
-        while (__atomic_load_n(&tlb_ack[i], __ATOMIC_ACQUIRE) != generation)
-        {
-            if (lume_counter_read() - began > lume_counter_frequency())
-                lume_fail("remote TLB synchronization timeout");
-            lume_cpu_relax_ordered();
-        }
 }
+
+static void tlb_notify(unsigned cpu)
+{
+    lume_apic_send(apic_ids[cpu], LUME_APIC_TLB);
+}
+
+#include "tlb_sync.h"
 
 static void kernel_lock_wait(void)
 {

@@ -568,7 +568,29 @@ static void file_map_around(unsigned task, const struct vm_area *area, uint64_t 
             break;
 }
 
-int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
+struct fault_preparation
+{
+    struct vm_chunk *chunk;
+    uint64_t frame, source, low, high;
+    bool metadata, contents, partial;
+};
+
+static void prepare_fault(void *context)
+{
+    struct fault_preparation *prepared = context;
+    if (prepared->metadata)
+        prepared->chunk = lume_kernel_allocate_private(sizeof(*prepared->chunk));
+    if (!prepared->contents)
+        return;
+    prepared->frame = prepared->source && !prepared->partial ? lume_page_alloc_uninitialized(0)
+                                                             : lume_page_alloc(0);
+    if (prepared->frame && prepared->source && prepared->high > prepared->low)
+        memcpy((void *)(uintptr_t)(prepared->frame + prepared->low),
+               (const void *)(uintptr_t)(prepared->source + prepared->low),
+               (size_t)(prepared->high - prepared->low));
+}
+
+static int fault_owned(unsigned task, uint64_t address, bool write, bool execute)
 {
     if (task >= LUME_TASK_LIMIT)
         return 0;
@@ -610,7 +632,8 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     root = lume_mmu_task_view_root(task, writer);
 #endif
     ++object->references;
-    struct vm_chunk *prepared = NULL;
+    struct fault_preparation prepared = {0};
+    bool source_pinned = false;
     struct vm_chunk *entry = chunk(object, page, false);
     bool owned = entry && entry->pages[page % 512];
     bool partial = source && (position < first || end < position + PAGE);
@@ -624,8 +647,23 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
             goto out;
         source_version = source->file_version;
     }
-    if (private && !entry)
-        prepared = allocate(sizeof(*prepared));
+    prepared.metadata = private && !entry;
+    prepared.contents = private && !owned;
+    prepared.source = source_physical;
+    prepared.partial = partial;
+    prepared.low = first > position ? first - position : 0;
+    prepared.high = end - position < PAGE ? end - position : PAGE;
+    if (prepared.contents && source_physical)
+    {
+        source_pinned = lume_page_pin(source_physical);
+        if (!source_pinned)
+        {
+            result = 2;
+            goto out;
+        }
+    }
+    if (prepared.metadata || prepared.contents)
+        lume_task_memory_prepare(prepare_fault, &prepared);
     area = find_area(task, address);
     if (!area || area->generation != generation || area->object != object || area->retiring ||
         !(area->protection & required))
@@ -682,7 +720,7 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         private = true;
     bool new_chunk = private && !entry;
     if (new_chunk)
-        entry = prepared;
+        entry = prepared.chunk;
     if (private && !entry)
     {
         result = -1;
@@ -693,29 +731,21 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
     uint64_t physical = private ? entry->pages[slot] : source_physical;
     if (new_frame)
     {
-        physical =
-            source_physical && !partial ? lume_page_alloc_uninitialized(0) : lume_page_alloc(0);
+        physical = prepared.frame;
         if (!physical)
         {
             result = -1;
             goto out;
         }
-        if (source_physical)
-        {
-            uint64_t low = first > position ? first - position : 0;
-            uint64_t high = end - position < PAGE ? end - position : PAGE;
-            if (high > low)
-                memcpy((void *)(uintptr_t)(physical + low),
-                       (const void *)(uintptr_t)(source_physical + low), (size_t)(high - low));
-        }
         entry->pages[slot] = physical;
+        prepared.frame = 0;
     }
     if (new_chunk)
     {
         entry->index = page / 512;
         entry->next = object->chunks[bucket];
         object->chunks[bucket] = entry;
-        prepared = NULL;
+        prepared.chunk = NULL;
     }
     if (!physical)
     {
@@ -777,9 +807,41 @@ int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
         }
     }
 out:
-    lume_kernel_free(prepared);
+    if (source_pinned)
+        lume_page_unpin(source_physical);
+    if (prepared.frame && !lume_page_free(prepared.frame))
+        lume_fail("virtual memory prepared frame release");
+    lume_kernel_free(prepared.chunk);
     drop(object);
     return result;
+}
+
+struct fault_request
+{
+    unsigned task;
+    uint64_t address;
+    bool write, execute;
+    int result;
+};
+
+static void fault_run(void *context)
+{
+    struct fault_request *request = context;
+    request->result =
+        fault_owned(request->task, request->address, request->write, request->execute);
+}
+
+int lume_vm_fault(unsigned task, uint64_t address, bool write, bool execute)
+{
+    struct fault_request request = {task, address, write, execute, 0};
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
+    if (!lume_mmu_owned(task, fault_run, &request))
+        return 2;
+#else
+    fault_run(&request);
+#endif
+    return request.result;
 }
 
 bool lume_vm_resolve_buffer(uint64_t root, uint64_t address, bool write)

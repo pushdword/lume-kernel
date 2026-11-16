@@ -27,7 +27,13 @@ struct lume_file_ops
 int lume_vfs_attach(struct lume_files *, const struct lume_file_ops *, void *, unsigned);
 void *lume_vfs_external(struct lume_files *, unsigned, const struct lume_file_ops *);
 const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *, unsigned, unsigned *);
+/* Descriptor references, installation and ordinary release require scheduler entry. */
 int lume_vfs_hold(struct lume_files *, unsigned);
+/* Borrowing retains the open description under descriptor-table publication.
+ * The caller retains the table's process lifetime. Independent callers run in
+ * a resource worker and release the reference with drop_independent. */
+int lume_vfs_borrow(struct lume_files *, unsigned, const struct lume_file_ops *, void **);
+void lume_vfs_drop_independent(int);
 int lume_vfs_install(struct lume_files *, int);
 void lume_vfs_drop(int);
 void lume_vfs_access_mode(struct lume_files *, unsigned, unsigned);

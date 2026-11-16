@@ -6,6 +6,11 @@
 #include <assert.h>
 #include <stdlib.h>
 
+__attribute__((weak)) void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
 /* This fixture accepts only the unrestricted profile and has no TTY or network endpoints. */
 static void unrestricted(struct lume_files *files)
 {

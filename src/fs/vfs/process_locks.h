@@ -96,7 +96,7 @@ void lume_vfs_process_release(unsigned pid)
 bool lume_vfs_metadata_close(struct lume_files *files, uint64_t fd, unsigned pid, int64_t *result)
 {
     struct open_file *description = descriptor(files, fd);
-    if (!description || description->references < 2)
+    if (!description || open_file_count(description) < 2)
         return false;
     *result = lume_vfs_process_close(files, fd, pid);
     return true;
@@ -107,7 +107,7 @@ static bool metadata_replacement(struct lume_files *files, uint64_t from, uint64
     if (!descriptor(files, from) || to >= LUME_FD_MAX)
         return false;
     struct open_file *target = descriptor(files, to);
-    return from == to || !target || target->references > 1;
+    return from == to || !target || open_file_count(target) > 1;
 }
 
 bool lume_vfs_metadata_dup2(struct lume_files *files, uint64_t from, uint64_t to, unsigned pid,

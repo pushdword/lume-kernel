@@ -2,6 +2,7 @@
 #include "lume/modules.h"
 #include "lume/abi.h"
 #include "lume/net.h"
+#include "lume/worker.h"
 
 #define REGISTRATIONS 128u
 
@@ -260,11 +261,12 @@ int lume_module_irq_domain_unregister(uint32_t id, void *context)
     return result;
 }
 
-int lume_module_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger,
-                                   lume_irq_handler handler, void *context)
+static int domain_interrupt_request(uint32_t id, unsigned irq, unsigned trigger,
+                                    lume_irq_handler handler, void *context, bool independent)
 {
     if (!id)
-        return lume_module_irq_register(irq, trigger, handler, context);
+        return independent ? -LUME_EINVAL
+                           : lume_module_irq_register(irq, trigger, handler, context);
     if (!handler || trigger > LUME_IRQ_EDGE || irq >= LUME_IRQ_DOMAIN_LINES)
         return -LUME_EINVAL;
     uint64_t flags = lume_irq_save();
@@ -273,12 +275,25 @@ int lume_module_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger,
         reserve_key(DOMAIN_INTERRUPT, (void *)(uintptr_t)(irq + 1), id, (uintptr_t)handler, &r);
     if (!result)
     {
-        result = lume_irq_domain_request(id, irq, trigger, handler, context);
+        result = independent ? lume_irq_domain_request_async(id, irq, trigger, handler, context)
+                             : lume_irq_domain_request(id, irq, trigger, handler, context);
         if (result)
             release(r);
     }
     lume_irq_restore(flags);
     return result;
+}
+
+int lume_module_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger,
+                                   lume_irq_handler handler, void *context)
+{
+    return domain_interrupt_request(id, irq, trigger, handler, context, false);
+}
+
+int lume_module_irq_domain_request_async(uint32_t id, unsigned irq, unsigned trigger,
+                                         lume_irq_handler handler, void *context)
+{
+    return domain_interrupt_request(id, irq, trigger, handler, context, true);
 }
 
 int lume_module_irq_domain_release(uint32_t id, unsigned irq, void *context)
@@ -309,7 +324,7 @@ static void run_work(void *context)
     release(r);
 }
 
-int lume_module_work_submit(struct lume_work *work)
+static int module_work_submit(struct lume_work *work)
 {
     if (!work || !work->run || work->domain >= LUME_WORK_DOMAINS)
         return -LUME_EINVAL;
@@ -337,7 +352,7 @@ int lume_module_work_submit(struct lume_work *work)
     return result;
 }
 
-bool lume_module_work_cancel(struct lume_work *work)
+static bool module_work_cancel(struct lume_work *work)
 {
     uint64_t flags = lume_irq_save();
     struct registration *r = find(WORK, work);
@@ -349,6 +364,38 @@ bool lume_module_work_cancel(struct lume_work *work)
     }
     lume_irq_restore(flags);
     return result;
+}
+
+struct work_publication
+{
+    struct lume_work *work;
+    int result;
+};
+
+static void submit_work(void *context)
+{
+    struct work_publication *publication = context;
+    publication->result = module_work_submit(publication->work);
+}
+
+static void cancel_work(void *context)
+{
+    struct work_publication *publication = context;
+    publication->result = module_work_cancel(publication->work);
+}
+
+int lume_module_work_submit(struct lume_work *work)
+{
+    struct work_publication publication = {.work = work};
+    lume_worker_scheduler(submit_work, &publication);
+    return publication.result;
+}
+
+bool lume_module_work_cancel(struct lume_work *work)
+{
+    struct work_publication publication = {.work = work};
+    lume_worker_scheduler(cancel_work, &publication);
+    return publication.result != 0;
 }
 
 int lume_module_netif_register(const struct lume_netif_descriptor *descriptor)

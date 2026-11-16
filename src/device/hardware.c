@@ -1,6 +1,8 @@
 #include "lume/hardware.h"
 #include "lume/abi.h"
 #include "lume/worker.h"
+#include "lume/ref_gate.h"
+#include "lume/early.h"
 #include <string.h>
 
 struct lume_hardware
@@ -17,11 +19,50 @@ struct lume_hardware
 };
 
 static struct lume_hardware hardware[LUME_HARDWARE_LIMIT];
+static struct lume_ref_gate references[LUME_HARDWARE_LIMIT] = {[0 ... LUME_HARDWARE_LIMIT - 1] =
+                                                                   LUME_REF_GATE_INITIALIZER};
+static uint32_t published_ids[LUME_HARDWARE_LIMIT];
 static const struct lume_driver *drivers[LUME_DRIVER_LIMIT];
 static const struct lume_hardware_services *services;
 static uint32_t next_id = 1;
 static uint64_t topology_epoch;
 static const struct lume_hardware_bus_ops *bus_ops;
+
+static struct lume_ref_gate *reference_gate(const struct lume_hardware *h)
+{
+    return references + (h - hardware);
+}
+
+static bool quiesce(struct lume_hardware *h)
+{
+    struct lume_ref_gate *gate = reference_gate(h);
+    return lume_ref_closed(gate) ? !lume_ref_count(gate) : lume_ref_close(gate);
+}
+
+static void publish_references(struct lume_hardware *h)
+{
+    if (!h->busy && !h->absent && h->info.state == LUME_HARDWARE_READY)
+        lume_ref_reopen(reference_gate(h));
+}
+
+struct context_memory
+{
+    void *memory;
+    size_t bytes;
+};
+
+static void prepare_context(void *context)
+{
+    struct context_memory *prepared = context;
+    prepared->memory = services->allocate(prepared->bytes);
+    if (prepared->memory)
+        memset(prepared->memory, 0, prepared->bytes);
+}
+
+static void release_context(void *context)
+{
+    services->free(context);
+}
 
 int lume_hardware_bus_services(const struct lume_hardware_bus_ops *ops)
 {
@@ -147,6 +188,8 @@ int lume_hardware_add(const struct lume_hardware_description *d, uint32_t *id)
             (struct lume_hardware_resource_info){r->base, r->size, r->kind, r->flags, r->domain, 0};
     }
     *id = slot->info.id;
+    __atomic_store_n(published_ids + (slot - hardware), slot->info.id, __ATOMIC_RELEASE);
+    publish_references(slot);
     return 0;
 }
 
@@ -155,11 +198,14 @@ int lume_hardware_remove(uint32_t id)
     struct lume_hardware *h = find(id);
     if (!h)
         return -LUME_ENOENT;
-    if (h->driver || h->busy || h->info.references)
+    if (h->driver || h->busy || lume_ref_count(reference_gate(h)))
         return -LUME_EBUSY;
     for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
         if (hardware[i].info.id && hardware[i].info.parent == id)
             return -LUME_EBUSY;
+    if (!quiesce(h))
+        return -LUME_EBUSY;
+    __atomic_store_n(published_ids + (h - hardware), 0, __ATOMIC_RELEASE);
     memset(h, 0, sizeof(*h));
     ++topology_epoch;
     return 0;
@@ -210,12 +256,15 @@ int lume_hardware_state(uint32_t id, unsigned state, int error)
         return -LUME_EINVAL;
     if (state != LUME_HARDWARE_ABSENT)
     {
+        lume_ref_block(reference_gate(h));
         h->info.state = state;
         h->info.error = error;
         h->absent = false;
         ++topology_epoch;
+        publish_references(h);
         return 0;
     }
+    lume_ref_block(reference_gate(h));
     h->busy = true;
     int result = -LUME_EBUSY;
     for (unsigned attempt = 0; attempt < 3; ++attempt)
@@ -243,6 +292,7 @@ int lume_hardware_state(uint32_t id, unsigned state, int error)
                 (!hardware[i].absent || &hardware[i] == h))
             {
                 struct lume_hardware *child = hardware + i;
+                lume_ref_block(reference_gate(child));
                 child->absent = true;
                 child->info.state = LUME_HARDWARE_ABSENT;
                 child->info.error = error;
@@ -252,6 +302,7 @@ int lume_hardware_state(uint32_t id, unsigned state, int error)
         break;
     }
     h->busy = false;
+    publish_references(h);
     return result;
 }
 
@@ -271,6 +322,7 @@ int lume_hardware_info(unsigned index, struct lume_hardware_info *info)
         if (hardware[i].info.id && !index--)
         {
             *info = hardware[i].info;
+            info->references = lume_ref_count(references + i);
             return 0;
         }
     return -LUME_ENOENT;
@@ -284,6 +336,7 @@ int lume_hardware_get(uint32_t id, struct lume_hardware_info *info)
     if (!h)
         return -LUME_ENOENT;
     *info = h->info;
+    info->references = lume_ref_count(reference_gate(h));
     return 0;
 }
 
@@ -427,7 +480,12 @@ static int detach(struct lume_hardware *h)
     if (d->ops->release)
         d->ops->release(h, h->context);
     if (h->context)
-        services->free(h->context);
+    {
+        if (services->independent_memory)
+            lume_task_memory_prepare(release_context, h->context);
+        else
+            release_context(h->context);
+    }
     h->context = NULL;
     h->driver = NULL;
     h->info.driver[0] = 0;
@@ -443,7 +501,7 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
         return -LUME_ENOENT;
     if (!services)
         return -LUME_ENOSYS;
-    if (h->driver || h->busy || h->info.references)
+    if (h->driver || h->busy || lume_ref_count(reference_gate(h)))
         return -LUME_EBUSY;
     if (h->info.state == LUME_HARDWARE_DISABLED)
         return -LUME_EACCES;
@@ -453,6 +511,8 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
         return -LUME_ENOSYS;
     if (!lume_driver_matches(driver, id))
         return -LUME_ENOENT;
+    if (!quiesce(h))
+        return -LUME_EBUSY;
     h->busy = true;
     h->driver = driver;
     int result = driver->owner_get ? driver->owner_get(driver->owner) : 0;
@@ -460,6 +520,7 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
     {
         h->driver = NULL;
         h->busy = false;
+        publish_references(h);
         return result;
     }
     unsigned claim_count = 0;
@@ -480,13 +541,17 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
     claimed = true;
     if (driver->context_bytes)
     {
-        h->context = services->allocate(driver->context_bytes);
+        struct context_memory prepared = {.bytes = driver->context_bytes};
+        if (services->independent_memory)
+            lume_task_memory_prepare(prepare_context, &prepared);
+        else
+            prepare_context(&prepared);
+        h->context = prepared.memory;
         if (!h->context)
         {
             result = -LUME_ENOMEM;
             goto fail;
         }
-        memset(h->context, 0, driver->context_bytes);
     }
     memcpy(h->info.driver, driver->name, strlen(driver->name) + 1);
     result = driver->ops->probe ? driver->ops->probe(h, h->context) : 0;
@@ -503,11 +568,13 @@ int lume_hardware_bind(uint32_t id, const struct lume_driver *driver)
                                                      : LUME_HARDWARE_FAILED;
         }
         h->busy = false;
+        publish_references(h);
         return cleanup ? cleanup : result;
     }
     h->info.state = LUME_HARDWARE_READY;
     h->info.error = 0;
     h->busy = false;
+    publish_references(h);
     return 0;
 
 fail:
@@ -517,6 +584,7 @@ fail:
     if (driver->owner_put)
         driver->owner_put(driver->owner);
     h->busy = false;
+    publish_references(h);
     return result;
 }
 
@@ -525,12 +593,14 @@ int lume_hardware_unbind(uint32_t id)
     struct lume_hardware *h = find(id);
     if (!h)
         return -LUME_ENOENT;
-    if (h->busy || h->info.references)
+    if (h->busy || lume_ref_count(reference_gate(h)))
         return -LUME_EBUSY;
     if (h->absent && h->driver)
         return -LUME_EIO;
     if (!h->driver)
         return 0;
+    if (!quiesce(h))
+        return -LUME_EBUSY;
     h->busy = true;
     int result = detach(h);
     if (!result)
@@ -539,29 +609,32 @@ int lume_hardware_unbind(uint32_t id)
         h->info.error = 0;
     }
     h->busy = false;
+    publish_references(h);
     return result;
 }
 
 int lume_hardware_reference(uint32_t id)
 {
-    struct lume_hardware *h = find(id);
-    if (!h)
-        return -LUME_ENOENT;
-    if (h->busy || h->info.state != LUME_HARDWARE_READY || h->info.references == UINT32_MAX)
-        return -LUME_EBUSY;
-    ++h->info.references;
-    return 0;
+    if (id)
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            if (__atomic_load_n(published_ids + i, __ATOMIC_ACQUIRE) == id)
+            {
+                if (!lume_ref_get(references + i))
+                    return -LUME_EBUSY;
+                if (__atomic_load_n(published_ids + i, __ATOMIC_ACQUIRE) == id)
+                    return 0;
+                (void)lume_ref_put(references + i);
+            }
+    return -LUME_ENOENT;
 }
 
 int lume_hardware_unreference(uint32_t id)
 {
-    struct lume_hardware *h = find(id);
-    if (!h)
-        return -LUME_ENOENT;
-    if (!h->info.references)
-        return -LUME_EINVAL;
-    --h->info.references;
-    return 0;
+    if (id)
+        for (unsigned i = 0; i < LUME_HARDWARE_LIMIT; ++i)
+            if (__atomic_load_n(published_ids + i, __ATOMIC_ACQUIRE) == id)
+                return lume_ref_put(references + i) ? 0 : -LUME_EINVAL;
+    return -LUME_ENOENT;
 }
 
 int lume_hardware_read_register(uint32_t id, unsigned resource, uint64_t offset, unsigned width,
@@ -582,10 +655,12 @@ int lume_hardware_read_register(uint32_t id, unsigned resource, uint64_t offset,
     if (h->busy || h->info.state != LUME_HARDWARE_READY || !h->driver ||
         !h->driver->ops->read_register)
         return -LUME_EACCES;
+    lume_ref_block(reference_gate(h));
     h->busy = true;
     uint64_t read = 0;
     int result = h->driver->ops->read_register(h, h->context, resource, offset, width, &read);
     h->busy = false;
+    publish_references(h);
     if (!result)
         *value = read;
     return result;

@@ -16,7 +16,7 @@ struct kernel_io_lane
     bool child_snapshot_ready;
 };
 
-static struct kernel_io_lane kernel_lanes[LUME_WORK_DOMAINS];
+static struct kernel_io_lane *kernel_lanes;
 static struct io_queue kernel_control_queue;
 static unsigned kernel_lane_cursor;
 static uint64_t kernel_parallel_epoch;

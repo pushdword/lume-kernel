@@ -5,6 +5,7 @@ bool lume_net_start(void);
 int lume_net_detach(uint32_t);
 bool lume_stream_busy(void);
 bool lume_stream_needs_poll(void);
+void lume_stream_publish(void);
 int lume_stream_socket_error(unsigned, unsigned, unsigned *, bool *);
 void lume_net_poll(void);
 void lume_net_poll_background(void);

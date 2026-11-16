@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "lume/worker.h"
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
     defined(LUME_ARCH_I686)
 #include "lume/user_buffer.h"
@@ -20,8 +21,8 @@ struct lume_socket_buffer
 
 /* A null context denotes a kernel-owned payload. User payloads retain their tokens
  * until every endpoint callback and final metadata copy has returned. */
-static inline bool lume_socket_buffer_check(const struct lume_socket_buffer *buffer, size_t offset,
-                                            size_t bytes, bool output)
+static inline bool lume_socket_buffer_check_locked(const struct lume_socket_buffer *buffer,
+                                                   size_t offset, size_t bytes, bool output)
 {
 #if LUME_SOCKET_NATIVE_BUFFER
     if (!buffer)
@@ -42,10 +43,11 @@ static inline bool lume_socket_buffer_check(const struct lume_socket_buffer *buf
 #endif
 }
 
-static inline bool lume_socket_buffer_copy(struct lume_socket_buffer *buffer, uint64_t address,
-                                           size_t offset, void *data, size_t bytes, bool output)
+static inline bool lume_socket_buffer_copy_locked(const struct lume_socket_buffer *buffer,
+                                                  uint64_t address, size_t offset, void *data,
+                                                  size_t bytes, bool output)
 {
-    if (!lume_socket_buffer_check(buffer, offset, bytes, output))
+    if (!lume_socket_buffer_check_locked(buffer, offset, bytes, output))
         return false;
 #if LUME_SOCKET_NATIVE_BUFFER
     if (buffer && buffer->payload)
@@ -58,5 +60,65 @@ static inline bool lume_socket_buffer_copy(struct lume_socket_buffer *buffer, ui
     else
         memcpy(data, (const void *)(uintptr_t)(address + offset), bytes);
     return true;
+}
+
+#if LUME_SOCKET_NATIVE_BUFFER
+struct lume_socket_buffer_operation
+{
+    const struct lume_socket_buffer *buffer;
+    uint64_t address;
+    size_t offset, bytes;
+    void *data;
+    bool output, result;
+};
+
+static inline void lume_socket_buffer_check_service(void *context)
+{
+    struct lume_socket_buffer_operation *operation = context;
+    operation->result = lume_socket_buffer_check_locked(operation->buffer, operation->offset,
+                                                        operation->bytes, operation->output);
+}
+
+static inline void lume_socket_buffer_copy_service(void *context)
+{
+    struct lume_socket_buffer_operation *operation = context;
+    operation->result =
+        lume_socket_buffer_copy_locked(operation->buffer, operation->address, operation->offset,
+                                       operation->data, operation->bytes, operation->output);
+}
+#endif
+
+static inline bool lume_socket_buffer_check(const struct lume_socket_buffer *buffer, size_t offset,
+                                            size_t bytes, bool output)
+{
+#if LUME_SOCKET_NATIVE_BUFFER
+    if (buffer && lume_worker_independent())
+    {
+        struct lume_socket_buffer_operation operation = {
+            .buffer = buffer, .offset = offset, .bytes = bytes, .output = output};
+        lume_worker_scheduler(lume_socket_buffer_check_service, &operation);
+        return operation.result;
+    }
+#endif
+    return lume_socket_buffer_check_locked(buffer, offset, bytes, output);
+}
+
+static inline bool lume_socket_buffer_copy(struct lume_socket_buffer *buffer, uint64_t address,
+                                           size_t offset, void *data, size_t bytes, bool output)
+{
+#if LUME_SOCKET_NATIVE_BUFFER
+    if (buffer && lume_worker_independent())
+    {
+        struct lume_socket_buffer_operation operation = {.buffer = buffer,
+                                                         .address = address,
+                                                         .offset = offset,
+                                                         .bytes = bytes,
+                                                         .data = data,
+                                                         .output = output};
+        lume_worker_scheduler(lume_socket_buffer_copy_service, &operation);
+        return operation.result;
+    }
+#endif
+    return lume_socket_buffer_copy_locked(buffer, address, offset, data, bytes, output);
 }
 #endif

@@ -55,6 +55,12 @@ int lume_irq_domain_unregister(uint32_t id, void *context);
 bool lume_irq_domain_available(uint32_t id);
 int lume_irq_domain_request(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler,
                             void *context);
+/* Deferred delivery runs outside the scheduler lock while retaining the domain
+ * and handler. Shared state requires independent synchronization. Kernel metadata
+ * services must bridge into the scheduler. Direct dispatch remains serialized.
+ * Domain zero is not supported. Handlers must not suspend. */
+int lume_irq_domain_request_async(uint32_t id, unsigned irq, unsigned trigger, lume_irq_handler,
+                                  void *context);
 int lume_irq_domain_release(uint32_t id, unsigned irq, void *context);
 int lume_irq_domain_enable(uint32_t id, unsigned irq, bool);
 int lume_irq_domain_info(uint32_t id, unsigned irq, struct lume_irq_info *);

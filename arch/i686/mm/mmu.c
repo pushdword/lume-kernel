@@ -4,6 +4,7 @@
 #include "lume/vm.h"
 #include "lume/paging.h"
 #include <string.h>
+#include "lume/mmu_domain_begin.h"
 #define PRESENT 1u
 #define WRITE 2u
 #define USER 4u
@@ -199,14 +200,18 @@ void lume_mmu_release_user(unsigned task)
         }
     if (mapped)
         lume_arch_flush_user_tlb();
+    uint64_t frames[2 * USER_BLOCKS];
+    struct mmu_frame_batch batch = {.frames = frames};
     for (unsigned view = 0; view < 2; ++view)
         for (unsigned i = 0; i < USER_BLOCKS; ++i)
         {
-            if (task_pt[task][view][i] && !lume_page_free((uintptr_t)task_pt[task][view][i]))
-                lume_fail("user page table release");
+            if (task_pt[task][view][i])
+                frames[batch.count++] = (uintptr_t)task_pt[task][view][i];
             task_pt[task][view][i] = NULL;
         }
     memset(task_root[task], 0, sizeof(task_root[task]));
+    if (batch.count)
+        lume_task_memory_prepare(mmu_release_frames, &batch);
 }
 
 static uint32_t *entry(unsigned task, unsigned view, uint64_t va, bool create)
@@ -215,7 +220,7 @@ static uint32_t *entry(unsigned task, unsigned view, uint64_t va, bool create)
     unsigned block = (unsigned)((va - LUME_USER_BASE) / BLOCK);
     if (!task_pt[task][view][block] && create)
     {
-        uint64_t page = lume_page_alloc(0);
+        uint64_t page = mmu_prepare_frame();
         if (!page)
             return NULL;
         task_pt[task][view][block] = (void *)(uintptr_t)page;
@@ -422,3 +427,6 @@ bool lume_mmu_module_protect(uint64_t physical, size_t bytes, unsigned flags)
     (void)flags;
     return false;
 }
+
+#define MMU_DOMAIN_OWNER owner
+#include "lume/mmu_domain_end.h"

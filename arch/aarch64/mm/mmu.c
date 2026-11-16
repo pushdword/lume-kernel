@@ -60,11 +60,17 @@ bool lume_mmu_root_active(uint64_t base)
     return current == base;
 }
 
-void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned count)
+struct user_invalidation
 {
-    if (!asid || asid >= 255 || !(asid & 1) || count > LUME_MMU_UNMAP_PAGES ||
-        (count && !addresses))
-        lume_fail("user translation invalidation range");
+    unsigned asid, count;
+    const uint64_t *addresses;
+};
+
+static void invalidate_user(void *context)
+{
+    const struct user_invalidation *range = context;
+    unsigned asid = range->asid, count = range->count;
+    const uint64_t *addresses = range->addresses;
     __asm__ volatile("dsb ishst" ::: "memory");
     for (unsigned view = 0; view < 2; ++view)
     {
@@ -79,6 +85,15 @@ void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned
             }
     }
     __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
+void lume_mmu_invalidate_user(unsigned asid, const uint64_t *addresses, unsigned count)
+{
+    if (!asid || asid >= 255 || !(asid & 1) || count > LUME_MMU_UNMAP_PAGES ||
+        (count && !addresses))
+        lume_fail("user translation invalidation range");
+    struct user_invalidation range = {asid, count, addresses};
+    lume_task_tlb_sync(invalidate_user, &range);
 }
 
 void lume_mmu_switch(uint64_t base)

@@ -60,6 +60,9 @@ SCHED_FAST void sched_service(struct sched_policy *s, unsigned slot, uint32_t ti
     struct sched_task *t = s->task + slot;
     t->service += ticks;
     t->used = UINT32_MAX - t->used < ticks ? UINT32_MAX : t->used + ticks;
+#ifdef SCHED_TASK_CHANGED
+    SCHED_TASK_CHANGED(slot);
+#endif
 }
 
 SCHED_FAST void sched_exclude(struct sched_policy *s, unsigned core, uint32_t now, uint64_t delay)
@@ -125,6 +128,9 @@ static void sched_floor_runnable(struct sched_policy *s, const uint64_t *runnabl
 static void sched_new(struct sched_policy *s, unsigned slot, uint32_t pid)
 {
     s->task[slot] = (struct sched_task){.service = s->floor, .pid = pid, .last_core = SCHED_CPUS};
+#ifdef SCHED_TASK_CHANGED
+    SCHED_TASK_CHANGED(slot);
+#endif
 }
 
 static void sched_wake(struct sched_policy *s, unsigned slot, uint32_t unit, unsigned interactive)
@@ -140,6 +146,9 @@ static void sched_wake(struct sched_policy *s, unsigned slot, uint32_t unit, uns
         t->used = 0;
     }
     /* Only terminal input starts a burst. Burst handling retains the task's service debt. */
+#ifdef SCHED_TASK_CHANGED
+    SCHED_TASK_CHANGED(slot);
+#endif
 }
 
 static int sched_choose_ready(const struct sched_policy *s, unsigned core, const uint64_t *ready,

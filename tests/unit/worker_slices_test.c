@@ -745,6 +745,76 @@ static void copy_ownership(void)
     lume_smp_unlock();
 }
 
+static void nested_domain(void *context)
+{
+    T(context && !lock_owned && lume_worker_independent());
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    T(!lock_owned && lume_worker_independent());
+}
+
+static void scheduler_bridge(void *context)
+{
+    struct independent_case *test = context;
+    T(lock_owned && !lume_worker_independent());
+    test->stage = 3;
+    lume_worker_domain(nested_domain, context);
+    T(lock_owned && !lume_worker_independent());
+    test->stage = 4;
+}
+
+static void domain_body(void *context)
+{
+    struct independent_case *test = context;
+    T(!lock_owned && lume_worker_independent());
+    test->stage = 1;
+    T(lume_worker_wait_bits(&test->event, 1, ticks + 1000000));
+    T(!lock_owned && lume_worker_independent());
+    test->stage = 2;
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    T(!lock_owned && lume_worker_independent());
+    lume_worker_scheduler(scheduler_bridge, context);
+    T(!lock_owned && lume_worker_independent());
+    lume_worker_device(device_job, (void *)&event);
+    T(!lock_owned && lume_worker_independent());
+    test->stage = 5;
+}
+
+static void domain_job(void *context)
+{
+    T(lock_owned && !lume_worker_independent());
+    lume_worker_domain(domain_body, context);
+    T(lock_owned && !lume_worker_independent());
+}
+
+static void domain_suspension(void)
+{
+    struct independent_case cases[2] = {0};
+    test_cpu = 0;
+    contended = false;
+    lume_smp_lock();
+    lume_worker_start();
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        T(lume_worker_submit_on(i, domain_job, cases + i));
+        T(lume_worker_resume_on(i) && cases[i].stage == 1 && lock_owned);
+    }
+    T(!lume_worker_resume_on(0) && !lume_worker_resume_on(1));
+    cases[0].event = 1;
+    test_cpu = 1;
+    T(lume_worker_resume_on(0) && cases[0].stage == 2 && lock_owned);
+    T(lume_worker_resume_on(0) && cases[0].stage == 3 && lock_owned);
+    test_cpu = 2;
+    T(lume_worker_resume_on(0) && cases[0].stage == 5 && lock_owned);
+    T(cases[1].stage == 1);
+    cases[1].event = 1;
+    T(lume_worker_resume_on(1) && cases[1].stage == 2 && lock_owned);
+    T(lume_worker_resume_on(1) && cases[1].stage == 3 && lock_owned);
+    T(lume_worker_resume_on(1) && cases[1].stage == 5 && lock_owned);
+    T(!lume_worker_busy());
+    lume_smp_unlock();
+    test_cpu = 0;
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -781,6 +851,7 @@ int main(void)
     compute_fairness();
     independent_waits();
     copy_ownership();
+    domain_suspension();
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
         release_fiber(&workers[i].fiber);
 #ifdef _WIN32

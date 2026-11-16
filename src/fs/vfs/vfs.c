@@ -19,6 +19,7 @@
 #include "lume/worker.h"
 #include <string.h>
 #include "file_locks.h"
+#include "fd_publication.h"
 
 #define NODES 192u
 #define CAPACITY 4096u
@@ -217,9 +218,11 @@ static void bind_descriptor(struct lume_files *files, unsigned fd, int object, u
     if (!++descriptor_sequence)
         ++descriptor_sequence;
     lume_poll_source_reset(&files->fd[fd].changed);
+    struct fd_guard guard = fd_enter(files);
     files->fd[fd].object = object;
     files->fd[fd].flags = flags;
     files->fd[fd].generation = descriptor_sequence;
+    fd_leave(guard);
 }
 
 /* Duplicated and inherited descriptors share one offset and access mode. Pipe endpoints
@@ -350,7 +353,8 @@ static void node_changed(struct node *node)
 
 int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
 {
-    if (!identity || object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
+    if (!identity || object < 0 || object >= (int)OPEN_FILES ||
+        !open_file_count(open_file_at(object)))
         return -LUME_EBADF;
     const struct open_file *file = open_file_at(object);
     if ((file->flags & 3) == LUME_O_WRONLY)
@@ -365,12 +369,9 @@ int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
 
 int lume_vfs_object_retain(int object)
 {
-    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_count(open_file_at(object)))
         return -LUME_EBADF;
-    if (open_file_at(object)->references == UINT32_MAX)
-        return -LUME_EOVERFLOW;
-    ++open_file_at(object)->references;
-    return 0;
+    return open_file_acquire(open_file_at(object)) ? 0 : -LUME_EOVERFLOW;
 }
 
 int lume_vfs_exec_pin(int object)
@@ -381,7 +382,7 @@ int lume_vfs_exec_pin(int object)
         return result;
     unsigned index = (unsigned)open_file_at(object)->node;
     for (unsigned i = 0; i < OPEN_FILES; ++i)
-        if (open_file_at(i)->references && !open_file_at(i)->external &&
+        if (open_file_count(open_file_at(i)) && !open_file_at(i)->external &&
             open_file_at(i)->pipe < 0 && open_file_at(i)->node == (int)index &&
             (open_file_at(i)->flags & 3))
             return -LUME_ETXTBSY;
@@ -393,7 +394,7 @@ int lume_vfs_exec_pin(int object)
 
 void lume_vfs_exec_unpin(int object)
 {
-    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references ||
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_count(open_file_at(object)) ||
         open_file_at(object)->node < 0 || !nodes[open_file_at(object)->node].executables)
         lume_fail("executable reference release");
     --nodes[open_file_at(object)->node].executables;
@@ -1130,7 +1131,7 @@ void lume_vfs_init(const void *shell, size_t bytes)
         storage->program_cache_owner(NULL);
     if (storage_handles())
         for (unsigned i = 0; i < OPEN_FILES; ++i)
-            if ((open_file_at(i)->references || open_file_at(i)->deferred_close) &&
+            if ((open_file_count(open_file_at(i)) || open_file_at(i)->deferred_close) &&
                 open_file_at(i)->storage_handle)
                 (void)storage->close(open_file_at(i)->storage_handle);
     for (unsigned task = 0; task < LUME_POLL_TASK_LIMIT; ++task)
@@ -1398,15 +1399,15 @@ bool lume_files_clone(struct lume_files *out, const struct lume_files *in)
         out->fd[i].changed = (struct lume_poll_source){0};
         lume_poll_source_reset(&out->fd[i].changed);
         if (out->fd[i].object >= 0)
-            ++open_file_at(out->fd[i].object)->references;
+            open_file_retain(open_file_at(out->fd[i].object));
     }
     if (authorities)
     {
         for (unsigned i = 0; i < LUME_SANDBOX_DIRECTORY_LIMIT; ++i)
             if (authorities->entry[i].active)
-                ++open_file_at(authorities->entry[i].object)->references;
+                open_file_retain(open_file_at(authorities->entry[i].object));
         if (authorities->generation == namespace_generation && authorities->x11_active)
-            ++open_file_at(authorities->x11_object)->references;
+            open_file_retain(open_file_at(authorities->x11_object));
     }
     return true;
 }
@@ -1519,7 +1520,7 @@ static struct open_file *descriptor(struct lume_files *f, uint64_t fd)
 bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
 {
     struct open_file *file = descriptor(files, fd);
-    return file && file->references && !file->external && file->pipe < 0 &&
+    return file && open_file_count(file) && !file->external && file->pipe < 0 &&
            nodes[file->node].kind == LUME_NODE_CHAR && !nodes[file->node].block &&
            !nodes[file->node].group && nodes[file->node].device <= 2;
 }
@@ -1527,14 +1528,14 @@ bool lume_vfs_console_io(struct lume_files *files, uint64_t fd)
 bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
 {
     struct open_file *file = descriptor(files, fd);
-    return file && file->references && !file->external && file->pipe >= 0;
+    return file && open_file_count(file) && !file->external && file->pipe >= 0;
 }
 
 /* Admission and the following resident copy require the scheduler lock. */
 int64_t lume_vfs_pipe_accept(struct lume_files *files, uint64_t fd, uint64_t bytes, bool writing)
 {
     struct open_file *file = descriptor(files, fd);
-    if (!file || !file->references || file->external || file->pipe < 0 ||
+    if (!file || !open_file_count(file) || file->external || file->pipe < 0 ||
         (writing ? !(file->flags & 3) : (file->flags & 3) == LUME_O_WRONLY))
         return -LUME_EBADF;
     struct channel *channel = &channels[file->pipe];
@@ -1607,14 +1608,23 @@ void lume_vfs_pipe_grow(struct lume_files *files, uint64_t fd, uint64_t bytes)
 bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
 {
     struct open_file *file = descriptor(files, fd);
-    return file && file->references &&
+    return file && open_file_count(file) &&
            (file->external ? file->external->memory_io : file->pipe >= 0);
+}
+
+unsigned lume_vfs_memory_lane(struct lume_files *files, uint64_t fd)
+{
+    struct open_file *file = descriptor(files, fd);
+    if (!file || !open_file_count(file))
+        return 0;
+    uintptr_t identity = file->pipe >= 0 ? (uintptr_t)file->pipe : (uintptr_t)file->context >> 4;
+    return (unsigned)(identity ^ (identity >> 12)) & 3u;
 }
 
 bool lume_vfs_storage_io(struct lume_files *files, uint64_t fd)
 {
     struct open_file *file = descriptor(files, fd);
-    return file && file->references && !file->external && file->pipe < 0 &&
+    return file && open_file_count(file) && !file->external && file->pipe < 0 &&
            nodes[file->node].kind == LUME_NODE_FILE && nodes[file->node].persistent &&
            !nodes[file->node].block;
 }
@@ -1673,11 +1683,33 @@ const struct lume_vm_dma_pin *lume_vfs_memory(struct lume_files *files, unsigned
 
 int lume_vfs_hold(struct lume_files *files, unsigned fd)
 {
+    struct fd_guard guard = fd_enter(files);
     struct open_file *object = descriptor(files, fd);
-    if (!object)
+    int result = -LUME_EBADF;
+    if (object)
+        result = open_file_acquire(object) ? files->fd[fd].object : -LUME_EOVERFLOW;
+    fd_leave(guard);
+    return result;
+}
+
+int lume_vfs_borrow(struct lume_files *files, unsigned fd, const struct lume_file_ops *ops,
+                    void **context)
+{
+    struct fd_guard guard = fd_enter(files);
+    struct open_file *file = descriptor(files, fd);
+    int result = -LUME_EBADF;
+    if (file && context && lume_ref_get(&file->borrowers))
+    {
+        result = files->fd[fd].object;
+        *context = file->context;
+    }
+    fd_leave(guard);
+    if (result >= 0 && file->external != ops)
+    {
+        lume_vfs_drop_independent(result);
         return -LUME_EBADF;
-    ++object->references;
-    return files->fd[fd].object;
+    }
+    return result;
 }
 
 int lume_vfs_install(struct lume_files *files, int object)
@@ -1686,7 +1718,7 @@ int lume_vfs_install(struct lume_files *files, int object)
     if (!files->fd)
         return -LUME_ENOMEM;
 #endif
-    if (object < 0 || object >= (int)OPEN_FILES || !open_file_at(object)->references)
+    if (object < 0 || object >= (int)OPEN_FILES || !open_file_count(open_file_at(object)))
         return -LUME_EBADF;
     for (unsigned i = 0; i < files->identity.limit[LUME_LIMIT_FILES].soft; ++i)
         if (files->fd[i].object < 0)
@@ -2051,16 +2083,8 @@ static int finish_object(struct open_file *d)
     return result;
 }
 
-static int release_object(struct open_file *d, bool deferred)
+static int retire_description(struct open_file *d, bool deferred)
 {
-    if (!d->references)
-        return -LUME_EBADF;
-    if (--d->references)
-        return 0;
-    --open_file_live;
-    /* A suspended close callback retains its object until device cleanup returns. */
-    d->closing = true;
-    file_locks_drop((int)d->index);
     if (deferred && storage_reap_enabled && !d->external && d->pipe < 0 && d->storage_handle)
     {
         /* The description retains its node and handle until STORAGE finishes closing it. */
@@ -2075,6 +2099,23 @@ static int release_object(struct open_file *d, bool deferred)
         return 0;
     }
     return finish_object(d);
+}
+
+static int release_object(struct open_file *d, bool deferred)
+{
+    unsigned previous = open_file_release(d);
+    if (!previous)
+        return -LUME_EBADF;
+    if (previous > 1)
+        return 0;
+    --open_file_live;
+    /* Descriptor references and independent borrows retire separately. The last
+     * borrow keeps callbacks and provider state alive until scheduler entry. */
+    d->closing = true;
+    file_locks_drop((int)d->index);
+    if (lume_ref_block_count(&d->borrowers))
+        return 0;
+    return retire_description(d, deferred);
 }
 
 void lume_vfs_reap_start(void)
@@ -2113,6 +2154,32 @@ void lume_vfs_drop(int object)
 {
     if (object >= 0 && object < (int)OPEN_FILES)
         (void)release_object(open_file_at(object), true);
+}
+
+static void drop_description(void *context)
+{
+    struct open_file *file = context;
+    if (open_file_count(file) || lume_ref_count(&file->borrowers) || !file->closing)
+        lume_fail("open description borrow retirement");
+    (void)retire_description(file, true);
+}
+
+void lume_vfs_drop_independent(int object)
+{
+    if (object < 0)
+        return;
+    struct open_file *file = open_file_at((unsigned)object);
+    uint32_t state = __atomic_load_n(&file->borrowers.state, __ATOMIC_ACQUIRE);
+    for (;;)
+    {
+        if (!(state & ~LUME_REF_CLOSED))
+            lume_fail("open description borrow release");
+        if (__atomic_compare_exchange_n(&file->borrowers.state, &state, state - 1, true,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+    }
+    if (state == (LUME_REF_CLOSED | 1u))
+        lume_worker_scheduler(drop_description, file);
 }
 
 int64_t lume_vfs_close(struct lume_files *f, uint64_t fd)
@@ -2244,7 +2311,7 @@ static int64_t read_description(struct lume_files *f, struct open_file *d, void 
         unsigned first = c->capacity - c->head;
         if (first > bytes)
             first = (unsigned)bytes;
-        ++d->references;
+        open_file_retain(d);
         c->copying = true;
         lume_worker_copy(data, c->data + c->head, first);
         lume_worker_copy((unsigned char *)data + first, c->data, (size_t)bytes - first);
@@ -2381,7 +2448,7 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
         unsigned first = c->capacity - end;
         if (first > bytes)
             first = (unsigned)bytes;
-        ++d->references;
+        open_file_retain(d);
         c->copying = true;
         lume_worker_copy(c->data + end, data, first);
         lume_worker_copy(c->data, (const unsigned char *)data + first, (size_t)bytes - first);
@@ -2490,7 +2557,7 @@ static int positioned_description(struct lume_files *files, uint64_t fd, uint64_
         return -LUME_ESPIPE;
     if (description->external)
     {
-        *positioned = *description;
+        open_file_snapshot(positioned, description);
         positioned->offset = (uint64_t)offset;
         return 0;
     }
@@ -2500,7 +2567,7 @@ static int positioned_description(struct lume_files *files, uint64_t fd, uint64_
     if (node->kind != LUME_NODE_FILE && !node->block)
         return -LUME_ESPIPE;
     /* A transfer owns its cursor while duplicated descriptors keep their shared offset. */
-    *positioned = *description;
+    open_file_snapshot(positioned, description);
     positioned->offset = (uint64_t)offset;
     positioned->flags &= ~LUME_O_APPEND;
     return 0;
@@ -3362,7 +3429,7 @@ int64_t lume_vfs_dup2(struct lume_files *f, uint64_t from, uint64_t to)
     /* Replacement ignores close errors and retires persistent handles to storage. */
     (void)close_deferred(f, to);
     bind_descriptor(f, (unsigned)to, f->fd[from].object, 0);
-    ++d->references;
+    open_file_retain(d);
     return (int64_t)to;
 }
 
@@ -4122,7 +4189,7 @@ int lume_vfs_program_hold(struct lume_files *files, const char *input, size_t *b
 /* The caller owns a held open-file reference for the complete positioned read. */
 int64_t lume_vfs_pread_object(int object, uint64_t offset, void *data, uint64_t bytes)
 {
-    if (object < 0 || object >= OPEN_FILES || !open_file_at(object)->references)
+    if (object < 0 || object >= OPEN_FILES || !open_file_count(open_file_at(object)))
         return -LUME_EBADF;
     struct open_file *file = open_file_at(object);
     if ((file->flags & 3) == LUME_O_WRONLY)

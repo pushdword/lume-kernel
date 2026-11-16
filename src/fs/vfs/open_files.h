@@ -1,11 +1,14 @@
 #ifndef LUME_VFS_OPEN_FILES_H
 #define LUME_VFS_OPEN_FILES_H
+#include "lume/ref_gate.h"
 
 struct open_file
 {
     unsigned index, next_free, next_reap;
     int node, pipe;
-    unsigned references, status;
+    unsigned references;
+    struct lume_ref_gate borrowers;
+    unsigned status;
     uint32_t flags;
     unsigned directory_authority_generation;
     bool closing, deferred_close;
@@ -18,6 +21,52 @@ struct open_file
     bool attribute_cached;
     char attribute_data[LUME_DEVFS_ATTRIBUTE_BYTES];
 };
+
+static unsigned open_file_count(const struct open_file *file)
+{
+    return __atomic_load_n(&file->references, __ATOMIC_ACQUIRE);
+}
+
+static bool open_file_acquire(struct open_file *file)
+{
+    unsigned count = open_file_count(file);
+    do
+    {
+        if (!count || count == UINT32_MAX)
+            return false;
+    } while (!__atomic_compare_exchange_n(&file->references, &count, count + 1, true,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
+    return true;
+}
+
+static void open_file_retain(struct open_file *file)
+{
+    if (!open_file_acquire(file))
+        lume_fail("open description reference exhausted");
+}
+
+static unsigned open_file_release(struct open_file *file)
+{
+    unsigned count = open_file_count(file);
+    do
+    {
+        if (!count)
+            return 0;
+    } while (!__atomic_compare_exchange_n(&file->references, &count, count - 1, true,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+    return count;
+}
+
+static void open_file_snapshot(struct open_file *destination, const struct open_file *source)
+{
+    size_t first = offsetof(struct open_file, references);
+    size_t tail = offsetof(struct open_file, status);
+    memcpy(destination, source, first);
+    memcpy((unsigned char *)destination + tail, (const unsigned char *)source + tail,
+           sizeof(*destination) - tail);
+    destination->references = open_file_count(source);
+    destination->borrowers = (struct lume_ref_gate)LUME_REF_GATE_INITIALIZER;
+}
 
 #if LUME_FILES_DYNAMIC
 #define OPEN_FILE_LIMIT 65536u
@@ -51,7 +100,7 @@ static void open_file_recycle(struct open_file *file)
 {
     unsigned index = file->index;
     --open_file_used;
-    if (file->references)
+    if (open_file_count(file))
         --open_file_live;
     *file = (struct open_file){.index = index, .next_free = open_file_free};
     open_file_free = index + 1;

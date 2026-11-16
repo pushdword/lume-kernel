@@ -11,6 +11,13 @@ static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
 static bool async_probe;
 
+#ifndef MODULE_WORK_PARALLEL
+void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    run(context);
+}
+#endif
+
 void lume_worker_checkpoint(unsigned bytes)
 {
     assert(!bytes);
@@ -31,7 +38,7 @@ int lume_module_pin(uintptr_t callback, void **owner)
         return 0;
     }
     *owner = &references;
-    references++;
+    __atomic_fetch_add(&references, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -43,8 +50,9 @@ void lume_module_unpin(void *owner)
         --foreign_references;
         return;
     }
-    assert(owner == &references && references);
-    references--;
+    assert(owner == &references);
+    unsigned previous = __atomic_fetch_sub(&references, 1, __ATOMIC_RELAXED);
+    assert(previous);
 }
 
 uint64_t lume_irq_save(void)
@@ -107,6 +115,13 @@ static void domain_handler(unsigned irq, void *context)
     assert(references == 2);
 }
 
+static void async_domain_handler(unsigned irq, void *context)
+{
+    assert(irq == 1 && context == &references && references == 2);
+    assert(lume_irq_domain_release(27, irq, context) == -LUME_EBUSY);
+    assert(!lume_module_work_submit(&work) && references == 3);
+}
+
 static void domain_services(void)
 {
     const struct lume_irq_domain_ops domain_ops = {domain_configure, domain_enable,
@@ -157,11 +172,14 @@ static void domain_services(void)
 
     assert(!lume_module_irq_domain_register_async(27, 32, &domain_ops, &work));
     assert(references == 1);
-    assert(!lume_module_irq_domain_request(27, 1, LUME_IRQ_EDGE, domain_handler, &references));
+    work.domain = LUME_WORK_DISPLAY;
+    assert(!lume_module_irq_domain_request_async(27, 1, LUME_IRQ_EDGE, async_domain_handler,
+                                                 &references));
     assert(references == 2 && !lume_irq_domain_enable(27, 1, true));
     assert(lume_irq_domain_defer(27, 1) && references == 2);
     lume_irq_domain_poll();
-    assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1 && references == 2);
+    assert(lume_work_drain_on(LUME_WORK_INTERRUPT, 1) == 1 && references == 3);
+    assert(lume_work_drain_on(LUME_WORK_DISPLAY, 1) == 1 && references == 2);
     assert(lume_irq_domain_defer(27, 1));
     lume_irq_domain_poll();
     assert(!lume_module_irq_domain_release(27, 1, &references) && references == 1);

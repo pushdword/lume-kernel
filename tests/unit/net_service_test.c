@@ -10,10 +10,29 @@
 static uint64_t milliseconds;
 static unsigned available, received_frames, checkpoints;
 static bool active_stream, active_datagram, nested_notification;
+static unsigned dns_notifications;
+static bool independent_network;
+
+void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    bool previous = independent_network;
+    independent_network = false;
+    run(context);
+    independent_network = previous;
+}
+
+void lume_worker_domain(void (*run)(void *), void *context)
+{
+    bool previous = independent_network;
+    independent_network = true;
+    run(context);
+    independent_network = previous;
+}
 
 void lume_tasks_dns_notify(unsigned owner)
 {
-    (void)owner;
+    assert(owner);
+    ++dns_notifications;
 }
 
 uint64_t lume_clock_monotonic(void)
@@ -64,6 +83,7 @@ bool lume_socket_reap_pending(void)
 
 void lume_socket_reap(void)
 {
+    assert(!independent_network);
 }
 
 void lume_datagram_reap(void)
@@ -77,6 +97,11 @@ bool lume_stream_needs_poll(void)
 
 void lume_stream_reap(void)
 {
+}
+
+void lume_stream_publish(void)
+{
+    assert(independent_network);
 }
 
 bool lume_icmp_reap_pending(void)
@@ -95,6 +120,7 @@ bool lume_icmp_busy(void)
 
 bool lume_entropy(void *data, size_t bytes)
 {
+    assert(!independent_network);
     memset(data, 1, bytes);
     return true;
 }
@@ -112,7 +138,7 @@ void lume_value(const char *name, uint64_t value)
 
 unsigned lume_activity_enter(unsigned kind)
 {
-    (void)kind;
+    assert(independent_network == (kind == LUME_ACTIVITY_NETWORK));
     return UINT32_MAX;
 }
 
@@ -127,15 +153,22 @@ _Noreturn void lume_fail(const char *message)
     exit(2);
 }
 
+static void background_poll(void *context)
+{
+    (void)context;
+    lume_net_poll_background();
+}
+
 void lume_worker_checkpoint(unsigned bytes)
 {
+    assert(independent_network);
     assert(bytes == 60 || !bytes);
     checkpoints += bytes != 0;
     if (nested_notification)
     {
         nested_notification = false;
         unsigned before = received_frames;
-        lume_net_poll_background();
+        lume_worker_scheduler(background_poll, NULL);
         lume_net_poll();
         assert(received_frames == before);
     }
@@ -143,17 +176,20 @@ void lume_worker_checkpoint(unsigned bytes)
 
 static void poll(void *context)
 {
+    assert(!independent_network);
     (void)context;
 }
 
 static bool link(void *context)
 {
+    assert(!independent_network);
     (void)context;
     return true;
 }
 
 static bool admin(void *context, bool up)
 {
+    assert(!independent_network);
     (void)context;
     (void)up;
     return true;
@@ -161,6 +197,7 @@ static bool admin(void *context, bool up)
 
 static bool transmit(void *context, const void *data, size_t bytes)
 {
+    assert(!independent_network);
     (void)context;
     (void)data;
     (void)bytes;
@@ -169,6 +206,7 @@ static bool transmit(void *context, const void *data, size_t bytes)
 
 static int receive(void *context, void *data, size_t capacity)
 {
+    assert(!independent_network);
     (void)context;
     assert(capacity >= 60);
     if (!available)

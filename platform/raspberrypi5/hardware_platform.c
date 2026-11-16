@@ -75,7 +75,8 @@ int lume_platform_hardware_start(const void *tree, size_t bytes)
     static const struct lume_hardware_services services = {.allocate = lume_kernel_allocate,
                                                            .free = lume_kernel_free,
                                                            .validate_resource = validate_resource,
-                                                           .dma_domain = dma_domain};
+                                                           .dma_domain = dma_domain,
+                                                           .independent_memory = true};
     static const struct lume_fdt_inventory_ops ops = {.interrupt = lume_pi5_fdt_interrupt};
     int result = lume_hardware_services(&services);
     if (result)

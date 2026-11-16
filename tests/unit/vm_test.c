@@ -30,6 +30,10 @@ static struct
 } mappings[4096];
 
 static uint64_t frames[4096];
+static unsigned frame_pins[4096];
+static bool frame_retired[4096];
+static unsigned preparations;
+static void (*preparation_pause)(void);
 static unsigned frame_span[4096], span_calls, file_holds;
 static bool span_unavailable;
 
@@ -234,6 +238,12 @@ bool lume_page_free(uint64_t physical)
     for (unsigned i = 0; i < 4096; ++i)
         if (frames[i] == physical)
         {
+            if (frame_pins[i])
+            {
+                CHECK(!frame_retired[i]);
+                frame_retired[i] = true;
+                return true;
+            }
             void *allocation = (void *)(uintptr_t)physical;
             if (frame_span[i])
             {
@@ -254,6 +264,52 @@ bool lume_page_free(uint64_t physical)
             return true;
         }
     return false;
+}
+
+bool lume_page_pin(uint64_t physical)
+{
+    for (unsigned i = 0; i < 4096; ++i)
+        if (frames[i] == physical && !frame_retired[i])
+        {
+            ++frame_pins[i];
+            return true;
+        }
+    return false;
+}
+
+void lume_page_unpin(uint64_t physical)
+{
+    for (unsigned i = 0; i < 4096; ++i)
+        if (frames[i] == physical)
+        {
+            CHECK(frame_pins[i]);
+            if (!--frame_pins[i] && frame_retired[i])
+            {
+                frame_retired[i] = false;
+                CHECK(lume_page_free(physical));
+            }
+            return;
+        }
+    CHECK(false);
+}
+
+bool lume_mmu_owned(unsigned task, void (*run)(void *), void *context)
+{
+    (void)task;
+    run(context);
+    return true;
+}
+
+void lume_task_memory_prepare(void (*run)(void *), void *context)
+{
+    ++preparations;
+    if (preparation_pause)
+    {
+        void (*hook)(void) = preparation_pause;
+        preparation_pause = NULL;
+        hook();
+    }
+    run(context);
 }
 
 void lume_fail(const char *message)
@@ -1020,6 +1076,19 @@ static void private_write_during_allocation(void)
 
 static void fault_suspend_cases(void)
 {
+    pause_fd = memory_file();
+    CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, pause_fd));
+    unsigned char marker = 0x93;
+    CHECK(descriptors[pause_fd].ops->write(descriptors[pause_fd].context, &marker, 1) == 1);
+    pause_base = call(0, LUME_VM_MAP, 0, PAGE, 3, LUME_MAP_PRIVATE, pause_fd);
+    pause_bytes = 0;
+    unsigned prepared_before = preparations;
+    preparation_pause = resize_during_allocation;
+    CHECK(lume_vm_fault(0, pause_base, true, false) == -1);
+    CHECK(!preparation_pause && preparations == prepared_before + 1);
+    CHECK(!physical_live && !mappings_live && !pause_result);
+    clean();
+
     const uint64_t sizes[] = {0, 4096, 4097, 16384};
     const uint64_t offsets[] = {0, 4096, 4096, 0};
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i)

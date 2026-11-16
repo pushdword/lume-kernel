@@ -18,6 +18,7 @@ int lume_module_irq_domain_register_async(uint32_t, unsigned, const struct lume_
                                           void *);
 int lume_module_irq_domain_unregister(uint32_t, void *);
 int lume_module_irq_domain_request(uint32_t, unsigned, unsigned, lume_irq_handler, void *);
+int lume_module_irq_domain_request_async(uint32_t, unsigned, unsigned, lume_irq_handler, void *);
 int lume_module_irq_domain_release(uint32_t, unsigned, void *);
 int lume_module_work_submit(struct lume_work *);
 bool lume_module_work_cancel(struct lume_work *);

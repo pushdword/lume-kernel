@@ -7,6 +7,10 @@
 uint64_t lume_page_alloc(unsigned);
 uint64_t lume_pages_alloc_span(unsigned);
 bool lume_page_free(uint64_t);
+bool lume_page_pin(uint64_t);
+void lume_page_unpin(uint64_t);
+void lume_task_memory_prepare(void (*)(void *), void *);
+bool lume_mmu_owned(unsigned, void (*)(void *), void *);
 void lume_fail(const char *);
 bool lume_user_buffer(uint64_t, uint64_t, bool);
 void lume_sync_code(uint64_t, size_t);

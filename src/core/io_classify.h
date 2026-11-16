@@ -89,6 +89,8 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_CLOSE:
         if (action < LUME_FD_MAX && lume_socket_network_io(files, (unsigned)action))
             return LUME_WORK_NETWORK;
+        if (number != LUME_SYS_CLOSE && lume_vfs_memory_io(files, action))
+            return LUME_WORK_LOCAL_FIRST + lume_vfs_memory_lane(files, action);
         if (number == LUME_SYS_CLOSE && !lume_vfs_storage_io(files, action))
             return lume_vfs_pipe_io(files, action) ? LUME_WORK_CONTROL : LUME_WORK_GENERAL;
         return LUME_WORK_STORAGE;

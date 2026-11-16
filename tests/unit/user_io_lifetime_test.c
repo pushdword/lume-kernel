@@ -200,6 +200,27 @@ _Noreturn void lume_fail(const char *why)
 #undef ENOTSUP
 #include "../../src/mm/vm.c"
 
+bool lume_mmu_owned(unsigned task, void (*run)(void *), void *context)
+{
+    CHECK(task < LUME_TASK_LIMIT && locked);
+    run(context);
+    return true;
+}
+
+void lume_task_memory_prepare(void (*run)(void *), void *context)
+{
+    if (lume_worker_current() < LUME_WORKER_LIMIT)
+        lume_worker_domain(run, context);
+    else if (lume_smp_owned())
+    {
+        lume_smp_unlock();
+        run(context);
+        lume_smp_lock();
+    }
+    else
+        run(context);
+}
+
 static struct
 {
     void *pointer;

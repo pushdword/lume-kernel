@@ -133,6 +133,8 @@ err_t udp_connect(struct udp_pcb *pcb, const ip_addr_t *address, u16_t port)
 
 struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t bytes, pbuf_type type)
 {
+    if (lume_worker_current() < LUME_WORKER_LIMIT)
+        CHECK(lume_worker_independent());
     CHECK(layer == PBUF_TRANSPORT && type == PBUF_RAM);
     CHECK(!packet_live && bytes <= sizeof(network_data));
     ++packet_allocations;
@@ -173,10 +175,12 @@ u8_t pbuf_free(struct pbuf *packet)
 
 err_t udp_sendto(struct udp_pcb *pcb, struct pbuf *packet, const ip_addr_t *address, u16_t port)
 {
+    CHECK(lume_worker_independent());
     CHECK(pcb == &network_udp && packet == network_packets && packet_live);
     CHECK(address && port == 9002);
     ++network_sends;
     transport_wait(PAUSE_UDP);
+    CHECK(lume_worker_independent());
     CHECK(packet_live);
     for (unsigned i = 0; i < packet->tot_len; ++i)
         CHECK(network_data[i] == 0xa7);
@@ -491,6 +495,8 @@ static void tcp_cases(void)
     begin_network(PAUSE_TCP);
     CHECK(lume_vfs_close(&files[0], network_fd) == 0);
     CHECK(lume_socket_reap_pending());
+    lume_socket_reap();
+    CHECK(lume_socket_reap_pending());
     lume_user_buffer_invalidate_root(0);
     end_network();
     CHECK(network_result == 4096 && network_sends == before + 1);
@@ -549,8 +555,11 @@ static void udp_cases(void)
     begin_network(PAUSE_NONE);
     CHECK(network_result == -LUME_EAGAIN);
     shared_cleanup();
+    queue_datagram(60);
     CHECK(lume_vfs_close(&files[0], network_fd) == 0);
+    CHECK(lume_datagram_busy() && lume_datagram_reap_pending());
     lume_datagram_reap();
+    CHECK(!lume_datagram_busy() && !lume_datagram_reap_pending());
 }
 
 #ifndef LUME_SOCKET_NETWORK_LIFETIME_INCLUDE

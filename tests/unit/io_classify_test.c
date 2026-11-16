@@ -44,6 +44,18 @@ bool lume_vfs_pipe_io(struct lume_files *files, uint64_t fd)
     return fd == 5;
 }
 
+bool lume_vfs_memory_io(struct lume_files *files, uint64_t fd)
+{
+    assert(files == &tasks[0].files);
+    return fd == 5 || (fd >= 8 && fd <= 11);
+}
+
+unsigned lume_vfs_memory_lane(struct lume_files *files, uint64_t fd)
+{
+    assert(lume_vfs_memory_io(files, fd));
+    return (unsigned)fd & 3u;
+}
+
 #include "io_classify.h"
 
 static void check(unsigned number, uint64_t action, unsigned domain, bool mutation)
@@ -71,6 +83,9 @@ int main(void)
     closing.x[0] = 3;
     assert(!kernel_metadata_call(1, &closing));
     check(LUME_SYS_READ, 3, LUME_WORK_STORAGE, false);
+    check(LUME_SYS_READ, 5, LUME_WORK_LOCAL_FIRST + 1, false);
+    for (unsigned fd = 8; fd <= 11; ++fd)
+        check(LUME_SYS_WRITE, fd, LUME_WORK_LOCAL_FIRST + fd % 4, false);
     check(LUME_SYS_FILE_IO, 0, LUME_WORK_STORAGE, false);
     check(LUME_SYS_WRITE, 7, LUME_WORK_NETWORK, false);
     check(LUME_SYS_CLOSE, 7, LUME_WORK_NETWORK, true);

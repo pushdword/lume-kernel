@@ -6,6 +6,7 @@
 #include "lume/counter.h"
 #include "lume/worker.h"
 #include "lume/net_limits.h"
+#include "lume/owner_retirement.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include <string.h>
@@ -40,6 +41,102 @@ struct stream
 static struct stream streams[LUME_NET_STREAM_LIMIT];
 static unsigned sequence;
 static unsigned receive_pages;
+static unsigned protocol_active;
+static bool retirement_pending;
+static struct lume_owner_retirements retired_owners;
+
+static bool owner_retired(unsigned owner)
+{
+    return lume_owner_retired(&retired_owners, owner);
+}
+
+static bool stream_closing(const struct stream *stream)
+{
+    return stream->closing || owner_retired(stream->owner);
+}
+
+struct stream_view
+{
+    unsigned owner, handle, flags;
+    bool busy, needs_poll;
+};
+
+static struct stream_view stream_views[LUME_NET_STREAM_LIMIT];
+static uint32_t busy_views[(LUME_NET_STREAM_LIMIT + 31u) / 32u];
+static uint32_t polling_views[(LUME_NET_STREAM_LIMIT + 31u) / 32u];
+
+static unsigned stream_flags(const struct stream *stream)
+{
+    if (!stream->owner || stream_closing(stream))
+        return 0;
+    unsigned flags = 0;
+    if (stream->count || stream->packets || stream->eof || stream->pending)
+        flags |= LUME_STREAM_READABLE;
+    if (stream->connected && !stream->failed && !stream->write_closed &&
+        (stream->udp || (stream->pcb && tcp_sndbuf(stream->pcb))))
+        flags |= LUME_STREAM_WRITABLE;
+    if (stream->failed)
+        flags |= LUME_STREAM_ERROR;
+    if (stream->eof)
+        flags |= LUME_STREAM_HANGUP;
+    return flags;
+}
+
+struct stream_publication
+{
+    struct stream_view view;
+    unsigned slot, notify_owner, notify_handle;
+};
+
+static void publish_view(void *context)
+{
+    struct stream_publication *publication = context;
+    unsigned slot = publication->slot, word = slot / 32u;
+    uint32_t bit = UINT32_C(1) << (slot % 32u);
+    stream_views[slot] = publication->view;
+    busy_views[word] = (busy_views[word] & ~bit) | (publication->view.busy ? bit : 0);
+    polling_views[word] = (polling_views[word] & ~bit) | (publication->view.needs_poll ? bit : 0);
+    if (publication->notify_owner)
+    {
+        lume_socket_stream_notify(publication->notify_owner, publication->notify_handle);
+        lume_tasks_stream_notify(publication->notify_owner, publication->notify_handle);
+    }
+}
+
+/* The NETWORK owner publishes protocol snapshots before notifying scheduler
+ * readers. Polling never dereferences a PCB or a receive allocation. */
+static void publish_stream(struct stream *stream, unsigned notify_owner, unsigned notify_handle)
+{
+    struct stream_publication publication = {
+        .slot = (unsigned)(stream - streams),
+        .notify_owner = notify_owner,
+        .notify_handle = notify_handle,
+        .view = {.owner = stream_closing(stream) ? 0 : stream->owner,
+                 .handle = stream->handle,
+                 .flags = stream_flags(stream),
+                 .busy = stream->owner != 0,
+                 .needs_poll = stream->owner &&
+                               (stream_closing(stream) || stream->count || stream->packets ||
+                                (stream->pcb && (stream->pcb->unacked || stream->pcb->unsent)))}};
+    const struct stream_view *old = stream_views + publication.slot;
+    if (!notify_owner && old->owner == publication.view.owner &&
+        old->handle == publication.view.handle && (publication.view.flags & ~old->flags))
+    {
+        publication.notify_owner = publication.view.owner;
+        publication.notify_handle = publication.view.handle;
+    }
+    if (!notify_owner && old->owner == publication.view.owner &&
+        old->handle == publication.view.handle && old->flags == publication.view.flags &&
+        old->busy == publication.view.busy && old->needs_poll == publication.view.needs_poll)
+        return;
+    lume_worker_scheduler(publish_view, &publication);
+}
+
+void lume_stream_publish(void)
+{
+    for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
+        publish_stream(streams + i, 0, 0);
+}
 
 static bool receive_buffer(struct stream *stream, unsigned pages)
 {
@@ -112,24 +209,23 @@ static void stream_failure(struct stream *stream, err_t error)
 
 static void notify(struct stream *s)
 {
-    lume_socket_stream_notify(s->owner, s->handle);
-    lume_tasks_stream_notify(s->owner, s->handle);
+    publish_stream(s, s->owner, s->handle);
 }
 
 bool lume_stream_busy(void)
 {
-    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i)
-        if (streams[i].owner)
+    for (unsigned i = 0; i < sizeof(busy_views) / sizeof(busy_views[0]); ++i)
+        if (busy_views[i])
             return true;
     return false;
 }
 
 bool lume_stream_needs_poll(void)
 {
-    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i)
-        if (streams[i].owner &&
-            (streams[i].count || streams[i].packets ||
-             (streams[i].pcb && (streams[i].pcb->unacked || streams[i].pcb->unsent))))
+    if (lume_owner_retire_pending(&retired_owners))
+        return true;
+    for (unsigned i = 0; i < sizeof(polling_views) / sizeof(polling_views[0]); ++i)
+        if (polling_views[i])
             return true;
     return false;
 }
@@ -170,10 +266,16 @@ static err_t sent(void *context, struct tcp_pcb *pcb, u16_t bytes)
     return ERR_OK;
 }
 
-static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
+static err_t received_owned(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
 {
     (void)pcb;
     struct stream *s = context;
+    if (stream_closing(s))
+    {
+        if (p)
+            pbuf_free(p);
+        return ERR_OK;
+    }
     if (!p)
     {
         s->eof = true;
@@ -197,6 +299,14 @@ static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t 
     notify(s);
     /* Advertise space only after userspace consumes these bytes. */
     return ERR_OK;
+}
+
+static err_t received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
+{
+    ++protocol_active;
+    err_t result = received_owned(context, pcb, p, error);
+    --protocol_active;
+    return result;
 }
 
 static err_t connected(void *context, struct tcp_pcb *pcb, err_t error)
@@ -241,8 +351,9 @@ static void close_stream(struct stream *s)
         if (!lume_page_free((uintptr_t)s->data + (uint64_t)i * 4096u))
             lume_fail("stream receive buffer release");
     receive_pages -= s->data_pages;
-    notify(s);
+    unsigned owner = s->owner, handle = s->handle;
     *s = (struct stream){0};
+    publish_stream(s, owner, handle);
 }
 
 static err_t accepted(void *context, struct tcp_pcb *pcb, err_t error)
@@ -266,11 +377,16 @@ static err_t accepted(void *context, struct tcp_pcb *pcb, err_t error)
     return ERR_OK;
 }
 
-static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *address,
-                     u16_t port)
+static void datagram_owned(void *context, struct udp_pcb *pcb, struct pbuf *p,
+                           const ip_addr_t *address, u16_t port)
 {
     (void)pcb;
     struct stream *s = context;
+    if (stream_closing(s))
+    {
+        pbuf_free(p);
+        return;
+    }
     if (p->tot_len <= LUME_IO_BYTES && s->packets < STREAM_PACKET_COUNT &&
         (!s->connected || (ip_addr_cmp(address, &s->peer) && port == s->peer_port)))
     {
@@ -289,23 +405,57 @@ static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const i
     pbuf_free(p);
 }
 
+static void datagram(void *context, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *address,
+                     u16_t port)
+{
+    ++protocol_active;
+    datagram_owned(context, pcb, p, address, port);
+    --protocol_active;
+}
+
 void lume_stream_release(unsigned pid)
 {
     lume_icmp_release(pid);
+    if (!pid || pid > LUME_TASK_LIMIT)
+        return;
+    (void)lume_owner_retire(&retired_owners, pid);
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
-        if (streams[i].owner == pid)
-            streams[i].closing = true;
+        if (stream_views[i].owner == pid)
+        {
+            lume_socket_stream_notify(pid, stream_views[i].handle);
+            lume_tasks_stream_notify(pid, stream_views[i].handle);
+        }
 }
 
 void lume_stream_reap(void)
 {
+    for (unsigned word = 0; word < LUME_RETIREMENT_WORDS; ++word)
+    {
+        uint32_t owners = lume_owner_retire_take(&retired_owners, word);
+        if (!owners)
+            continue;
+        for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
+        {
+            unsigned owner = streams[i].owner;
+            if (owner && (owner - 1) / 32u == word &&
+                (owners & (UINT32_C(1) << ((owner - 1) % 32u))))
+            {
+                streams[i].closing = true;
+                retirement_pending = true;
+                publish_stream(streams + i, 0, 0);
+            }
+        }
+    }
+    if (!retirement_pending || protocol_active)
+        return;
+    retirement_pending = false;
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
         if (streams[i].owner && streams[i].closing)
             close_stream(&streams[i]);
 }
 
-static int stream_request(unsigned pid, unsigned op, struct lume_stream_request *r,
-                          bool nonblocking, unsigned options)
+static int stream_request_owned(unsigned pid, unsigned op, struct lume_stream_request *r,
+                                bool nonblocking, unsigned options)
 {
     if (op >= LUME_ICMP_ECHO_START && op <= LUME_ICMP_ECHO_CLOSE)
         return lume_icmp_call(pid, op, r);
@@ -398,13 +548,14 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         if (op == LUME_STREAM_CONNECT_ASYNC)
             return 0;
         uint32_t start = lume_clock_millis();
-        while (!s->connected && !s->failed && (uint32_t)(lume_clock_millis() - start) < 5000)
+        while (!s->connected && !s->failed && !stream_closing(s) &&
+               (uint32_t)(lume_clock_millis() - start) < 5000)
         {
             lume_net_poll();
-            if (!s->connected && !s->failed)
+            if (!s->connected && !s->failed && !stream_closing(s))
                 stream_pause();
         }
-        if (!s->connected || s->failed)
+        if (!s->connected || s->failed || stream_closing(s))
         {
             int failure = s->failure ? -(int)s->failure : -LUME_ETIMEDOUT;
             close_stream(s);
@@ -414,7 +565,8 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         return 0;
     }
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
-        if (streams[i].owner == pid && streams[i].handle == r->handle && !streams[i].closing)
+        if (streams[i].owner == pid && streams[i].handle == r->handle &&
+            !stream_closing(streams + i))
             s = &streams[i];
     if (!s)
         return -LUME_EBADF;
@@ -439,6 +591,8 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         return (int)flags;
     }
     lume_net_poll();
+    if (stream_closing(s))
+        return -LUME_EBADF;
     if (op == LUME_STREAM_ACCEPT)
     {
         if (!s->listening)
@@ -496,13 +650,15 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
     uint32_t start = lume_clock_millis();
     if (op == LUME_STREAM_RECEIVE)
     {
-        while (!nonblocking && !s->count && !s->eof && !s->failed &&
+        while (!nonblocking && !s->count && !s->eof && !s->failed && !stream_closing(s) &&
                (uint32_t)(lume_clock_millis() - start) < 5000)
         {
             lume_net_poll();
-            if (!s->count && !s->eof && !s->failed)
+            if (!s->count && !s->eof && !s->failed && !stream_closing(s))
                 stream_pause();
         }
+        if (stream_closing(s))
+            return -LUME_EBADF;
         if (!s->count)
             return s->failed ? -(int)s->failure : s->eof ? 0 : -LUME_EAGAIN;
         unsigned n = r->count < s->count ? r->count : s->count;
@@ -522,13 +678,15 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
         return -LUME_EPIPE;
     if (!s->connected)
         return -LUME_ENOTCONN;
-    while (!nonblocking && s->pcb && !s->failed && !tcp_sndbuf(s->pcb) &&
+    while (!nonblocking && s->pcb && !s->failed && !stream_closing(s) && !tcp_sndbuf(s->pcb) &&
            (uint32_t)(lume_clock_millis() - start) < 5000)
     {
         lume_net_poll();
-        if (s->pcb && !s->failed && !tcp_sndbuf(s->pcb))
+        if (s->pcb && !s->failed && !stream_closing(s) && !tcp_sndbuf(s->pcb))
             stream_pause();
     }
+    if (stream_closing(s))
+        return -LUME_EBADF;
     if (!s->pcb || s->failed)
         return s->failure ? -(int)s->failure : -LUME_EPIPE;
     unsigned n = r->count < tcp_sndbuf(s->pcb) ? r->count : tcp_sndbuf(s->pcb);
@@ -540,6 +698,33 @@ static int stream_request(unsigned pid, unsigned op, struct lume_stream_request 
     return (int)n;
 }
 
+struct stream_operation
+{
+    unsigned pid, op, options;
+    struct lume_stream_request *request;
+    bool nonblocking;
+    int result;
+};
+
+static void stream_operation(void *context)
+{
+    struct stream_operation *operation = context;
+    lume_stream_reap();
+    ++protocol_active;
+    operation->result = stream_request_owned(operation->pid, operation->op, operation->request,
+                                             operation->nonblocking, operation->options);
+    --protocol_active;
+    lume_stream_publish();
+}
+
+static int stream_request(unsigned pid, unsigned op, struct lume_stream_request *request,
+                          bool nonblocking, unsigned options)
+{
+    struct stream_operation operation = {pid, op, options, request, nonblocking, 0};
+    lume_worker_domain(stream_operation, &operation);
+    return operation.result;
+}
+
 int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *request)
 {
     return stream_request(pid, op, request, false, 0);
@@ -547,6 +732,21 @@ int lume_stream_call(unsigned pid, unsigned op, struct lume_stream_request *requ
 
 int lume_stream_nowait(unsigned pid, unsigned op, struct lume_stream_request *request)
 {
+    if (op == LUME_STREAM_POLL)
+    {
+        if (!pid || request->version != LUME_IO_VERSION || request->reserved ||
+            request->count > LUME_IO_BYTES)
+            return -LUME_EINVAL;
+        if (owner_retired(pid))
+            return -LUME_EBADF;
+        for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
+            if (stream_views[i].owner == pid && stream_views[i].handle == request->handle)
+            {
+                request->count = stream_views[i].flags;
+                return (int)request->count;
+            }
+        return -LUME_EBADF;
+    }
     return stream_request(pid, op, request, true, 0);
 }
 
@@ -576,7 +776,7 @@ int lume_stream_progress(unsigned pid, unsigned op, struct lume_stream_request *
     for (unsigned i = 0; i < LUME_NET_STREAM_LIMIT; ++i)
     {
         struct stream *s = &streams[i];
-        if (s->owner != pid || s->handle != request->handle || s->closing)
+        if (s->owner != pid || s->handle != request->handle || stream_closing(s))
             continue;
         if (op == LUME_STREAM_CONNECT)
         {

@@ -253,24 +253,25 @@ int main(void)
     assert(!stop(&h1, &b));
     dispatch(8);
     assert(lume_work_pending() && !a.hpd_batches[HDMI_IRQ_HPD_REMOVED]);
-    assert(lume_work_drain(1) == 1 && a.hpd_batches[HDMI_IRQ_HPD_REMOVED] == 1);
+    assert(lume_work_drain_on(LUME_WORK_DISPLAY, 1) == 1 &&
+           a.hpd_batches[HDMI_IRQ_HPD_REMOVED] == 1);
     dispatch(7);
     dispatch(8);
-    assert(lume_work_drain(2) == 1);
+    assert(lume_work_drain_on(LUME_WORK_DISPLAY, 2) == 1);
     assert(a.hpd_batches[HDMI_IRQ_HPD_CONNECTED] == 1);
     assert(a.hpd_batches[HDMI_IRQ_HPD_REMOVED] == 2);
     struct lume_work full[LUME_WORK_LIMIT];
     for (unsigned i = 0; i < LUME_WORK_LIMIT; ++i)
     {
-        full[i] = (struct lume_work){.run = dummy};
+        full[i] = (struct lume_work){.run = dummy, .domain = LUME_WORK_DISPLAY};
         assert(!lume_work_submit(full + i));
     }
     dispatch(7);
     assert(atomic_load(&a.hpd_work_error) == -LUME_ENOSPC);
     assert(atomic_load(&a.hpd_events) == (1u << HDMI_IRQ_HPD_CONNECTED));
-    assert(lume_work_drain(LUME_WORK_LIMIT) == LUME_WORK_LIMIT);
+    assert(lume_work_drain_on(LUME_WORK_DISPLAY, LUME_WORK_LIMIT) == LUME_WORK_LIMIT);
     dispatch(8);
-    assert(lume_work_drain(1) == 1 && !atomic_load(&a.hpd_events));
+    assert(lume_work_drain_on(LUME_WORK_DISPLAY, 1) == 1 && !atomic_load(&a.hpd_events));
     assert(!atomic_load(&a.hpd_work_error));
     assert(a.hpd_batches[HDMI_IRQ_HPD_CONNECTED] == 2);
     assert(a.hpd_batches[HDMI_IRQ_HPD_REMOVED] == 3);

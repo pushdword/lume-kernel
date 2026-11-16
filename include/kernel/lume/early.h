@@ -144,6 +144,16 @@ uint64_t lume_clock_monotonic(void);
 uint64_t lume_clock_read(void);
 bool lume_entropy(void *, size_t);
 bool lume_task_storage_context(void);
+/* Prepare unpublished memory or pinned RAM outside the scheduler lock. The callback
+ * must not publish metadata, access devices or suspend outside a worker. */
+void lume_task_memory_prepare(void (*run)(void *), void *context);
+unsigned lume_task_memory_owner(void);
+void lume_task_memory_ready(unsigned owner);
+/* TLB callbacks access retained translations and resident IPI registers. They
+ * cannot allocate, suspend or enter scheduler services. */
+void lume_task_tlb_sync(void (*run)(void *), void *context);
+/* Run a metadata operation while retaining its address space across preparation. */
+bool lume_mmu_owned(unsigned task, void (*run)(void *), void *context);
 void lume_task_vm_ready(void);
 void lume_task_vm_buffer_wait(void);
 #endif
