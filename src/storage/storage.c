@@ -60,7 +60,10 @@ static struct lume_work flush_work = {.run = flush_one, .domain = LUME_WORK_STOR
 
 void lume_storage_poll_background(void)
 {
-    if (mounted && !data_faulted && lume_clock_monotonic() >= next_flush_at)
+    if (!mounted || data_faulted)
+        return;
+    uint64_t now = lume_clock_monotonic();
+    if (now >= next_flush_at || now >= cache_writeback_at)
         (void)lume_work_submit(&flush_work);
 }
 
@@ -108,6 +111,7 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
         lume_worker_checkpoint(group * 512);
         if (!result)
         {
+            cache_retry_submitted();
             if (!drive && replacing)
                 replacement_io_failed = true;
             return RES_ERROR;
@@ -134,6 +138,7 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
         lume_worker_checkpoint(group * 512);
         if (!result)
         {
+            cache_retry_submitted();
             if (!drive && replacing)
                 replacement_io_failed = true;
             return RES_ERROR;
@@ -155,7 +160,7 @@ DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
     switch (command)
     {
     case CTRL_SYNC:
-        return (drive ? lume_sd_sync() : cache_sync()) ? RES_OK : RES_ERROR;
+        return (drive ? cache_barrier() : cache_sync()) ? RES_OK : RES_ERROR;
     case GET_SECTOR_COUNT:
         *(LBA_t *)data = (LBA_t)v->count;
         return RES_OK;
@@ -270,26 +275,31 @@ static int restore_file_size(struct storage_file *file, FSIZE_t bytes)
     return failed;
 }
 
-/* Deferred work commits one file and the shared sector cache at each deadline. */
+/* File deadlines commit data and metadata. Earlier turns submit one cache line. */
 static void flush_one(void *context)
 {
     (void)context;
-    if (data_faulted)
+    if (!mounted || data_faulted)
         return;
     uint64_t now = lume_clock_monotonic();
-    for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
+    if (now >= next_flush_at)
     {
-        unsigned slot = (flush_cursor + i) % STORAGE_HANDLES;
-        struct storage_file *file = storage_files + slot;
-        if (file->references && file->dirty && !file->write_error &&
-            now - file->dirty_at >= STORAGE_FLUSH_MS)
+        for (unsigned i = 0; i < STORAGE_HANDLES; ++i)
         {
-            (void)sync_file(file);
-            flush_cursor = (slot + 1) % STORAGE_HANDLES;
-            break;
+            unsigned slot = (flush_cursor + i) % STORAGE_HANDLES;
+            struct storage_file *file = storage_files + slot;
+            if (file->references && file->dirty && !file->write_error &&
+                now - file->dirty_at >= STORAGE_FLUSH_MS)
+            {
+                (void)sync_file(file);
+                flush_cursor = (slot + 1) % STORAGE_HANDLES;
+                break;
+            }
         }
+        flush_deadline();
     }
-    flush_deadline();
+    else if (now >= cache_writeback_at)
+        cache_writeback_turn();
     lume_storage_poll_background();
 }
 

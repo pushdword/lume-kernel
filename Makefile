@@ -298,7 +298,7 @@ check: check-storage-handles
 .PHONY: check-storage-cache
 $(OUT)/tests/storage-cache$(HOSTEXE): tests/unit/storage_cache_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/sector_cache.h src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1 -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
 check-storage-cache: $(OUT)/tests/storage-cache$(HOSTEXE)
 	env "$<"
 check: check-storage-cache
