@@ -46,7 +46,7 @@ struct vm_area
 {
     uint64_t first, end, offset, generation, stable_end;
     uint64_t fault_next;
-    unsigned protection, maximum, thread, saved, owner;
+    unsigned protection, maximum, thread, owner;
     bool shared, retiring, jit, image;
     struct vm_object *object;
     struct vm_area *next, *object_next, *retire_next;
@@ -467,6 +467,115 @@ static void revoke(unsigned task, struct vm_area *area, uint64_t offset, uint64_
         revoke_object(task, area, area->object->backing, area->object->backing_offset, offset, end);
 }
 
+static void unlink_alias(struct vm_area *area)
+{
+    struct vm_area **alias = &area->object->areas;
+    while (*alias && *alias != area)
+        alias = &(*alias)->object_next;
+    if (!*alias)
+        lume_fail("virtual memory alias ownership");
+    *alias = area->object_next;
+}
+
+static bool mergeable(const struct vm_area *left, const struct vm_area *right)
+{
+    bool stable = (left->stable_end == 0 && right->stable_end == 0) ||
+                  (left->stable_end == right->offset && right->stable_end > right->offset);
+    return left->end == right->first && left->object == right->object &&
+           left->offset + (left->end - left->first) == right->offset &&
+           left->protection == right->protection && left->maximum == right->maximum &&
+           left->shared == right->shared && left->jit == right->jit &&
+           left->image == right->image && left->owner == right->owner && !left->thread &&
+           !right->thread && !left->retiring && !right->retiring && stable;
+}
+
+static void merge_areas(unsigned task, uint64_t first, uint64_t end)
+{
+    struct vm_area *area = spaces[task];
+    while (area && area->end < first)
+        area = area->next;
+    while (area && area->next && area->next->first <= end)
+    {
+        struct vm_area *next = area->next;
+        if (!mergeable(area, next))
+        {
+            area = next;
+            continue;
+        }
+        area->end = next->end;
+        area->stable_end = next->stable_end;
+        area->fault_next = 0;
+        area->next = next->next;
+        area_changed(area);
+        unlink_alias(next);
+        drop(next->object);
+        lume_kernel_free(next);
+    }
+}
+
+static void discard_pages(unsigned task, struct vm_area *area, uint64_t first, uint64_t end)
+{
+    uint64_t offset = area->offset + (first > area->first ? first - area->first : 0);
+    uint64_t limit = area->offset + ((end < area->end ? end : area->end) - area->first);
+    struct vm_object *object = area->object;
+    revoke(task, area, offset, limit);
+    unsigned discarded = 0;
+    for (unsigned bucket = 0; bucket < HASH; ++bucket)
+        for (struct vm_chunk *entry = object->chunks[bucket]; entry; entry = entry->next)
+        {
+            uint64_t base = entry->index * 512 * PAGE;
+            if (!overlap(offset, limit, base, base + 512 * PAGE))
+                continue;
+            unsigned start = offset > base ? (unsigned)((offset - base) / PAGE) : 0;
+            unsigned stop = limit - base < 512 * PAGE ? (unsigned)((limit - base) / PAGE) : 512;
+            for (unsigned i = start; i < stop; ++i)
+                if (entry->pages[i])
+                {
+                    if (!lume_page_free(entry->pages[i]))
+                        lume_fail("virtual memory discard release");
+                    entry->pages[i] = 0;
+                    if (++discarded % 16 == 0)
+                        lume_worker_checkpoint(0);
+                }
+        }
+    prune_chunks(object);
+}
+
+static int64_t advise_range(unsigned task, uint64_t first, uint64_t end, unsigned advice)
+{
+    struct vm_area *head = find_area(task, first);
+    bool discardable = true, busy = false;
+    uint64_t position = first;
+    for (struct vm_area *area = head; position < end; area = area->next)
+    {
+        if (!area || area->first > position)
+            return -LUME_ENOMEM;
+        discardable &= !area->shared && !area->object->persistent && area->object->discardable;
+        busy |= area->object->changing;
+        position = area->end;
+    }
+    if (advice <= LUME_MADV_WILLNEED)
+        return 0;
+    if ((advice != LUME_MADV_DONTNEED && advice != LUME_MADV_FREE) || !discardable)
+        return -ENOTSUP;
+    if (busy)
+        return -LUME_EBUSY;
+
+    /* Keep the existing areas and exclude faults until revocation and release finish. */
+    changing[task] = true;
+    for (struct vm_area *area = head; area && area->first < end; area = area->next)
+    {
+        area_changed(area);
+        area->object->changing = true;
+    }
+    for (struct vm_area *area = head; area && area->first < end; area = area->next)
+        discard_pages(task, area, first, end);
+    for (struct vm_area *area = head; area && area->first < end; area = area->next)
+        area->object->changing = false;
+    changing[task] = false;
+    return 0;
+}
+
 static void forget_retiring(struct vm_area *area)
 {
     struct vm_area **position = &retired_threads, *previous = NULL;
@@ -497,12 +606,7 @@ static void remove_range(unsigned task, uint64_t first, uint64_t end)
             bool was_changing = area->object->changing;
             area->object->changing = true;
             *position = area->next;
-            struct vm_area **alias = &area->object->areas;
-            while (*alias && *alias != area)
-                alias = &(*alias)->object_next;
-            if (!*alias)
-                lume_fail("virtual memory alias ownership");
-            *alias = area->object_next;
+            unlink_alias(area);
             revoke(task, area, area->offset, area->offset + area->end - area->first);
             trim(area->object);
             area->object->changing = was_changing;
@@ -690,13 +794,15 @@ static int fault_owned(unsigned task, uint64_t address, bool write, bool execute
         lume_task_memory_prepare(prepare_fault, &prepared);
     if (prepared_work || source)
         area = find_area(task, address);
-    if (!area || area->generation != generation || area->object != object || area->retiring ||
+    if (!area || area->object != object || area->retiring ||
         !(area->protection & required))
     {
         result = 0;
         goto out;
     }
-    if (changing[task] || object->changing || (source && source->changing))
+    /* A surviving mapping can retry with fresh state after its area changes. */
+    if (area->generation != generation || changing[task] || object->changing ||
+        (source && source->changing))
     {
         result = 2;
         goto out;
@@ -1792,6 +1898,8 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
              (first < LUME_VM_BASE || first >= LUME_VM_LIMIT || length > LUME_VM_LIMIT - first)))
             return -LUME_EINVAL;
         uint64_t end = first + length;
+        if (operation == LUME_VM_ADVISE)
+            return advise_range(task, first, end, request->advice);
         unsigned protection = request->protection;
         if (operation == LUME_VM_PROTECT)
         {
@@ -1799,11 +1907,11 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
                 return -LUME_EACCES;
             if (protection)
                 protection |= LUME_PROT_READ;
+            bool changed = false;
             uint64_t position = first;
-            while (position < end)
+            for (struct vm_area *area = find_area(task, first); position < end; area = area->next)
             {
-                struct vm_area *area = find_area(task, position);
-                if (!area || (image && !area->image))
+                if (!area || area->first > position || (image && !area->image))
                     return -LUME_ENOMEM;
                 if (area->object->changing)
                     return -LUME_EBUSY;
@@ -1815,35 +1923,16 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
                                    area->offset + (area->end < end ? area->end : end) - area->first,
                                    protection, task, first, end))
                     return -LUME_EACCES;
+                changed |= area->protection != protection;
                 position = area->end;
             }
-        }
-        if (operation == LUME_VM_ADVISE)
-        {
-            for (uint64_t position = first; position < end;)
-            {
-                struct vm_area *area = find_area(task, position);
-                if (!area)
-                    return -LUME_ENOMEM;
-                position = area->end;
-            }
-            if (request->advice <= LUME_MADV_WILLNEED)
+            if (!changed)
                 return 0;
-            if (request->advice != LUME_MADV_DONTNEED && request->advice != LUME_MADV_FREE)
-                return -ENOTSUP;
-            for (uint64_t position = first; position < end;)
-            {
-                struct vm_area *area = find_area(task, position);
-                if (!area)
-                    return -LUME_ENOMEM;
-                if (area->shared || area->object->persistent || !area->object->discardable)
-                    return -ENOTSUP;
-                position = area->end;
-            }
         }
-        for (struct vm_area *area = spaces[task]; area && area->first < end; area = area->next)
-            if (area->end > first && area->object->changing)
-                return -LUME_EBUSY;
+        else
+            for (struct vm_area *area = spaces[task]; area && area->first < end; area = area->next)
+                if (area->end > first && area->object->changing)
+                    return -LUME_EBUSY;
         if (!boundaries(task, first, end))
             return -LUME_ENOMEM;
         changing[task] = true;
@@ -1853,47 +1942,21 @@ static int64_t vm_call(struct lume_files *files, unsigned pid, unsigned operatio
             changing[task] = false;
             return 0;
         }
-        for (struct vm_area *area = spaces[task]; area; area = area->next)
-            if (area->first >= first && area->end <= end)
-            {
-                area->saved = area->protection;
-                area->protection = 0;
-                area_changed(area);
-                area->object->changing = true;
-            }
-        unsigned discarded = 0;
-        for (struct vm_area *area = spaces[task]; area; area = area->next)
-            if (area->first >= first && area->end <= end)
-            {
-                revoke(task, area, area->offset, area->offset + area->end - area->first);
-                if (operation == LUME_VM_ADVISE)
-                    for (unsigned bucket = 0; bucket < HASH; ++bucket)
-                        for (struct vm_chunk *entry = area->object->chunks[bucket]; entry;
-                             entry = entry->next)
-                            for (unsigned i = 0; i < 512; ++i)
-                            {
-                                uint64_t offset = (entry->index * 512 + i) * PAGE;
-                                if (entry->pages[i] && offset >= area->offset &&
-                                    offset - area->offset < area->end - area->first)
-                                {
-                                    if (!lume_page_free(entry->pages[i]))
-                                        lume_fail("virtual memory discard release");
-                                    entry->pages[i] = 0;
-                                    if (++discarded % 16 == 0)
-                                        lume_worker_checkpoint(0);
-                                }
-                            }
-            }
-        if (operation == LUME_VM_ADVISE)
-            for (struct vm_area *area = spaces[task]; area; area = area->next)
-                if (area->first >= first && area->end <= end)
-                    prune_chunks(area->object);
-        for (struct vm_area *area = spaces[task]; area; area = area->next)
-            if (area->first >= first && area->end <= end)
-                area->protection = operation == LUME_VM_PROTECT ? protection : area->saved;
-        for (struct vm_area *area = spaces[task]; area; area = area->next)
-            if (area->first >= first && area->end <= end)
-                area->object->changing = false;
+        struct vm_area *head = find_area(task, first);
+        for (struct vm_area *area = head; area && area->first < end; area = area->next)
+        {
+            area->protection = 0;
+            area_changed(area);
+            area->object->changing = true;
+        }
+        for (struct vm_area *area = head; area && area->first < end; area = area->next)
+            revoke(task, area, area->offset, area->offset + area->end - area->first);
+        for (struct vm_area *area = head; area && area->first < end; area = area->next)
+        {
+            area->protection = protection;
+            area->object->changing = false;
+        }
+        merge_areas(task, first, end);
         changing[task] = false;
         return 0;
     }

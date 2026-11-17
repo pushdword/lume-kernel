@@ -719,6 +719,9 @@ static void stable_size_cases(void)
     CHECK(call(0, LUME_VM_RESIZE, 0, 3 * PAGE - 8, 0, 0, fd) == -LUME_EBUSY);
     CHECK(!call(0, LUME_VM_RESIZE, 0, 3 * PAGE - 7, 0, 0, fd));
     CHECK(!call(0, LUME_VM_PROTECT, base + PAGE, PAGE, 0, 0, -1));
+    CHECK(!call(0, LUME_VM_PROTECT, base + PAGE, PAGE, LUME_PROT_READ, 0, -1));
+    CHECK(!spaces[0]->next && spaces[0]->stable_end == 3 * PAGE - 7);
+    CHECK(call(0, LUME_VM_RESIZE, 0, 3 * PAGE - 8, 0, 0, fd) == -LUME_EBUSY);
     CHECK(call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd) == -LUME_EBUSY);
     CHECK(!call(0, LUME_VM_UNMAP, base + 2 * PAGE, PAGE, 0, 0, -1));
     CHECK(!call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd));
@@ -765,8 +768,106 @@ static void retirement_cases(void)
     clean();
 }
 
+static int64_t advise(uint64_t first, uint64_t bytes, unsigned advice)
+{
+    struct lume_vm_request request = {.version = LUME_VM_VERSION,
+                                      .address = first,
+                                      .length = bytes,
+                                      .advice = advice};
+    return lume_vm_call(&files, 1, LUME_VM_ADVISE, &request);
+}
+
+static void discard_cases(void)
+{
+    const unsigned flags = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
+    const uint64_t bytes = 512 * PAGE;
+    uint64_t base = call(0, LUME_VM_MAP, 0, bytes, 3, flags, -1);
+    CHECK(base == LUME_VM_BASE);
+    uint64_t kept = physical(0, base, true, false);
+    *(unsigned char *)(uintptr_t)kept = 0x5a;
+    struct vm_area *area = spaces[0];
+    for (unsigned i = 0; i < 2048; ++i)
+    {
+        uint64_t address = base + (2 * (i % 256) + 1) * PAGE;
+        uint64_t frame = physical(0, address, false, false), translated;
+        CHECK(!*(unsigned char *)(uintptr_t)frame);
+        *(unsigned char *)(uintptr_t)frame = 0xa5;
+        metadata_budget = 0;
+        CHECK(!advise(address, PAGE, i % 2 ? LUME_MADV_FREE : LUME_MADV_DONTNEED));
+        metadata_budget = -1;
+        CHECK(spaces[0] == area && !area->next && area->first == base &&
+              area->end == base + bytes && area->object->references == 1);
+        CHECK(!lume_mmu_translate(1, address, false, true, false, &translated));
+        CHECK(lume_mmu_translate(1, base, true, true, false, &translated) && translated == kept);
+        CHECK(physical_live == 1 && mappings_live == 1);
+    }
+    CHECK(*(unsigned char *)(uintptr_t)kept == 0x5a);
+    CHECK(!advise(base, bytes, LUME_MADV_DONTNEED));
+    CHECK(spaces[0] == area && !area->next && !physical_live && !mappings_live);
+    clean();
+
+    base = call(0, LUME_VM_MAP, 0, 4 * PAGE, 3, flags, -1);
+    CHECK(base == LUME_VM_BASE);
+    CHECK(!call(0, LUME_VM_PROTECT, base + PAGE, PAGE, LUME_PROT_READ, 0, -1));
+    CHECK(physical(0, base, true, false) && physical(0, base + PAGE, false, false) &&
+          physical(0, base + 2 * PAGE, true, false));
+    CHECK(advise(base, 5 * PAGE, LUME_MADV_DONTNEED) == -LUME_ENOMEM);
+    CHECK(physical_live == 3 && mappings_live == 3);
+    CHECK(!advise(base, 2 * PAGE, LUME_MADV_DONTNEED));
+    CHECK(physical_live == 1 && mappings_live == 1);
+    CHECK(!lume_vm_fault(0, base + PAGE, true, false));
+    CHECK(!*(unsigned char *)(uintptr_t)physical(0, base + PAGE, false, false));
+    CHECK(spaces[0]->next && spaces[0]->next->next && !spaces[0]->next->next->next);
+    uint64_t pinned = physical(0, base + 2 * PAGE, false, false);
+    CHECK(lume_page_pin(pinned));
+    CHECK(!advise(base + 2 * PAGE, PAGE, LUME_MADV_DONTNEED));
+    CHECK(physical_live == 2 && mappings_live == 1);
+    lume_page_unpin(pinned);
+    CHECK(physical_live == 1);
+    clean();
+}
+
+static void protect_cases(void)
+{
+    const unsigned flags = LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS;
+    const unsigned rw = LUME_PROT_READ | LUME_PROT_WRITE;
+    uint64_t base = call(0, LUME_VM_MAP, 0, 4 * PAGE, rw, flags, -1);
+    CHECK(base == LUME_VM_BASE);
+    uint64_t middle = base + PAGE;
+    uint64_t frame = physical(0, middle, true, false), translated;
+    uint64_t generation = spaces[0]->generation;
+    *(unsigned char *)(uintptr_t)frame = 0xc7;
+    CHECK(!call(0, LUME_VM_PROTECT, base, 4 * PAGE, rw, 0, -1));
+    metadata_budget = 0;
+    CHECK(!call(0, LUME_VM_PROTECT, middle, PAGE, LUME_PROT_WRITE, 0, -1));
+    metadata_budget = -1;
+    CHECK(!spaces[0]->next && spaces[0]->generation == generation && mappings_live == 1);
+    CHECK(lume_mmu_translate(1, middle, true, true, false, &translated) && translated == frame);
+    CHECK(call(0, LUME_VM_PROTECT, middle, 4 * PAGE, rw, 0, -1) == -LUME_ENOMEM);
+    CHECK(lume_mmu_translate(1, middle, true, true, false, &translated) && translated == frame);
+
+    CHECK(!call(0, LUME_VM_PROTECT, middle, PAGE, LUME_PROT_READ, 0, -1));
+    CHECK(!lume_mmu_translate(1, middle, true, true, false, &translated));
+    CHECK(!lume_vm_fault(0, middle, true, false));
+    CHECK(physical(0, middle, false, false) == frame);
+    CHECK(!call(0, LUME_VM_PROTECT, middle, PAGE, 0, 0, -1));
+    CHECK(!lume_mmu_translate(1, middle, false, true, false, &translated));
+    CHECK(!lume_vm_fault(0, middle, false, false));
+    uint64_t neighbor = call(0, LUME_VM_MAP, 0, PAGE, rw, flags, -1);
+    CHECK(neighbor == base + 4 * PAGE);
+    CHECK(!call(0, LUME_VM_PROTECT, base, 5 * PAGE, rw, 0, -1));
+    struct vm_area *area = spaces[0];
+    CHECK(area->end == neighbor && area->object->references == 1);
+    CHECK(area->next && area->next->first == neighbor && !area->next->next);
+    CHECK(area->object != area->next->object);
+    CHECK(physical(0, middle, true, false) == frame && *(unsigned char *)(uintptr_t)frame == 0xc7);
+    clean();
+}
+
 int main(void)
 {
+    discard_cases();
+    protect_cases();
     anonymous_group_cases();
     retirement_cases();
     stable_size_cases();
@@ -1099,6 +1200,12 @@ static void protect_during_allocation(void)
     CHECK(!call(0, LUME_VM_PROTECT, pause_base, 8192, 3, 0, -1));
 }
 
+static void discard_during_preparation(void)
+{
+    CHECK(!advise(pause_base, PAGE, LUME_MADV_DONTNEED));
+    CHECK(!physical_live && !mappings_live && !spaces[0]->object->chunks[0]);
+}
+
 static void switch_view_during_allocation(void)
 {
     writer_view[0] = true;
@@ -1136,6 +1243,14 @@ static void private_write_during_allocation(void)
 
 static void fault_suspend_cases(void)
 {
+    pause_base = call(0, LUME_VM_MAP, 0, 2 * PAGE, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(pause_base == LUME_VM_BASE && physical(0, pause_base, true, false));
+    preparation_pause = discard_during_preparation;
+    CHECK(lume_vm_fault(0, pause_base + PAGE, true, false) == 2);
+    CHECK(!preparation_pause && !physical_live && !mappings_live);
+    CHECK(physical(0, pause_base + PAGE, true, false));
+    clean();
+
     pause_fd = memory_file();
     CHECK(!call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, pause_fd));
     unsigned char marker = 0x93;
@@ -1234,7 +1349,7 @@ static void fault_suspend_cases(void)
         pause_object = ((struct vm_handle *)descriptors[pause_fd].context)->object;
         allocation_pause = mutations[i];
         int result = lume_vm_fault(0, pause_base, true, false);
-        CHECK(!allocation_pause && result == (i >= 3 ? 2 : 0));
+        CHECK(!allocation_pause && result == (i ? 2 : 0));
         CHECK(!mappings_live && !physical_live);
         if (i)
             CHECK(!pause_object->chunks[0]);

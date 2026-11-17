@@ -47,7 +47,7 @@ extern void *lume_net_heap;
 #define TCP_WND LUME_NET_TCP_WINDOW
 #define TCP_SND_BUF LUME_NET_TCP_SEND_BYTES
 #define TCP_SNDLOWAT (4 * TCP_MSS)
-#define DNS_TABLE_SIZE 4
+#define DNS_TABLE_SIZE LUME_NET_DNS_ENTRIES
 #define DNS_MAX_NAME_LENGTH 128
 #define IP_REASSEMBLY 0
 #define IP_FRAG 0
