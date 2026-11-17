@@ -625,6 +625,11 @@ void lume_console_write(const char *text, size_t bytes)
     (void)bytes;
 }
 
+void lume_timer_idle(bool idle)
+{
+    (void)idle;
+}
+
 int lume_console_getc(void)
 {
     return -LUME_EAGAIN;

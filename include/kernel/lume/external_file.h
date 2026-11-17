@@ -22,6 +22,8 @@ struct lume_file_ops
     /* Memory callbacks return stable pin metadata without suspending. The VM
      * retains the object before another caller can close the description. */
     const struct lume_vm_dma_pin *(*memory)(void *);
+    /* The open description stays retained while the callback admits and copies user data. */
+    int64_t (*write_user)(void *, unsigned, uint64_t, uint64_t);
 };
 
 int lume_vfs_attach(struct lume_files *, const struct lume_file_ops *, void *, unsigned);

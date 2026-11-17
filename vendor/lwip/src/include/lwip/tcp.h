@@ -497,6 +497,8 @@ extern "C"
     err_t tcp_shutdown(struct tcp_pcb *pcb, int shut_rx, int shut_tx);
 
     err_t tcp_write(struct tcp_pcb *pcb, const void *dataptr, u16_t len, u8_t apiflags);
+    err_t tcp_write_prepared(struct tcp_pcb *pcb, void *data, u16_t len,
+                             err_t (*prepare)(void *, u16_t), void *context);
 
     void tcp_setprio(struct tcp_pcb *pcb, u8_t prio);
 

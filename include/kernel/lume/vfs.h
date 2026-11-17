@@ -89,6 +89,9 @@ int64_t lume_vfs_stat_inode(uint64_t, struct lume_stat *);
 int64_t lume_vfs_close(struct lume_files *, uint64_t fd);
 int64_t lume_vfs_read(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
 int64_t lume_vfs_write(struct lume_files *, uint64_t fd, const void *, uint64_t bytes);
+/* Returns true when the write was handled and its status was stored in result. */
+bool lume_vfs_write_user(struct lume_files *, uint64_t fd, unsigned pid, uint64_t address,
+                         uint64_t bytes, int64_t *result);
 int64_t lume_vfs_pread(struct lume_files *, uint64_t fd, void *, uint64_t bytes, int64_t offset);
 int64_t lume_vfs_pwrite(struct lume_files *, uint64_t fd, const void *, uint64_t bytes,
                         int64_t offset);

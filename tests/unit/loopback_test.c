@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "lwip/init.h"
 #include "lwip/ip4.h"
+#include "lwip/memp.h"
 #include "lwip/netif.h"
 #include "lwip/tcp.h"
 #include <assert.h>
@@ -70,6 +71,51 @@ static void connection_error(void *context, err_t error)
     refused = true;
 }
 
+struct write_payload
+{
+    unsigned char *data;
+    unsigned offset, calls;
+    err_t result;
+};
+
+static err_t prepare_write(void *context, u16_t bytes)
+{
+    struct write_payload *payload = context;
+    ++payload->calls;
+    if (payload->result != ERR_OK)
+        return payload->result;
+    for (unsigned i = 0; i < bytes; ++i)
+        payload->data[i] = (unsigned char)((payload->offset + i) * 37u);
+    return ERR_OK;
+}
+
+static void prepared_write_cases(struct tcp_pcb *client, unsigned char *data, u16_t bytes)
+{
+    struct write_payload payload = {.data = data};
+    void *segments[MEMP_NUM_TCP_SEG];
+    unsigned allocated = 0;
+    while (allocated < MEMP_NUM_TCP_SEG && (segments[allocated] = memp_malloc(MEMP_TCP_SEG)))
+        ++allocated;
+    assert(allocated);
+    memp_free(MEMP_TCP_SEG, segments[--allocated]);
+    unsigned capacity = tcp_sndbuf(client);
+    assert(tcp_write_prepared(client, data, bytes, prepare_write, &payload) == ERR_MEM);
+    assert(!payload.calls && tcp_sndbuf(client) == capacity && !client->unsent);
+    while (allocated)
+        memp_free(MEMP_TCP_SEG, segments[--allocated]);
+
+    assert(tcp_write(client, data, 17, TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE) == ERR_OK);
+    capacity = tcp_sndbuf(client);
+    struct tcp_seg *unsent = client->unsent;
+    payload.result = ERR_ABRT;
+    payload.offset = 17;
+    assert(tcp_write_prepared(client, data, bytes - 17, prepare_write, &payload) == ERR_ABRT);
+    assert(payload.calls == 1 && tcp_sndbuf(client) == capacity && client->unsent == unsent);
+    payload.result = ERR_OK;
+    assert(tcp_write_prepared(client, data, bytes - 17, prepare_write, &payload) == ERR_OK);
+    assert(payload.calls == 2 && tcp_sndbuf(client) == capacity - (bytes - 17u));
+}
+
 int main(void)
 {
     lwip_init();
@@ -95,11 +141,13 @@ int main(void)
     unsigned char payload[4097];
     for (unsigned i = 0; i < sizeof(payload); ++i)
         payload[i] = (unsigned char)(i * 37u);
-    assert(tcp_write(client, payload, sizeof(payload), TCP_WRITE_FLAG_COPY) == ERR_OK);
+    prepared_write_cases(client, payload, sizeof(payload));
     assert(tcp_output(client) == ERR_OK && !received_bytes);
     for (unsigned i = 0; i < 8 && received_bytes < sizeof(payload); ++i)
         netif_poll_all();
     assert(received_bytes == sizeof(payload));
+    for (unsigned i = 0; i < sizeof(payload); ++i)
+        payload[i] = (unsigned char)(i * 37u);
     assert(tcp_write(server, payload, sizeof(payload), TCP_WRITE_FLAG_COPY) == ERR_OK);
     assert(tcp_output(server) == ERR_OK);
     for (unsigned i = 0; i < 8 && response_bytes < sizeof(payload); ++i)

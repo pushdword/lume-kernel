@@ -16,6 +16,8 @@ static uint64_t metadata_base, payload_base, revoke_address;
 static bool metadata_present[2];
 static unsigned descriptor_baseline, revocations;
 static int lock_fd, probe_fd;
+static bool count_write_payload;
+static size_t write_payload_copied;
 
 static unsigned descriptor_count(void)
 {
@@ -57,7 +59,10 @@ bool lume_user_buffer_copy(struct lume_user_buffer_token *token, void *data, siz
                            bool output)
 {
     revoke_metadata(token, output);
-    return scm_real_copy(token, data, bytes, output);
+    bool copied = scm_real_copy(token, data, bytes, output);
+    if (copied && count_write_payload && !output)
+        write_payload_copied += bytes;
+    return copied;
 }
 
 int lume_sandbox_socket(struct lume_files *owner, unsigned operation,
@@ -415,6 +420,62 @@ static void large_local_stream(void)
     metadata_cleanup();
 }
 
+static void tcp_user_write_cases(void)
+{
+    active_root = 2;
+    int fd = make_socket(1);
+    const unsigned bytes = LUME_FILE_IO_MAX;
+    uint64_t base = vm(0, LUME_VM_MAP, 0, bytes, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);
+    CHECK(base >= LUME_VM_BASE && lume_user_buffer(base, bytes, true));
+    unsigned char page[LUME_IO_BYTES];
+    for (unsigned offset = 0; offset < bytes; offset += sizeof(page))
+    {
+        for (unsigned i = 0; i < sizeof(page); ++i)
+            page[i] = (unsigned char)((offset + i) * 37u + (offset + i) / 4096u);
+        vm_bytes(base + offset, page, sizeof(page), true);
+    }
+    count_write_payload = true;
+    unsigned sends_before = network_sends;
+    CHECK(!lume_vfs_write_user(&files[0], fd, 1, base, bytes, NULL));
+    CHECK(network_sends == sends_before && !write_payload_copied);
+    for (unsigned partial = 0; partial < 2; ++partial)
+    {
+        unsigned done = 0, calls = 0;
+        write_payload_copied = 0;
+        while (done < bytes)
+        {
+            tcp_send_capacity = partial ? 997 : LUME_IO_BYTES;
+            unsigned expected = bytes - done;
+            if (expected > tcp_send_capacity)
+                expected = tcp_send_capacity;
+            int64_t result =
+                lume_user_io_call(&files[0], 1, fd, base + done, bytes - done, true, false, 0);
+            CHECK(result == expected && write_payload_copied == done + expected);
+            for (unsigned i = 0; i < expected; ++i)
+                CHECK(network_data[i] == (unsigned char)((done + i) * 37u + (done + i) / 4096u));
+            done += expected;
+            ++calls;
+            if (partial && done < bytes)
+            {
+                tcp_send_capacity = 0;
+                CHECK(lume_user_io_call(&files[0], 1, fd, base + done, bytes - done, true, false,
+                                        0) == -LUME_EAGAIN);
+                CHECK(write_payload_copied == done);
+            }
+        }
+        CHECK(write_payload_copied == bytes);
+        printf("TCP_USER_WRITE bytes=%u copied=%zu calls=%u capacity=%u\n", done,
+               write_payload_copied, calls, tcp_send_capacity);
+    }
+    count_write_payload = false;
+    tcp_send_capacity = LUME_IO_BYTES;
+    CHECK(lume_user_io_call(&files[0], 1, fd, base + bytes, 1, true, false, 0) == -LUME_EFAULT);
+    CHECK(!vm(0, LUME_VM_UNMAP, base, bytes, 0, 0, -1));
+    CHECK(!lume_vfs_close(&files[0], (unsigned)fd));
+    while (lume_socket_reap_pending())
+        lume_socket_reap();
+}
+
 int main(void)
 {
 #ifdef _WIN32
@@ -428,6 +489,7 @@ int main(void)
         lume_files_init(&files[i]);
     baseline_frames = frame_live;
     lume_worker_start();
+    tcp_user_write_cases();
     active_root = 2;
     payload_base =
         (uint64_t)vm(0, LUME_VM_MAP, 0, 4096, 3, LUME_MAP_PRIVATE | LUME_MAP_ANONYMOUS, -1);

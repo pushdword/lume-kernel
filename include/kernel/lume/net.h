@@ -24,6 +24,9 @@ bool lume_net_tcp(const char *);
 #include "lume/io.h"
 int lume_stream_call(unsigned, unsigned, struct lume_stream_request *);
 int lume_stream_nowait(unsigned, unsigned, struct lume_stream_request *);
+typedef int (*lume_stream_payload_copy)(void *, void *, size_t);
+/* The callback supplies only the admitted bytes before the send queue is updated. */
+int lume_stream_send_from(unsigned, struct lume_stream_request *, lume_stream_payload_copy, void *);
 /* Pending is set only for TCP readiness waits. CONNECT resumes with started set after its
  * initial attempt. Callers retain the request until completion or cancellation. */
 int lume_stream_progress(unsigned, unsigned, struct lume_stream_request *, bool, bool *);

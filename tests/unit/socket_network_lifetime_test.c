@@ -3,6 +3,7 @@
 #undef main
 #undef active
 #include "lume/io.h"
+#include "lume/net.h"
 #include "lume/socket_file.h"
 #include "lume/datagram.h"
 #include "lume/socket_buffer.h"
@@ -24,6 +25,7 @@ static unsigned char network_data[8192];
 static unsigned network_sends, network_reads, packet_allocations, packet_frees;
 static unsigned network_pauses;
 static unsigned network_owner;
+static unsigned tcp_send_capacity = LUME_IO_BYTES;
 static bool packet_live;
 static bool oversized_receive;
 static bool oversized_send;
@@ -218,6 +220,21 @@ int lume_stream_nowait(unsigned owner, unsigned op, struct lume_stream_request *
             return request->count + 1;
     }
     return request->count;
+}
+
+int lume_stream_send_from(unsigned owner, struct lume_stream_request *request,
+                          lume_stream_payload_copy copy, void *context)
+{
+    CHECK(owner == network_owner && request->handle == 42 && request->count <= LUME_IO_BYTES);
+    unsigned bytes = request->count < tcp_send_capacity ? request->count : tcp_send_capacity;
+    if (!bytes)
+        return -LUME_EAGAIN;
+    CHECK(bytes <= sizeof(network_data));
+    int result = copy(context, network_data, bytes);
+    if (result)
+        return result;
+    ++network_sends;
+    return (int)bytes;
 }
 
 int lume_stream_socket_create(unsigned owner, unsigned op, struct lume_stream_request *request,

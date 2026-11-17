@@ -126,6 +126,9 @@ int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, u
         return -LUME_EINVAL;
     if (!bytes)
         return transfer(files, fd, NULL, 0, writing, positioned, offset);
+    int64_t direct;
+    if (writing && !positioned && lume_vfs_write_user(files, fd, pid, address, bytes, &direct))
+        return direct;
     bool pipe = !positioned && lume_vfs_pipe_io(files, fd);
     uint64_t requested = bytes;
     if (pipe)

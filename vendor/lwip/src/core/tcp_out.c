@@ -410,7 +410,8 @@ static err_t tcp_write_checks(struct tcp_pcb *pcb, u16_t len)
  * - TCP_WRITE_FLAG_MORE (0x02) for TCP connection, PSH flag will not be set on last segment sent,
  * @return ERR_OK if enqueued, another err_t on error
  */
-err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
+static err_t tcp_write_common(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags,
+                              err_t (*prepare)(void *, u16_t), void *context)
 {
     struct pbuf *concat_p = NULL;
     struct tcp_seg *last_unsent = NULL, *seg = NULL, *prev_seg = NULL, *queue = NULL;
@@ -578,11 +579,14 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 #if TCP_OVERSIZE_DBGCHECK
                 oversize_add = oversize;
 #endif /* TCP_OVERSIZE_DBGCHECK */
-                TCP_DATA_COPY2(concat_p->payload, (const u8_t *)arg + pos, seglen, &concat_chksum,
-                               &concat_chksum_swapped);
+                if (!prepare)
+                {
+                    TCP_DATA_COPY2(concat_p->payload, (const u8_t *)arg + pos, seglen,
+                                   &concat_chksum, &concat_chksum_swapped);
 #if TCP_CHECKSUM_ON_COPY
-                concat_chksummed += seglen;
+                    concat_chksummed += seglen;
 #endif /* TCP_CHECKSUM_ON_COPY */
+                }
                 queuelen += pbuf_clen(concat_p);
             }
             else
@@ -662,8 +666,9 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
             }
             LWIP_ASSERT("tcp_write: check that first pbuf can hold the complete seglen",
                         (p->len >= seglen));
-            TCP_DATA_COPY2((char *)p->payload + optlen, (const u8_t *)arg + pos, seglen, &chksum,
-                           &chksum_swapped);
+            if (!prepare)
+                TCP_DATA_COPY2((char *)p->payload + optlen, (const u8_t *)arg + pos, seglen,
+                               &chksum, &chksum_swapped);
         }
         else
         {
@@ -730,9 +735,12 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
         seg->oversize_left = oversize;
 #endif /* TCP_OVERSIZE_DBGCHECK */
 #if TCP_CHECKSUM_ON_COPY
-        seg->chksum = chksum;
-        seg->chksum_swapped = chksum_swapped;
-        seg->flags |= TF_SEG_DATA_CHECKSUMMED;
+        if (!prepare)
+        {
+            seg->chksum = chksum;
+            seg->chksum_swapped = chksum_swapped;
+            seg->flags |= TF_SEG_DATA_CHECKSUMMED;
+        }
 #endif /* TCP_CHECKSUM_ON_COPY */
 
         /* first segment of to-be-queued data? */
@@ -754,6 +762,32 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
                      lwip_ntohl(seg->tcphdr->seqno) + TCP_TCPLEN(seg)));
 
         pos += seglen;
+    }
+
+    if (prepare && len)
+    {
+        err = prepare(context, len);
+        if (err != ERR_OK)
+            goto discard;
+        pos = 0;
+#if TCP_OVERSIZE
+        pos = oversize_used;
+#endif /* TCP_OVERSIZE */
+        if (concat_p)
+        {
+            TCP_DATA_COPY2(concat_p->payload, (const u8_t *)arg + pos, concat_p->len,
+                           &concat_chksum, &concat_chksum_swapped);
+            pos += concat_p->len;
+#if TCP_CHECKSUM_ON_COPY
+            concat_chksummed = concat_p->len;
+#endif /* TCP_CHECKSUM_ON_COPY */
+        }
+        for (struct tcp_seg *part = queue; part; part = part->next)
+        {
+            TCP_DATA_COPY((u8_t *)part->p->payload + TCP_HLEN + optlen,
+                          (const u8_t *)arg + pos, part->len, part);
+            pos += part->len;
+        }
     }
 
     /*
@@ -872,7 +906,8 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
 memerr:
     tcp_set_flags(pcb, TF_NAGLEMEMERR);
     TCP_STATS_INC(tcp.memerr);
-
+    err = ERR_MEM;
+discard:
     if (concat_p != NULL)
     {
         pbuf_free(concat_p);
@@ -886,8 +921,21 @@ memerr:
         LWIP_ASSERT("tcp_write: valid queue length", pcb->unacked != NULL || pcb->unsent != NULL);
     }
     LWIP_DEBUGF(TCP_QLEN_DEBUG | LWIP_DBG_STATE,
-                ("tcp_write: %" S16_F " (with mem err)\n", pcb->snd_queuelen));
-    return ERR_MEM;
+                ("tcp_write: %" S16_F " (discarded write)\n", pcb->snd_queuelen));
+    return err;
+}
+
+err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags)
+{
+    return tcp_write_common(pcb, arg, len, apiflags, NULL, NULL);
+}
+
+/* Prepare the copied payload after allocation and before publishing any segment.
+ * The callback must retain exclusive access to the PCB until it returns. */
+err_t tcp_write_prepared(struct tcp_pcb *pcb, void *data, u16_t len,
+                         err_t (*prepare)(void *, u16_t), void *context)
+{
+    return tcp_write_common(pcb, data, len, TCP_WRITE_FLAG_COPY, prepare, context);
 }
 
 /**

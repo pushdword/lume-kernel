@@ -306,6 +306,38 @@ err_t tcp_write(struct tcp_pcb *p, const void *data, u16_t count, u8_t flags)
     return write_failure ? ERR_MEM : ERR_OK;
 }
 
+err_t tcp_write_prepared(struct tcp_pcb *p, void *data, u16_t count,
+                         err_t (*prepare)(void *, u16_t), void *context)
+{
+    assert(independent_request && p == &pcb && count);
+    if (write_failure)
+        return ERR_MEM;
+    err_t result = prepare(context, count);
+    return result == ERR_OK ? tcp_write(p, data, count, TCP_WRITE_FLAG_COPY) : result;
+}
+
+static int copy_payload(void *context, void *data, size_t bytes)
+{
+    size_t *copied = context;
+    *copied += bytes;
+    memset(data, 0x7a, bytes);
+    return 0;
+}
+
+static void retire_stream(void *unused)
+{
+    (void)unused;
+    lume_stream_release(2);
+}
+
+static int retire_during_send(void *context, void *data, size_t bytes)
+{
+    lume_worker_scheduler(retire_stream, NULL);
+    lume_stream_reap();
+    assert(lume_stream_busy());
+    return copy_payload(context, data, bytes);
+}
+
 err_t tcp_output(struct tcp_pcb *p)
 {
     (void)p;
@@ -386,6 +418,16 @@ int main(void)
     struct lume_stream_request r = {
         .version = LUME_IO_VERSION, .port = 8095, .address = {172, 30, 1, 163}};
     assert(lume_stream_call(2, LUME_STREAM_CONNECT, &r) == 0 && r.handle);
+    size_t copied = 0;
+    r.count = LUME_IO_BYTES;
+    pcb.snd_buf = 0;
+    assert(lume_stream_send_from(2, &r, copy_payload, &copied) == -LUME_EAGAIN && !copied);
+    pcb.snd_buf = 127;
+    write_failure = true;
+    assert(lume_stream_send_from(2, &r, copy_payload, &copied) == -LUME_EAGAIN && !copied);
+    write_failure = false;
+    assert(lume_stream_send_from(2, &r, copy_payload, &copied) == 127 && copied == 127);
+    assert(r.data[126] == 0x7a && !r.data[127]);
     assert(!pauses);
     bool pending;
     r.count = 1;
@@ -613,6 +655,13 @@ int main(void)
     assert(!lume_stream_busy());
     for (unsigned i = 0; i < 64; ++i)
         assert(!receive_allocations[i].memory);
+    assert(!lume_stream_call(2, LUME_STREAM_CONNECT, &r));
+    r.count = 100;
+    copied = 0;
+    assert(lume_stream_send_from(2, &r, retire_during_send, &copied) == -LUME_EBADF);
+    assert(copied == 100);
+    lume_stream_reap();
+    assert(!lume_stream_busy());
     r = (struct lume_stream_request){
         .version = LUME_IO_VERSION, .port = 8095, .address = {127, 0, 0, 1}};
     assert(!lume_stream_call(UINT32_C(0x40000001), LUME_STREAM_CONNECT, &r));

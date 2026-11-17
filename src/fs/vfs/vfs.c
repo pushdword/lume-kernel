@@ -2612,6 +2612,33 @@ int64_t lume_vfs_write(struct lume_files *f, uint64_t fd, const void *data, uint
     return write_description(f, descriptor(f, fd), data, bytes);
 }
 
+bool lume_vfs_write_user(struct lume_files *files, uint64_t fd, unsigned pid, uint64_t address,
+                         uint64_t bytes, int64_t *result)
+{
+    if (!result)
+        return false;
+    struct open_file *file = descriptor(files, fd);
+    if (!file || !file->external || !file->external->write_user)
+        return false;
+    *result = lume_vfs_sandbox_access(files, fd, true);
+    if (*result)
+        return true;
+    if (!(file->flags & 3))
+    {
+        *result = -LUME_EBADF;
+        return true;
+    }
+    int held = lume_vfs_hold(files, (unsigned)fd);
+    if (held < 0)
+    {
+        *result = held;
+        return true;
+    }
+    *result = file->external->write_user(file->context, pid, address, bytes);
+    lume_vfs_drop(held);
+    return true;
+}
+
 static int positioned_description(struct lume_files *files, uint64_t fd, uint64_t bytes,
                                   int64_t offset, bool writing, struct open_file *positioned)
 {

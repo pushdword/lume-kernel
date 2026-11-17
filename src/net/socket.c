@@ -279,10 +279,59 @@ static int64_t tcp_write(void *context, const void *data, uint64_t bytes)
     return tcp_write_buffer(context, data, bytes, NULL);
 }
 
+#if LUME_SOCKET_NATIVE_BUFFER
+struct tcp_user_payload
+{
+    unsigned pid;
+    uint64_t address;
+    void *data;
+    size_t bytes;
+    int result;
+};
+
+static void copy_user_payload(void *context)
+{
+    struct tcp_user_payload *payload = context;
+    struct lume_user_buffer_token token = {0};
+    if (!lume_user_buffer_prepare(&token, payload->pid, payload->address, payload->bytes, false) ||
+        !lume_user_buffer_copy(&token, payload->data, payload->bytes, false))
+        payload->result = -LUME_EFAULT;
+    lume_user_buffer_release(&token);
+}
+
+static int prepare_user_payload(void *context, void *data, size_t bytes)
+{
+    struct tcp_user_payload *payload = context;
+    payload->data = data;
+    payload->bytes = bytes;
+    lume_worker_scheduler(copy_user_payload, payload);
+    return payload->result;
+}
+
+static int64_t tcp_write_user(void *context, unsigned pid, uint64_t address, uint64_t bytes)
+{
+    struct tcp_file *file = context;
+    if (!file->handle || file->listening || file->shutdown)
+        return -LUME_EPIPE;
+    struct lume_stream_request request = {.version = LUME_IO_VERSION,
+                                          .handle = file->handle,
+                                          .count = bytes < LUME_IO_BYTES ? (unsigned)bytes
+                                                                         : LUME_IO_BYTES};
+    struct tcp_user_payload payload = {.pid = pid, .address = address};
+    ++file->active;
+    int result = lume_stream_send_from(file->owner, &request, prepare_user_payload, &payload);
+    --file->active;
+    return result > (int)request.count ? -LUME_EIO : result;
+}
+#endif
+
 static const struct lume_file_ops tcp_ops = {.kind = LUME_NODE_SOCKET,
                                              .close = tcp_close,
                                              .read = tcp_read,
                                              .write = tcp_write,
+#if LUME_SOCKET_NATIVE_BUFFER
+                                             .write_user = tcp_write_user,
+#endif
                                              .poll = tcp_poll,
                                              .source = tcp_source,
                                              .memory_io = false};

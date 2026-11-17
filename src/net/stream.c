@@ -454,8 +454,28 @@ void lume_stream_reap(void)
             close_stream(&streams[i]);
 }
 
+struct send_payload
+{
+    lume_stream_payload_copy copy;
+    void *context;
+    unsigned char *data;
+    struct stream *stream;
+    int error;
+};
+
+static err_t prepare_send(void *context, u16_t bytes)
+{
+    struct send_payload *payload = context;
+    payload->error = stream_closing(payload->stream)
+                         ? -LUME_EBADF
+                         : payload->copy(payload->context, payload->data, bytes);
+    if (!payload->error && stream_closing(payload->stream))
+        payload->error = -LUME_EBADF;
+    return payload->error ? ERR_ABRT : ERR_OK;
+}
+
 static int stream_request_owned(unsigned pid, unsigned op, struct lume_stream_request *r,
-                                bool nonblocking, unsigned options)
+                                bool nonblocking, unsigned options, struct send_payload *payload)
 {
     if (op >= LUME_ICMP_ECHO_START && op <= LUME_ICMP_ECHO_CLOSE)
         return lume_icmp_call(pid, op, r);
@@ -620,6 +640,8 @@ static int stream_request_owned(unsigned pid, unsigned op, struct lume_stream_re
         return -LUME_EINVAL;
     if (s->udp)
     {
+        if (payload)
+            return -LUME_EINVAL;
         if (op == LUME_STREAM_RECEIVE)
         {
             if (!s->packets)
@@ -692,7 +714,17 @@ static int stream_request_owned(unsigned pid, unsigned op, struct lume_stream_re
     unsigned n = r->count < tcp_sndbuf(s->pcb) ? r->count : tcp_sndbuf(s->pcb);
     if (!n)
         return -LUME_EAGAIN;
-    if (tcp_write(s->pcb, r->data, (u16_t)n, TCP_WRITE_FLAG_COPY) != ERR_OK)
+    err_t queued;
+    if (payload)
+    {
+        payload->stream = s;
+        queued = tcp_write_prepared(s->pcb, r->data, (u16_t)n, prepare_send, payload);
+        if (payload->error)
+            return payload->error;
+    }
+    else
+        queued = tcp_write(s->pcb, r->data, (u16_t)n, TCP_WRITE_FLAG_COPY);
+    if (queued != ERR_OK)
         return -LUME_EAGAIN;
     (void)tcp_output(s->pcb);
     return (int)n;
@@ -702,6 +734,7 @@ struct stream_operation
 {
     unsigned pid, op, options;
     struct lume_stream_request *request;
+    struct send_payload *payload;
     bool nonblocking;
     int result;
 };
@@ -711,8 +744,9 @@ static void stream_operation(void *context)
     struct stream_operation *operation = context;
     lume_stream_reap();
     ++protocol_active;
-    operation->result = stream_request_owned(operation->pid, operation->op, operation->request,
-                                             operation->nonblocking, operation->options);
+    operation->result =
+        stream_request_owned(operation->pid, operation->op, operation->request,
+                             operation->nonblocking, operation->options, operation->payload);
     --protocol_active;
     lume_stream_publish();
 }
@@ -720,7 +754,21 @@ static void stream_operation(void *context)
 static int stream_request(unsigned pid, unsigned op, struct lume_stream_request *request,
                           bool nonblocking, unsigned options)
 {
-    struct stream_operation operation = {pid, op, options, request, nonblocking, 0};
+    struct stream_operation operation = {
+        .pid = pid, .op = op, .options = options, .request = request, .nonblocking = nonblocking};
+    lume_worker_domain(stream_operation, &operation);
+    return operation.result;
+}
+
+int lume_stream_send_from(unsigned pid, struct lume_stream_request *request,
+                          lume_stream_payload_copy copy, void *context)
+{
+    struct send_payload payload = {.copy = copy, .context = context, .data = request->data};
+    struct stream_operation operation = {.pid = pid,
+                                         .op = LUME_STREAM_SEND,
+                                         .request = request,
+                                         .payload = &payload,
+                                         .nonblocking = true};
     lume_worker_domain(stream_operation, &operation);
     return operation.result;
 }
