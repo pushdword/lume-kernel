@@ -173,6 +173,11 @@ static bool render_operation(uint64_t action)
     case LUME_RENDER_PRIME_EXPORT:
     case LUME_RENDER_PRIME_IMPORT:
     case LUME_RENDER_DISPLAY:
+    case LUME_RENDER_V3D:
+    case LUME_RENDER_SYNC_MERGE:
+    case LUME_RENDER_SYNC_INFO:
+    case LUME_RENDER_SYNC_EXPORT:
+    case LUME_RENDER_MEMORY_SYNC:
         return true;
     default:
         return false;

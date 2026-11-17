@@ -140,6 +140,7 @@ ifneq ($(strip $(SCHED_INTERVAL_MS)),)
 SCHED_CPPFLAGS += -DSCHED_TICK_MS=$(SCHED_INTERVAL_MS)
 endif
 CPPFLAGS += $(SCHED_CPPFLAGS)
+include mk/linux-drivers.mk
 OBJECTS := $(addprefix $(OUT)/obj/,$(addsuffix .o,$(KERNEL_S) $(KERNEL_C)))
 .PHONY: all headers user-headers check check-image clean
 all: $(PAYLOAD) headers
@@ -540,7 +541,7 @@ FORCE:
 $(OUT):
 	mkdir -p "$@"
 $(OUT)/configuration: FORCE | $(OUT)
-	$(file >$@.tmp,$(CC) | $(CPPFLAGS) | $(CFLAGS) | $(SDK) | $(SHELL_ELF) | $(DRIVER_OBJECTS))
+	$(file >$@.tmp,$(CC) | $(CPPFLAGS) | $(CFLAGS) | $(SDK) | $(SHELL_ELF) | $(DRIVER_OBJECTS) | $(LINUX_DRIVERS))
 	cmp -s "$@.tmp" "$@" || cp "$@.tmp" "$@"
 
 $(OUT)/tests/user-stack$(HOSTEXE): tests/unit/user_stack_test.c src/mm/user_stack.c
@@ -1095,6 +1096,14 @@ $(OUT)/tests/virtio-gpu-device$(HOSTEXE): tests/unit/virtio_gpu_device_test.c sr
 
 .PHONY: check-render-control
 .PHONY: check-sandbox-render
+.PHONY: check-task-slots
+check-task-slots: $(OUT)/tests/task-slots$(HOSTEXE)
+	$(HOSTRUN) "$<"
+
+$(OUT)/tests/task-slots$(HOSTEXE): tests/unit/task_slot_test.c src/core/thread_state.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG "$<" -o "$@"
+
 check-sandbox-render: $(OUT)/tests/sandbox-render$(HOSTEXE)
 	env "$<"
 
@@ -1114,6 +1123,9 @@ check-render-control: $(OUT)/tests/render-control$(HOSTEXE)
 $(OUT)/tests/render-control$(HOSTEXE): tests/unit/render_test.c src/device/render.c src/device/render_virgl.h src/device/render_prime.h src/device/render_display.h src/device/virtio_gpu_device.c include/uapi/lume/render.h include/kernel/lume/render_device.h include/kernel/lume/virtio_gpu_device.h include/kernel/lume/vm_dma.h include/kernel/lume/worker.h include/kernel/lume/devfs_character.h include/ddk/lume/work.h tests/fixtures/render_host/lume/early.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 -Itests/fixtures/render_host -Iinclude/kernel -Iinclude/abi/native -Iinclude/uapi -Iinclude/ddk tests/unit/render_test.c src/device/virtio_gpu_device.c -o "$@"
+
+$(OUT)/tests/render-control$(HOSTEXE): src/device/render_v3d.h tests/unit/render_v3d_cases.h include/kernel/lume/v3d_device.h include/uapi/lume/v3d.h
+$(OUT)/tests/v3d$(HOSTEXE): include/uapi/lume/v3d.h
 
 $(OUT)/tests/io-calls$(HOSTEXE) $(OUT)/tests/worker-slices$(HOSTEXE): include/ddk/lume/work.h include/kernel/lume/worker.h
 

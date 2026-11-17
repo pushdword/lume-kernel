@@ -13,6 +13,8 @@
 #define PTE_WRITE (UINT32_C(1) << 29)
 #define EVENT_DONE 1u
 #define EVENT_FAULT 2u
+#define OVERFLOW_ADDRESS UINT32_C(0xe0000000)
+#define OVERFLOW_PAGES 64u
 #define FAULT_MASK                                                                                 \
     (V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI | V3D_HUB_INT_MMU_CAP | V3D_V7_HUB_INT_GMPV)
 #define TFU_R32F 29u
@@ -40,10 +42,10 @@ static bool wait_register(struct lume_v3d *gpu, unsigned bank, unsigned offset, 
     return false;
 }
 
-static void halt(struct lume_v3d *gpu)
+static bool halt(struct lume_v3d *gpu)
 {
     if (!gpu->powered)
-        return;
+        return true;
     gpu->io.interrupts(gpu->io.context, false);
     write_register(gpu, V3D_HUB, V3D_HUB_INT_MSK_SET, UINT32_MAX);
     write_register(gpu, V3D_CORE, V3D_CTL_INT_MSK_SET, UINT32_MAX);
@@ -53,8 +55,12 @@ static void halt(struct lume_v3d *gpu)
     write_register(gpu, V3D_HUB, V3D_MMUC_CONTROL, 0);
     gpu->io.barrier(gpu->io.context);
     if (gpu->io.power(gpu->io.context, false))
-        gpu->io.fatal("V3D DMA did not halt");
+    {
+        gpu->failed = true;
+        return false;
+    }
     gpu->powered = false;
+    return true;
 }
 
 static bool map_page(struct lume_v3d *gpu, uint32_t address, uint64_t physical)
@@ -69,9 +75,12 @@ static bool map_page(struct lume_v3d *gpu, uint32_t address, uint64_t physical)
     return true;
 }
 
-void lume_v3d_unbind(struct lume_v3d *gpu)
+bool lume_v3d_unbind(struct lume_v3d *gpu)
 {
-    halt(gpu);
+    if (!halt(gpu))
+        return false;
+    while (gpu->overflow_count)
+        gpu->io.release(gpu->io.context, gpu->overflow[--gpu->overflow_count], OVERFLOW_PAGES);
     if (gpu->table)
         gpu->io.release(gpu->io.context, gpu->table, TABLE_PAGES);
     if (gpu->scratch)
@@ -83,6 +92,7 @@ void lume_v3d_unbind(struct lume_v3d *gpu)
     gpu->bound = false;
     gpu->linear_surface = false;
     gpu->surface = (struct lume_gpu_surface){0};
+    return true;
 }
 
 int lume_v3d_bind(struct lume_v3d *gpu, const struct lume_gpu_surface *surface)
@@ -202,7 +212,8 @@ int lume_v3d_bind(struct lume_v3d *gpu, const struct lume_gpu_surface *surface)
     gpu->io.interrupts(gpu->io.context, true);
     return 0;
 fail:
-    lume_v3d_unbind(gpu);
+    if (!lume_v3d_unbind(gpu))
+        gpu->io.fatal("V3D DMA did not halt");
     return result ? result : -LUME_EIO;
 }
 
@@ -216,6 +227,9 @@ void lume_v3d_interrupt(struct lume_v3d *gpu)
         __atomic_fetch_or(&gpu->event, EVENT_DONE, __ATOMIC_RELEASE);
     if (status & FAULT_MASK)
         __atomic_fetch_or(&gpu->event, EVENT_FAULT, __ATOMIC_RELEASE);
+    uint32_t core = read_register(gpu, V3D_CORE, V3D_CTL_INT_STS);
+    write_register(gpu, V3D_CORE, V3D_CTL_INT_CLR, core);
+    __atomic_fetch_or(&gpu->core_event, core, __ATOMIC_RELEASE);
 }
 
 bool lume_v3d_completed(struct lume_v3d *gpu)
@@ -232,6 +246,7 @@ bool lume_v3d_completed(struct lume_v3d *gpu)
 static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsigned width,
                     unsigned height)
 {
+    gpu->io.interrupts(gpu->io.context, false);
     __atomic_store_n(&gpu->event, 0, __ATOMIC_RELEASE);
     gpu->phase = 12;
     gpu->completion =
@@ -250,6 +265,7 @@ static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsi
     write_register(gpu, V3D_HUB, V3D_TFU_COEF2(71), 0);
     write_register(gpu, V3D_HUB, V3D_TFU_COEF3(71), 0);
     gpu->io.barrier(gpu->io.context);
+    gpu->io.interrupts(gpu->io.context, true);
     write_register(gpu, V3D_HUB, V3D_TFU_ICFG(71),
                    TFU_R32F << V3D71_TFU_ICFG_OTYPE_SHIFT | V3D_TFU_ICFG_IOC);
     gpu->io.barrier(gpu->io.context);
@@ -260,12 +276,196 @@ static int transfer(struct lume_v3d *gpu, uint32_t source, uint32_t target, unsi
         gpu->status = read_register(gpu, V3D_HUB, V3D_TFU_CS(71));
         gpu->violation = read_register(gpu, V3D_HUB, V3D_MMU_VIO_ADDR);
         gpu->failed = true;
-        halt(gpu);
+        if (!halt(gpu))
+            gpu->io.fatal("V3D DMA did not halt");
         return -LUME_EIO;
     }
     ++gpu->jobs;
     gpu->phase = 13;
     return 0;
+}
+
+static bool render_overflow(struct lume_v3d *gpu, uint64_t table_address)
+{
+    if (gpu->overflow_count == sizeof(gpu->overflow) / sizeof(gpu->overflow[0]))
+        return false;
+    uint64_t memory = gpu->io.allocate_zeroed(gpu->io.context, OVERFLOW_PAGES);
+    if (!memory)
+        return false;
+    unsigned slot = gpu->overflow_count++;
+    gpu->overflow[slot] = memory;
+    uint32_t address = OVERFLOW_ADDRESS + slot * OVERFLOW_PAGES * 4096u;
+    uint32_t *table = (void *)(uintptr_t)table_address;
+    for (unsigned i = 0; i < OVERFLOW_PAGES; ++i)
+    {
+        uint64_t bus;
+        if (!gpu->io.map(gpu->io.context, memory + (uint64_t)i * 4096, 4096, &bus) ||
+            (bus & 4095) || bus >= (UINT64_C(1) << 36))
+            return false;
+        table[(address >> 12) + i] = PTE_VALID | PTE_WRITE | (uint32_t)(bus >> 12);
+    }
+    if (!gpu->io.sync(gpu->io.context, (const void *)(uintptr_t)memory, OVERFLOW_PAGES * 4096u,
+                      OVERFLOW_PAGES * 4096u, 1, LUME_DMA_BIDIRECTIONAL, false) ||
+        !gpu->io.sync(gpu->io.context, table + (address >> 12), OVERFLOW_PAGES * 4u,
+                      OVERFLOW_PAGES * 4u, 1, LUME_DMA_TO_DEVICE, false))
+        return false;
+    write_register(gpu, V3D_HUB, V3D_MMU_CTL,
+                   read_register(gpu, V3D_HUB, V3D_MMU_CTL) | V3D_MMU_CTL_TLB_CLEAR);
+    write_register(gpu, V3D_HUB, V3D_MMUC_CONTROL,
+                   V3D_MMUC_CONTROL_ENABLE | V3D_MMUC_CONTROL_FLUSH);
+    if (!wait_register(gpu, V3D_HUB, V3D_MMU_CTL, V3D_MMU_CTL_TLB_CLEARING, 0) ||
+        !wait_register(gpu, V3D_HUB, V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSHING, 0))
+        return false;
+    write_register(gpu, V3D_CORE, V3D_PTB_BPOA, address);
+    gpu->io.barrier(gpu->io.context);
+    write_register(gpu, V3D_CORE, V3D_PTB_BPOS, OVERFLOW_PAGES * 4096u);
+    return true;
+}
+
+static bool render_overflow_release(struct lume_v3d *gpu, uint64_t table_address)
+{
+    uint32_t *table = (void *)(uintptr_t)table_address;
+    memset(table + (OVERFLOW_ADDRESS >> 12), 0, gpu->overflow_count * OVERFLOW_PAGES * 4u);
+    unsigned bytes = gpu->overflow_count * OVERFLOW_PAGES * 4u;
+    if (bytes && gpu->powered &&
+        !gpu->io.sync(gpu->io.context, table + (OVERFLOW_ADDRESS >> 12), bytes, bytes, 1,
+                      LUME_DMA_TO_DEVICE, false))
+        return false;
+    while (gpu->overflow_count)
+        gpu->io.release(gpu->io.context, gpu->overflow[--gpu->overflow_count], OVERFLOW_PAGES);
+    return true;
+}
+
+static int render_wait(struct lume_v3d *gpu, uint32_t completion, uint64_t table)
+{
+    uint64_t deadline = gpu->io.ticks(gpu->io.context) + gpu->io.frequency * 2;
+    for (;;)
+    {
+        lume_v3d_interrupt(gpu);
+        if (__atomic_load_n(&gpu->event, __ATOMIC_ACQUIRE) & EVENT_FAULT)
+            return -LUME_EIO;
+        uint32_t core = __atomic_load_n(&gpu->core_event, __ATOMIC_ACQUIRE);
+        if (core & V3D_INT_OUTOMEM)
+        {
+            __atomic_fetch_and(&gpu->core_event, ~V3D_INT_OUTOMEM, __ATOMIC_ACQ_REL);
+            if (!render_overflow(gpu, table))
+                return -LUME_ENOMEM;
+        }
+        if (core & completion)
+            return 0;
+        if ((int64_t)(gpu->io.ticks(gpu->io.context) - deadline) >= 0)
+            return -LUME_ETIMEDOUT;
+        (void)gpu->io.wait(gpu->io.context, &gpu->core_event, completion | V3D_INT_OUTOMEM,
+                           deadline);
+    }
+}
+
+static bool render_clean(struct lume_v3d *gpu)
+{
+    write_register(gpu, V3D_CORE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF);
+    if (!wait_register(gpu, V3D_CORE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_TMUWCF, 0))
+        return false;
+    write_register(gpu, V3D_CORE, V3D_CTL_L2TCACTL,
+                   V3D_L2TCACTL_L2TFLS | (V3D_L2TCACTL_FLM_CLEAN << V3D_L2TCACTL_FLM_SHIFT));
+    return wait_register(gpu, V3D_CORE, V3D_CTL_L2TCACTL, V3D_L2TCACTL_L2TFLS, 0);
+}
+
+int lume_v3d_execute(struct lume_v3d *gpu, uint64_t table, const struct lume_v3d_request *request)
+{
+    uint64_t bus;
+    if (!gpu || !gpu->bound || gpu->failed || !table || (table & 4095) ||
+        !gpu->io.map(gpu->io.context, table, TABLE_PAGES * 4096u, &bus) || (bus & 4095) ||
+        bus >= (UINT64_C(1) << 36))
+        return -LUME_EINVAL;
+    gpu->io.interrupts(gpu->io.context, false);
+    write_register(gpu, V3D_HUB, V3D_HUB_INT_CLR, UINT32_MAX);
+    write_register(gpu, V3D_CORE, V3D_CTL_INT_CLR, UINT32_MAX);
+    __atomic_store_n(&gpu->event, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&gpu->core_event, 0, __ATOMIC_RELEASE);
+    write_register(gpu, V3D_HUB, V3D_MMU_PT_PA_BASE, (uint32_t)(bus >> 12));
+    write_register(gpu, V3D_HUB, V3D_MMU_CTL,
+                   read_register(gpu, V3D_HUB, V3D_MMU_CTL) | V3D_MMU_CTL_TLB_CLEAR);
+    write_register(gpu, V3D_HUB, V3D_MMUC_CONTROL,
+                   V3D_MMUC_CONTROL_ENABLE | V3D_MMUC_CONTROL_FLUSH);
+    if (!wait_register(gpu, V3D_HUB, V3D_MMU_CTL, V3D_MMU_CTL_TLB_CLEARING, 0) ||
+        !wait_register(gpu, V3D_HUB, V3D_MMUC_CONTROL, V3D_MMUC_CONTROL_FLUSHING, 0))
+        goto fail;
+    write_register(gpu, V3D_CORE, V3D_CTL_L2TFLSTA, 0);
+    write_register(gpu, V3D_CORE, V3D_CTL_L2TFLEND, UINT32_MAX);
+    write_register(gpu, V3D_CORE, V3D_CTL_L2TCACTL,
+                   V3D_L2TCACTL_L2TFLS | (V3D_L2TCACTL_FLM_FLUSH << V3D_L2TCACTL_FLM_SHIFT));
+    write_register(
+        gpu, V3D_CORE, V3D_CTL_SLCACTL,
+        (UINT32_C(15) << V3D_SLCACTL_TVCCS_SHIFT) | (UINT32_C(15) << V3D_SLCACTL_TDCCS_SHIFT) |
+            (UINT32_C(15) << V3D_SLCACTL_UCC_SHIFT) | (UINT32_C(15) << V3D_SLCACTL_ICC_SHIFT));
+    write_register(gpu, V3D_CORE, V3D_CTL_INT_CLR, UINT32_MAX);
+    write_register(gpu, V3D_CORE, V3D_CTL_INT_MSK_CLR,
+                   V3D_INT_FLDONE | V3D_INT_FRDONE | V3D_INT_OUTOMEM | V3D_INT_CSDDONE(71));
+    gpu->io.interrupts(gpu->io.context, true);
+    const uint32_t *r = request->registers;
+    int result = 0;
+    if (request->operation == LUME_V3D_SUBMIT_CL)
+    {
+        if (r[0] != r[1])
+        {
+            write_register(gpu, V3D_CORE, V3D_PTB_BPOS, 0);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT0QMA, r[4]);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT0QMS, r[5]);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT0QTS, r[6] ? r[6] | V3D_CLE_CT0QTS_ENABLE : 0);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT0QBA, r[0]);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT0QEA, r[1]);
+            result = render_wait(gpu, V3D_INT_FLDONE, table);
+        }
+        if (!result && r[2] != r[3])
+        {
+            write_register(gpu, V3D_CORE, V3D_CLE_CT1QBA, r[2]);
+            write_register(gpu, V3D_CORE, V3D_CLE_CT1QEA, r[3]);
+            result = render_wait(gpu, V3D_INT_FRDONE, table);
+        }
+    }
+    else if (request->operation == LUME_V3D_SUBMIT_TFU)
+    {
+        gpu->completion =
+            (V3D_GET_FIELD(read_register(gpu, V3D_HUB, V3D_TFU_CS(71)), V3D_TFU_CS_CVTCT) + 1) &
+            255;
+        const unsigned offsets[] = {V3D_TFU_IIA(71),   V3D_TFU_IIS(71),   V3D_TFU_ICA(71),
+                                    V3D_TFU_IUA(71),   V3D_TFU_IOA(71),   V3D_TFU_IOS(71),
+                                    V3D_TFU_COEF0(71), V3D_TFU_COEF1(71), V3D_TFU_COEF2(71),
+                                    V3D_TFU_COEF3(71), V3D_V7_TFU_IOC};
+        for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i)
+            write_register(gpu, V3D_HUB, offsets[i], r[i + 1]);
+        gpu->io.barrier(gpu->io.context);
+        write_register(gpu, V3D_HUB, V3D_TFU_ICFG(71), r[0] | V3D_TFU_ICFG_IOC);
+        if (!gpu->io.wait(gpu->io.context, &gpu->event, EVENT_DONE | EVENT_FAULT,
+                          gpu->io.ticks(gpu->io.context) + gpu->io.frequency * 2) ||
+            (__atomic_load_n(&gpu->event, __ATOMIC_ACQUIRE) & EVENT_FAULT))
+            result = -LUME_EIO;
+    }
+    else if (request->operation == LUME_V3D_SUBMIT_CSD)
+    {
+        for (unsigned i = 1; i < 7; ++i)
+            write_register(gpu, V3D_CORE, V3D_CSD_QUEUED_CFG0(71) + i * 4, r[i]);
+        write_register(gpu, V3D_CORE, V3D_V7_CSD_QUEUED_CFG7, 0);
+        gpu->io.barrier(gpu->io.context);
+        write_register(gpu, V3D_CORE, V3D_CSD_QUEUED_CFG0(71), r[0]);
+        result = render_wait(gpu, V3D_INT_CSDDONE(71), table);
+    }
+    else
+        return -LUME_EINVAL;
+    if (result || !render_clean(gpu))
+        goto fail;
+    gpu->io.barrier(gpu->io.context);
+    if (!render_overflow_release(gpu, table))
+        goto fail;
+    ++gpu->jobs;
+    return 0;
+fail:
+    gpu->status = read_register(gpu, V3D_CORE, V3D_CTL_INT_STS);
+    gpu->violation = read_register(gpu, V3D_HUB, V3D_MMU_VIO_ADDR);
+    if (halt(gpu))
+        (void)render_overflow_release(gpu, table);
+    gpu->failed = true;
+    return -LUME_EIO;
 }
 
 static bool independent(const struct lume_v3d *gpu, const struct lume_gpu_rect *rectangles,

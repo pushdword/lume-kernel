@@ -1287,6 +1287,7 @@ struct program_launch_scratch
     char arguments[LUME_ARG_BYTES], environment[LUME_ENV_BYTES];
     uint64_t pointers[LUME_ARG_MAX + 1];
     unsigned offsets[LUME_ARG_MAX], env_offsets[LUME_ENV_MAX];
+    unsigned reserved_child;
     const char *argument_pointers[LUME_ARG_MAX], *environment_pointers[LUME_ENV_MAX];
 };
 
@@ -1311,13 +1312,14 @@ static int start_program_with_scratch(struct lume_context *frame,
     if (!replacing && !process_quota(owner))
         return -LUME_EAGAIN;
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
-        if (i != 2 && !states[i])
+        if (i != 2 && thread_slot_available(thread_slots, states, i))
         {
             child = i;
             break;
         }
-    if (child == LUME_TASK_LIMIT)
+    if (child == LUME_TASK_LIMIT || !thread_slot_reserve(thread_slots, states, child, owner))
         return -LUME_EAGAIN;
+    scratch->reserved_child = child;
     struct lume_run_request request = {.path = LUME_CONTEXT_REG(frame, 0),
                                        .argv = LUME_CONTEXT_REG(frame, 1),
                                        .argc = (uint32_t)LUME_CONTEXT_REG(frame, 2)};
@@ -1692,7 +1694,10 @@ static int start_program(struct lume_context *frame)
     struct program_launch_scratch *scratch = lume_kernel_allocate(sizeof(*scratch));
     if (!scratch)
         return -LUME_ENOMEM;
+    scratch->reserved_child = LUME_TASK_LIMIT;
     int result = start_program_with_scratch(frame, scratch);
+    if (scratch->reserved_child < LUME_TASK_LIMIT)
+        thread_slots[scratch->reserved_child].reservation = 0;
     lume_kernel_free(scratch);
     return result;
 }
@@ -1728,10 +1733,11 @@ static int fork_program(struct lume_context *frame)
     {
         if (thread_slots[i].thread && states[i] && process_slot(i) == owner)
             return -LUME_EBUSY;
-        if (i && i != 2 && !states[i] && child == LUME_TASK_LIMIT)
+        if (i && i != 2 && thread_slot_available(thread_slots, states, i) &&
+            child == LUME_TASK_LIMIT)
             child = i;
     }
-    if (child == LUME_TASK_LIMIT)
+    if (child == LUME_TASK_LIMIT || !thread_slot_reserve(thread_slots, states, child, owner))
         return -LUME_EAGAIN;
     memset(&tasks[child], 0, sizeof(tasks[child]));
     kernel_memory_release[child] = KERNEL_MEMORY_LIVE;
@@ -1807,6 +1813,7 @@ fail:
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
         if (tasks[child].stack[i])
             (void)lume_page_free(tasks[child].stack[i]);
+    thread_slots[child].reservation = 0;
     return -LUME_ENOMEM;
 }
 
@@ -2161,6 +2168,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         }
 #endif
         exit_signals[task] = 11;
+        request_exit(task, 139);
         return finish_program(139);
     }
     extern unsigned char lume_user_kernel_probe[], lume_user_ro_probe[];

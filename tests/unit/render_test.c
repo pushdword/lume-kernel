@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "../../src/device/render.c"
 
 static struct lume_files files;
@@ -21,6 +22,7 @@ static bool full_work_queue;
 static uint64_t graphics_generation;
 static unsigned preferred_width, preferred_height;
 static bool release_graphics_wait;
+static void native_v3d_cases(void);
 
 uint64_t lume_graphics_active_generation(void)
 {
@@ -456,8 +458,11 @@ static void finish(void)
     assert(!lume_virtio_gpu_device_unregister(&device));
 }
 
+#include "render_v3d_cases.h"
+
 int main(void)
 {
+    native_v3d_cases();
     setup();
     struct lume_render_request data = request(-1);
     files.identity.euid = 123;
@@ -478,7 +483,8 @@ int main(void)
     data.data = (uintptr_t)&info;
     data.length = sizeof(info);
     assert(!call(LUME_RENDER_INFO, &data) && info.backend == LUME_RENDER_BACKEND_VIRGL);
-    assert(info.operations == 524287 && info.capsets == 2 && info.transport_features == 1);
+    assert(info.operations == (UINT64_C(524287) | LUME_RENDER_OPERATION(LUME_RENDER_MEMORY_SYNC)) &&
+           info.capsets == 2 && info.transport_features == 1);
     assert(info.file_id != 0);
     struct lume_render_pci pci;
     data = request(3);

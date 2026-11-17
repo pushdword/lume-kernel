@@ -27,6 +27,7 @@
 #include "lume/block.h"
 #include "lume/gpu_device.h"
 #include "lume/virtio_gpu_device.h"
+#include "lume/v3d_device.h"
 #include <string.h>
 #if defined(LUME_ARCH_AMD64)
 #include "lume/q35.h"
@@ -112,6 +113,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_virtio_gpu_device_unregister)
     EXPORT(lume_gpu_register)
     EXPORT(lume_gpu_unregister)
+    EXPORT(lume_v3d_device_register)
+    EXPORT(lume_v3d_device_unregister)
     EXPORT(lume_entropy)
     EXPORT(lume_fail)
     EXPORT(lume_files_init)
@@ -179,6 +182,8 @@ static int resolve(const char *name, uint64_t *address)
     EXPORT(lume_worker_pause)
     EXPORT(lume_worker_pause_ms)
     EXPORT(lume_worker_current)
+    EXPORT(lume_worker_scheduler)
+    EXPORT(lume_worker_independent)
     EXPORT(lume_worker_busy)
     EXPORT(lume_worker_checkpoint)
     EXPORT(lume_worker_compute)

@@ -9,9 +9,15 @@ PLATFORM_sd := drivers/storage/sdhci/sd.c
 PLATFORM_usb := drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c
 PLATFORM_display := drivers/display/rp1_dsi/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 PLATFORM_entropy := drivers/random/rng200/entropy.c
+PLATFORM_ENTROPY_WRAPPER := platform/raspberrypi5/modules/entropy.c
+ifeq ($(LINUX_DRIVERS),1)
+PLATFORM_entropy := $(LINUX_COMPAT_COMMON) drivers/linux/iproc_rng200.c $(LINUX_RNG200_SOURCE)
+PLATFORM_ENTROPY_WRAPPER :=
+$(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(PLATFORM_entropy))): CPPFLAGS += $(LINUX_COMPAT_CPPFLAGS) -DLUME_LINUX_RNG_NAME='"pi5-entropy"' -DKBUILD_MODNAME='"iproc_rng200"'
+endif
 PLATFORM_wifi := drivers/storage/bcm2712_sdio/host.c drivers/net/cyw43455/firmware.c drivers/storage/sdio/sdio.c src/net/wifi/wifi.c src/net/wifi/wifi_net.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
 PLATFORM_gem := examples/ddk/gem_board.c examples/ddk/gem.c examples/ddk/gem_netif.c
-PLATFORM_MODULE_SOURCES := $(sort $(foreach name,$(PLATFORM_MODULE_NAMES),$(PLATFORM_$(name)) platform/raspberrypi5/modules/$(name).c))
+PLATFORM_MODULE_SOURCES := $(sort $(foreach name,$(PLATFORM_MODULE_NAMES),$(PLATFORM_$(name)) $(if $(filter entropy,$(name)),$(PLATFORM_ENTROPY_WRAPPER),platform/raspberrypi5/modules/$(name).c)))
 HDMI_MODULE_SOURCE := drivers/display/bcm2712_hdmi/module.c drivers/display/bcm2712_hdmi/firmware.c drivers/display/bcm2712_hdmi/console.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 PLATFORM_MODULE_SOURCES += $(HDMI_MODULE_SOURCE)
 PLATFORM_MODULES += $(OUT)/modules/bcm2712-hdmi.lkm
@@ -35,7 +41,7 @@ $(OUT)/lkm/obj/%.c.o: %.c $(OUT)/configuration $(OUT)/ddk/include/lume/module_bu
 	$(CC) $(CPPFLAGS) -Iexamples/ddk -I$(OUT)/ddk/include -DLUME_PLATFORM_LKM=1 $(filter-out -ffunction-sections -fdata-sections,$(CFLAGS)) -MMD -MP -MF "$@.d" -MT "$@" -c "$<" -o "$@"
 
 define platform_module_rule
-$(OUT)/modules/$(1).lkm: $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(PLATFORM_$(1)) platform/raspberrypi5/modules/$(1).c))
+$(OUT)/modules/$(1).lkm: $(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(PLATFORM_$(1)) $(if $(filter entropy,$(1)),$(PLATFORM_ENTROPY_WRAPPER),platform/raspberrypi5/modules/$(1).c)))
 	mkdir -p "$$(@D)"
 	$(LD) -r --build-id=none $$^ -o "$$@"
 endef

@@ -10,6 +10,8 @@
 #include "lume/irq.h"
 #include "lume/worker.h"
 #include "lume/pi5_firmware.h"
+#include "lume/v3d_device.h"
+#include "../../../vendor/linux-v3d/v3d_regs.h"
 #include <string.h>
 
 #define PM_RESET UINT32_C(0x40)
@@ -23,6 +25,9 @@ struct binding
     unsigned hub_irq, core_irq;
     bool claimed, irq_registered, core_irq_registered, registered;
     uint32_t irq_access;
+    uint32_t parameters[7];
+    uint64_t render_memory;
+    bool render_registered;
 };
 
 static uint32_t read_register(void *context, unsigned bank, unsigned offset)
@@ -194,8 +199,16 @@ static bool wait(void *context, volatile uint32_t *event, uint32_t mask, uint64_
     struct binding *binding = context;
     do
     {
-        if (lume_v3d_completed(&binding->gpu))
+        if (event == &binding->gpu.event && lume_v3d_completed(&binding->gpu))
             return true;
+        if (event != &binding->gpu.event)
+        {
+            lume_v3d_interrupt(&binding->gpu);
+            if (__atomic_load_n(event, __ATOMIC_ACQUIRE) & mask)
+                return true;
+            if (__atomic_load_n(&binding->gpu.event, __ATOMIC_ACQUIRE) & 2u)
+                return true;
+        }
         uint64_t now = lume_counter_read();
         if ((int64_t)(now - deadline) >= 0)
             break;
@@ -255,7 +268,8 @@ static void unbind_surface(void *context, void *session)
         lume_fail("V3D surface owner");
     lume_value("V3D_COPY_JOBS", binding->gpu.jobs);
     lume_value("V3D_COPY_PIXELS", binding->gpu.pixels);
-    lume_v3d_unbind(session);
+    if (!lume_v3d_unbind(session))
+        lume_fail("V3D DMA did not halt");
 }
 
 static const struct lume_gpu_backend backend = {
@@ -265,6 +279,79 @@ static const struct lume_gpu_backend backend = {
     .copy = copy,
     .unbind = unbind_surface,
 };
+
+static int render_start(void *context)
+{
+    struct binding *binding = context;
+    if (binding->gpu.bound)
+        return -LUME_EBUSY;
+    binding->render_memory = allocate_zeroed(context, 1);
+    if (!binding->render_memory)
+        return -LUME_ENOMEM;
+    struct lume_gpu_surface surface = {
+        binding->render_memory, &binding->render_memory, 64, 16, 256, 1};
+    int result = lume_v3d_bind(&binding->gpu, &surface);
+    if (result && !binding->gpu.powered)
+    {
+        release(context, binding->render_memory, 1);
+        binding->render_memory = 0;
+    }
+    return result;
+}
+
+static int render_stop(void *context)
+{
+    struct binding *binding = context;
+    if (!lume_v3d_unbind(&binding->gpu))
+        return -LUME_EBUSY;
+    binding->gpu.failed = false;
+    if (binding->render_memory)
+    {
+        release(context, binding->render_memory, 1);
+        binding->render_memory = 0;
+    }
+    return 0;
+}
+
+static int render_parameter(void *context, unsigned index, uint64_t *value)
+{
+    const struct binding *binding = context;
+    if (index < 7)
+        *value = binding->parameters[index];
+    else if (index == 7 || index == 8 || index == 9)
+        *value = 1;
+    else if (index < 16)
+        *value = 0;
+    else
+        return -LUME_EINVAL;
+    return 0;
+}
+
+static int render_execute(void *context, uint64_t table, const struct lume_v3d_request *request)
+{
+    struct binding *binding = context;
+    return lume_v3d_execute(&binding->gpu, table, request);
+}
+
+static bool render_sync(void *context, const void *memory, size_t bytes,
+                        enum lume_dma_direction direction, bool cpu)
+{
+    return sync(context, memory, bytes, bytes, 1, direction, cpu);
+}
+
+static bool render_isolated(void *context)
+{
+    const struct binding *binding = context;
+    return !binding->gpu.powered;
+}
+
+static const struct lume_v3d_device_ops render_operations = {.start = render_start,
+                                                             .stop = render_stop,
+                                                             .parameter = render_parameter,
+                                                             .execute = render_execute,
+                                                             .map = map,
+                                                             .sync = render_sync,
+                                                             .isolated = render_isolated};
 
 static int qualify(struct binding *binding)
 {
@@ -285,6 +372,11 @@ static int qualify(struct binding *binding)
     lume_value("V3D_VERSION", binding->gpu.version);
     if (!result)
     {
+        const unsigned offsets[] = {V3D_HUB_UIFCFG, V3D_HUB_IDENT1, V3D_HUB_IDENT2, V3D_HUB_IDENT3,
+                                    V3D_CTL_IDENT0, V3D_CTL_IDENT1, V3D_CTL_IDENT2};
+        for (unsigned i = 0; i < 7; ++i)
+            binding->parameters[i] =
+                read_register(binding, i <= 3 ? V3D_HUB : V3D_CORE, offsets[i]);
         uint32_t *pixels = (void *)(uintptr_t)client, *expected = (void *)(uintptr_t)reference;
         for (unsigned i = 0; i < 4096; ++i)
             pixels[i] = expected[i] = UINT32_C(0xa5230000) ^ (i * 65537u);
@@ -300,7 +392,8 @@ static int qualify(struct binding *binding)
         if (!result && memcmp(pixels, expected, 16384))
             result = -LUME_EIO;
     }
-    lume_v3d_unbind(&binding->gpu);
+    if (!lume_v3d_unbind(&binding->gpu))
+        lume_fail("V3D DMA did not halt");
     if (result)
     {
         lume_value("V3D_PHASE", binding->gpu.phase);
@@ -393,6 +486,11 @@ static int start(struct lume_hardware *hardware, void *context)
         return result;
     result = lume_gpu_register(&backend, binding);
     binding->registered = !result;
+    if (!result)
+    {
+        result = lume_v3d_device_register(&render_operations, binding);
+        binding->render_registered = !result;
+    }
     return result;
 }
 
@@ -400,6 +498,13 @@ static int stop(struct lume_hardware *hardware, void *context)
 {
     (void)hardware;
     struct binding *binding = context;
+    if (binding->render_registered)
+    {
+        int result = lume_v3d_device_unregister(&render_operations, binding);
+        if (result)
+            return result;
+        binding->render_registered = false;
+    }
     if (binding->registered)
     {
         int result = lume_gpu_unregister(&backend, binding);
@@ -407,7 +512,8 @@ static int stop(struct lume_hardware *hardware, void *context)
             return result;
         binding->registered = false;
     }
-    lume_v3d_unbind(&binding->gpu);
+    if (!lume_v3d_unbind(&binding->gpu))
+        return -LUME_EBUSY;
     if (binding->core_irq_registered)
     {
         int result = lume_irq_unregister(binding->core_irq, binding);

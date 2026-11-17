@@ -3,6 +3,7 @@
 #define LUME_V3D_H
 #include "lume/gpu_device.h"
 #include "lume/dma.h"
+#include "lume/v3d.h"
 
 enum
 {
@@ -40,14 +41,17 @@ struct lume_v3d
     unsigned phase;
     uint32_t identity, debug, status, violation;
     unsigned completion;
-    volatile uint32_t event;
+    volatile uint32_t event, core_event;
     bool powered, bound, failed, linear_surface;
     uint64_t jobs, pixels;
+    uint64_t overflow[64];
+    unsigned overflow_count;
 };
 
 int lume_v3d_bind(struct lume_v3d *, const struct lume_gpu_surface *);
 int lume_v3d_copy(struct lume_v3d *, const struct lume_gpu_rect *, unsigned);
-void lume_v3d_unbind(struct lume_v3d *);
+bool lume_v3d_unbind(struct lume_v3d *);
 void lume_v3d_interrupt(struct lume_v3d *);
 bool lume_v3d_completed(struct lume_v3d *);
+int lume_v3d_execute(struct lume_v3d *, uint64_t, const struct lume_v3d_request *);
 #endif

@@ -12,6 +12,7 @@
 #include "lume/devfs_character.h"
 #include "lume/file_mode.h"
 #include "lume/graphics_device.h"
+#include "lume/dma.h"
 #include <string.h>
 
 struct render_resource;
@@ -33,6 +34,7 @@ struct render_file
 static struct render_file *render_files;
 static unsigned render_file_count;
 static uint64_t render_file_serial;
+static unsigned render_devices;
 static void reap_file(void *);
 static void retire_jobs(struct render_file *, unsigned *);
 static void poll_buffers(void);
@@ -120,6 +122,8 @@ static const struct lume_file_ops operations = {.kind = LUME_NODE_CHAR,
                                                 .poll = poll_file,
                                                 .memory_io = true};
 
+#include "render_v3d.h"
+
 int lume_render_open_file(struct lume_files *files, unsigned flags)
 {
     if (!files || files->identity.euid || files->identity.jailed)
@@ -128,7 +132,7 @@ int lume_render_open_file(struct lume_files *files, unsigned flags)
         return -LUME_EINVAL;
     struct lume_virtio_gpu_device *device = lume_virtio_gpu_device_hold();
     if (!device)
-        return -LUME_ENOENT;
+        return native_v3d_open(files, flags);
     if (render_file_count == 64)
     {
         lume_virtio_gpu_device_drop(device);
@@ -177,12 +181,22 @@ static struct lume_devfs_character character_device = {
 
 int lume_render_device_register(void)
 {
-    return lume_devfs_register_character(&character_device);
+    if (render_devices == UINT32_MAX)
+        return -LUME_EBUSY;
+    int result = render_devices ? 0 : lume_devfs_register_character(&character_device);
+    if (!result)
+        ++render_devices;
+    return result;
 }
 
 int lume_render_device_unregister(void)
 {
-    return lume_devfs_unregister_character(&character_device);
+    if (!render_devices)
+        return -LUME_ENOENT;
+    int result = render_devices > 1 ? 0 : lume_devfs_unregister_character(&character_device);
+    if (!result)
+        --render_devices;
+    return result;
 }
 
 static void complete(void *context, uint64_t fence, int result, const void *data, size_t bytes)
@@ -202,6 +216,7 @@ static void complete(void *context, uint64_t fence, int result, const void *data
 
 void lume_render_poll_background(void)
 {
+    native_v3d_poll();
     struct control_reply **position = &quarantined;
     while (*position)
     {
@@ -337,7 +352,8 @@ static int call_file(struct render_file *file, unsigned action, struct lume_rend
                                             LUME_RENDER_OPERATION(LUME_RENDER_PRIME_EXPORT) |
                                             LUME_RENDER_OPERATION(LUME_RENDER_PRIME_IMPORT) |
                                             LUME_RENDER_OPERATION(LUME_RENDER_DISPLAY) |
-                                            LUME_RENDER_OPERATION(LUME_RENDER_PRESENT),
+                                            LUME_RENDER_OPERATION(LUME_RENDER_PRESENT) |
+                                            LUME_RENDER_OPERATION(LUME_RENDER_MEMORY_SYNC),
                                         .scanouts = device->scanouts,
                                         .capsets = device->capsets,
                                         .file_id = file->identity};
@@ -399,6 +415,72 @@ static int call_file(struct render_file *file, unsigned action, struct lume_rend
     return result;
 }
 
+struct render_memory_sync
+{
+    struct lume_vm_dma_span span;
+    enum lume_dma_direction direction;
+    bool end;
+    int result;
+};
+
+static void sync_memory_cache(void *context)
+{
+    struct render_memory_sync *sync = context;
+    for (unsigned first = 0; first < sync->span.count;)
+    {
+        uint64_t address = sync->span.pages[first];
+        unsigned count = 1;
+        while (count < 16 && first + count < sync->span.count &&
+               sync->span.pages[first + count] == address + (uint64_t)count * 4096)
+            ++count;
+        size_t bytes = (size_t)count * 4096;
+        if (address > UINTPTR_MAX - (bytes - 1))
+        {
+            sync->result = -LUME_EOVERFLOW;
+            return;
+        }
+        bool valid = sync->end ? lume_dma_sync_rect_for_device((const void *)(uintptr_t)address,
+                                                               bytes, bytes, 1, sync->direction)
+                               : lume_dma_sync_rect_for_cpu((const void *)(uintptr_t)address, bytes,
+                                                            bytes, 1, sync->direction);
+        if (!valid)
+        {
+            sync->result = -LUME_EIO;
+            return;
+        }
+        first += count;
+    }
+}
+
+static int sync_memory(struct lume_files *files, const struct lume_render_request *request)
+{
+    uint64_t access = request->value & (LUME_RENDER_MEMORY_READ | LUME_RENDER_MEMORY_WRITE);
+    if (request->flags || request->data || request->length || request->id || request->index ||
+        request->revision || !access ||
+        (request->value &
+         ~(LUME_RENDER_MEMORY_READ | LUME_RENDER_MEMORY_WRITE | LUME_RENDER_MEMORY_END)))
+        return -LUME_EINVAL;
+    struct lume_stat stat;
+    int result = (int)lume_vfs_stat(files, (unsigned)request->fd, &stat);
+    if (result)
+        return result;
+    if (!stat.size || (stat.size & 4095) || stat.size / 4096 > LUME_VM_DMA_MAX_PAGES)
+        return -LUME_EINVAL;
+    struct lume_vm_dma_pin *pin = NULL;
+    struct render_memory_sync sync = {
+        .direction = access == LUME_RENDER_MEMORY_READ    ? LUME_DMA_FROM_DEVICE
+                     : access == LUME_RENDER_MEMORY_WRITE ? LUME_DMA_TO_DEVICE
+                                                          : LUME_DMA_BIDIRECTIONAL,
+        .end = (request->value & LUME_RENDER_MEMORY_END) != 0};
+    result = lume_vm_dma_pin(files, (unsigned)request->fd, 0, stat.size,
+                             (access & LUME_RENDER_MEMORY_WRITE) != 0, &pin, &sync.span);
+    if (result)
+        return result;
+    lume_worker_domain(sync_memory_cache, &sync);
+    lume_vm_dma_unpin(&pin);
+    return sync.result;
+}
+
 int64_t lume_render_call(struct lume_files *files, unsigned pid, unsigned action, uint64_t pointer,
                          uint64_t bytes)
 {
@@ -424,7 +506,7 @@ int64_t lume_render_call(struct lume_files *files, unsigned pid, unsigned action
         {
             struct lume_virtio_gpu_device *device = lume_virtio_gpu_device_hold_failed();
             if (!device)
-                return -LUME_ENOENT;
+                return native_v3d_reset();
             result = reset_device(device);
             lume_render_poll_background();
             lume_virtio_gpu_device_drop(device);
@@ -446,6 +528,23 @@ int64_t lume_render_call(struct lume_files *files, unsigned pid, unsigned action
     }
     else
     {
+        if (action == LUME_RENDER_MEMORY_SYNC)
+            return sync_memory(files, &request);
+        if (action == LUME_RENDER_SYNC_MERGE || action == LUME_RENDER_SYNC_INFO)
+            return native_v3d_sync_call(files, action, &request);
+        struct native_v3d_file *native =
+            lume_vfs_external(files, (unsigned)request.fd, &native_v3d_file_ops);
+        if (native)
+        {
+            if (native->busy || native->references == UINT32_MAX)
+                return -LUME_EBUSY;
+            ++native->references;
+            native->busy = true;
+            result = native_v3d_call(native, files, pid, action, &request);
+            native->busy = false;
+            native_v3d_file_drop(native);
+            goto reply;
+        }
         struct render_file *file = lume_vfs_external(files, (unsigned)request.fd, &operations);
         if (!file)
             return -LUME_EBADF;
@@ -459,12 +558,13 @@ int64_t lume_render_call(struct lume_files *files, unsigned pid, unsigned action
         file->busy = false;
         drop_file(file);
     }
+reply:
     if (!lume_user_buffer(pointer, bytes, true))
     {
         if (!result && action == LUME_RENDER_OPEN)
             (void)lume_vfs_close(files, (unsigned)request.fd);
-        if (!result &&
-            (action == LUME_RENDER_RESOURCE_EXPORT || action == LUME_RENDER_PRIME_EXPORT))
+        if (!result && (action == LUME_RENDER_RESOURCE_EXPORT ||
+                        action == LUME_RENDER_PRIME_EXPORT || action == LUME_RENDER_SYNC_EXPORT))
             (void)lume_vfs_close(files, (unsigned)request.value);
         return -LUME_EFAULT;
     }

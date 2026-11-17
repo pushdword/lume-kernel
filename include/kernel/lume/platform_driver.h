@@ -118,16 +118,32 @@ struct lume_platform_entropy_ops
 
 struct lume_graphics_request;
 
+enum
+{
+    LUME_GRAPHICS_TARGET_QUERY,
+    LUME_GRAPHICS_TARGET_ACQUIRE,
+    LUME_GRAPHICS_TARGET_RELEASE
+};
+
+struct lume_graphics_target
+{
+    uint64_t physical, bytes;
+    uint32_t width, height, pitch, depth, order;
+};
+
 struct lume_platform_graphics_ops
 {
     int (*query)(struct lume_graphics_request *);
     int (*claim)(bool);
     int (*present)(const struct lume_graphics_request *);
+    int (*target)(struct lume_graphics_target *, unsigned);
 };
 
 int lume_platform_graphics_query(struct lume_graphics_request *);
 int lume_platform_graphics_claim(bool);
 int lume_platform_graphics_present(const struct lume_graphics_request *);
+/* ACQUIRE retains framebuffer storage until RELEASE after DMA completion or reset. */
+int lume_platform_graphics_target(struct lume_graphics_target *, unsigned);
 
 struct lume_platform_wifi_ops
 {

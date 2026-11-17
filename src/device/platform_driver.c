@@ -45,7 +45,7 @@ static struct provider
     const void *source;
     void *owner;
     union operations operations;
-    bool mounted;
+    bool mounted, graphics_claimed;
     unsigned bindings;
     unsigned active;
 } providers[LUME_PLATFORM_DRIVER_COUNT];
@@ -90,9 +90,11 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
     size_t required = operation_bytes(kind);
     size_t display_base = offsetof(struct lume_platform_display_ops, pending);
     size_t sd_base = offsetof(struct lume_platform_sd_ops, lume_sd_write_deferred);
+    size_t graphics_base = offsetof(struct lume_platform_graphics_ops, target);
     if (!operations || !required ||
         (bytes != required && !(kind == LUME_PLATFORM_DISPLAY && bytes == display_base) &&
-         !(kind == LUME_PLATFORM_SD && bytes == sd_base)))
+         !(kind == LUME_PLATFORM_SD && bytes == sd_base) &&
+         !(kind == LUME_PLATFORM_GRAPHICS && bytes == graphics_base)))
         return -LUME_EINVAL;
     if (kind == LUME_PLATFORM_SD && bytes == required)
     {
@@ -123,6 +125,8 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
         if (!callback && kind == LUME_PLATFORM_DISPLAY && offset >= display_base)
             continue;
         if (!callback && kind == LUME_PLATFORM_SD && offset >= sd_base)
+            continue;
+        if (!callback && kind == LUME_PLATFORM_GRAPHICS && offset >= graphics_base)
             continue;
         int result = callback ? lume_module_pin(callback, &current) : -LUME_EINVAL;
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
@@ -708,7 +712,18 @@ int lume_platform_graphics_claim(bool acquire)
         return -LUME_ENOSYS;
     int result = provider->operations.graphics.claim(acquire);
     if (!result)
-        provider->active = acquire;
+    {
+        if (acquire)
+        {
+            ++provider->active;
+            provider->graphics_claimed = true;
+        }
+        else if (provider->graphics_claimed)
+        {
+            --provider->active;
+            provider->graphics_claimed = false;
+        }
+    }
     return result;
 }
 
@@ -716,6 +731,26 @@ int lume_platform_graphics_present(const struct lume_graphics_request *request)
 {
     struct provider *provider = providers + LUME_PLATFORM_GRAPHICS;
     return provider->source ? provider->operations.graphics.present(request) : -LUME_ENOSYS;
+}
+
+int lume_platform_graphics_target(struct lume_graphics_target *target, unsigned action)
+{
+    struct provider *provider = providers + LUME_PLATFORM_GRAPHICS;
+    if (!provider->source || !provider->operations.graphics.target)
+        return -LUME_ENOSYS;
+    if (action > LUME_GRAPHICS_TARGET_RELEASE ||
+        (action != LUME_GRAPHICS_TARGET_RELEASE && !target))
+        return -LUME_EINVAL;
+    if (action == LUME_GRAPHICS_TARGET_ACQUIRE && provider->active == UINT32_MAX)
+        return -LUME_EBUSY;
+    if (action == LUME_GRAPHICS_TARGET_RELEASE && !provider->active)
+        return -LUME_EINVAL;
+    int result = provider->operations.graphics.target(target, action);
+    if (!result && action == LUME_GRAPHICS_TARGET_ACQUIRE)
+        ++provider->active;
+    if (!result && action == LUME_GRAPHICS_TARGET_RELEASE)
+        --provider->active;
+    return result;
 }
 
 void lume_display_putc(char c)

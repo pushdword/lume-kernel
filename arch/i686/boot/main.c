@@ -92,7 +92,16 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
         lume_fail("PC data volume");
     lume_value("PERSISTENT_VOLUME_READY", 1);
     extern int lume_pc_entropy_start(void);
+#if defined(LUME_LINUX_BUILTIN)
+    extern int lume_linux_virtio_rng_start(void);
+    int entropy_result = lume_linux_virtio_rng_start();
+    lume_value("LINUX_ENTROPY_READY", entropy_result == 0);
+    if (entropy_result)
+        entropy_result = lume_pc_entropy_start();
+    lume_value("PC_ENTROPY_READY", entropy_result == 0);
+#else
     lume_value("PC_ENTROPY_READY", lume_pc_entropy_start() == 0);
+#endif
     lume_puts("LUME i686 INTERACTIVE CONSOLE READY\n");
     static const char greeting[] = "Lume i686 interactive console ready.\n";
     lume_display_write(greeting, sizeof(greeting) - 1);

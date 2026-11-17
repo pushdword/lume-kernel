@@ -183,7 +183,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             .ddk_version = LUME_DDK_VERSION,
             .boot_profile = LUME_BOOT_PROFILE,
             .capabilities = lume_task_capabilities(pid)};
-#if defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
         ((struct lume_system_features *)(uintptr_t)a)->features |= LUME_FEATURE_SHARED_WORD_WAIT;
 #endif
 #if defined(LUME_ARCH_I686)

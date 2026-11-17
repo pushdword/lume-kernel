@@ -133,7 +133,7 @@ static int64_t thread_create(const struct lume_thread_request *r)
         !lume_user_buffer(images[owner].tls_address, images[owner].tls_file, false))
         return -LUME_EFAULT;
     for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
-        if (i != 2 && !states[i] &&
+        if (i != 2 && thread_slot_available(thread_slots, states, i) &&
             (native_vm ||
              (LUME_THREAD_BASE + (uint64_t)i * 0x100000 + 4096 <= LUME_USER_STACK &&
               (uint64_t)pages * 4096 <=

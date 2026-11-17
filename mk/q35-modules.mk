@@ -10,6 +10,10 @@ PLATFORM_MODULES := $(addprefix $(OUT)/modules/,$(addsuffix .lkm,$(PLATFORM_MODU
 Q35_vblk := drivers/storage/virtio_blk/block.c platform/q35/virtio.c
 Q35_vnet := drivers/net/virtio_net/net.c platform/q35/virtio.c
 Q35_vrng := drivers/entropy/virtio_rng/rng.c platform/q35/virtio.c
+ifeq ($(LINUX_DRIVERS),1)
+Q35_vrng := $(LINUX_COMPAT_COMMON) drivers/linux/virtio_rng.c $(LINUX_VIRTIO_RNG_SOURCE) platform/q35/virtio.c
+$(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(Q35_vrng))): CPPFLAGS += $(LINUX_COMPAT_CPPFLAGS) -DLUME_LINUX_RNG_NAME='"q35-virtio-rng"' -DKBUILD_MODNAME='"virtio_rng"'
+endif
 Q35_vga := drivers/display/bochs_vbe/module.c drivers/display/bochs_vbe/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 Q35_ps2 := drivers/input/ps2/keyboard.c drivers/input/usb_hid/hid_keyboard.c
 Q35_xhci := platform/q35/modules/usb.c drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c

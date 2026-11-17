@@ -61,7 +61,9 @@ static bool kernel_call_mutates(const struct lume_context *frame)
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_OPEN ||
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_RESOURCE_EXPORT ||
                LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_EXPORT ||
-               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_IMPORT;
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_PRIME_IMPORT ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_SYNC_EXPORT ||
+               LUME_CONTEXT_REG(frame, 0) == LUME_RENDER_SYNC_MERGE;
     case LUME_SYS_VM:
         return LUME_CONTEXT_REG(frame, 0) != LUME_VM_INFO;
     case LUME_SYS_CREDENTIAL:
@@ -139,6 +141,8 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_GPU:
         if (action == LUME_RENDER_OPEN)
             return LUME_WORK_STORAGE;
+        if (action == LUME_RENDER_SYNC_MERGE || action == LUME_RENDER_SYNC_INFO)
+            return LUME_WORK_GENERAL;
         if (action >= LUME_RENDER_OPEN && action <= LUME_RENDER_LAST)
             return LUME_WORK_RENDER;
         return LUME_WORK_DISPLAY;

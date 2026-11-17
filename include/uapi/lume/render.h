@@ -7,6 +7,8 @@
 #define LUME_RENDER_CLOEXEC 1u
 #define LUME_RENDER_RDWR 2u
 #define LUME_RENDER_COMMAND_BYTES (260u * 1024u)
+#define LUME_RENDER_DISPLAY_RGB565 UINT32_C(0x10000)
+#define LUME_RENDER_DISPLAY_BGR UINT32_C(0x20000)
 #define LUME_RENDER_ACTION_BASE 256u
 #define LUME_RENDER_OPERATION(action) (UINT64_C(1) << ((action) - LUME_RENDER_ACTION_BASE))
 
@@ -31,12 +33,18 @@ enum
     LUME_RENDER_PRIME_IMPORT,
     LUME_RENDER_DISPLAY,
     LUME_RENDER_PRESENT,
-    LUME_RENDER_LAST = LUME_RENDER_PRESENT
+    LUME_RENDER_V3D,
+    LUME_RENDER_SYNC_MERGE,
+    LUME_RENDER_SYNC_INFO,
+    LUME_RENDER_SYNC_EXPORT,
+    LUME_RENDER_MEMORY_SYNC,
+    LUME_RENDER_LAST = LUME_RENDER_MEMORY_SYNC
 };
 
 enum
 {
-    LUME_RENDER_BACKEND_VIRGL = 1
+    LUME_RENDER_BACKEND_VIRGL = 1,
+    LUME_RENDER_BACKEND_V3D = 2
 };
 
 /* Supported operations describe the kernel interface. Transport feature bits
@@ -63,6 +71,15 @@ struct lume_render_request
     uint32_t id, index, revision, reserved;
     uint64_t reserved2;
 };
+
+#define LUME_RENDER_MEMORY_READ UINT64_C(1)
+#define LUME_RENDER_MEMORY_WRITE UINT64_C(2)
+#define LUME_RENDER_MEMORY_END UINT64_C(4)
+
+/* MEMORY_SYNC maintains cache coherency for the complete shared anonymous object
+ * identified by fd. value combines READ, WRITE and an optional END flag. The caller
+ * waits for device work before beginning CPU access and submits follow-up work
+ * after ending CPU access. Cache maintenance runs without the scheduler lock. */
 
 /* Resource handles belong to a render descriptor and its context. Storage is
  * zeroed shared memory. EXPORT returns an independently retained memory descriptor.

@@ -429,8 +429,35 @@ static int graphics_present(const struct lume_graphics_request *request)
     return result;
 }
 
+static int graphics_target(struct lume_graphics_target *target, unsigned action)
+{
+    if (!console.enabled)
+        return -LUME_ENOSYS;
+    if (action == LUME_GRAPHICS_TARGET_RELEASE)
+    {
+        if (!console.presenting)
+            return -LUME_EINVAL;
+        --console.presenting;
+        if (!console.graphics_owned)
+            schedule_render();
+        return 0;
+    }
+    if (action == LUME_GRAPHICS_TARGET_ACQUIRE)
+    {
+        if (!console.graphics_owned || console.rendering || console.presenting)
+            return -LUME_EBUSY;
+        ++console.presenting;
+    }
+    else if (action != LUME_GRAPHICS_TARGET_QUERY)
+        return -LUME_EINVAL;
+    *target = (struct lume_graphics_target){console.memory, console.bytes, console.width,
+                                            console.height, console.pitch, console.depth,
+                                            console.order};
+    return 0;
+}
+
 static const struct lume_platform_graphics_ops graphics_operations = {
-    graphics_query, graphics_claim, graphics_present};
+    graphics_query, graphics_claim, graphics_present, graphics_target};
 
 int hdmi_console_attach(uintptr_t memory, unsigned width, unsigned height, unsigned depth,
                         unsigned order, unsigned pitch, size_t bytes)
