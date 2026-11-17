@@ -34,6 +34,83 @@ int lume_task_drop_capabilities(unsigned pid, uint64_t capabilities)
     return 0;
 }
 
+static const struct
+{
+    const char *path, *target;
+    unsigned kind;
+} link_entries[] = {{"/data", NULL, LUME_NODE_DIR},
+                    {"/data/share", NULL, LUME_NODE_DIR},
+                    {"/data/share/fonts", NULL, LUME_NODE_DIR},
+                    {"/data/share/fonts/font", NULL, LUME_NODE_FILE},
+                    {"/data/share/fonts/good", "font", LUME_NODE_LINK},
+                    {"/data/share/fonts/escape", "/tmp/stat-root/private", LUME_NODE_LINK}};
+
+static bool link_walk(lume_storage_visit visit, void *context)
+{
+    for (unsigned i = 1; i < sizeof link_entries / sizeof *link_entries; ++i)
+        if (!visit(link_entries[i].path, link_entries[i].kind == LUME_NODE_DIR,
+                   link_entries[i].target ? strlen(link_entries[i].target) : 0, context))
+            return false;
+    return true;
+}
+
+static int link_metadata(const char *path, struct lume_stat *out, unsigned *mode)
+{
+    for (unsigned i = 0; i < sizeof link_entries / sizeof *link_entries; ++i)
+        if (!strcmp(path, link_entries[i].path))
+        {
+            *out = (struct lume_stat){
+                .inode = UINT64_C(0x100000000) + i,
+                .size = link_entries[i].target ? strlen(link_entries[i].target) : 0,
+                .kind = link_entries[i].kind};
+            *mode = out->kind == LUME_NODE_LINK  ? 0120777
+                    : out->kind == LUME_NODE_DIR ? 0040755
+                                                 : 0100644;
+            return 0;
+        }
+    return -LUME_ENOENT;
+}
+
+static int link_read(const char *path, void *out, size_t bytes)
+{
+    for (unsigned i = 0; i < sizeof link_entries / sizeof *link_entries; ++i)
+        if (!strcmp(path, link_entries[i].path) && link_entries[i].target)
+        {
+            size_t count = strlen(link_entries[i].target);
+            if (count > bytes)
+                count = bytes;
+            memcpy(out, link_entries[i].target, count);
+            return (int)count;
+        }
+    return -LUME_EINVAL;
+}
+
+static void symlink_authority(struct lume_files *owner)
+{
+    static const struct lume_storage_ops ops = {
+        .walk = link_walk, .metadata = link_metadata, .read_only = true, .readlink = link_read};
+    T(lume_vfs_mount_storage(&ops));
+    struct lume_files restricted;
+    lume_files_clone(&restricted, owner);
+    restricted.identity.sandbox_profile = LUME_SANDBOX_NETWORK;
+    struct lume_stat status;
+    char target[64];
+    T(lume_vfs_stat_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/good", &status) ==
+      0100644);
+    T(lume_vfs_lstat_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/escape", &status) ==
+      0120777);
+    T(lume_vfs_readlink_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/escape", target,
+                           sizeof target) == 22);
+    T(lume_vfs_stat_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/escape", &status) ==
+      -LUME_EPERM);
+    T(lume_vfs_open(&restricted, "/data/share/fonts/escape", LUME_O_RDONLY) == -LUME_EPERM);
+    T(lume_vfs_open(&restricted, "/data/share/fonts/escape", LUME_FILES_OPEN_NOFOLLOW) ==
+      -LUME_ELOOP);
+    T(lume_vfs_readlink_at(&restricted, LUME_FILES_AT_CWD, "/tmp/stat-root/private", target,
+                           sizeof target) == -LUME_EPERM);
+    lume_files_release(&restricted);
+}
+
 int main(void)
 {
     const char image[] = "ELF";
@@ -88,6 +165,7 @@ int main(void)
     T(lume_vfs_stat_path(&network, "/tmp/stat-root", &status) == -LUME_EPERM);
     T(lume_vfs_stat_at(&network, grant, "..", &status) == -LUME_EPERM);
     lume_files_release(&network);
+    symlink_authority(&owner);
     lume_files_release(&owner);
 #if LUME_FILES_DYNAMIC
     assert(lume_test_vfs_live_tables() == 0);

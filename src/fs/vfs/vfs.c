@@ -306,6 +306,7 @@ static struct node
     const unsigned char *image;
     uint64_t bytes;
     uint64_t version;
+    uint64_t storage_inode;
     unsigned char *data;
     struct lume_block *block;
     struct lume_devfs_character *character;
@@ -336,6 +337,11 @@ static const struct lume_storage_ops *storage;
 static uint64_t node_identity(const struct node *node)
 {
     return ((uint64_t)namespace_generation << 32) | ((unsigned)(node - nodes) + 1u);
+}
+
+static uint64_t node_inode(unsigned index)
+{
+    return nodes[index].storage_inode ? nodes[index].storage_inode : (uint64_t)index + 1;
 }
 
 void lume_vfs_mapping_notify(void (*notify)(uint64_t, uint64_t, uint64_t))
@@ -570,7 +576,8 @@ static int find(const char *p)
 }
 
 /* Resolve components in order so a regular file followed by /.. remains invalid. */
-static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_PATH_MAX])
+static int resolve_path(struct lume_files *f, const char *input, char out[LUME_FILES_PATH_MAX],
+                        bool follow_final, bool follow_trailing)
 {
     out[0] = 0;
     if (!*input)
@@ -614,6 +621,7 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_
     size_t used = 1;
     int index = find("/");
     const char *cursor = raw;
+    unsigned links = 0;
     while (*cursor)
     {
         while (*cursor == '/')
@@ -646,6 +654,7 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_
             out[0] = 0;
             return -LUME_ENAMETOOLONG;
         }
+        size_t parent_bytes = used;
         if (used > 1)
             out[used++] = '/';
         copy(out + used, part, count);
@@ -656,13 +665,66 @@ static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_
         {
             used = length(nodes[index].path);
             copy(out, nodes[index].path, used + 1);
+            const char *remaining = cursor;
+            while (*remaining == '/')
+                ++remaining;
+            if (nodes[index].kind == LUME_NODE_LINK &&
+                (follow_final || *remaining || (follow_trailing && *cursor)))
+            {
+                if (++links > 40)
+                    return -LUME_ELOOP;
+                if (!storage || !storage->readlink || !nodes[index].persistent)
+                    return -LUME_EIO;
+                char *target = lume_kernel_allocate(LUME_FILES_PATH_MAX);
+                if (!target)
+                    return -LUME_ENOMEM;
+                int result = storage->readlink(nodes[index].path, target, LUME_FILES_PATH_MAX);
+                if (result <= 0 || result >= (int)LUME_FILES_PATH_MAX)
+                {
+                    lume_kernel_free(target);
+                    return result < 0 ? result : result ? -LUME_ENAMETOOLONG : -LUME_ENOENT;
+                }
+                for (int i = 0; i < result; ++i)
+                    if (!target[i])
+                    {
+                        lume_kernel_free(target);
+                        return -LUME_EIO;
+                    }
+                size_t base = target[0] == '/' ? 0 : parent_bytes;
+                size_t separator = base > 1;
+                size_t suffix = length(cursor);
+                size_t start = base + separator + (size_t)result;
+                if (start + suffix >= sizeof raw)
+                {
+                    lume_kernel_free(target);
+                    return -LUME_ENAMETOOLONG;
+                }
+                memmove(raw + start, cursor, suffix + 1);
+                if (base)
+                    copy(raw, out, base);
+                if (separator)
+                    raw[base] = '/';
+                copy(raw + base + separator, target, (size_t)result);
+                lume_kernel_free(target);
+                cursor = raw;
+                index = find("/");
+                used = 1;
+                out[0] = '/';
+                out[1] = 0;
+            }
         }
     }
     if (f->identity.euid && (index < 0 || !nodes[index].group))
         return -LUME_EACCES;
-    if (index >= 0 && bytes && input[bytes - 1] == '/' && nodes[index].kind != LUME_NODE_DIR)
+    size_t raw_bytes = length(raw);
+    if (index >= 0 && raw_bytes && raw[raw_bytes - 1] == '/' && nodes[index].kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
     return index;
+}
+
+static int resolve(struct lume_files *f, const char *input, char out[LUME_FILES_PATH_MAX])
+{
+    return resolve_path(f, input, out, true, true);
 }
 
 static unsigned parent_node(const char *path)
@@ -1933,11 +1995,12 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
 #endif
     if (terminal_open)
     {
-        int fd = terminal_open(f, input, flags);
+        int fd = terminal_open(f, input, flags & ~(uint64_t)LUME_FILES_OPEN_NOFOLLOW);
         if (fd != -LUME_ENOSYS)
             return fd;
     }
-    const uint64_t allowed = 3 | LUME_O_CREAT | LUME_O_TRUNC | LUME_O_APPEND | LUME_O_EXCL;
+    const uint64_t allowed =
+        3 | LUME_O_CREAT | LUME_O_TRUNC | LUME_O_APPEND | LUME_O_EXCL | LUME_FILES_OPEN_NOFOLLOW;
     if ((flags & ~allowed) || (flags & 3) == 3 ||
         (!(flags & 3) && (flags & (LUME_O_TRUNC | LUME_O_APPEND))))
         return -LUME_EINVAL;
@@ -1947,9 +2010,14 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
     if (fd >= f->identity.limit[LUME_LIMIT_FILES].soft)
         return -LUME_EMFILE;
     char p[LUME_FILES_PATH_MAX] = {0};
-    int index = resolve(f, input, p);
+    bool nofollow = (flags & LUME_FILES_OPEN_NOFOLLOW) ||
+                    ((flags & (LUME_O_CREAT | LUME_O_EXCL)) == (LUME_O_CREAT | LUME_O_EXCL));
+    int index = resolve_path(f, input, p, !nofollow, true);
     if (index >= 0 && (flags & LUME_O_CREAT) && (flags & LUME_O_EXCL))
         return -LUME_EEXIST;
+    if (index >= 0 && nodes[index].kind == LUME_NODE_LINK)
+        return -LUME_ELOOP;
+    flags &= ~(uint64_t)LUME_FILES_OPEN_NOFOLLOW;
     if (index == -LUME_ENOENT && (flags & LUME_O_CREAT) && p[0])
     {
         if (input[length(input) - 1] == '/')
@@ -2733,7 +2801,7 @@ int64_t lume_vfs_stat(struct lume_files *f, uint64_t fd, struct lume_stat *s)
         return 0;
     }
     struct node *n = &nodes[d->node];
-    *s = (struct lume_stat){(uint64_t)d->node + 1, n->bytes, n->kind, 0};
+    *s = (struct lume_stat){node_inode((unsigned)d->node), n->bytes, n->kind, 0};
     return 0;
 }
 
@@ -2793,13 +2861,13 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
         if (extended)
         {
             struct lume_files_dirent entry = {
-                .inode = i + 1, .kind = nodes[i].kind, .name_bytes = (uint32_t)name_bytes};
+                .inode = node_inode(i), .kind = nodes[i].kind, .name_bytes = (uint32_t)name_bytes};
             copy(entry.name, name, name_bytes + 1);
             copy((unsigned char *)out + used, &entry, sizeof(entry));
         }
         else
         {
-            struct lume_dirent entry = {.inode = i + 1, .kind = nodes[i].kind};
+            struct lume_dirent entry = {.inode = node_inode(i), .kind = nodes[i].kind};
             copy(entry.name, name, name_bytes + 1);
             copy((unsigned char *)out + used, &entry, sizeof(entry));
         }
@@ -2825,6 +2893,7 @@ static unsigned default_mode_at(const struct node *n, const char *path)
     unsigned mode = (n->kind == LUME_NODE_DIR     ? 0040555
                      : n->kind == LUME_NODE_CHAR  ? 0020444
                      : n->kind == LUME_NODE_BLOCK ? 0060444
+                     : n->kind == LUME_NODE_LINK  ? 0120777
                                                   : 0100555) |
                     (n->writable ? 0222 : 0);
     if (n->writable && (n->kind == LUME_NODE_FILE || n->kind == LUME_NODE_DIR))
@@ -2846,11 +2915,13 @@ static unsigned default_mode(const struct node *n)
 static int64_t stat_node(unsigned index, struct lume_stat *out)
 {
     const struct node *n = &nodes[index];
-    *out = (struct lume_stat){index + 1, n->bytes, n->kind, 0};
+    *out = (struct lume_stat){node_inode(index), n->bytes, n->kind, 0};
     unsigned mode = default_mode(n);
     if (n->mode_set)
         mode = (mode & ~0777u) | n->mode;
-    return n->persistent && n->linked ? lume_file_mode_get(n->path, mode, true) : mode;
+    return n->persistent && n->linked && !storage->read_only
+               ? lume_file_mode_get(n->path, mode, true)
+               : mode;
 }
 
 int64_t lume_vfs_stat_mode(struct lume_files *f, uint64_t fd, struct lume_stat *out)
@@ -2869,6 +2940,13 @@ int64_t lume_vfs_stat_mode(struct lume_files *f, uint64_t fd, struct lume_stat *
 
 int64_t lume_vfs_stat_inode(uint64_t inode, struct lume_stat *out)
 {
+    if (inode > UINT32_MAX)
+    {
+        for (unsigned i = 0; i < count; ++i)
+            if (nodes[i].linked && nodes[i].storage_inode == inode)
+                return stat_node(i, out);
+        return -LUME_ENOENT;
+    }
     if (!inode || inode > count || !nodes[inode - 1].linked)
         return -LUME_ENOENT;
     return stat_node((unsigned)inode - 1, out);
@@ -3131,7 +3209,8 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
                                 bool replace)
 {
     char a[LUME_FILES_PATH_MAX], b[LUME_FILES_PATH_MAX], parent[LUME_FILES_PATH_MAX];
-    int source = resolve(files, from, a), target = resolve(files, to, b);
+    int source = resolve_path(files, from, a, false, false);
+    int target = resolve_path(files, to, b, false, false);
     if (source < 0)
         return source;
     if (target < 0 && (target != -LUME_ENOENT || !b[0]))
@@ -3151,7 +3230,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
         return -LUME_EEXIST;
     struct node *incoming = &nodes[source];
     bool directory = incoming->kind == LUME_NODE_DIR;
-    if (incoming->kind != LUME_NODE_FILE && !directory)
+    if (incoming->kind != LUME_NODE_FILE && incoming->kind != LUME_NODE_LINK && !directory)
         return -LUME_EINVAL;
     if (!incoming->writable || incoming->block || equal(a, "/tmp") || equal(a, "/data"))
         return -LUME_EROFS;
@@ -3746,7 +3825,7 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
 int64_t lume_vfs_mkdir(struct lume_files *f, const char *input)
 {
     char p[LUME_FILES_PATH_MAX] = {0};
-    int r = resolve(f, input, p);
+    int r = resolve_path(f, input, p, false, true);
     if (r >= 0)
         return -LUME_EEXIST;
     if (r != -LUME_ENOENT || !p[0])
@@ -3793,21 +3872,21 @@ int64_t lume_vfs_mkdir(struct lume_files *f, const char *input)
 int64_t lume_vfs_remove(struct lume_files *files, const char *input, bool directory)
 {
     char path[LUME_FILES_PATH_MAX];
-    int index = resolve(files, input, path);
+    int index = resolve_path(files, input, path, false, false);
     if (index < 0)
         return index;
     int permission = sandbox_mutation(files, path, true);
     if (permission)
         return permission;
     struct node *node = &nodes[index];
-    if (!node->writable || node->block || equal(path, "/tmp") || equal(path, "/data"))
-        return -LUME_EROFS;
-    if (lume_file_mode_namespace_busy(path))
-        return -LUME_EBUSY;
     if (directory && node->kind != LUME_NODE_DIR)
         return -LUME_ENOTDIR;
     if (!directory && node->kind == LUME_NODE_DIR)
         return -LUME_EISDIR;
+    if (!node->writable || node->block || equal(path, "/tmp") || equal(path, "/data"))
+        return -LUME_EROFS;
+    if (lume_file_mode_namespace_busy(path))
+        return -LUME_EBUSY;
     if (directory)
         for (unsigned i = 0; i < count; ++i)
             if ((int)i != index && nodes[i].linked && subtree(nodes[i].path, path))
@@ -3930,16 +4009,40 @@ bool lume_vfs_mount_fat(const void *data, size_t bytes)
     return success;
 }
 
+static bool import_storage_metadata(struct node *node, bool root)
+{
+    if (!storage->metadata)
+        return true;
+    struct lume_stat metadata;
+    unsigned mode;
+    if (storage->metadata(node->path, &metadata, &mode) || metadata.inode <= UINT32_MAX)
+        return false;
+    bool link = !root && node->kind == LUME_NODE_FILE && metadata.kind == LUME_NODE_LINK &&
+                storage->readlink;
+    if ((!link && metadata.kind != node->kind) || (!root && metadata.size != node->bytes) ||
+        (mode & 0170000u) != (link                          ? 0120000u
+                              : node->kind == LUME_NODE_DIR ? 0040000u
+                                                            : 0100000u))
+        return false;
+    node->kind = metadata.kind;
+    node->storage_inode = metadata.inode;
+    node->bytes = metadata.size;
+    node->mode = mode & 07777u;
+    node->mode_set = true;
+    return true;
+}
+
 static bool import_storage(const char *path, bool directory, uint64_t bytes, void *unused)
 {
     (void)unused;
     if (count == node_capacity || find(path) >= 0 || length(path) >= LUME_FILES_PATH_MAX)
         return false;
     unsigned index = count;
-    if (!add(path, directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, (size_t)bytes, true))
+    if (!add(path, directory ? LUME_NODE_DIR : LUME_NODE_FILE, 0, 0, !storage->read_only))
         return false;
+    nodes[index].bytes = bytes;
     nodes[index].persistent = true;
-    return true;
+    return import_storage_metadata(&nodes[index], false);
 }
 
 bool lume_vfs_mount_storage(const struct lume_storage_ops *ops)
@@ -3969,17 +4072,21 @@ bool lume_vfs_mount_storage(const struct lume_storage_ops *ops)
     if (mount >= 0)
     {
         nodes[mount].persistent = true;
-        nodes[mount].writable = true;
+        nodes[mount].writable = !storage->read_only;
         nodes[mount].on_fat = false;
         nodes[mount].mode_set = false;
+        nodes[mount].storage_inode = 0;
         index_insert((unsigned)mount);
-        success = true;
+        success = import_storage_metadata(&nodes[mount], true);
     }
     else
     {
-        success = add("/data", LUME_NODE_DIR, 0, 0, true);
+        success = add("/data", LUME_NODE_DIR, 0, 0, !storage->read_only);
         if (success)
+        {
             nodes[before].persistent = true;
+            success = import_storage_metadata(&nodes[before], true);
+        }
     }
     if (success)
         success = ops->walk(import_storage, 0);
@@ -4248,7 +4355,7 @@ int lume_vfs_canonical(struct lume_files *files, const char *input, char output[
 }
 
 static int resolve_at(struct lume_files *files, int64_t directory, const char *input,
-                      char output[LUME_FILES_PATH_MAX])
+                      char output[LUME_FILES_PATH_MAX], bool follow_final, bool follow_trailing)
 {
     output[0] = 0;
     struct lume_files base;
@@ -4269,7 +4376,7 @@ static int resolve_at(struct lume_files *files, int64_t directory, const char *i
         base.cwd_generation = namespace_generation;
         files = &base;
     }
-    int result = resolve(files, input, output);
+    int result = resolve_path(files, input, output, follow_final, follow_trailing);
     if (result < 0)
     {
         size_t bytes = length(input), used = length(output);
@@ -4288,15 +4395,29 @@ static int resolve_at(struct lume_files *files, int64_t directory, const char *i
 int lume_vfs_canonical_at(struct lume_files *files, int64_t directory, const char *input,
                           char output[LUME_FILES_PATH_MAX])
 {
-    int result = resolve_at(files, directory, input, output);
+    int result = resolve_at(files, directory, input, output, true, true);
     return result < 0 ? result : lume_sandbox_path(files, output);
 }
 
-int64_t lume_vfs_stat_at(struct lume_files *files, int64_t directory, const char *input,
-                         struct lume_stat *out)
+int lume_vfs_canonical_nofollow_at(struct lume_files *files, int64_t directory, const char *input,
+                                   char output[LUME_FILES_PATH_MAX])
+{
+    int result = resolve_at(files, directory, input, output, false, true);
+    return result < 0 ? result : lume_sandbox_path(files, output);
+}
+
+int lume_vfs_canonical_entry_at(struct lume_files *files, int64_t directory, const char *input,
+                                char output[LUME_FILES_PATH_MAX])
+{
+    int result = resolve_at(files, directory, input, output, false, false);
+    return result < 0 ? result : lume_sandbox_path(files, output);
+}
+
+static int64_t stat_at(struct lume_files *files, int64_t directory, const char *input,
+                       struct lume_stat *out, bool follow_final)
 {
     char canonical[LUME_FILES_PATH_MAX];
-    int index = resolve_at(files, directory, input, canonical);
+    int index = resolve_at(files, directory, input, canonical, follow_final, true);
     if (index == -LUME_ENOENT && terminal_stat && !strncmp(canonical, "/dev/pts/", 9))
     {
         int permission = lume_sandbox_path(files, canonical);
@@ -4306,6 +4427,35 @@ int64_t lume_vfs_stat_at(struct lume_files *files, int64_t directory, const char
         return index;
     int permission = sandbox_stat(files, canonical, (unsigned)index);
     return permission ? permission : stat_node((unsigned)index, out);
+}
+
+int64_t lume_vfs_stat_at(struct lume_files *files, int64_t directory, const char *input,
+                         struct lume_stat *out)
+{
+    return stat_at(files, directory, input, out, true);
+}
+
+int64_t lume_vfs_lstat_at(struct lume_files *files, int64_t directory, const char *input,
+                          struct lume_stat *out)
+{
+    return stat_at(files, directory, input, out, false);
+}
+
+int64_t lume_vfs_readlink_at(struct lume_files *files, int64_t directory, const char *input,
+                             void *out, size_t bytes)
+{
+    if (!bytes || !out)
+        return -LUME_EINVAL;
+    char canonical[LUME_FILES_PATH_MAX];
+    int index = resolve_at(files, directory, input, canonical, false, true);
+    if (index < 0)
+        return index;
+    int permission = sandbox_stat(files, canonical, (unsigned)index);
+    if (permission)
+        return permission;
+    if (nodes[index].kind != LUME_NODE_LINK || !storage || !storage->readlink)
+        return -LUME_EINVAL;
+    return storage->readlink(canonical, out, bytes);
 }
 
 int lume_vfs_fd_path(struct lume_files *files, int64_t fd, char output[LUME_FILES_PATH_MAX])

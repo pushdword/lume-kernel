@@ -2,6 +2,7 @@
 #include "lume/external_file.h"
 #include "lume/wait.h"
 #include "lume/file_mode.h"
+#include "lume/files.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -84,21 +85,26 @@ static void replace_files(void)
     T(lume_vfs_close(&files, fd) == 0);
     fd = (int)lume_vfs_open(&files, target, LUME_O_CREAT | LUME_O_RDWR);
     T(fd >= 0 && lume_vfs_write(&files, fd, "previous", 8) == 8);
-    T(lume_vfs_replace(&files, source, target) == -LUME_EBUSY);
-    T(lume_vfs_close(&files, fd) == 0);
     struct lume_stat original, replaced, result;
     T(lume_vfs_stat_path(&files, source, &original) == 0100644);
     T(lume_vfs_stat_path(&files, target, &replaced) == 0100644);
     T(lume_vfs_rename(&files, source, target) == -LUME_EEXIST);
-    T(lume_vfs_replace(&files, source, "/tmp") == -LUME_EISDIR);
+    T(lume_vfs_mkdir(&files, "/tmp/replace-directory") == 0);
+    T(lume_vfs_replace(&files, source, "/tmp/replace-directory") == -LUME_EISDIR);
+    T(lume_vfs_remove(&files, "/tmp/replace-directory", true) == 0);
+    T(lume_vfs_replace(&files, source, "/tmp") == -LUME_EROFS);
     T(lume_vfs_replace(&files, source, source) == 0);
     T(lume_vfs_replace(&files, source, target) == 0);
+    char data[16];
+    T(lume_vfs_seek(&files, fd, 0, LUME_SEEK_SET) == 0);
+    T(lume_vfs_read(&files, fd, data, sizeof(data)) == 8 && !memcmp(data, "previous", 8));
+    T(lume_vfs_stat(&files, fd, &result) == 0 && result.inode == replaced.inode);
+    T(lume_vfs_close(&files, fd) == 0);
     T(lume_vfs_stat_path(&files, source, &result) == -LUME_ENOENT);
     T(lume_vfs_stat_inode(replaced.inode, &result) == -LUME_ENOENT);
     T(lume_vfs_stat_path(&files, target, &result) == 0100644 && result.size == 3 &&
       result.inode == original.inode);
     fd = (int)lume_vfs_open(&files, target, LUME_O_RDONLY);
-    char data[16];
     T(fd >= 0 && lume_vfs_read(&files, fd, data, sizeof(data)) == 3 && !memcmp(data, "new", 3));
     T(lume_vfs_close(&files, fd) == 0 && lume_vfs_remove(&files, target, false) == 0);
     lume_files_release(&files);
@@ -298,7 +304,9 @@ int main(void)
     T(lume_vfs_write(&f, fd, "abc", 3) == 3);
     T(lume_vfs_open_compat(&g, "/tmp/note", LUME_O_RDWR) == -LUME_EBUSY);
     T(lume_vfs_remove_compat(&g, "/tmp/note", false) == -LUME_EBUSY);
-    T(lume_vfs_rename(&g, "/tmp/note", "/tmp/renamed") == -LUME_EBUSY);
+    T(lume_vfs_rename(&g, "/tmp/note", "/tmp/renamed") == 0);
+    T(lume_vfs_open(&g, "/tmp/note", LUME_O_RDONLY) == -LUME_ENOENT);
+    T(lume_vfs_rename(&g, "/tmp/renamed", "/tmp/note") == 0);
     int other = (int)lume_vfs_open(&g, "/tmp/note", 0);
     T(other == 3);
     char b[4096] = {0};
@@ -355,9 +363,9 @@ int main(void)
     T(lume_vfs_open(&f, "/etc/motd", 0) == -LUME_EMFILE);
     for (unsigned i = 3; i < LUME_FD_MAX; ++i)
         T(lume_vfs_close(&f, i) == 0);
-    char longpath[200];
+    char longpath[LUME_FILES_PATH_MAX + 1];
     memset(longpath, 'a', sizeof(longpath));
-    longpath[199] = 0;
+    longpath[sizeof(longpath) - 1] = 0;
     T(lume_vfs_open(&f, longpath, 0) == -LUME_ENAMETOOLONG);
     T(lume_vfs_mkdir(&f, "/tmp/a") == 0);
     T(lume_vfs_mkdir(&f, "/tmp/a") == -LUME_EEXIST);
@@ -425,7 +433,9 @@ int main(void)
         T(lume_vfs_read(&f, reading, prefix, sizeof(prefix)) == sizeof(prefix));
         T(!memcmp(prefix, b, sizeof(prefix)));
         T(lume_vfs_write(&f, writing, b, 32) == -LUME_EAGAIN);
-        T(lume_vfs_write(&f, writing, b, 513) == 17);
+        char non_atomic[LUME_PIPE_ATOMIC + 1] = {0};
+        memcpy(non_atomic, b, 17);
+        T(lume_vfs_write(&f, writing, non_atomic, sizeof(non_atomic)) == 17);
         T(lume_vfs_read(&f, reading, b, sizeof(b)) == sizeof(b));
         for (unsigned i = 0; i < sizeof(b); ++i)
             T((unsigned char)b[i] == (i < sizeof(b) - 17 ? (unsigned char)(i + 17)

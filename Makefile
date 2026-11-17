@@ -179,6 +179,22 @@ TEST_CPPFLAGS := -Iplatform/raspberrypi5/include -Iarch/aarch64/include/kernel -
 TEST_NAMES := ddk devfs fdt-device fdt-initrd usb uart-input sdio wifi-net netif wpa volume watchdog stream icmp vfs poll heap user-stack mmu elf-load font memory
 TEST_NAMES += io-queue io-calls vfs-storage-handles ip4-route
 TEST_NAMES += net-service
+TEST_NAMES += ext4
+
+.PHONY: check-ext4
+check: check-ext4
+check-ext4: $(OUT)/tests/ext4$(HOSTEXE) $(OUT)/tests/vfs-ext4$(HOSTEXE)
+	"$(OUT)/tests/ext4$(HOSTEXE)"
+	"$(OUT)/tests/vfs-ext4$(HOSTEXE)"
+
+$(OUT)/tests/ext4$(HOSTEXE): tests/unit/ext4_test.c src/fs/ext4/ext4.c include/kernel/lume/ext4.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
+
+EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/vfs-ext4$(HOSTEXE): $(EXT4_VFS_TEST_SOURCES) tests/unit/ext4_test.c include/kernel/lume/ext4.h include/kernel/lume/ext4_storage.h include/kernel/lume/storage.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(EXT4_VFS_TEST_SOURCES) -o "$@"
 .PHONY: check-console-calls
 .PHONY: check-file-io
 .PHONY: check-file-locks
@@ -186,12 +202,14 @@ FILE_IO_HOST_FIXTURE := $(if $(wildcard include/kernel/lume/sandbox_policy.h),te
 FILE_IO_HOST_FLAGS := $(if $(FILE_IO_HOST_FIXTURE),-DLUME_ARCH_AMD64=1,)
 $(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE) $(OUT)/tests/vfs-file-lock$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS)
 $(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-storage-handles$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE) $(OUT)/tests/vfs-file-lock$(HOSTEXE): $(FILE_IO_HOST_FIXTURE)
+$(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1
+$(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE): tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c
 check: check-file-locks
 check-file-locks: $(OUT)/tests/vfs-file-lock$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h src/security/sandbox.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out src/security/sandbox.c,$(filter %.c,$^)) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out src/security/sandbox.c $(FILE_IO_HOST_FIXTURE),$(filter %.c,$^)) -o "$@"
 check: check-file-io
 check-file-io: $(OUT)/tests/file-io-call$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE)
 	env "$(OUT)/tests/file-io-call$(HOSTEXE)"
@@ -413,6 +431,7 @@ $(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c in
 check-ip4-route: $(OUT)/tests/ip4-route$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATION_LIMIT=2048
 .PHONY: check-fd-parallel
 check-fd-parallel: $(OUT)/tests/fd-parallel$(HOSTEXE)
 	env "$<"
@@ -521,7 +540,7 @@ $(OUT)/tests/wifi-scan$(HOSTEXE): tests/unit/wifi_scan_test.c drivers/net/cyw434
 $(OUT)/tests/wifi-net$(HOSTEXE): tests/unit/wifi_net_test.c src/net/wifi/wifi_net.c
 $(OUT)/tests/netif$(HOSTEXE): tests/unit/netif_test.c src/net/netif.c src/net/wireless.c src/net/net_control.c
 $(OUT)/tests/wpa$(HOSTEXE): tests/unit/wpa_test.c src/net/wifi/wpa.c vendor/mbedtls/library/aes.c vendor/mbedtls/library/sha1.c
-$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service stream poll,$(TEST_NAMES)))):
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(filter-out user-stack mmu elf-load font memory io-queue io-calls ip4-route net-service stream poll ext4,$(TEST_NAMES)))):
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 clean:
@@ -1145,6 +1164,7 @@ $(OUT)/tests/desktop-limits$(HOSTEXE): tests/unit/desktop_limits_test.c tests/fi
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 
+$(OUT)/tests/desktop-storage$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1
 $(OUT)/tests/desktop-storage$(HOSTEXE): tests/unit/vfs_storage_handles_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"

@@ -22,6 +22,8 @@ KERNEL_C_aarch64 := \
     src/device/drivers.c \
     src/exec/elf.c \
     src/fs/fat/fat.c \
+    src/fs/ext4/ext4.c \
+    src/fs/ext4/storage.c \
     src/fs/path.c \
     platform/raspberrypi5/fdt.c \
     platform/raspberrypi5/fdt_irq.c \

@@ -5,7 +5,15 @@
 #include "lume/vfs_paths.h"
 #include "lume/file_mode.h"
 #include "lume/path.h"
+#include "lume/kernel_memory.h"
 #include <string.h>
+
+enum
+{
+    PATH_FOLLOW,
+    PATH_NOFOLLOW,
+    PATH_ENTRY
+};
 
 static int path_string(uint64_t address, char path[LUME_FILES_PATH_MAX])
 {
@@ -22,13 +30,15 @@ static int path_string(uint64_t address, char path[LUME_FILES_PATH_MAX])
 }
 
 static int path_at(struct lume_files *files, uint64_t address, int64_t directory,
-                   char path[LUME_FILES_PATH_MAX], bool missing, bool spelling)
+                   char path[LUME_FILES_PATH_MAX], bool missing, bool spelling, unsigned nofollow)
 {
     char input[LUME_FILES_PATH_MAX];
     int result = path_string(address, input);
     if (result)
         return result;
-    result = lume_vfs_canonical_at(files, directory, input, path);
+    result = nofollow == PATH_ENTRY ? lume_vfs_canonical_entry_at(files, directory, input, path)
+             : nofollow             ? lume_vfs_canonical_nofollow_at(files, directory, input, path)
+                                    : lume_vfs_canonical_at(files, directory, input, path);
     if (result == -LUME_ENOENT && missing && path[0])
         result = 0;
     return !result && spelling ? lume_path_final_spelling(input, path) : result;
@@ -51,7 +61,7 @@ static int64_t copy_path(const struct lume_files_request *request, const char *p
 int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t address,
                         uint64_t bytes)
 {
-    if (operation > LUME_FILES_VOLUME || bytes != sizeof(struct lume_files_request))
+    if (operation > LUME_FILES_READLINK || bytes != sizeof(struct lume_files_request))
         return -LUME_EINVAL;
     if (address > UINTPTR_MAX || bytes > UINTPTR_MAX - address ||
         !lume_user_buffer(address, bytes, false))
@@ -109,7 +119,37 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                        : lume_vfs_stat_mode(files, (uint64_t)request.fd,
                                             (void *)(uintptr_t)request.buffer);
         }
-        return lume_vfs_stat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer);
+        return request.flags & LUME_FILES_STAT_NOFOLLOW
+                   ? lume_vfs_lstat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer)
+                   : lume_vfs_stat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer);
+    }
+    case LUME_FILES_READLINK:
+    {
+        if (request.path2 || request.fd2 || request.mode || request.flags ||
+            request.descriptor_flags || !request.count || request.count > LUME_FILE_IO_MAX)
+            return -LUME_EINVAL;
+        int result = path_string(request.path, second);
+        if (result)
+            return result;
+        if (request.buffer > UINTPTR_MAX || request.count > UINTPTR_MAX - request.buffer ||
+            !lume_user_buffer(request.buffer, request.count, true))
+            return -LUME_EFAULT;
+        void *target = lume_kernel_allocate((size_t)request.count);
+        if (!target)
+            return -LUME_ENOMEM;
+        int64_t count =
+            lume_vfs_readlink_at(files, request.fd, second, target, (size_t)request.count);
+        if (count > (int64_t)request.count)
+            count = -LUME_EIO;
+        if (count > 0)
+        {
+            if (!lume_user_buffer(request.buffer, (uint64_t)count, true))
+                count = -LUME_EFAULT;
+            else
+                memcpy((void *)(uintptr_t)request.buffer, target, (size_t)count);
+        }
+        lume_kernel_free(target);
+        return count;
     }
     case LUME_FILES_VOLUME:
     {
@@ -129,7 +169,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                          : lume_vfs_volume_fd(files, (uint64_t)request.fd, &volume);
         else
         {
-            result = path_at(files, request.path, request.fd, first, false, false);
+            result = path_at(files, request.path, request.fd, first, false, false, false);
             if (!result)
                 result = lume_vfs_volume_path(files, first, &volume);
         }
@@ -145,7 +185,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         if (request.path2 || request.fd2 || request.flags || request.mode ||
             request.descriptor_flags)
             return -LUME_EINVAL;
-        int result = path_at(files, request.path, request.fd, first, false, false);
+        int result = path_at(files, request.path, request.fd, first, false, false, false);
         return result ? result : copy_path(&request, first);
     }
     case LUME_FILES_RENAME:
@@ -154,9 +194,9 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         if (request.buffer || request.count || request.flags || request.mode ||
             request.descriptor_flags)
             return -LUME_EINVAL;
-        int result = path_at(files, request.path, request.fd, first, false, false);
+        int result = path_at(files, request.path, request.fd, first, false, false, PATH_ENTRY);
         if (!result)
-            result = path_at(files, request.path2, request.fd2, second, true, true);
+            result = path_at(files, request.path2, request.fd2, second, true, true, PATH_ENTRY);
         if (result)
             return result;
         return operation == LUME_FILES_RENAME ? lume_vfs_rename(files, first, second)
@@ -185,27 +225,36 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
                 ((flags & LUME_FILES_OPEN_DIRECTORY) && (flags & (LUME_O_CREAT | LUME_O_TRUNC))))
                 return -LUME_EINVAL;
         }
+        bool nofollow =
+            operation == LUME_FILES_MKDIR ||
+            (operation == LUME_FILES_OPEN &&
+             ((flags & LUME_FILES_OPEN_NOFOLLOW) ||
+              ((flags & (LUME_O_CREAT | LUME_O_EXCL)) == (LUME_O_CREAT | LUME_O_EXCL))));
         int result = path_at(files, request.path, request.fd, first,
-                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN, false);
+                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN, false,
+                             nofollow ? PATH_NOFOLLOW : PATH_FOLLOW);
         if (result)
             return result;
         if (operation == LUME_FILES_OPEN && (flags & LUME_FILES_OPEN_DIRECTORY))
         {
             struct lume_stat metadata;
-            int64_t status = lume_vfs_stat_path(files, first, &metadata);
+            int64_t status = nofollow
+                                 ? lume_vfs_lstat_at(files, LUME_FILES_AT_CWD, first, &metadata)
+                                 : lume_vfs_stat_path(files, first, &metadata);
             if (status < 0)
                 return status;
             if (metadata.kind != LUME_NODE_DIR)
-                return -LUME_ENOTDIR;
+                return metadata.kind == LUME_NODE_LINK && (flags & LUME_FILES_OPEN_NOFOLLOW)
+                           ? -LUME_ELOOP
+                           : -LUME_ENOTDIR;
         }
-        struct lume_file_mode_request mode = {
-            .version = LUME_FILE_MODE_VERSION,
-            .bytes = sizeof(mode),
-            .mode = request.mode,
-            .uid = UINT32_MAX,
-            .gid = UINT32_MAX,
-            .flags = flags & ~(uint64_t)(LUME_FILES_OPEN_DIRECTORY | LUME_FILES_OPEN_NOFOLLOW),
-            .descriptor_flags = request.descriptor_flags};
+        struct lume_file_mode_request mode = {.version = LUME_FILE_MODE_VERSION,
+                                              .bytes = sizeof(mode),
+                                              .mode = request.mode,
+                                              .uid = UINT32_MAX,
+                                              .gid = UINT32_MAX,
+                                              .flags = flags & ~(uint64_t)LUME_FILES_OPEN_DIRECTORY,
+                                              .descriptor_flags = request.descriptor_flags};
         unsigned action = operation == LUME_FILES_OPEN    ? LUME_FILE_MODE_OPEN
                           : operation == LUME_FILES_MKDIR ? LUME_FILE_MODE_MKDIR
                                                           : LUME_FILE_MODE_PATH;
@@ -216,7 +265,8 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         if (request.path2 || request.buffer || request.count || request.fd2 || request.flags ||
             request.mode || request.descriptor_flags)
             return -LUME_EINVAL;
-        int result = path_at(files, request.path, request.fd, first, false, false);
+        int result = path_at(files, request.path, request.fd, first, false, false,
+                             operation != LUME_FILES_CHDIR ? PATH_ENTRY : PATH_FOLLOW);
         if (result)
             return result;
         if (operation == LUME_FILES_CHDIR)

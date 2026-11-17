@@ -22,7 +22,8 @@ enum
     LUME_FILES_FD_PATH,
     LUME_FILES_CANONICAL,
     LUME_FILES_MODE,
-    LUME_FILES_VOLUME
+    LUME_FILES_VOLUME,
+    LUME_FILES_READLINK
 };
 
 enum
@@ -52,7 +53,9 @@ enum
  * excluding the terminator. Their count includes space for the terminator. MODE sets
  * the low permission bits without changing ownership. VOLUME writes a lume_files_volume.
  * VOLUME_FD selects fd and requires path to be zero. Otherwise it resolves path using fd.
- * Volume block counts use fragment_bytes as their unit. Unused fields are zero. */
+ * Volume block counts use fragment_bytes as their unit. READLINK returns target bytes
+ * without a terminator, truncated to count. It leaves the final link unresolved.
+ * STAT_NOFOLLOW leaves the final link unresolved. Unused fields are zero. */
 struct lume_files_request
 {
     uint32_t version, bytes;

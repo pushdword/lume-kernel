@@ -113,6 +113,8 @@ int64_t lume_vfs_stat(struct lume_files *, uint64_t fd, struct lume_stat *);
 int64_t lume_vfs_stat_mode(struct lume_files *, uint64_t, struct lume_stat *);
 int64_t lume_vfs_stat_path(struct lume_files *, const char *, struct lume_stat *);
 int64_t lume_vfs_stat_at(struct lume_files *, int64_t, const char *, struct lume_stat *);
+int64_t lume_vfs_lstat_at(struct lume_files *, int64_t, const char *, struct lume_stat *);
+int64_t lume_vfs_readlink_at(struct lume_files *, int64_t, const char *, void *, size_t);
 int lume_vfs_volume_path(struct lume_files *, const char *, struct lume_files_volume *);
 int lume_vfs_volume_fd(struct lume_files *, uint64_t, struct lume_files_volume *);
 int64_t lume_vfs_truncate(struct lume_files *, uint64_t);

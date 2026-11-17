@@ -94,7 +94,12 @@ int lume_sandbox_open(struct lume_files *files, const char *input, uint64_t flag
     if (!files->identity.sandbox_profile)
         return 0;
     char canonical[LUME_FILES_PATH_MAX];
-    int result = lume_vfs_canonical_long(files, input, canonical);
+    bool nofollow = (flags & LUME_FILES_OPEN_NOFOLLOW) ||
+                    ((flags & (LUME_O_CREAT | LUME_O_EXCL)) == (LUME_O_CREAT | LUME_O_EXCL));
+    int result = nofollow
+                     ? lume_vfs_canonical_nofollow_at(files, LUME_FILES_AT_CWD, input, canonical)
+                     : lume_vfs_canonical_long(files, input, canonical);
+    flags &= ~(uint64_t)LUME_FILES_OPEN_NOFOLLOW;
     if (result == -LUME_ENOENT && (flags & LUME_O_CREAT) && canonical[0])
         return lume_vfs_sandbox_directory(files, canonical, true) ? 0 : -LUME_EPERM;
     if (result)
@@ -242,6 +247,7 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
                        action == LUME_FILES_CHDIR || action == LUME_FILES_GETCWD ||
                        action == LUME_FILES_GETDENTS || action == LUME_FILES_FD_PATH ||
                        action == LUME_FILES_CANONICAL || action == LUME_FILES_VOLUME ||
+                       action == LUME_FILES_READLINK ||
                        (profile == LUME_SANDBOX_NETWORK && action <= LUME_FILES_MODE)
                    ? 0
                    : -LUME_EPERM;

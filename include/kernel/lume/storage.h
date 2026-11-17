@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 struct lume_files_volume;
+struct lume_stat;
 
 typedef bool (*lume_storage_visit)(const char *, bool, uint64_t, void *);
 
@@ -57,6 +58,12 @@ struct lume_storage_ops
     int (*snapshot_handle)(void *, struct lume_storage_snapshot *);
     /* Release cached handles before resetting or remounting the backend. */
     void (*program_cache_owner)(int (*release)(void));
+    /* Immutable providers retain native inode identities and permission bits.
+     * Inode keys exceed UINT32_MAX to separate them from RAM node identities. */
+    int (*metadata)(const char *, struct lume_stat *, unsigned *mode);
+    bool read_only;
+    /* Return target bytes without a terminator. The final component remains a link. */
+    int (*readlink)(const char *, void *, size_t);
 };
 
 struct lume_volume

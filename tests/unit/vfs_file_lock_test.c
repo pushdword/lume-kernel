@@ -13,6 +13,9 @@
 #include "../../src/security/sandbox.c"
 #undef lume_sandbox_open
 #undef lume_sandbox_path
+#define lume_sandbox_io lume_fixture_sandbox_io
+#include "../fixtures/vfs_unrestricted_services.c"
+#undef lume_sandbox_io
 
 bool lume_task_sandbox_ready(unsigned pid)
 {
@@ -77,6 +80,12 @@ void lume_worker_checkpoint(unsigned bytes)
 {
     (void)bytes;
     assert(!flock_running);
+}
+
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    assert(!flock_running);
+    memcpy(destination, source, bytes);
 }
 
 _Noreturn void lume_fail(const char *message)
@@ -590,7 +599,7 @@ static void flock_request_and_admission(void)
     {
         first.identity.sandbox_profile = profile;
         assert(lume_sandbox_check(&first, 1, &frame) == 0);
-        LUME_CONTEXT_REG(&frame, 0) = LUME_FILE_IO_FLOCK_NB + 1;
+        LUME_CONTEXT_REG(&frame, 0) = UINT64_MAX;
         assert(lume_sandbox_check(&first, 1, &frame) == -LUME_EPERM);
         LUME_CONTEXT_REG(&frame, 0) = LUME_FILE_IO_FLOCK_NB;
     }
@@ -661,6 +670,19 @@ int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, u
     (void)positioned;
     (void)offset;
     assert(!"unexpected user transfer in file lock test");
+    abort();
+}
+
+int64_t lume_user_io_vector_call(struct lume_files *files, unsigned pid, uint64_t fd,
+                                 uint64_t address, unsigned count, bool writing)
+{
+    (void)files;
+    (void)pid;
+    (void)fd;
+    (void)address;
+    (void)count;
+    (void)writing;
+    assert(!"unexpected vector transfer in file lock test");
     abort();
 }
 

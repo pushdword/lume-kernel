@@ -63,8 +63,11 @@ bool lume_socket_network_io(struct lume_files *files, unsigned fd)
 }
 
 #if LUME_FILES_DYNAMIC && !defined(LUME_VFS_HOST_EXTERNAL_ALLOCATOR)
-static void *tables[64];
-static size_t allocation_bytes[64];
+#ifndef LUME_VFS_HOST_ALLOCATION_LIMIT
+#define LUME_VFS_HOST_ALLOCATION_LIMIT 64u
+#endif
+static void *tables[LUME_VFS_HOST_ALLOCATION_LIMIT];
+static size_t allocation_bytes[LUME_VFS_HOST_ALLOCATION_LIMIT];
 
 void *lume_kernel_allocate(size_t bytes)
 {
