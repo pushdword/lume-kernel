@@ -375,6 +375,12 @@ void lume_worker_checkpoint(unsigned bytes)
     struct worker_state *state = active;
     if (state->computing)
         lume_fail("kernel compute suspension");
+    if (state->independent && !lume_smp_owned() && slice_ticks &&
+        lume_counter_read() - state->slice_started < slice_ticks)
+    {
+        state->remaining = LUME_WORKER_SLICE_BYTES;
+        return;
+    }
     bool contended = lume_smp_contended();
     if (bytes < state->remaining)
     {

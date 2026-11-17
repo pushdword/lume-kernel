@@ -699,6 +699,7 @@ static void independent_job(void *context)
     T(lume_worker_wait_bits(&test->event, 1, ticks + 1000000));
     T(test->event == 1);
     test->stage = 2;
+    ticks += slice_ticks;
     lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
     for (unsigned i = 0; i < 64; ++i)
         T(preserved[i] == (test->marker ^ i));
@@ -769,6 +770,7 @@ static void copy_ownership(void)
 static void nested_domain(void *context)
 {
     T(context && !lock_owned && lume_worker_independent());
+    ticks += slice_ticks;
     lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
     T(!lock_owned && lume_worker_independent());
 }
@@ -791,6 +793,7 @@ static void domain_body(void *context)
     T(lume_worker_wait_bits(&test->event, 1, ticks + 1000000));
     T(!lock_owned && lume_worker_independent());
     test->stage = 2;
+    ticks += slice_ticks;
     lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
     T(!lock_owned && lume_worker_independent());
     lume_worker_scheduler(scheduler_bridge, context);
@@ -836,6 +839,46 @@ static void domain_suspension(void)
     test_cpu = 0;
 }
 
+static void independent_budget_body(void *context)
+{
+    struct independent_case *test = context;
+    T(!lock_owned && lume_worker_independent());
+    uint64_t start = ticks;
+    contended = true;
+    for (unsigned i = 0; i < 64; ++i)
+        lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    T(ticks == start && !lock_owned);
+    test->stage = 1;
+    ticks += slice_ticks - 1;
+    lume_worker_checkpoint(LUME_WORKER_SLICE_BYTES);
+    test->stage = 2;
+    ++ticks;
+    lume_worker_checkpoint(0);
+    T(!lock_owned && lume_worker_independent());
+    test->stage = 3;
+    contended = false;
+}
+
+static void independent_budget_job(void *context)
+{
+    lume_worker_domain(independent_budget_body, context);
+}
+
+static void independent_time_budget(void)
+{
+    struct independent_case test = {0};
+    frequency = 1000000;
+    ticks = 100;
+    contended = false;
+    test_cpu = 0;
+    lume_smp_lock();
+    lume_worker_start();
+    T(lume_worker_submit(independent_budget_job, &test));
+    T(lume_worker_resume() && test.stage == 2 && lock_owned);
+    T(lume_worker_resume() && test.stage == 3 && !lume_worker_busy());
+    lume_smp_unlock();
+}
+
 int main(void)
 {
     deadline_cases();
@@ -874,6 +917,7 @@ int main(void)
     independent_waits();
     copy_ownership();
     domain_suspension();
+    independent_time_budget();
     for (unsigned i = 0; i < LUME_WORKER_LIMIT; ++i)
         release_fiber(&workers[i].fiber);
 #ifdef _WIN32

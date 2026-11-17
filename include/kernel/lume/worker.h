@@ -52,8 +52,9 @@ bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t dea
 uint64_t lume_worker_next_deadline(uint64_t latest);
 bool lume_worker_pause(uint64_t deadline);
 bool lume_worker_pause_ms(unsigned milliseconds);
-/* Checkpoints charge processed bytes and yield after 64 KiB or 500 us of running time.
- * A CPU waiting for the kernel lock also causes a yield at the next checkpoint.
+/* Locked workers yield after 64 KiB or 500 us of running time.
+ * Independent workers without the kernel lock use the 500 us time budget.
+ * A CPU waiting for a held kernel lock also causes a yield at the next checkpoint.
  * A contended yield resumes after another lock acquisition or on another CPU.
  * Zero bytes checks time and contention. Calls outside the running worker have no effect.
  * A yield preserves the active operation and does not release subsystem ownership. */
