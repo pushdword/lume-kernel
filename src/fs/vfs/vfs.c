@@ -333,6 +333,18 @@ static struct
 } character_devices[LUME_DEVICE_LIMIT];
 static struct lume_fat root_fat;
 static const struct lume_storage_ops *storage;
+static bool import_storage_metadata(struct node *, bool);
+
+static bool native_storage(const struct node *node)
+{
+    return node->persistent && storage && storage->metadata;
+}
+
+static bool same_backing(const struct node *a, const struct node *b)
+{
+    return a == b || (native_storage(a) && a->storage_inode && b->persistent &&
+                      a->storage_inode == b->storage_inode);
+}
 
 static uint64_t node_identity(const struct node *node)
 {
@@ -355,6 +367,39 @@ static void node_changed(struct node *node)
         lume_fail("file version exhausted");
     if (mapping_changed)
         mapping_changed(node_identity(node), node->bytes, node->version);
+}
+
+static void native_aliases(struct node *node, bool contents, bool mode)
+{
+    if (!native_storage(node) || !node->storage_inode)
+        return;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        struct node *alias = &nodes[i];
+        if (alias == node || !alias->linked || !alias->persistent ||
+            alias->storage_inode != node->storage_inode)
+            continue;
+        alias->bytes = node->bytes;
+        if (mode)
+        {
+            alias->mode = node->mode;
+            alias->mode_set = node->mode_set;
+        }
+        if (contents)
+            node_changed(alias);
+    }
+}
+
+static bool executable_backing(const struct node *node)
+{
+    if (node->executables)
+        return true;
+    if (native_storage(node) && node->storage_inode)
+        for (unsigned i = 0; i < count; ++i)
+            if (nodes[i].persistent && nodes[i].storage_inode == node->storage_inode &&
+                nodes[i].executables)
+                return true;
+    return false;
 }
 
 int lume_vfs_object_identity(int object, struct lume_file_identity *identity)
@@ -389,7 +434,8 @@ int lume_vfs_exec_pin(int object)
     unsigned index = (unsigned)open_file_at(object)->node;
     for (unsigned i = 0; i < OPEN_FILES; ++i)
         if (open_file_count(open_file_at(i)) && !open_file_at(i)->external &&
-            open_file_at(i)->pipe < 0 && open_file_at(i)->node == (int)index &&
+            open_file_at(i)->pipe < 0 && open_file_at(i)->node >= 0 &&
+            same_backing(&nodes[open_file_at(i)->node], &nodes[index]) &&
             (open_file_at(i)->flags & 3))
             return -LUME_ETXTBSY;
     if (nodes[index].executables == UINT32_MAX)
@@ -2055,6 +2101,11 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         }
         index = (int)reserved;
         nodes[index].persistent = nodes[directory].persistent;
+        if (native_storage(&nodes[index]) && !import_storage_metadata(&nodes[index], true))
+        {
+            cancel_node(reserved);
+            return -LUME_EIO;
+        }
         publish_node((unsigned)index);
     }
     if (index < 0)
@@ -2068,7 +2119,7 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         return -LUME_EISDIR;
     if ((flags & 3) && !n->writable)
         return -LUME_EROFS;
-    if ((flags & 3) && n->executables)
+    if ((flags & 3) && executable_backing(n))
         return -LUME_ETXTBSY;
     if ((flags & LUME_O_TRUNC) && n->kind == LUME_NODE_FILE)
     {
@@ -2080,6 +2131,7 @@ int64_t lume_vfs_open(struct lume_files *f, const char *input, uint64_t flags)
         }
         n->bytes = 0;
         node_changed(n);
+        native_aliases(n, true, false);
     }
     if (n->character)
     {
@@ -2556,7 +2608,7 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
     }
     if (!n->writable)
         return -LUME_EROFS;
-    if (n->executables)
+    if (executable_backing(n))
         return -LUME_ETXTBSY;
     if (!bytes)
         return 0;
@@ -2577,6 +2629,7 @@ static int64_t write_description(struct lume_files *f, struct open_file *d, cons
             if (d->offset > n->bytes)
                 n->bytes = d->offset;
             node_changed(n);
+            native_aliases(n, true, false);
         }
         return r;
     }
@@ -2941,12 +2994,29 @@ static unsigned default_mode(const struct node *n)
 
 static int64_t stat_node(unsigned index, struct lume_stat *out)
 {
-    const struct node *n = &nodes[index];
+    struct node *n = &nodes[index];
+    if (native_storage(n) && !storage->read_only && n->linked)
+    {
+        unsigned mode;
+        struct lume_stat metadata;
+        int error = storage->metadata(n->path, &metadata, &mode);
+        if (error)
+            return error;
+        if (metadata.inode != n->storage_inode || metadata.kind != n->kind)
+            return -LUME_EIO;
+        bool changed = n->bytes != metadata.size;
+        n->bytes = metadata.size;
+        n->mode = mode & 07777u;
+        n->mode_set = true;
+        native_aliases(n, changed, true);
+        *out = metadata;
+        return mode;
+    }
     *out = (struct lume_stat){node_inode(index), n->bytes, n->kind, 0};
     unsigned mode = default_mode(n);
     if (n->mode_set)
         mode = (mode & ~0777u) | n->mode;
-    return n->persistent && n->linked && !storage->read_only
+    return n->persistent && n->linked && !storage->read_only && !storage->metadata
                ? lume_file_mode_get(n->path, mode, true)
                : mode;
 }
@@ -3130,8 +3200,11 @@ static int64_t file_mode(struct lume_files *files, unsigned operation,
         mode &= ~files->identity.umask;
     int result = 0;
     if (node->persistent && node->linked)
-        result = mode == (default_mode(node) & 0777u) ? lume_file_mode_remove(node->path, true)
-                                                      : lume_file_mode_set(node->path, mode, true);
+        result = storage->metadata
+                     ? (storage->set_mode ? storage->set_mode(node->path, mode) : -LUME_EOPNOTSUPP)
+                 : mode == (default_mode(node) & 0777u)
+                     ? lume_file_mode_remove(node->path, true)
+                     : lume_file_mode_set(node->path, mode, true);
     if (result)
     {
         if (fd >= 0)
@@ -3140,6 +3213,7 @@ static int64_t file_mode(struct lume_files *files, unsigned operation,
     }
     node->mode = mode;
     node->mode_set = true;
+    native_aliases(node, false, true);
     return fd >= 0 ? fd : 0;
 }
 
@@ -3172,7 +3246,7 @@ int64_t lume_vfs_resize(struct lume_files *f, uint64_t fd, uint64_t length)
         return -LUME_EINVAL;
     if (!n->writable)
         return -LUME_EROFS;
-    if (n->executables)
+    if (executable_backing(n))
         return -LUME_ETXTBSY;
     if (f->identity.euid || f->identity.jailed)
         return -LUME_EACCES;
@@ -3210,6 +3284,7 @@ int64_t lume_vfs_resize(struct lume_files *f, uint64_t fd, uint64_t length)
     }
     n->bytes = length;
     node_changed(n);
+    native_aliases(n, true, false);
     return 0;
 }
 
@@ -3256,6 +3331,9 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
     if (!same && target >= 0 && !replace)
         return -LUME_EEXIST;
     struct node *incoming = &nodes[source];
+    if (replace && target >= 0 && native_storage(incoming) &&
+        same_backing(incoming, &nodes[target]))
+        return 0;
     bool directory = incoming->kind == LUME_NODE_DIR;
     if (incoming->kind != LUME_NODE_FILE && incoming->kind != LUME_NODE_LINK && !directory)
         return -LUME_EINVAL;
@@ -3304,6 +3382,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
         previous_permissions = (unsigned)mode & 0777u;
     }
     bool persistent = incoming->persistent;
+    bool legacy_modes = persistent && !storage->metadata;
     if (persistent && incoming->kind == LUME_NODE_FILE && incoming->references &&
         !storage->rename_state)
         return -LUME_EBUSY;
@@ -3357,7 +3436,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
                                       .hash = namespace_hash(owned),
                                       .old_path = nodes[i].path,
                                       .new_path = owned};
-        if (persistent)
+        if (legacy_modes)
         {
             result = lume_file_mode_override(owned, &entry->previous_mode, true);
             unsigned mode = entry->permissions;
@@ -3369,7 +3448,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
         ++prepared;
         lume_worker_checkpoint(0);
     }
-    if (!result && persistent)
+    if (!result && legacy_modes)
         result = lume_file_mode_batch(changes, affected, true);
     if (result)
         goto discard;
@@ -3390,7 +3469,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
     }
     if (state != LUME_STORAGE_NAMESPACE_COMMITTED)
     {
-        if (persistent && state == LUME_STORAGE_NAMESPACE_UNCHANGED)
+        if (legacy_modes && state == LUME_STORAGE_NAMESPACE_UNCHANGED)
         {
             for (unsigned i = 0; i < prepared; ++i)
                 changes[i] =
@@ -3426,7 +3505,7 @@ static int64_t rename_namespace(struct lume_files *files, const char *from, cons
     if (previous)
         release_ram(previous);
     unsigned cleanup = 0;
-    if (!result && persistent)
+    if (!result && legacy_modes)
     {
         for (unsigned i = 0; i < prepared; ++i)
             if (!lume_path_equal_folded(paths[i].old_path, nodes[paths[i].node].path))
@@ -3892,6 +3971,11 @@ int64_t lume_vfs_mkdir(struct lume_files *f, const char *input)
         }
     }
     nodes[reserved].persistent = nodes[r].persistent;
+    if (native_storage(&nodes[reserved]) && !import_storage_metadata(&nodes[reserved], true))
+    {
+        cancel_node(reserved);
+        return -LUME_EIO;
+    }
     publish_node(reserved);
     return 0;
 }
@@ -3946,7 +4030,9 @@ int64_t lume_vfs_remove(struct lume_files *files, const char *input, bool direct
     node->linked = false;
     bool persistent = node->persistent;
     release_ram(node);
-    return result ? result : lume_file_mode_remove(path, persistent);
+    return result                            ? result
+           : persistent && storage->metadata ? 0
+                                             : lume_file_mode_remove(path, persistent);
 }
 
 static int find_folded(const char *path)

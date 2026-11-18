@@ -23,6 +23,7 @@ KERNEL_C_aarch64 := \
     src/exec/elf.c \
     src/fs/fat/fat.c \
     src/fs/ext4/ext4.c \
+    src/fs/ext4/write.c \
     src/fs/ext4/storage.c \
     src/fs/path.c \
     platform/raspberrypi5/fdt.c \

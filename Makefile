@@ -182,6 +182,11 @@ TEST_NAMES += net-service
 TEST_NAMES += ext4
 
 .PHONY: check-ext4
+.PHONY: check-ext4-write
+check-ext4-write: $(OUT)/tests/ext4-write$(HOSTEXE)
+$(OUT)/tests/ext4-write$(HOSTEXE): tests/unit/ext4_write_test.c src/fs/ext4/ext4.c src/fs/ext4/write.c include/kernel/lume/ext4_write.h include/kernel/lume/ext4.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
 check: check-ext4
 check-ext4: $(OUT)/tests/ext4$(HOSTEXE) $(OUT)/tests/vfs-ext4$(HOSTEXE)
 	"$(OUT)/tests/ext4$(HOSTEXE)"
@@ -191,7 +196,12 @@ $(OUT)/tests/ext4$(HOSTEXE): tests/unit/ext4_test.c src/fs/ext4/ext4.c include/k
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
 
-EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/write.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+EXT4_WRITE_VFS_SOURCES := tests/unit/vfs_ext4_write_test.c $(filter-out tests/unit/vfs_ext4_test.c src/syscall/files.c,$(EXT4_VFS_TEST_SOURCES))
+check-ext4-write: $(OUT)/tests/vfs-ext4-write$(HOSTEXE)
+$(OUT)/tests/vfs-ext4-write$(HOSTEXE): $(EXT4_WRITE_VFS_SOURCES) tests/unit/ext4_write_test.c include/kernel/lume/ext4_write.h
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(EXT4_WRITE_VFS_SOURCES) -o "$@"
 $(OUT)/tests/vfs-ext4$(HOSTEXE): $(EXT4_VFS_TEST_SOURCES) tests/unit/ext4_test.c include/kernel/lume/ext4.h include/kernel/lume/ext4_storage.h include/kernel/lume/storage.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(EXT4_VFS_TEST_SOURCES) -o "$@"

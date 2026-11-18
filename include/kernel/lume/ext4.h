@@ -9,10 +9,13 @@ enum
     LUME_EXT4_IO = -1,
     LUME_EXT4_INVALID = -2,
     LUME_EXT4_UNSUPPORTED = -3,
-    LUME_EXT4_NOT_FOUND = -4
+    LUME_EXT4_NOT_FOUND = -4,
+    LUME_EXT4_NO_SPACE = -5,
+    LUME_EXT4_EXISTS = -6,
+    LUME_EXT4_NOT_EMPTY = -7
 };
 
-/* The reader addresses bytes relative to one immutable filesystem image. */
+/* The reader addresses bytes relative to one filesystem image. */
 typedef int (*lume_ext4_read_bytes)(void *, uint64_t, void *, size_t);
 
 struct lume_ext4
