@@ -1,18 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <lume/linux_compat.h>
+#include <lume/linux_memory.h>
+#include <linux/string.h>
 #include <stdarg.h>
 
 static struct lume_linux_host_ops host;
 static bool started, reading;
-static unsigned allocations;
 static struct hwrng *active_rng;
 static struct virtio_device *poll_device;
+static struct lume_linux_runtime_stats statistics;
 
-struct allocation
+void lume_linux_runtime_snapshot(struct lume_linux_runtime_stats *out)
 {
-    void *base;
-    size_t bytes;
-};
+    if (out)
+        *out = statistics;
+}
+
+static void pause_us(unsigned us)
+{
+    ++statistics.pause_calls;
+    statistics.pause_requested_microseconds += us;
+    host.pause(us);
+}
 
 int lume_linux_runtime_start(const struct lume_linux_host_ops *ops)
 {
@@ -22,15 +31,22 @@ int lume_linux_runtime_start(const struct lume_linux_host_ops *ops)
         !ops->irq_save || !ops->irq_restore || !ops->map || !ops->unmap || !ops->read32 ||
         !ops->write32)
         return -EINVAL;
+    int result = lume_linux_memory_start(ops->allocate, ops->free);
+    if (result)
+        return result;
     host = *ops;
+    statistics = (struct lume_linux_runtime_stats){0};
     started = true;
     return 0;
 }
 
 int lume_linux_runtime_stop(void)
 {
-    if (allocations || active_rng || poll_device || reading)
+    if (lume_linux_allocations() || active_rng || poll_device || reading)
         return -EBUSY;
+    int result = lume_linux_memory_stop();
+    if (result)
+        return result;
     memset(&host, 0, sizeof(host));
     started = false;
     return 0;
@@ -38,43 +54,7 @@ int lume_linux_runtime_stop(void)
 
 unsigned lume_linux_allocations(void)
 {
-    return allocations;
-}
-
-void *kmalloc(size_t bytes, gfp_t flags)
-{
-    if (!started || flags != GFP_KERNEL || !bytes ||
-        bytes > SIZE_MAX - sizeof(struct allocation) - 63)
-        return NULL;
-    void *base = host.allocate(bytes + sizeof(struct allocation) + 63);
-    if (!base)
-        return NULL;
-    uintptr_t address = ((uintptr_t)base + sizeof(struct allocation) + 63) & ~(uintptr_t)63;
-    struct allocation *record = (struct allocation *)address - 1;
-    *record = (struct allocation){base, bytes};
-    ++allocations;
-    return (void *)address;
-}
-
-void *kzalloc(size_t bytes, gfp_t flags)
-{
-    void *memory = kmalloc(bytes, flags);
-    if (memory)
-        memset(memory, 0, bytes);
-    return memory;
-}
-
-void kfree(const void *memory)
-{
-    if (!memory)
-        return;
-    const struct allocation *record = (const struct allocation *)memory - 1;
-    void *base = record->base;
-    volatile unsigned char *bytes = (volatile unsigned char *)memory;
-    for (size_t i = 0; i < record->bytes; ++i)
-        bytes[i] = 0;
-    --allocations;
-    host.free(base);
+    return lume_linux_memory_allocations();
 }
 
 static int managed(struct device *device, void (*release)(void *), void *data)
@@ -192,7 +172,7 @@ unsigned long lume_linux_jiffies(void)
 void usleep_range(unsigned long minimum, unsigned long maximum)
 {
     if (minimum && maximum >= minimum && minimum <= UINT32_MAX)
-        host.pause((unsigned)minimum);
+        pause_us((unsigned)minimum);
 }
 
 unsigned long lume_linux_irq_save(void)
@@ -231,30 +211,39 @@ void complete(struct completion *completion)
     __atomic_fetch_add(&completion->done, 1u, __ATOMIC_RELEASE);
 }
 
+static int completion_result(uint64_t start, int result)
+{
+    statistics.completion_microseconds += host.microseconds() - start;
+    statistics.completion_timeouts += result == -ETIMEDOUT;
+    return result;
+}
+
 int wait_for_completion_killable(struct completion *completion)
 {
     if (!started || !completion)
         return -EINVAL;
     uint64_t start = host.microseconds();
+    ++statistics.completion_waits;
     for (;;)
     {
+        ++statistics.completion_polls;
         unsigned done = __atomic_load_n(&completion->done, __ATOMIC_ACQUIRE);
         if (done && __atomic_compare_exchange_n(&completion->done, &done, done - 1, false,
                                                 __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-            return 0;
+            return completion_result(start, 0);
         if (poll_device)
         {
             int result = lume_linux_virtio_poll(poll_device);
             if (result < 0)
-                return result;
+                return completion_result(start, result);
         }
         if (host.microseconds() - start >= UINT64_C(5000000))
         {
             if (poll_device)
                 poll_device->error = -ETIMEDOUT;
-            return -ETIMEDOUT;
+            return completion_result(start, -ETIMEDOUT);
         }
-        host.pause(50);
+        pause_us(50);
     }
 }
 
@@ -388,6 +377,8 @@ int lume_linux_hwrng_read(void *out, size_t bytes, bool wait)
         return -EINVAL;
     if (reading)
         return -EBUSY;
+    uint64_t start = host.microseconds();
+    ++statistics.entropy_reads;
     reading = true;
     size_t copied = 0;
     int result = 0;
@@ -415,15 +406,15 @@ int lume_linux_hwrng_read(void *out, size_t bytes, bool wait)
         if (!wait)
             break;
     }
-    volatile unsigned char *wipe = buffer;
-    for (unsigned i = 0; i < sizeof(buffer); ++i)
-        wipe[i] = 0;
+    memzero_explicit(buffer, sizeof(buffer));
     reading = false;
+    statistics.entropy_microseconds += host.microseconds() - start;
     if (result < 0)
     {
         memset(out, 0, bytes);
         return result;
     }
+    statistics.entropy_bytes += copied;
     return (int)copied;
 }
 

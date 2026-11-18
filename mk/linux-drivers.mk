@@ -1,5 +1,5 @@
 LINUX_COMPAT_CPPFLAGS := -Iinclude/compat/linux -Ivendor/linux/include
-LINUX_COMPAT_COMMON := src/compat/linux/runtime.c src/compat/linux/ddk.c
+LINUX_COMPAT_COMMON := src/compat/linux/memory.c src/compat/linux/runtime.c src/compat/linux/ddk.c
 LINUX_RNG200_SOURCE := vendor/linux/drivers/char/hw_random/iproc-rng200.c
 LINUX_VIRTIO_RNG_SOURCE := vendor/linux/drivers/char/hw_random/virtio-rng.c
 LINUX_NATIVE_SOURCES := $(LINUX_COMPAT_COMMON)
@@ -28,7 +28,13 @@ endif
 
 LINUX_NATIVE_OBJECTS := $(addprefix $(OUT)/linux/obj/,$(addsuffix .o,$(LINUX_NATIVE_SOURCES)))
 LINUX_COMPAT_HEADERS := $(wildcard include/compat/linux/linux/*.h include/compat/linux/asm/*.h include/compat/linux/lume/*.h) vendor/linux/include/linux/hw_random.h
-.PHONY: linux-drivers linux-driver-modules check-linux-compat
+.PHONY: linux-drivers linux-driver-modules check-linux-compat check-linux-memory
+check: check-linux-memory
+check-linux-memory: $(OUT)/tests/linux-memory$(HOSTEXE)
+	env "$<"
+$(OUT)/tests/linux-memory$(HOSTEXE): tests/unit/linux_memory_test.c src/compat/linux/memory.c $(LINUX_COMPAT_HEADERS)
+	mkdir -p "$(@D)"
+	$(HOSTCC) $(HOSTCFLAGS) -std=c11 -Wall -Wextra -Werror -UNDEBUG $(LINUX_COMPAT_CPPFLAGS) $(filter %.c,$^) -o "$@"
 ifeq ($(ARCH),i686)
 ifeq ($(LINUX_DRIVERS),1)
 linux-drivers: $(OUT)/lume.elf
@@ -54,7 +60,7 @@ linux-driver-modules:
 	$(error Dynamic Linux driver modules require aarch64 or amd64)
 endif
 
-LINUX_HOST_SOURCES := tests/unit/linux_compat_test.c src/compat/linux/runtime.c $(LINUX_RNG200_SOURCE) $(LINUX_VIRTIO_RNG_SOURCE)
+LINUX_HOST_SOURCES := tests/unit/linux_compat_test.c src/compat/linux/memory.c src/compat/linux/runtime.c $(LINUX_RNG200_SOURCE) $(LINUX_VIRTIO_RNG_SOURCE)
 LINUX_HOST_OBJECTS := $(addprefix $(OUT)/linux/host/,$(addsuffix .o,$(LINUX_HOST_SOURCES)))
 LINUX_HOST_FLAGS := -std=gnu11 -Wall -Wextra -Werror -UNDEBUG
 ifeq ($(OS),Windows_NT)
@@ -74,6 +80,6 @@ check-linux-compat: $(OUT)/tests/linux-compat$(HOSTEXE)
 check-linux-ddk: $(OUT)/tests/linux-ddk$(HOSTEXE)
 	env "$<"
 check: check-linux-compat check-linux-ddk
-$(OUT)/tests/linux-ddk$(HOSTEXE): tests/unit/linux_ddk_test.c tests/fixtures/linux_ddk_worker_host.h src/core/worker.c src/compat/linux/runtime.c src/compat/linux/ddk.c $(LINUX_COMPAT_HEADERS)
+$(OUT)/tests/linux-ddk$(HOSTEXE): tests/unit/linux_ddk_test.c tests/fixtures/linux_ddk_worker_host.h src/core/worker.c src/compat/linux/memory.c src/compat/linux/runtime.c src/compat/linux/ddk.c $(LINUX_COMPAT_HEADERS)
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -std=gnu11 -Wall -Wextra -Werror -UNDEBUG $(LINUX_COMPAT_CPPFLAGS) -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Iarch/amd64/include/kernel tests/unit/linux_ddk_test.c src/compat/linux/runtime.c $(LINUX_HOST_LINK_FLAGS) -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -std=gnu11 -Wall -Wextra -Werror -UNDEBUG $(LINUX_COMPAT_CPPFLAGS) -Iinclude/kernel -Iinclude/ddk -Iinclude/uapi -Iinclude/abi/native -Iarch/amd64/include/kernel tests/unit/linux_ddk_test.c src/compat/linux/memory.c src/compat/linux/runtime.c $(LINUX_HOST_LINK_FLAGS) -o "$@"

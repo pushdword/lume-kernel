@@ -1,6 +1,7 @@
 #include "lume/early.h"
 #include "lume/vfs.h"
 #include "lume/credential.h"
+#include "lume/credentials.h"
 #include <string.h>
 
 static bool permitted(unsigned value, unsigned real, unsigned effective, unsigned saved)
@@ -8,16 +9,87 @@ static bool permitted(unsigned value, unsigned real, unsigned effective, unsigne
     return value == UINT32_MAX || value == real || value == effective || value == saved;
 }
 
+void lume_credential_exec(struct lume_identity *id)
+{
+    id->suid = id->euid;
+    id->sgid = id->egid;
+}
+
+static int change_ids(struct lume_identity *id, unsigned operation,
+                      const struct lume_credential_request *r)
+{
+    bool group = operation == LUME_CREDENTIAL_GID || operation == LUME_CREDENTIAL_SETGID ||
+                 operation == LUME_CREDENTIAL_SETEGID || operation == LUME_CREDENTIAL_SETREGID;
+    unsigned real = group ? id->gid : id->uid;
+    unsigned effective = group ? id->egid : id->euid;
+    unsigned saved = group ? id->sgid : id->suid;
+    unsigned a = group ? r->gid : r->uid;
+    unsigned b = group ? r->egid : r->euid;
+    unsigned c = group ? r->sgid : r->suid;
+    bool privileged = id->euid == 0;
+    bool single = operation == LUME_CREDENTIAL_SETUID || operation == LUME_CREDENTIAL_SETGID;
+    bool effective_only =
+        operation == LUME_CREDENTIAL_SETEUID || operation == LUME_CREDENTIAL_SETEGID;
+    bool pair = operation == LUME_CREDENTIAL_SETREUID || operation == LUME_CREDENTIAL_SETREGID;
+
+    if (single || effective_only)
+    {
+        if (a > LUME_ID_MAX)
+            return -LUME_EINVAL;
+        if (!privileged && a != real && a != saved && (!effective_only || a != effective))
+            return -LUME_EPERM;
+        effective = a;
+        if (single && privileged)
+            real = saved = a;
+    }
+    else
+    {
+        if ((a != UINT32_MAX && a > LUME_ID_MAX) || (b != UINT32_MAX && b > LUME_ID_MAX) ||
+            (!pair && c != UINT32_MAX && c > LUME_ID_MAX))
+            return -LUME_EINVAL;
+        if (!privileged && (!permitted(a, real, effective, pair && !group ? real : saved) ||
+                            !permitted(b, real, effective, saved) ||
+                            (!pair && !permitted(c, real, effective, saved))))
+            return -LUME_EPERM;
+        if (pair)
+        {
+            if (a != UINT32_MAX || (b != UINT32_MAX && b != real))
+                saved = b == UINT32_MAX ? effective : b;
+        }
+        else if (c != UINT32_MAX)
+            saved = c;
+        if (a != UINT32_MAX)
+            real = a;
+        if (b != UINT32_MAX)
+            effective = b;
+    }
+    if (group)
+    {
+        id->gid = real;
+        id->egid = effective;
+        id->sgid = saved;
+    }
+    else
+    {
+        id->uid = real;
+        id->euid = effective;
+        id->suid = saved;
+    }
+    return 0;
+}
+
 int64_t lume_credential_call(struct lume_files *files, unsigned pid, unsigned operation,
                              uint64_t address, uint64_t bytes)
 {
-    if (operation > LUME_CREDENTIAL_UMASK)
+    if (operation > LUME_CREDENTIAL_SETREGID)
         return -LUME_EINVAL;
     bool limit = operation >= LUME_CREDENTIAL_LIMIT_GET && operation <= LUME_CREDENTIAL_LIMIT_SET;
     if (bytes !=
         (limit ? sizeof(struct lume_limit_request) : sizeof(struct lume_credential_request)))
         return -LUME_EINVAL;
-    if (!lume_user_buffer(address, bytes, false) || !lume_user_buffer(address, bytes, true))
+    bool output = operation == LUME_CREDENTIAL_GET || operation == LUME_CREDENTIAL_LIMIT_GET;
+    if (!lume_user_buffer(address, bytes, false) ||
+        (output && !lume_user_buffer(address, bytes, true)))
         return -LUME_EFAULT;
     struct lume_identity *id = &files->identity;
     if (limit)
@@ -47,13 +119,6 @@ int64_t lume_credential_call(struct lume_files *files, unsigned pid, unsigned op
     if (r.version != LUME_CREDENTIAL_VERSION || r.bytes != sizeof(r) || r.reserved ||
         r.groups_count > LUME_GROUP_MAX)
         return -LUME_EINVAL;
-    if (operation == LUME_CREDENTIAL_UID || operation == LUME_CREDENTIAL_GID)
-    {
-        const unsigned values[] = {r.uid, r.euid, r.suid, r.gid, r.egid, r.sgid};
-        for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
-            if (values[i] != UINT32_MAX && values[i] > LUME_ID_MAX)
-                return -LUME_EINVAL;
-    }
     if (operation == LUME_CREDENTIAL_GROUPS)
         for (unsigned i = 0; i < r.groups_count; ++i)
             if (r.groups[i] > LUME_ID_MAX)
@@ -79,34 +144,22 @@ int64_t lume_credential_call(struct lume_files *files, unsigned pid, unsigned op
         *user = r;
         return 0;
     }
-    if (operation == LUME_CREDENTIAL_UID)
+    if (operation == LUME_CREDENTIAL_UID || operation == LUME_CREDENTIAL_GID ||
+        operation >= LUME_CREDENTIAL_SETUID)
     {
-        if (id->euid && (!permitted(r.uid, id->uid, id->euid, id->suid) ||
-                         !permitted(r.euid, id->uid, id->euid, id->suid) ||
-                         !permitted(r.suid, id->uid, id->euid, id->suid)))
-            return -LUME_EPERM;
-        if (r.uid != UINT32_MAX)
-            id->uid = r.uid;
-        if (r.euid != UINT32_MAX)
-            id->euid = r.euid;
-        if (r.suid != UINT32_MAX)
-            id->suid = r.suid;
-        if (id->euid)
-            (void)lume_task_drop_capabilities(pid, lume_task_capabilities(pid));
-        return 0;
-    }
-    if (operation == LUME_CREDENTIAL_GID)
-    {
-        if (id->euid && (!permitted(r.gid, id->gid, id->egid, id->sgid) ||
-                         !permitted(r.egid, id->gid, id->egid, id->sgid) ||
-                         !permitted(r.sgid, id->gid, id->egid, id->sgid)))
-            return -LUME_EPERM;
-        if (r.gid != UINT32_MAX)
-            id->gid = r.gid;
-        if (r.egid != UINT32_MAX)
-            id->egid = r.egid;
-        if (r.sgid != UINT32_MAX)
-            id->sgid = r.sgid;
+        struct lume_identity next = *id;
+        int result = change_ids(&next, operation, &r);
+        if (result)
+            return result;
+        bool group = operation == LUME_CREDENTIAL_GID || operation == LUME_CREDENTIAL_SETGID ||
+                     operation == LUME_CREDENTIAL_SETEGID || operation == LUME_CREDENTIAL_SETREGID;
+        if (!group && next.euid)
+        {
+            result = lume_task_drop_capabilities(pid, lume_task_capabilities(pid));
+            if (result)
+                return result;
+        }
+        *id = next;
         return 0;
     }
     if (id->euid)
@@ -114,7 +167,8 @@ int64_t lume_credential_call(struct lume_files *files, unsigned pid, unsigned op
     if (operation == LUME_CREDENTIAL_GROUPS)
     {
         id->groups_count = r.groups_count;
-        memcpy(id->groups, r.groups, sizeof(id->groups));
+        memset(id->groups, 0, sizeof(id->groups));
+        memcpy(id->groups, r.groups, r.groups_count * sizeof(r.groups[0]));
         return 0;
     }
     char path[LUME_PATH_MAX];

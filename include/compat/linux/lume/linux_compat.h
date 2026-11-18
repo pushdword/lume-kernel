@@ -24,6 +24,16 @@ struct lume_linux_host_ops
     void (*log)(const char *, const char *);
 };
 
+struct lume_linux_runtime_stats
+{
+    uint64_t completion_waits, completion_polls, completion_microseconds, completion_timeouts;
+    uint64_t pause_calls, pause_requested_microseconds;
+    uint64_t entropy_reads, entropy_bytes, entropy_microseconds;
+};
+
+/* Counters cover one runtime instance and reset on successful startup.
+ * Snapshot calls require the same serialization as driver operations. */
+void lume_linux_runtime_snapshot(struct lume_linux_runtime_stats *);
 int lume_linux_runtime_start(const struct lume_linux_host_ops *);
 int lume_linux_runtime_stop(void);
 unsigned lume_linux_allocations(void);

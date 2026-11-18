@@ -173,6 +173,12 @@ static void memory_and_waits(void)
     uint64_t start = now;
     assert(wait_for_completion_killable(&completion) == -ETIMEDOUT);
     assert(now - start >= 5000000);
+    struct lume_linux_runtime_stats stats;
+    lume_linux_runtime_snapshot(&stats);
+    assert(stats.completion_waits == 4 && stats.completion_timeouts == 1);
+    assert(stats.completion_microseconds == now);
+    assert(stats.pause_calls && stats.pause_requested_microseconds == now);
+    assert(stats.completion_polls >= stats.completion_waits);
     spinlock_t lock = {0};
     unsigned long flags;
     spin_lock_irqsave(&lock, flags);
@@ -222,6 +228,10 @@ static void rng200(void)
     fifo = true;
     next_word = UINT32_C(0x44332211);
     assert(lume_linux_hwrng_read(output + 1, 73, true) == 73);
+    struct lume_linux_runtime_stats stats;
+    lume_linux_runtime_snapshot(&stats);
+    assert(stats.entropy_reads == 1 && stats.entropy_bytes == 73);
+    assert(stats.entropy_microseconds == 0);
     assert(output[0] == 0xa5 && output[74] == 0xa5);
     assert(output[1] == 0x11 && output[2] == 0x22 && output[3] == 0x33 && output[4] == 0x44);
     fifo = false;

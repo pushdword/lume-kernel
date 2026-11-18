@@ -29,6 +29,7 @@
 #include "lume/vfs_paths.h"
 #include "lume/sandbox_policy.h"
 #include "lume/worker.h"
+#include "lume/credentials.h"
 #include "lume/user_io.h"
 #include "lume/socket_io.h"
 #include "lume/work.h"
@@ -57,8 +58,6 @@ int lume_clock_realtime_ms(uint64_t monotonic, uint64_t *out)
     *out = seconds * 1000u + fraction;
     return 0;
 }
-
-extern int64_t lume_credential_call(struct lume_files *, unsigned, unsigned, uint64_t, uint64_t);
 
 static int string(uint64_t p, char out[LUME_PATH_MAX])
 {
@@ -104,8 +103,8 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return -LUME_ENOSYS;
 #endif
     case LUME_SYS_CREDENTIAL:
-        return a > LUME_CREDENTIAL_UMASK ? -LUME_EINVAL
-                                         : lume_credential_call(files, pid, (unsigned)a, b, n);
+        return a > LUME_CREDENTIAL_SETREGID ? -LUME_EINVAL
+                                            : lume_credential_call(files, pid, (unsigned)a, b, n);
     case LUME_SYS_FILE_MODE:
     {
         if (a > LUME_FILE_MODE_MKDIR || n != sizeof(struct lume_file_mode_request))

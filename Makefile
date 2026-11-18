@@ -1227,3 +1227,5 @@ check-vfs-metadata: $(OUT)/tests/vfs-metadata$(HOSTEXE)
 $(OUT)/tests/vfs-metadata$(HOSTEXE): tests/unit/vfs_metadata_test.c src/fs/vfs/vfs.c tests/fixtures/vfs_unrestricted_services.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_COMPUTE_PROVIDED=1 -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
+
+include mk/credentials.mk

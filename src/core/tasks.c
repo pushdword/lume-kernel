@@ -33,6 +33,7 @@ static void scheduler_task_changed(unsigned task);
 #include "lume/thread.h"
 #include "lume/supervision.h"
 #include "lume/signal.h"
+#include "lume/credentials.h"
 #include "lume/process.h"
 #include "lume/tty_device.h"
 #include "lume/user_io.h"
@@ -1004,8 +1005,8 @@ static void task_query_publish(const struct lume_context *frame)
             static const struct lume_context pid_query = {
                 .LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_GETPID}};
             static const struct lume_context tid_query = {
-                .LUME_CONTEXT_REGISTERS = {[0] = LUME_THREAD_SELF,
-                                           [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
+                .LUME_CONTEXT_REGISTERS = {
+                    [0] = LUME_THREAD_SELF, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_THREAD}};
             pid = process + 1;
             tid = thread_id(thread_slots, task);
             if (!tasks[process].files.identity.sandbox_profile)
@@ -1018,10 +1019,10 @@ static void task_query_publish(const struct lume_context *frame)
                 {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CLOCK}},
                 {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_ABI}},
                 {.LUME_CONTEXT_REGISTERS = {[LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}},
-                {.LUME_CONTEXT_REGISTERS = {[0] = 1,
-                                            [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}},
-                {.LUME_CONTEXT_REGISTERS = {[0] = 2,
-                                            [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}}};
+                {.LUME_CONTEXT_REGISTERS =
+                     {[0] = 1, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}},
+                {.LUME_CONTEXT_REGISTERS = {
+                     [0] = 2, [LUME_CONTEXT_SYSCALL_REGISTER] = LUME_SYS_CPU}}};
             unsigned values = LUME_QUERY_CLOCK | LUME_QUERY_ABI | LUME_QUERY_CPU;
             for (unsigned i = 0; i < sizeof(value_queries) / sizeof(*value_queries); ++i)
                 if (lume_sandbox_check(&tasks[process].files, pid, value_queries + i))
@@ -1559,6 +1560,7 @@ static int start_program_with_scratch(struct lume_context *frame,
         for (unsigned i = 0; i < LUME_FD_MAX; ++i)
             if (tasks[child].files.fd[i].flags & LUME_FD_CLOEXEC)
                 (void)lume_vfs_close(&tasks[child].files, i);
+    lume_credential_exec(&tasks[child].files.identity);
     if (replacing)
     {
         if (lume_vfs_exec_callbacks(&tasks[owner].files))
