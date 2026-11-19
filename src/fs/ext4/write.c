@@ -2002,7 +2002,11 @@ static void initialize_writer(struct lume_ext4_writer *w, struct lume_ext4 *fs,
                               lume_ext4_write_bytes write, lume_ext4_flush flush, void *memory,
                               size_t required)
 {
-    *w = (struct lume_ext4_writer){.fs = fs, .write = write, .flush = flush, .memory = memory};
+    memset(w, 0, sizeof(*w));
+    w->fs = fs;
+    w->write = write;
+    w->flush = flush;
+    w->memory = memory;
     size_t fast = fast_workspace_bytes(fs);
     if (fast)
         w->fast_buffer = w->memory + required - fast;

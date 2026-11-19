@@ -291,16 +291,19 @@ static int publish(struct entry *e)
     hex(path + 9, e->address >> 16, 2);
     hex(path + 12, (e->address >> 11) & 31, 2);
     hex(path + 15, (e->address >> 8) & 7, 1);
-    struct lume_hardware_identity match = {.kind = LUME_HARDWARE_ID_PCI};
-    memcpy(match.value, identity, sizeof(identity));
+    struct lume_hardware_identity matches[] = {
+        {.kind = LUME_HARDWARE_ID_PCI},
+        {.kind = LUME_HARDWARE_ID_PCI, .value = "pci-class,000000"}};
+    memcpy(matches[0].value, identity, sizeof(identity));
+    hex(matches[1].value + 10, lume_q35_pci_read(e->address, 8) >> 8, 6);
     static const struct lume_firmware_ops firmware = {.property = property};
     struct lume_hardware_description d = {.parent = e->parent ? entries[e->parent - 1].id : root_id,
                                           .origin = LUME_HARDWARE_PCI,
                                           .state = LUME_HARDWARE_DISCOVERED,
                                           .name = identity,
                                           .path = path,
-                                          .identities = &match,
-                                          .identity_count = 1,
+                                          .identities = matches,
+                                          .identity_count = sizeof(matches) / sizeof(*matches),
                                           .resources = resources,
                                           .resource_count = count,
                                           .firmware = &firmware,

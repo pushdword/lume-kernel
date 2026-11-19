@@ -1,14 +1,16 @@
-PLATFORM_MODULE_NAMES := vblk vnet vrng vga ps2 xhci
+PLATFORM_MODULE_NAMES := ahci vblk vnet rtl8168h vrng vga ps2 xhci
 PLATFORM_MODULE_NAMES += lume2d vgpu
 Q35_vgpu := drivers/gpu/virtio_gpu/module.c src/device/virtio_pci.c src/device/virtio_gpu.c
 Q35_vgpu += drivers/display/bochs_vbe/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 Q35_lume2d := drivers/gpu/lume2d/module.c
 ifeq ($(PROFILE),recovery)
-PLATFORM_MODULE_NAMES := $(filter-out vnet,$(PLATFORM_MODULE_NAMES))
+PLATFORM_MODULE_NAMES := $(filter-out vnet rtl8168h,$(PLATFORM_MODULE_NAMES))
 endif
 PLATFORM_MODULES := $(addprefix $(OUT)/modules/,$(addsuffix .lkm,$(PLATFORM_MODULE_NAMES)))
 Q35_vblk := drivers/storage/virtio_blk/block.c platform/q35/virtio.c
+Q35_ahci := drivers/storage/ahci/ahci.c
 Q35_vnet := drivers/net/virtio_net/net.c platform/q35/virtio.c
+Q35_rtl8168h := drivers/net/rtl8168h/net.c
 Q35_vrng := drivers/entropy/virtio_rng/rng.c platform/q35/virtio.c
 ifeq ($(LINUX_DRIVERS),1)
 Q35_vrng := $(LINUX_COMPAT_COMMON) drivers/linux/virtio_rng.c $(LINUX_VIRTIO_RNG_SOURCE) platform/q35/virtio.c

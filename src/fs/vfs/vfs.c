@@ -3920,6 +3920,14 @@ int64_t lume_vfs_fd_call(struct lume_files *f, unsigned op, struct lume_fd_reque
         return -LUME_EINVAL;
     switch (op)
     {
+    case LUME_FD_BLOCK_SECTOR_SIZE:
+        if (r->flags)
+            return -LUME_EINVAL;
+        if (d->node < 0 || !nodes[d->node].block)
+            return -LUME_ENOTTY;
+        if (nodes[d->node].block->device->state != LUME_DEVICE_READY)
+            return -LUME_EIO;
+        return nodes[d->node].block->sector_bytes;
     case LUME_FD_GETFD:
         return r->flags ? -LUME_EINVAL : (int)f->fd[r->fd].flags;
     case LUME_FD_SETFD:

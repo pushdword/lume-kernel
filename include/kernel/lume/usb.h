@@ -12,6 +12,16 @@ struct lume_usb_interface
 };
 
 #define LUME_USB_INPUTS 4u
+#if defined(LUME_ARCH_AMD64)
+#define LUME_XHCI_HOSTS 4u
+bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent,
+                            bool (*present)(unsigned));
+#else
+#define LUME_XHCI_HOSTS 2u
+#endif
+bool lume_usb_configure_host(unsigned index, bool enabled);
+bool lume_usb_start_host(unsigned index, uint64_t frequency);
+bool lume_usb_stop_host(unsigned index);
 
 struct lume_usb_configuration
 {

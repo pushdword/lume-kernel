@@ -110,6 +110,17 @@ enum lume_volume_format lume_volume_identify(const unsigned char p[512], uint64_
     if (p[510] != 0x55 || p[511] != 0xaa)
         return LUME_VOLUME_NONE;
 #if defined(LUME_ARCH_AMD64)
+    if (u32(p + 440) == LUME_Q35_EFI_DISK_ID)
+    {
+        uint64_t first = LUME_Q35_EFI_DATA_FIRST;
+        if (sectors > UINT32_MAX || sectors < first + 65536 || !empty(p, 440) ||
+            p[444] || p[445] || !empty(p + 478, 32) ||
+            !typed_partition(p + 446, true, 0xef, LUME_Q35_EFI_FIRST, LUME_Q35_EFI_SECTORS) ||
+            !typed_partition(p + 462, false, 0x83, (uint32_t)first, (uint32_t)(sectors - first)))
+            return LUME_VOLUME_NONE;
+        *out = (struct lume_volume){first, sectors - first};
+        return LUME_VOLUME_EXT4;
+    }
     if (u32(p + 440) == LUME_Q35_DISK_ID)
         return pc_data(p, sectors, 2048, false, out);
 #endif

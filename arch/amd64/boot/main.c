@@ -3,16 +3,26 @@
 #include "lume/vfs.h"
 #include "lume/mmu.h"
 #include "lume/net.h"
+#include "lume/netif.h"
 #include "lume/storage.h"
 #include "lume/platform_driver.h"
 #include "lume/boot.h"
 #include "lume/modules.h"
 #include "lume/display.h"
+#include "lume/usb.h"
 #include "lume/pci.h"
 #include "lume/smp.h"
 #include "lume/worker.h"
+#include "lume/firmware.h"
+#include <string.h>
 static uint64_t program_memory;
 static unsigned program_pages;
+
+static void console_status(const char *message, size_t bytes)
+{
+    lume_puts(message);
+    lume_display_write(message, bytes);
+}
 
 unsigned lume_program_staging_pages(void)
 {
@@ -39,11 +49,30 @@ static void *allocate_program(size_t bytes)
     return (void *)(uintptr_t)memory;
 }
 
+static bool persistent_boot(void)
+{
+    static const char expected[] = "persistent\n";
+    struct lume_files files;
+    if (!lume_files_init(&files))
+        lume_fail("boot mode initialization");
+    char mode[sizeof(expected)];
+    int64_t fd = lume_vfs_open(&files, "/etc/bootmode", LUME_O_RDONLY);
+    bool persistent = false;
+    if (fd >= 0)
+    {
+        int64_t bytes = lume_vfs_read(&files, (uint64_t)fd, mode, sizeof(mode));
+        persistent = bytes == sizeof(expected) - 1 && !memcmp(mode, expected, sizeof(expected) - 1);
+    }
+    lume_files_release(&files);
+    return persistent;
+}
+
 _Noreturn void lume_main(uint64_t info, uint64_t magic)
 {
     lume_amd64_context_start();
     lume_q35_console_start();
     lume_puts("\nLUME AMD64 BOOT BEGIN\nPLATFORM=q35 UART=COM1 115200_8N1\n");
+    bool firmware_boot = magic == LUME_MULTIBOOT2_MAGIC;
     struct lume_fdt memory;
     if (!lume_q35_boot_read(info, magic, &memory))
         lume_fail("invalid Multiboot memory map or application root");
@@ -70,29 +99,74 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_vfs_mount_fat((const void *)(uintptr_t)memory.initrd_start,
                             (size_t)(memory.initrd_end - memory.initrd_start)))
         lume_fail("FAT32 application root");
+    bool ssd_boot = firmware_boot && persistent_boot();
+    bool storage_boot = ssd_boot || !firmware_boot;
     lume_platform_firmware_configure(&memory);
     if (lume_q35_hardware_start())
         lume_fail("kernel module and hardware services");
     lume_platform_modules_boot();
-    if (!lume_platform_driver_ready(LUME_PLATFORM_SD) ||
-        !lume_platform_driver_ready(LUME_PLATFORM_DISPLAY) ||
-        !lume_platform_driver_ready(LUME_PLATFORM_KEYBOARD) ||
+    if (firmware_boot && !lume_platform_driver_ready(LUME_PLATFORM_DISPLAY))
+        lume_value("FIRMWARE_FRAMEBUFFER_READY", lume_amd64_framebuffer_start(&memory));
+    if (firmware_boot)
+    {
+        static const char keyboard[] = "USB keyboard ready.\n";
+        static const char no_keyboard[] = "USB controller ready. Waiting for a keyboard.\n";
+        static const char no_controller[] = "No USB controller ready.\n";
+        if (lume_usb_keyboards())
+            console_status(keyboard, sizeof(keyboard) - 1);
+        else if (lume_platform_driver_ready(LUME_PLATFORM_USB))
+            console_status(no_keyboard, sizeof(no_keyboard) - 1);
+        else
+            console_status(no_controller, sizeof(no_controller) - 1);
+    }
+    if (firmware_boot && !lume_platform_driver_ready(LUME_PLATFORM_ENTROPY))
+        (void)lume_amd64_entropy_start();
+    if ((!firmware_boot && (!lume_platform_driver_ready(LUME_PLATFORM_DISPLAY) ||
+                       !lume_platform_driver_ready(LUME_PLATFORM_KEYBOARD))) ||
+        (storage_boot && !lume_platform_driver_ready(LUME_PLATFORM_SD)) ||
         !lume_platform_driver_ready(LUME_PLATFORM_ENTROPY))
         lume_fail("required q35 modules unavailable");
     lume_puts("LUME Q35 MODULES READY\n");
-    const struct lume_storage_ops *storage = lume_storage_start();
+    const struct lume_storage_ops *storage = storage_boot ? lume_storage_start() : NULL;
+    if (ssd_boot && (!storage || storage->read_only || !lume_storage_is_ext4()))
+        lume_fail("writable persistent data volume required");
     if (storage && !lume_vfs_mount_storage(storage))
         lume_fail("persistent data volume");
     lume_value("PERSISTENT_VOLUME_READY", storage != NULL);
+    if (firmware_boot && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY)
+    {
+        bool ethernet = false;
+        for (unsigned i = 0; i < lume_netif_count(); ++i)
+        {
+            struct lume_netif *interface = lume_netif_at(i);
+            struct lume_netif_info status;
+            lume_netif_info(interface, &status);
+            if (status.kind == LUME_IF_ETHERNET)
+            {
+                ethernet = true;
+                (void)lume_netif_admin(interface, true);
+            }
+        }
+        static const char nic[] = "Ethernet interface detected.\n";
+        static const char no_nic[] = "No Ethernet interface detected.\n";
+        console_status(ethernet ? nic : no_nic, ethernet ? sizeof(nic) - 1 : sizeof(no_nic) - 1);
+    }
     bool network = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_net_start();
     lume_value("NETWORK_READY", network);
+    if (firmware_boot)
+    {
+        static const char online[] = "Lume network stack ready.\n";
+        static const char offline[] = "Lume network stack unavailable.\n";
+        lume_display_write(network ? online : offline,
+                           network ? sizeof(online) - 1 : sizeof(offline) - 1);
+    }
     lume_puts("LUME AMD64 INTERACTIVE CONSOLE READY\n");
     static const char greeting[] = "Lume AMD64 interactive console ready.\n";
     lume_display_write(greeting, sizeof(greeting) - 1);
     if (!lume_shell_start(lume_counter_frequency(), false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");
-    if (!lume_storage_finish())
+    if (storage && !lume_storage_finish())
         lume_fail("persistent data volume close");
     lume_q35_hardware_stop();
     if (lume_platform_modules_stop())

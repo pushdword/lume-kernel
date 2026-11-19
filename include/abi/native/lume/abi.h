@@ -34,6 +34,7 @@ enum
     LUME_EINVAL = 22,
     LUME_EMFILE = 24,
     LUME_ETXTBSY = 26,
+    LUME_ENOTTY = 25,
     LUME_ENOSPC = 28,
     LUME_ESPIPE = 29,
     LUME_EROFS = 30,

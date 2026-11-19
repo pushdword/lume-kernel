@@ -21,9 +21,8 @@ static struct
 {
     uint64_t base, size;
     uint32_t parent;
-} pci_hosts[2];
-
-bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent);
+    bool (*present)(unsigned);
+} pci_hosts[LUME_XHCI_HOSTS];
 #endif
 #define RP1 LUME_BOARD_RP1_BASE
 #define MAX_SLOTS 8u
@@ -87,7 +86,7 @@ struct host
     enum host_operation operation;
     struct lume_work topology;
 };
-static struct host hosts[2];
+static struct host hosts[LUME_XHCI_HOSTS];
 static void topology_work(void *);
 static unsigned keyboard_count, mouse_count, hub_count;
 #ifdef LUME_PLATFORM_LKM
@@ -98,7 +97,7 @@ static unsigned configured_hosts = 3;
 
 bool lume_usb_configure_host(unsigned index, bool enabled)
 {
-    if (index >= 2 || hosts[index].valid || hosts[index].operation != HOST_IDLE)
+    if (index >= LUME_XHCI_HOSTS || hosts[index].valid || hosts[index].operation != HOST_IDLE)
         return false;
     if (enabled)
         configured_hosts |= 1u << index;
@@ -107,15 +106,16 @@ bool lume_usb_configure_host(unsigned index, bool enabled)
     return true;
 }
 #if defined(LUME_ARCH_AMD64)
-bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent)
+bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent,
+                            bool (*present)(unsigned))
 {
-    if (index >= 2 || hosts[index].valid || hosts[index].operation != HOST_IDLE || !parent ||
-        (base & 4095) || size < 0x4000 || base < UINT64_C(0xc0000000) ||
-        base >= UINT64_C(0x100000000) || size > UINT64_C(0x100000000) - base)
+    if (index >= LUME_XHCI_HOSTS || hosts[index].valid || hosts[index].operation != HOST_IDLE ||
+        !parent || !present || !base || (base & 4095) || size < 4096 || size > UINT64_MAX - base)
         return false;
     pci_hosts[index].base = base;
     pci_hosts[index].size = size;
     pci_hosts[index].parent = parent;
+    pci_hosts[index].present = present;
     return true;
 }
 #endif
@@ -608,8 +608,10 @@ static bool hub(struct host *h, struct device *d, unsigned protocol)
     s[1] = (s[1] & 0x00ffffff) | (ports << 24);
     if (d->speed == 3)
         s[2] = (s[2] & ~(3u << 16)) | (((characteristics >> 5) & 3) << 16);
+    s[3] = 0;
     cache(d->input, 4096, false);
-    if (!command(h, 13, dma(d->input), d->slot << 24, 0))
+    /* xHCI 1.x updates the hub and transaction translator through Configure Endpoint. */
+    if (!command(h, 12, dma(d->input), d->slot << 24, 0))
         return false;
     ++hub_count;
     d->hub = true;
@@ -866,6 +868,10 @@ static void topology_work(void *context)
     struct host *h = context;
     if (!h->running || h->operation != HOST_IDLE)
         return;
+#if defined(LUME_ARCH_AMD64)
+    if (!pci_hosts[h->index].present(h->index))
+        return;
+#endif
     h->operation = HOST_SCAN;
     scan_roots(h, false);
     h->operation = HOST_IDLE;
@@ -881,6 +887,42 @@ static void queue_topology(struct host *h)
     h->topology.domain = LUME_WORK_USB;
     (void)lume_work_submit(&h->topology);
 }
+
+#if defined(LUME_ARCH_AMD64)
+static bool release_firmware(struct host *h, uint32_t hcc, uint64_t size)
+{
+    uint64_t offset = (hcc >> 16) * 4u;
+    while (offset)
+    {
+        if (offset > size - 4)
+            return false;
+        uint64_t address = h->base + offset;
+        uint32_t support = lume_mmio_read32(address);
+        if (support == UINT32_MAX)
+            return false;
+        if ((support & 255) == 1)
+        {
+            if (offset > size - 8)
+                return false;
+            lume_mmio_write32(address, support | (1u << 24));
+            if (!wait_register(h, address, 1u << 16, 0, 1000))
+            {
+                lume_value("USB_FIRMWARE_OWNED", h->index);
+                return false;
+            }
+            /* Disable the legacy SMI sources and acknowledge their pending events. */
+            uint32_t control = lume_mmio_read32(address + 4);
+            lume_mmio_write32(address + 4, (control & 0x000e1fee) | 0xe0000000);
+            return true;
+        }
+        unsigned next = (support >> 8) & 255;
+        if (!next)
+            break;
+        offset += next * 4u;
+    }
+    return true;
+}
+#endif
 
 static bool host_start(struct host *h, unsigned index, uint64_t frequency)
 {
@@ -913,6 +955,8 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
     uint64_t size = pci_hosts[index].size;
     if (h->op - h->base + 0x400 + h->ports * 16 > size || h->rt - h->base + 0x40 > size ||
         h->doorbells - h->base + (MAX_SLOTS + 1) * 4 > size)
+        return false;
+    if (!release_firmware(h, hcc, size) || !wait_register(h, h->op + 4, 0x800, 0, 1000))
         return false;
 #endif
     lume_mmio_write32(h->op, 0);
@@ -983,7 +1027,7 @@ static bool host_start(struct host *h, unsigned index, uint64_t frequency)
 
 bool lume_usb_start_host(unsigned index, uint64_t frequency)
 {
-    if (index >= 2 || !(configured_hosts & (1u << index)) || !frequency ||
+    if (index >= LUME_XHCI_HOSTS || !(configured_hosts & (1u << index)) || frequency < 1000 ||
         hosts[index].operation != HOST_IDLE)
         return false;
     if (hosts[index].valid)
@@ -999,9 +1043,7 @@ bool lume_usb_start_host(unsigned index, uint64_t frequency)
 
 bool lume_usb_start(uint64_t frequency)
 {
-    if (!hosts[0].valid && !hosts[1].valid)
-        keyboard_count = mouse_count = hub_count = 0;
-    for (unsigned i = 0; i < 2; ++i)
+    for (unsigned i = 0; i < LUME_XHCI_HOSTS; ++i)
         if ((configured_hosts & (1u << i)) && !lume_usb_start_host(i, frequency))
             lume_value("USB_HOST_START_FAILED", i);
     lume_value("USB_HUB_COUNT", hub_count);
@@ -1012,11 +1054,15 @@ bool lume_usb_start(uint64_t frequency)
 
 void lume_usb_poll(void)
 {
-    for (unsigned i = 0; i < 2; ++i)
+    for (unsigned i = 0; i < LUME_XHCI_HOSTS; ++i)
     {
         struct host *h = &hosts[i];
         if (!h->running || h->operation == HOST_STOP)
             continue;
+#if defined(LUME_ARCH_AMD64)
+        if (!pci_hosts[i].present(i))
+            continue;
+#endif
         queue_topology(h);
         uint64_t now = lume_counter_read();
         if (h->poll_scheduled && (int64_t)(now - h->next_poll) < 0 && !h->waiting_command &&
@@ -1053,7 +1099,7 @@ int lume_usb_getc(void)
 #if !defined(LUME_ARCH_AMD64)
     lume_usb_poll();
 #endif
-    for (unsigned i = 0; i < 2; ++i)
+    for (unsigned i = 0; i < LUME_XHCI_HOSTS; ++i)
     {
         if (!hosts[i].running)
             continue;
@@ -1083,7 +1129,7 @@ unsigned lume_usb_keyboards(void)
 void lume_usb_stats(void)
 {
     unsigned reports = 0, characters = 0, dropped = 0, errors = 0;
-    for (unsigned i = 0; i < 2; ++i)
+    for (unsigned i = 0; i < LUME_XHCI_HOSTS; ++i)
     {
         errors += hosts[i].errors;
         reports += hosts[i].retired_reports;
@@ -1109,7 +1155,7 @@ void lume_usb_stats(void)
 
 bool lume_usb_stop_host(unsigned index)
 {
-    if (index >= 2)
+    if (index >= LUME_XHCI_HOSTS)
         return false;
     struct host *h = &hosts[index];
     if (h->operation != HOST_IDLE)
@@ -1176,7 +1222,9 @@ bool lume_usb_stop_host(unsigned index)
 
 bool lume_usb_stop(void)
 {
-    bool first = lume_usb_stop_host(0);
-    bool second = lume_usb_stop_host(1);
-    return first && second;
+    bool stopped = true;
+    for (unsigned i = 0; i < LUME_XHCI_HOSTS; ++i)
+        if (!lume_usb_stop_host(i))
+            stopped = false;
+    return stopped;
 }

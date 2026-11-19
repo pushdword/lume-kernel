@@ -3,7 +3,7 @@ OUTPUT_ARCH(i386:x86-64)
 ENTRY(lume_boot32)
 SECTIONS
 {
-    . = 0x200000;
+    . = 0x1000000;
     __image_start = .;
     .text : { KEEP(*(.multiboot)) KEEP(*(.text.boot)) *(.text .text.*) }
     . = ALIGN(4096);
@@ -35,4 +35,4 @@ SECTIONS
     __image_end = .;
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.note.GNU-stack) }
 }
-ASSERT(__image_end < 0x2000000, "Kernel exceeds the early mapping window")
+ASSERT(__image_end - __image_start <= 0x2000000, "Kernel exceeds the early mapping window")

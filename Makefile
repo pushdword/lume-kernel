@@ -50,7 +50,7 @@ KERNEL_C += arch/amd64/boot/main.c arch/amd64/context/context.c arch/amd64/mm/mm
 ifeq ($(DEBUG),1)
 CFLAGS += -g -fno-omit-frame-pointer
 endif
-KERNEL_C += arch/amd64/apic.c
+KERNEL_C += arch/amd64/apic.c arch/amd64/boot/entropy.c arch/amd64/boot/framebuffer.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 KERNEL_S := arch/amd64/boot/start.S arch/amd64/boot/secondary.S arch/amd64/boot/payload.S arch/amd64/context/interrupt.S arch/amd64/context/worker.S
 ifneq ($(strip $(SHELL_ELF)),)
 $(OUT)/obj/arch/amd64/boot/payload.S.o: CPPFLAGS += -DLUME_SHELL_ELF_FILE='"$(SHELL_ELF)"'

@@ -166,6 +166,27 @@ int main(void)
     assert(!lume_volume_journal_select(mbr, start + 131072, &journal));
     assert(lume_volume_identify(mbr, start + 131072, &volume) == LUME_VOLUME_NONE);
 #endif
+#if defined(LUME_ARCH_AMD64)
+    memset(mbr, 0, sizeof(mbr));
+    const uint32_t sata_sectors = 468862128;
+    const uint32_t data_first = LUME_Q35_EFI_DATA_FIRST;
+    put(mbr + 440, LUME_Q35_EFI_DISK_ID);
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    entry(mbr + 446, true, LUME_Q35_EFI_FIRST, LUME_Q35_EFI_SECTORS);
+    mbr[450] = 0xef;
+    entry(mbr + 462, false, data_first, sata_sectors - data_first);
+    mbr[466] = 0x83;
+    assert(lume_volume_identify(mbr, sata_sectors, &volume) == LUME_VOLUME_EXT4);
+    assert(volume.first == data_first && volume.count == sata_sectors - data_first);
+    assert(!lume_volume_select(mbr, sata_sectors - 1, &volume));
+    assert(!lume_volume_select(mbr, sata_sectors + 1, &volume));
+    mbr[450] = 0x0c;
+    assert(!lume_volume_select(mbr, sata_sectors, &volume));
+    mbr[450] = 0xef;
+    mbr[478] = 0x80;
+    assert(!lume_volume_select(mbr, sata_sectors, &volume));
+#endif
     puts("PASS dedicated card selection, malformed layouts and legacy data isolation");
     return 0;
 }

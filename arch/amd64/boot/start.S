@@ -6,6 +6,25 @@ lume_multiboot_header:
     .long 0x1badb002, 0x00010003, -(0x1badb002 + 0x00010003)
     .long lume_multiboot_header, __image_start, __load_end, __image_end, lume_boot32
 
+.balign 8
+lume_multiboot2_header:
+    .long 0xe85250d6, 0, lume_multiboot2_end - lume_multiboot2_header
+    .long -(0xe85250d6 + (lume_multiboot2_end - lume_multiboot2_header))
+    .short 2, 0
+    .long 24
+    .long lume_multiboot2_header, __image_start, __load_end, __image_end
+    .short 3, 0
+    .long 12
+    .long lume_boot32
+    .balign 8
+    .short 5, 1
+    .long 20
+    .long 0, 0, 32
+    .balign 8
+    .short 0, 0
+    .long 8
+lume_multiboot2_end:
+
 .section .text.boot,"ax"
 .code32
 .global lume_boot32

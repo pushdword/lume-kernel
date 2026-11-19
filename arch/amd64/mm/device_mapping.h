@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define DEVICE_FIRST UINT64_C(0x9000000000)
 #define DEVICE_END UINT64_C(0x10000000000)
+#define FRAMEBUFFER_VA (DEVICE_END - UINT64_C(0x40000000))
+#define FRAMEBUFFER_BYTES UINT64_C(0x4000000)
 #define DEVICE_DIRECTORY_LIMIT 16u
 #define DEVICE_TABLE_LIMIT 64u
 #define DEVICE_BYTES ((uint64_t)DEVICE_TABLE_LIMIT * BLOCK)
@@ -38,8 +40,8 @@ bool lume_mmu_device_prepare(uint64_t address, uint64_t bytes)
         return false;
     if (address >= UINT64_C(0xc0000000) && address < UINT64_C(0x100000000))
         return bytes <= UINT64_C(0x100000000) - address;
-    if (!device_initialized || address < DEVICE_FIRST || address >= DEVICE_END ||
-        bytes > DEVICE_END - address || bytes > DEVICE_BYTES)
+    if (!device_initialized || address < DEVICE_FIRST || address >= FRAMEBUFFER_VA ||
+        bytes > FRAMEBUFFER_VA - address || bytes > DEVICE_BYTES)
         return false;
     uint64_t first = address & ~UINT64_C(4095);
     uint64_t end = (address + bytes + 4095) & ~UINT64_C(4095);
@@ -95,11 +97,42 @@ bool lume_mmu_device_prepare(uint64_t address, uint64_t bytes)
     return true;
 }
 
+uintptr_t lume_mmu_framebuffer_map(uint64_t physical, uint64_t bytes)
+{
+    const unsigned index = (FRAMEBUFFER_VA >> 30) & 511;
+    uint64_t first = physical & ~UINT64_C(4095), offset = physical - first;
+    if (!device_initialized || device_pdpt[index] || !physical || !bytes ||
+        bytes > FRAMEBUFFER_BYTES - offset || physical > ADDRESS ||
+        bytes - 1 > (ADDRESS | UINT64_C(4095)) - physical ||
+        device_directory_count == DEVICE_DIRECTORY_LIMIT)
+        return 0;
+    uint64_t span = (offset + bytes + 4095) & ~UINT64_C(4095);
+    for (unsigned i = 0; i < device_ram_count; ++i)
+        if (device_ram[i].base < first + span && first < device_ram[i].base + device_ram[i].size)
+            return 0;
+    unsigned tables = (unsigned)((span + BLOCK - 1) / BLOCK);
+    if (tables > DEVICE_TABLE_LIMIT - device_table_count)
+        return 0;
+
+    /* The boot CPU installs this supervisor mapping before creating application roots. */
+    uint64_t *directory = device_directories[device_directory_count++];
+    for (unsigned i = 0; i < tables; ++i)
+    {
+        uint64_t *pages = device_pages[device_table_count++];
+        uint64_t base = (uint64_t)i * BLOCK;
+        directory[i] = table(pages, false);
+        for (unsigned j = 0; j < 512 && base + (uint64_t)j * 4096 < span; ++j)
+            pages[j] = (first + base + (uint64_t)j * 4096) | PRESENT | WRITE | NX | UINT64_C(0x18);
+    }
+    device_pdpt[index] = table(directory, false);
+    return FRAMEBUFFER_VA + offset;
+}
+
 static bool device_mapping_present(uint64_t address)
 {
     if (address >= UINT64_C(0xc0000000) && address < UINT64_C(0x100000000))
         return true;
-    if (!device_initialized || address < DEVICE_FIRST || address >= DEVICE_END)
+    if (!device_initialized || address < DEVICE_FIRST || address >= FRAMEBUFFER_VA)
         return false;
     uint64_t value = device_pdpt[(address >> 30) & 511];
     if (!value)
