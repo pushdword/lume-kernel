@@ -18,9 +18,11 @@ struct lume_ext4_storage_io
     uint32_t (*timestamp)(void *);
     void *context;
     uint64_t bytes;
+    const struct lume_ext4_journal_io *journal;
 };
 
-/* Writable opening requires exclusive access. The optional clock returns Unix seconds.
+/* Writable opening requires exclusive access. The optional clock returns Unix seconds
+ * or zero when the clock is unavailable.
  * Closing requires an unmounted VFS and releases the provider even on an I/O error. */
 int lume_ext4_storage_open_write(const struct lume_ext4_storage_io *,
                                  const struct lume_storage_ops **);

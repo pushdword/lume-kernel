@@ -47,4 +47,11 @@ bool lume_sd_sync(void)
     ++sd_mock_sync_calls;
     return !sd_mock_sync_fail && lume_sd_sectors() != 0;
 }
+
+bool lume_sd_allow_journal_volume(uint64_t first, uint64_t count)
+{
+    (void)first;
+    (void)count;
+    return false;
+}
 #endif

@@ -191,7 +191,8 @@ int main(void)
     CHECK(!lume_sd_write_blocks(16, 32, data));
     CHECK(!entries && !pins);
     CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &operations,
-                                        sizeof(operations) - sizeof(void *)) == -LUME_EINVAL);
+                                        offsetof(struct lume_platform_sd_ops, lume_sd_sync)) ==
+          -LUME_EINVAL);
     CHECK(!pins);
     CHECK(lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations)) == 0);
     CHECK(pins == 11 && unpins == 10);
@@ -223,6 +224,14 @@ int main(void)
     CHECK(lume_sd_sync());
     succeed = false;
     CHECK(!lume_sd_sync());
+    CHECK(lume_platform_driver_unregister(LUME_PLATFORM_SD, &deferred) == 0);
+    succeed = true;
+    CHECK(lume_platform_driver_register(
+              LUME_PLATFORM_SD, &deferred,
+              offsetof(struct lume_platform_sd_ops, lume_sd_allow_journal_volume)) == 0);
+    CHECK(lume_sd_write_deferred(16, 32, data));
+    CHECK(lume_sd_sync());
+    CHECK(!lume_sd_allow_journal_volume(48, 32));
     CHECK(lume_platform_driver_unregister(LUME_PLATFORM_SD, &deferred) == 0);
     CHECK(pins == unpins && entries == leaves);
     printf("PASS SD provider group dispatch: checks=%u\n", checks);

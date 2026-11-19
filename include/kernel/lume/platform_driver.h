@@ -84,6 +84,7 @@ struct lume_platform_sd_ops
     /* The optional pair defers persistence until sync completes successfully. */
     bool (*lume_sd_write_deferred)(uint64_t sector, unsigned count, const void *data);
     bool (*lume_sd_sync)(void);
+    bool (*lume_sd_allow_journal_volume)(uint64_t first, uint64_t count);
 };
 
 struct lume_platform_usb_ops

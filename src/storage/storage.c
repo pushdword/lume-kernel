@@ -1,5 +1,5 @@
-/* Each FatFs drive is bounded to an identified partition. The boot volume
- * is available only on the dedicated Lume card, through the slot updater. */
+/* Each volume is bounded to an identified partition. The boot volume is
+ * available only on the dedicated Lume card, through the slot updater. */
 #include "lume/early.h"
 #include "lume/sd.h"
 #include "lume/storage.h"
@@ -10,10 +10,14 @@
 #include "lume/kernel_memory.h"
 #include "lume/path.h"
 #include "lume/files.h"
+#include "lume/ext4_storage.h"
+#include "lume/realtime.h"
 #include "ff.h"
 #include "diskio.h"
+#include <limits.h>
 #include <string.h>
 #define STORAGE_HANDLES 256u
+#define JOURNAL_DRIVE 2u
 
 static struct storage_file
 {
@@ -28,7 +32,7 @@ static struct storage_file
     DWORD cluster_map[32];
     bool map_attempted;
 #endif
-} storage_files[STORAGE_HANDLES];
+} *storage_files;
 
 static struct storage_handle
 {
@@ -38,8 +42,10 @@ static struct storage_handle
 
 static int close_handle(void *);
 static struct lume_volume volume;
+static struct lume_volume journal_volume;
 static FATFS filesystem;
 static bool mounted;
+static const struct lume_storage_ops *ext4_ops;
 static bool data_faulted;
 static bool replacing, replacement_io_failed;
 static struct lume_volume boot_volume;
@@ -79,7 +85,10 @@ static int close_read_cache(void)
 
 static const struct lume_volume *drive_volume(BYTE drive)
 {
-    return drive == 0 ? &volume : drive == 1 ? &boot_volume : 0;
+    return drive == 0               ? &volume
+           : drive == 1             ? &boot_volume
+           : drive == JOURNAL_DRIVE ? &journal_volume
+                                    : 0;
 }
 
 DSTATUS disk_initialize(BYTE drive)
@@ -121,13 +130,12 @@ DRESULT disk_read(BYTE drive, BYTE *out, LBA_t sector, UINT count)
     return RES_OK;
 }
 
-DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
+static DRESULT write_volume(BYTE drive, const BYTE *data, LBA_t sector, UINT count, bool writable)
 {
     if (!drive && (data_faulted || (replacing && replacement_io_failed)))
         return RES_NOTRDY;
     const struct lume_volume *v = drive_volume(drive);
-    if (!v || !(drive == 0 ? mounted : boot_mounted) || !count || sector >= v->count ||
-        count > v->count - sector)
+    if (!v || !writable || !count || sector >= v->count || count > v->count - sector)
         return RES_PARERR;
     if (LUME_STORAGE_CACHE_BYTES && !drive && !replacing)
         return cache_write(v->first + sector, count, data) ? RES_OK : RES_ERROR;
@@ -148,6 +156,13 @@ DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
         i += group;
     }
     return RES_OK;
+}
+
+DRESULT disk_write(BYTE drive, const BYTE *data, LBA_t sector, UINT count)
+{
+    bool writable =
+        drive == 0 ? mounted || (ext4_ops && !ext4_ops->read_only) : drive == 1 && boot_mounted;
+    return write_volume(drive, data, sector, count, writable);
 }
 
 DRESULT disk_ioctl(BYTE drive, BYTE command, void *data)
@@ -946,8 +961,139 @@ static bool walk(lume_storage_visit visit, void *context)
     return ok;
 }
 
+static bool ext4_range(const struct lume_volume *partition, uint64_t offset, size_t bytes)
+{
+    uint64_t capacity = partition->count * 512;
+    return offset <= capacity && bytes <= capacity - offset;
+}
+
+static int ext4_read(void *context, uint64_t offset, void *out, size_t bytes)
+{
+    if ((context != &volume && context != &journal_volume) || !ext4_range(context, offset, bytes))
+        return -1;
+    BYTE drive = context == &volume ? 0 : JOURNAL_DRIVE;
+    unsigned char *target = out;
+    unsigned char sector[512];
+    while (bytes)
+    {
+        size_t within = offset % sizeof sector;
+        size_t count;
+        if (within || bytes < sizeof sector)
+        {
+            if (disk_read(drive, sector, offset / sizeof sector, 1) != RES_OK)
+                return -1;
+            count = sizeof sector - within;
+            if (count > bytes)
+                count = bytes;
+            memcpy(target, sector + within, count);
+        }
+        else
+        {
+            size_t sectors = bytes / sizeof sector;
+            if (sectors > UINT_MAX)
+                sectors = UINT_MAX;
+            if (disk_read(drive, target, offset / sizeof sector, (UINT)sectors) != RES_OK)
+                return -1;
+            count = sectors * sizeof sector;
+        }
+        offset += count;
+        target += count;
+        bytes -= count;
+    }
+    return 0;
+}
+
+static int ext4_write(void *context, uint64_t offset, const void *data, size_t bytes)
+{
+    if ((context != &volume && context != &journal_volume) || (offset | bytes) % 512 ||
+        bytes / 512 > UINT_MAX || !ext4_range(context, offset, bytes))
+        return -1;
+    if (!bytes)
+        return 0;
+    BYTE drive = context == &volume ? 0 : JOURNAL_DRIVE;
+    return write_volume(drive, data, offset / 512, (UINT)(bytes / 512), true) == RES_OK ? 0 : -1;
+}
+
+static int ext4_flush(void *context)
+{
+    BYTE drive = context == &volume ? 0 : JOURNAL_DRIVE;
+    return disk_ioctl(drive, CTRL_SYNC, NULL) == RES_OK ? 0 : -1;
+}
+
+static uint32_t ext4_timestamp(void *context)
+{
+    (void)context;
+    uint64_t milliseconds;
+    if (lume_clock_realtime_ms(lume_clock_monotonic(), &milliseconds))
+        return 0;
+    uint64_t seconds = milliseconds / 1000;
+    return seconds <= UINT32_MAX ? (uint32_t)seconds : 0;
+}
+
+static const struct lume_storage_ops *start_ext4(const unsigned char mbr[512])
+{
+    static const unsigned char label[16] = "LUME_DATA";
+    unsigned char sector[512];
+    if (disk_read(0, sector, 2, 1) != RES_OK || sector[0x38] != 0x53 || sector[0x39] != 0xef ||
+        memcmp(sector + 0x78, label, sizeof label))
+        return NULL;
+    if (!lume_sd_allow_volume(volume.first, volume.count))
+        return NULL;
+    struct lume_ext4_journal_io journal;
+    const struct lume_ext4_journal_io *external = NULL;
+    if ((sector[0x5c] & 4) && !memcmp(sector + 0xe0, "\0\0\0\0", 4) &&
+        lume_volume_journal_select(mbr, lume_sd_sectors(), &journal_volume) &&
+        lume_sd_allow_journal_volume(journal_volume.first, journal_volume.count))
+    {
+        journal = (struct lume_ext4_journal_io){.read = ext4_read,
+                                                .write = ext4_write,
+                                                .flush = ext4_flush,
+                                                .context = &journal_volume,
+                                                .bytes = journal_volume.count * 512};
+        external = &journal;
+    }
+    const struct lume_ext4_storage_io io = {.read = ext4_read,
+                                            .write = ext4_write,
+                                            .flush = ext4_flush,
+                                            .timestamp = ext4_timestamp,
+                                            .context = &volume,
+                                            .bytes = volume.count * 512,
+                                            .journal = external};
+    const struct lume_storage_ops *ops;
+    int result = lume_ext4_storage_open_write(&io, &ops);
+    if (result == -LUME_EOPNOTSUPP)
+        result = lume_ext4_storage_open(io.read, io.context, io.bytes, &ops);
+    if (result)
+    {
+        lume_value("EXT4_DATA_OPEN_ERROR", (uint64_t)(int64_t)result);
+        return NULL;
+    }
+    ext4_ops = ops;
+    lume_value("SD_LUME_FIRST_SECTOR", volume.first);
+    lume_value("SD_LUME_SECTORS", volume.count);
+    return ops;
+}
+
+bool lume_storage_is_ext4(void)
+{
+    return ext4_ops != NULL;
+}
+
+bool lume_storage_finish(void)
+{
+    if (!ext4_ops)
+        return true;
+    if (lume_ext4_storage_close())
+        return false;
+    ext4_ops = NULL;
+    journal_volume = (struct lume_volume){0};
+    return true;
+}
+
 const struct lume_storage_ops *lume_storage_start(void)
 {
+    if (ext4_ops)
+        return ext4_ops;
     if (program_cache_release && program_cache_release())
         return 0;
     if (data_faulted)
@@ -966,8 +1112,14 @@ const struct lume_storage_ops *lume_storage_start(void)
     else
         ++mount_epoch;
     volume = (struct lume_volume){0};
+    journal_volume = (struct lume_volume){0};
     unsigned char block[512];
-    if (!lume_sd_read(0, block) || !lume_volume_select(block, lume_sd_sectors(), &volume))
+    if (!lume_sd_read(0, block))
+        return 0;
+    enum lume_volume_format format = lume_volume_identify(block, lume_sd_sectors(), &volume);
+    if (format == LUME_VOLUME_EXT4)
+        return start_ext4(block);
+    if (format != LUME_VOLUME_FAT32)
         return 0;
     if (!lume_sd_read(volume.first, block))
         return 0;
@@ -982,6 +1134,14 @@ const struct lume_storage_ops *lume_storage_start(void)
     if (f_mount(&filesystem, "", 1) != FR_OK || filesystem.fs_type != FS_FAT32 ||
         filesystem.volbase != 0 || filesystem.database >= volume.count)
         return 0;
+    if (!storage_files)
+    {
+        size_t bytes = STORAGE_HANDLES * sizeof(*storage_files);
+        storage_files = lume_kernel_allocate(bytes);
+        if (!storage_files)
+            return NULL;
+        memset(storage_files, 0, bytes);
+    }
     if (!lume_sd_allow_volume(volume.first, volume.count))
         return 0;
     mounted = true;
@@ -1018,7 +1178,7 @@ bool lume_storage_boot_mount(void)
     if (boot_mounted)
         return true;
     unsigned char block[512];
-    if (!mounted || !lume_sd_read(0, block) ||
+    if ((!mounted && !ext4_ops) || !lume_sd_read(0, block) ||
         !lume_volume_boot_select(block, lume_sd_sectors(), &boot_volume) ||
         !lume_sd_read(boot_volume.first, block))
         return false;

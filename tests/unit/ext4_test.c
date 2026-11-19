@@ -28,6 +28,7 @@ static int memory_read(void *context, uint64_t offset, void *out, size_t bytes)
     assert(context == image);
     assert(offset <= sizeof image && bytes <= sizeof image - offset);
     ++reads;
+    last_disk_offset = offset;
     if (fail_read)
         return -1;
     memcpy(out, image + offset, bytes);
@@ -85,6 +86,55 @@ static void fixture(void)
     entry(image + 8216, 12, 1000, "hello");
     memcpy(image + 9216, "hello", 5);
     fail_read = reads = 0;
+}
+
+static void contiguous_reads(void)
+{
+    fixture();
+    struct lume_ext4 fs;
+    struct lume_ext4_inode file;
+    assert(!lume_ext4_open(&fs, memory_read, image, sizeof image, scratch, sizeof scratch));
+    assert(!lume_ext4_inode_get(&fs, 12, &file, scratch, sizeof scratch));
+    file.bytes = sizeof output;
+    memset(image + 9 * 1024, 0xb2, 4 * 1024);
+    put16(file.block + 2, 2);
+    extent(file.block + 12, 0, 1, 9);
+    extent(file.block + 24, 1, 3, 10);
+    reads = 0;
+    assert(!lume_ext4_read(&fs, &file, 17, output, sizeof output - 17, scratch, sizeof scratch));
+    assert(reads == 1 && last_disk_offset == 9 * 1024 + 17);
+    assert(!memcmp(output, image + 9 * 1024 + 17, sizeof output - 17));
+
+    unsigned char *leaf = image + 16 * 1024;
+    memcpy(leaf, file.block, sizeof file.block);
+    put16(leaf + 4, 84);
+    put16(file.block + 2, 1);
+    put16(file.block + 6, 1);
+    memset(file.block + 12, 0, sizeof file.block - 12);
+    put32(file.block + 16, 16);
+    reads = 0;
+    assert(!lume_ext4_read(&fs, &file, 0, output, sizeof output, scratch, sizeof scratch));
+    assert(reads == 2 && !memcmp(output, image + 9 * 1024, sizeof output));
+
+    put16(leaf + 2, 4);
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        extent(leaf + 12 + i * 12, i, 1, 9 + 2 * i);
+        memset(image + (9 + 2 * i) * 1024, i + 1, 1024);
+    }
+    reads = 0;
+    assert(!lume_ext4_read(&fs, &file, 0, output, sizeof output, scratch, sizeof scratch));
+    assert(reads == 5);
+    for (unsigned i = 0; i < 4; ++i)
+        assert(!memcmp(output + i * 1024, image + (9 + 2 * i) * 1024, 1024));
+
+    file.flags = 0;
+    memset(file.block, 0, sizeof file.block);
+    for (unsigned i = 0; i < 4; ++i)
+        put32(file.block + i * 4, 9 + i);
+    reads = 0;
+    assert(!lume_ext4_read(&fs, &file, 0, output, sizeof output, scratch, sizeof scratch));
+    assert(reads == 1 && !memcmp(output, image + 9 * 1024, sizeof output));
 }
 
 static void synthetic(void)
@@ -313,6 +363,9 @@ static void indexed_blocks(void)
     assert(lume_ext4_lookup(&fs, &directory, "hello", &file, scratch, sizeof scratch) ==
            LUME_EXT4_INVALID);
     root[29] = 8;
+    root[30] = 2;
+    assert(lume_ext4_lookup(&fs, &directory, "hello", &file, scratch, sizeof scratch) ==
+           LUME_EXT4_INVALID);
     root[30] = 3;
     assert(lume_ext4_lookup(&fs, &directory, "hello", &file, scratch, sizeof scratch) ==
            LUME_EXT4_UNSUPPORTED);
@@ -548,6 +601,7 @@ static void symbolic_links(void)
 int main(int argc, char **argv)
 {
     synthetic();
+    contiguous_reads();
     traditional_blocks();
     indexed_blocks();
     symbolic_links();

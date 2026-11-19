@@ -2781,6 +2781,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
             ok = lume_page_free(tasks[2].stack[i]) && ok;
         service_loaded = false;
     }
+    lume_vm_cache_reclaim();
     lume_stream_reap();
     lume_icmp_reap();
     while (lume_vfs_reap_pending() || lume_socket_reap_pending() || lume_datagram_reap_pending())

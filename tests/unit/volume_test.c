@@ -28,6 +28,7 @@ int main(void)
     entry(mbr + 446, true, LUME_CARD_BOOT_FIRST, LUME_CARD_BOOT_SECTORS);
     entry(mbr + 462, false, LUME_CARD_DATA_FIRST, sectors - LUME_CARD_DATA_FIRST);
     assert(lume_volume_select(mbr, sectors, &volume));
+    assert(lume_volume_identify(mbr, sectors, &volume) == LUME_VOLUME_FAT32);
     assert(volume.first == LUME_CARD_DATA_FIRST);
     assert(volume.count == sectors - LUME_CARD_DATA_FIRST);
     struct lume_volume boot;
@@ -73,6 +74,13 @@ int main(void)
     assert(lume_volume_boot_select(mbr, sectors, &boot) && boot.first == LUME_CARD_BOOT_FIRST);
     assert(lume_volume_alternate_boot_select(mbr, sectors, &boot));
     assert(boot.first == linux_first && boot.count == LUME_CARD_BOOT_SECTORS);
+    mbr[466] = 0x83;
+    assert(lume_volume_identify(mbr, sectors, &volume) == LUME_VOLUME_EXT4);
+    assert(volume.first == LUME_CARD_DATA_FIRST && volume.count == data_count);
+    assert(lume_volume_select(mbr, sectors, &volume));
+    assert(lume_volume_boot_select(mbr, sectors, &boot) && boot.first == LUME_CARD_BOOT_FIRST);
+    assert(lume_volume_alternate_boot_select(mbr, sectors, &boot) && boot.first == linux_first);
+    mbr[466] = 0x0c;
     put(mbr + 486, linux_first - 2048);
     assert(!lume_volume_select(mbr, sectors, &volume));
     put(mbr + 486, linux_first);
@@ -92,6 +100,27 @@ int main(void)
     mbr[478] = 0;
     memset(mbr + 494, 0, 16);
     assert(!lume_volume_select(mbr, sectors, &volume));
+
+    const uint32_t journal_first = (uint32_t)(LUME_CARD_DATA_FIRST + data_count);
+    struct lume_volume journal;
+    entry(mbr + 478, false, journal_first, 65536);
+    mbr[482] = 0x83;
+    assert(!lume_volume_journal_select(mbr, sectors, &journal));
+    mbr[466] = 0x83;
+    assert(lume_volume_identify(mbr, sectors, &volume) == LUME_VOLUME_EXT4);
+    assert(lume_volume_journal_select(mbr, sectors, &journal));
+    assert(journal.first == journal_first && journal.count == 65536);
+    assert(lume_volume_boot_select(mbr, sectors, &boot));
+    assert(!lume_volume_alternate_boot_select(mbr, sectors, &boot));
+    assert(lume_volume_contains(&journal, journal_first, 65536));
+    assert(!lume_volume_contains(&journal, journal_first - 1, 2));
+    assert(!lume_volume_contains(&journal, journal_first + 65535, 2));
+    put(mbr + 486, journal_first - 1);
+    assert(lume_volume_identify(mbr, sectors, &volume) == LUME_VOLUME_NONE);
+    assert(!lume_volume_journal_select(mbr, sectors, &journal));
+    put(mbr + 486, journal_first);
+    assert(!lume_volume_journal_select(mbr, journal_first + 65535, &journal));
+
     memset(mbr, 0, sizeof(mbr));
     put(mbr + 440, 0xb8d65c68);
     mbr[450] = 0x0c;
@@ -107,8 +136,36 @@ int main(void)
     mbr[511] = 0xaa;
     assert(lume_volume_select(mbr, 121503744, &volume));
     assert(volume.first == 87949312 && volume.count == 33554432);
+    mbr[482] = 0x83;
+    assert(lume_volume_identify(mbr, 121503744, &volume) == LUME_VOLUME_NONE);
+    mbr[482] = 0x0c;
     assert(!lume_volume_boot_select(mbr, 121503744, &boot));
     assert(!lume_volume_select(mbr, sectors, &volume));
+
+#if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
+    memset(mbr, 0, sizeof(mbr));
+#if defined(LUME_ARCH_I686)
+    mbr[0] = 0xeb;
+    put(mbr + 440, LUME_PC_DISK_ID);
+    const uint32_t start = LUME_PC_DATA_FIRST;
+#else
+    put(mbr + 440, LUME_Q35_DISK_ID);
+    const uint32_t start = 2048;
+#endif
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    entry(mbr + 446, false, start, 65536);
+    mbr[450] = 0x83;
+    entry(mbr + 462, false, start + 65536, 65536);
+    mbr[466] = 0x83;
+    assert(lume_volume_journal_select(mbr, start + 131072, &journal));
+    assert(journal.first == start + 65536 && journal.count == 65536);
+    assert(lume_volume_identify(mbr, start + 131072, &volume) == LUME_VOLUME_EXT4);
+    assert(volume.first == start && volume.count == 65536);
+    mbr[450] = 0x0c;
+    assert(!lume_volume_journal_select(mbr, start + 131072, &journal));
+    assert(lume_volume_identify(mbr, start + 131072, &volume) == LUME_VOLUME_NONE);
+#endif
     puts("PASS dedicated card selection, malformed layouts and legacy data isolation");
     return 0;
 }

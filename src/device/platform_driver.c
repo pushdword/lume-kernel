@@ -90,13 +90,14 @@ int lume_platform_driver_register(unsigned kind, const void *operations, size_t 
     size_t required = operation_bytes(kind);
     size_t display_base = offsetof(struct lume_platform_display_ops, pending);
     size_t sd_base = offsetof(struct lume_platform_sd_ops, lume_sd_write_deferred);
+    size_t sd_sync = offsetof(struct lume_platform_sd_ops, lume_sd_allow_journal_volume);
     size_t graphics_base = offsetof(struct lume_platform_graphics_ops, target);
     if (!operations || !required ||
         (bytes != required && !(kind == LUME_PLATFORM_DISPLAY && bytes == display_base) &&
-         !(kind == LUME_PLATFORM_SD && bytes == sd_base) &&
+         !(kind == LUME_PLATFORM_SD && (bytes == sd_base || bytes == sd_sync)) &&
          !(kind == LUME_PLATFORM_GRAPHICS && bytes == graphics_base)))
         return -LUME_EINVAL;
-    if (kind == LUME_PLATFORM_SD && bytes == required)
+    if (kind == LUME_PLATFORM_SD && bytes >= sd_sync)
     {
         const struct lume_platform_sd_ops *sd = operations;
         if (!!sd->lume_sd_write_deferred != !!sd->lume_sd_sync)
@@ -604,6 +605,13 @@ bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count)
     if (!provider->source)
         return false;
     return provider->operations.sd.lume_sd_allow_boot_volume(first, count);
+}
+
+bool lume_sd_allow_journal_volume(uint64_t first, uint64_t count)
+{
+    struct provider *provider = providers + LUME_PLATFORM_SD;
+    return provider->mounted && provider->operations.sd.lume_sd_allow_journal_volume &&
+           provider->operations.sd.lume_sd_allow_journal_volume(first, count);
 }
 
 void lume_sd_stats(void)

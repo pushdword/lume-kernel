@@ -66,6 +66,8 @@ include platform/$(BOARD)/config.mk
 include arch/aarch64/config.mk
 CPPFLAGS := -DLUME_BOOT_PROFILE=$(PROFILE_ID) -DLUME_SD_POLL=$(SD_POLL) -Isrc/core -Isrc/terminal -Iinclude/freestanding -Iinclude/ddk -Iinclude/kernel -Iinclude/uapi -Iinclude/abi/native -Ivendor/fatfs -Ivendor/lwip/src/include -Ivendor/mbedtls/include -DMBEDTLS_CONFIG_FILE='"lume/crypto_config.h"'
 KERNEL_C := $(KERNEL_C_aarch64)
+AARCH64_SIZE_SOURCES := src/fs/ext4/jbd2.c src/fs/ext4/write.c
+$(addprefix $(OUT)/obj/,$(addsuffix .o,$(AARCH64_SIZE_SOURCES))): CFLAGS += -Os
 CPPFLAGS += $(PLATFORM_CPPFLAGS) -Iarch/aarch64/include/kernel -Isrc/core -Isrc/terminal -Ivendor/libfdt
 KERNEL_C := $(filter-out %/gem.c,$(KERNEL_C))
 ifeq ($(DEBUG),1)
@@ -93,7 +95,7 @@ NATIVE_CPPFLAGS ?= -nostdinc -isystem "$(SDK)/sdk/bare"
 native-directories: $(OUT)/diagnostic.elf $(OUT)/configuration
 	mkdir -p $(foreach directory,$(sort $(dir $(OBJECTS))),"$(directory)")
 native-responses: native-directories
-	$(foreach source,$(KERNEL_C),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(CFLAGS) $(if $(filter arch/aarch64/context/query.c,$(source)),-mgeneral-regs-only) -MMD -MP -MF "$(OUT)/obj/$(source).o.d" -MT "$(OUT)/obj/$(source).o" -c "$(source)" -o "$(OUT)/obj/$(source).o"))
+	$(foreach source,$(KERNEL_C),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(CFLAGS) $(if $(filter arch/aarch64/context/query.c,$(source)),-mgeneral-regs-only) $(if $(filter $(AARCH64_SIZE_SOURCES),$(source)),-Os) -MMD -MP -MF "$(OUT)/obj/$(source).o.d" -MT "$(OUT)/obj/$(source).o" -c "$(source)" -o "$(OUT)/obj/$(source).o"))
 	$(foreach source,$(KERNEL_S),$(file >$(OUT)/obj/$(source).o.rsp,$(NATIVE_CPPFLAGS) $(CPPFLAGS) $(filter-out -mgeneral-regs-only,$(CFLAGS)) $(if $(filter arch/aarch64/boot/elf_blob.S,$(source)),-DLUME_USER_ELF_FILE='"$(OUT)/diagnostic.elf"') $(if $(filter arch/aarch64/boot/shell_blob.S,$(source)),-DLUME_SHELL_ELF_FILE='"$(SHELL_ELF)"') -c "$(source)" -o "$(OUT)/obj/$(source).o"))
 	$(file >$(OUT)/native-jobs)
 	$(foreach object,$(OBJECTS),$(file >>$(OUT)/native-jobs,$(object).rsp))
@@ -184,7 +186,7 @@ TEST_NAMES += ext4
 .PHONY: check-ext4
 .PHONY: check-ext4-write
 check-ext4-write: $(OUT)/tests/ext4-write$(HOSTEXE)
-$(OUT)/tests/ext4-write$(HOSTEXE): tests/unit/ext4_write_test.c src/fs/ext4/ext4.c src/fs/ext4/write.c include/kernel/lume/ext4_write.h include/kernel/lume/ext4.h
+$(OUT)/tests/ext4-write$(HOSTEXE): tests/unit/ext4_write_test.c src/fs/ext4/ext4.c src/fs/ext4/htree.c src/fs/ext4/jbd2.c src/fs/ext4/write.c include/kernel/lume/ext4_write.h include/kernel/lume/ext4.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
 check: check-ext4
@@ -192,17 +194,17 @@ check-ext4: $(OUT)/tests/ext4$(HOSTEXE) $(OUT)/tests/vfs-ext4$(HOSTEXE)
 	"$(OUT)/tests/ext4$(HOSTEXE)"
 	"$(OUT)/tests/vfs-ext4$(HOSTEXE)"
 
-$(OUT)/tests/ext4$(HOSTEXE): tests/unit/ext4_test.c src/fs/ext4/ext4.c include/kernel/lume/ext4.h
+$(OUT)/tests/ext4$(HOSTEXE): tests/unit/ext4_test.c src/fs/ext4/ext4.c src/fs/ext4/htree.c include/kernel/lume/ext4.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
 
-EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/write.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/htree.c src/fs/ext4/jbd2.c src/fs/ext4/write.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
 EXT4_WRITE_VFS_SOURCES := tests/unit/vfs_ext4_write_test.c $(filter-out tests/unit/vfs_ext4_test.c src/syscall/files.c,$(EXT4_VFS_TEST_SOURCES))
 check-ext4-write: $(OUT)/tests/vfs-ext4-write$(HOSTEXE)
-$(OUT)/tests/vfs-ext4-write$(HOSTEXE): $(EXT4_WRITE_VFS_SOURCES) tests/unit/ext4_write_test.c include/kernel/lume/ext4_write.h
+$(OUT)/tests/vfs-ext4-write$(HOSTEXE): $(EXT4_WRITE_VFS_SOURCES) tests/unit/ext4_write_test.c include/kernel/lume/ext4_write.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(EXT4_WRITE_VFS_SOURCES) -o "$@"
-$(OUT)/tests/vfs-ext4$(HOSTEXE): $(EXT4_VFS_TEST_SOURCES) tests/unit/ext4_test.c include/kernel/lume/ext4.h include/kernel/lume/ext4_storage.h include/kernel/lume/storage.h
+$(OUT)/tests/vfs-ext4$(HOSTEXE): $(EXT4_VFS_TEST_SOURCES) tests/unit/ext4_test.c include/kernel/lume/ext4.h include/kernel/lume/ext4_storage.h include/kernel/lume/storage.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(EXT4_VFS_TEST_SOURCES) -o "$@"
 .PHONY: check-console-calls
@@ -271,6 +273,10 @@ check-net-control-call: $(OUT)/tests/net-control-call$(HOSTEXE)
 $(OUT)/tests/net-control-call$(HOSTEXE): tests/unit/net_control_call_test.c src/syscall/net_control.h include/kernel/lume/user_buffer.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) "$<" -o "$@"
+
+STORAGE_TEST_EXT4 := src/fs/ext4/ext4.c src/fs/ext4/htree.c src/fs/ext4/jbd2.c src/fs/ext4/write.c src/fs/ext4/storage.c tests/fixtures/storage_clock_host.c include/kernel/lume/ext4_storage.h include/kernel/lume/ext4_write.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
+STORAGE_TESTS := boot-storage boot-trial storage-handles storage-seek storage-sync storage-cache storage-replace
+$(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(STORAGE_TESTS))): $(STORAGE_TEST_EXT4)
 
 $(OUT)/tests/boot-storage$(HOSTEXE): tests/unit/boot_storage_test.c src/storage/storage.c src/storage/boot_storage.c src/storage/volume.c src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h
 	mkdir -p "$(@D)"
@@ -703,15 +709,15 @@ $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/de
 .PHONY: check-ata-pio
 check-ata-pio: $(OUT)/tests/ata-pio$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c include/kernel/lume/platform_driver.h include/kernel/lume/worker.h include/ddk/lume/irq.h
+$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/worker.h include/ddk/lume/irq.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) -DLUME_ARCH_I686=1 "$<" src/storage/volume.c -o "$@"
 check: check-ata-pio
 check-virtio-block-groups: $(OUT)/tests/virtio-block-groups$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c include/kernel/lume/platform_driver.h include/kernel/lume/sd.h
+$(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/sd.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) "$<" -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) -DLUME_ARCH_AMD64=1 "$<" src/storage/volume.c -o "$@"
 check: check-virtio-block-groups
 
 .PHONY: check-q35

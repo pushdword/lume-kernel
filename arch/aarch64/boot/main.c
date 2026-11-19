@@ -376,8 +376,12 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (storage)
     {
         if (!lume_vfs_mount_storage(storage))
-            lume_fail("persistent FAT32 VFS import");
-        lume_puts("LUME PERSISTENT FAT32 READY /data\n");
+            lume_fail("persistent data volume VFS import");
+        if (lume_storage_is_ext4())
+            lume_puts(storage->read_only ? "LUME PERSISTENT EXT4 READ-ONLY READY /data\n"
+                                         : "LUME PERSISTENT EXT4 READY /data\n");
+        else
+            lume_puts("LUME PERSISTENT FAT32 READY /data\n");
     }
     else
         lume_puts("LUME PERSISTENT VOLUME UNAVAILABLE; WRITES DISABLED\n");
@@ -405,6 +409,8 @@ _Noreturn void lume_main(uint64_t dtb, uint64_t entry_el)
     if (!lume_shell_start(freq, false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");
+    if (!lume_storage_finish())
+        lume_fail("persistent data volume close");
     lume_usb_stats();
     lume_uart_input_stats();
     lume_sd_stats();

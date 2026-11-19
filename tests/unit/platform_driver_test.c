@@ -356,9 +356,9 @@ int main(void)
     assert(lume_display_geometry() == (100 | 37u << 16));
     assert(!lume_platform_driver_unregister(LUME_PLATFORM_DISPLAY, &display));
     assert(!references && lume_display_geometry() == (80 | 25u << 16));
-    const struct lume_platform_sd_ops sd = {start,        configure,   stop,        read_sector,
-                                            write_sector, sectors,     allow,       allow,
-                                            poll_driver,  read_blocks, write_blocks};
+    const struct lume_platform_sd_ops sd = {
+        start, configure,   stop,        read_sector,  write_sector, sectors, allow,
+        allow, poll_driver, read_blocks, write_blocks, NULL,         NULL,    NULL};
     assert(!lume_platform_driver_register(LUME_PLATFORM_SD, &sd, sizeof(sd)));
     assert(lume_sd_allow_volume(2048, 4096));
     assert(lume_platform_driver_can_stop(LUME_PLATFORM_SD, &sd) == -LUME_EBUSY);

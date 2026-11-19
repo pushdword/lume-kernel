@@ -49,7 +49,8 @@ static void check_file(struct lume_files *files, const char *path, const char *c
 {
     struct lume_stat status;
     assert(lume_vfs_stat_path(files, path, &status) == mode);
-    assert(status.inode > UINT32_MAX && status.size == bytes);
+    assert(status.inode >= 0x8000 && status.inode <= UINT16_MAX);
+    assert(status.size == bytes);
     struct lume_stat by_inode;
     assert(lume_vfs_stat_inode(status.inode, &by_inode) == mode);
     assert(by_inode.inode == status.inode && by_inode.size == bytes);
@@ -305,6 +306,7 @@ static void from_disk(const char *path, unsigned mode, bool links)
     int64_t directory = lume_vfs_open(&files, "/data/nested", LUME_O_RDONLY);
     assert(directory >= 0);
     unsigned listed = 0, long_names = 0;
+    uint64_t cursor = 0;
     for (;;)
     {
         struct lume_files_dirent entries[4];
@@ -315,7 +317,8 @@ static void from_disk(const char *path, unsigned mode, bool links)
             break;
         for (unsigned i = 0; i < (uint64_t)amount / sizeof entries[0]; ++i)
         {
-            assert(entries[i].inode > UINT32_MAX);
+            assert(entries[i].inode > cursor && entries[i].inode <= UINT16_MAX);
+            cursor = entries[i].inode;
             assert(entries[i].name_bytes == strlen(entries[i].name));
             if (!strncmp(entries[i].name, "entry-", 6))
             {

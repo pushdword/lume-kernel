@@ -26,6 +26,7 @@ static volatile uint32_t pending;
 static uint64_t interrupts;
 static uint64_t frequency, capacity, write_first, write_count;
 static uint64_t boot_first, boot_count;
+static struct lume_volume journal_volume;
 static uint32_t rca;
 static uint64_t reads, writes, errors, rejected;
 static bool ready, transferring;
@@ -424,6 +425,7 @@ static bool initialize(uint64_t hz)
     ready = transferring = false;
     capacity = write_first = write_count = 0;
     boot_first = boot_count = 0;
+    journal_volume = (struct lume_volume){0};
     rca = 0;
     reads = writes = errors = rejected = 0;
     frequency = hz;
@@ -634,6 +636,18 @@ bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count)
     return true;
 }
 
+bool lume_sd_allow_journal_volume(uint64_t first, uint64_t count)
+{
+    unsigned char mbr[512];
+    struct lume_volume allowed;
+    if (!ready || !write_count || journal_volume.count || !lume_sd_read(0, mbr) ||
+        !lume_volume_journal_select(mbr, capacity, &allowed) || first != allowed.first ||
+        count != allowed.count)
+        return false;
+    journal_volume = allowed;
+    return true;
+}
+
 static void abort_transfer(void)
 {
     bool use_interrupts = interrupt_mode;
@@ -660,7 +674,8 @@ static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
                         count <= write_count - (sector - write_first);
     bool boot_allowed = boot_count && sector >= boot_first && sector - boot_first < boot_count &&
                         count <= boot_count - (sector - boot_first);
-    if (write && !data_allowed && !boot_allowed)
+    bool journal_allowed = lume_volume_contains(&journal_volume, sector, count);
+    if (write && !data_allowed && !boot_allowed && !journal_allowed)
     {
         ++rejected;
         return false;

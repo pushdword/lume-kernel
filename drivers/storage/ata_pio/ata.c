@@ -11,6 +11,7 @@
 #define DATA 0x1f0
 #define CONTROL 0x3f6
 static uint64_t capacity, allowed_first, allowed_count;
+static struct lume_volume journal_volume;
 static uint64_t reads, writes, failures;
 static bool failed;
 static bool flush_supported;
@@ -119,9 +120,10 @@ static bool read_blocks_owned(uint64_t sector, unsigned count, void *buffer)
 
 static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buffer)
 {
-    if (!buffer || !count || count > LUME_SD_MAX_SECTORS || !allowed_count ||
-        sector < allowed_first || sector - allowed_first >= allowed_count ||
-        count > allowed_count - (sector - allowed_first) ||
+    const struct lume_volume data = {allowed_first, allowed_count};
+    if (!buffer || !count || count > LUME_SD_MAX_SECTORS ||
+        (!lume_volume_contains(&data, sector, count) &&
+         !lume_volume_contains(&journal_volume, sector, count)) ||
         !select_sectors(sector, count, multiple_sectors > 1 ? 0xc5 : 0x30))
         return false;
     const unsigned char *in = buffer;
@@ -247,8 +249,16 @@ static uint64_t sectors(void)
 static bool allow(uint64_t first, uint64_t count)
 {
     if (operating || failed || allowed_count || first != LUME_PC_DATA_FIRST || first >= capacity ||
-        !count || count != capacity - first)
+        !count || count > capacity - first)
         return false;
+    if (count != capacity - first)
+    {
+        unsigned char mbr[512];
+        struct lume_volume allowed;
+        if (!read_sector(0, mbr) || !lume_volume_select(mbr, capacity, &allowed) ||
+            first != allowed.first || count != allowed.count)
+            return false;
+    }
     allowed_first = first;
     allowed_count = count;
     return true;
@@ -259,6 +269,18 @@ static bool allow_boot(uint64_t first, uint64_t count)
     (void)first;
     (void)count;
     return false;
+}
+
+static bool allow_journal(uint64_t first, uint64_t count)
+{
+    unsigned char mbr[512];
+    struct lume_volume allowed;
+    if (!allowed_count || journal_volume.count || !read_sector(0, mbr) ||
+        !lume_volume_journal_select(mbr, capacity, &allowed) || first != allowed.first ||
+        count != allowed.count)
+        return false;
+    journal_volume = allowed;
+    return true;
 }
 
 static void stats(void)
@@ -303,8 +325,9 @@ static int register_owned(void)
         current <= LUME_SD_MAX_SECTORS)
         multiple_sectors = current;
     static const struct lume_platform_sd_ops operations = {
-        start,      configure, stop,        read_sector,  write_sector,   sectors,    allow,
-        allow_boot, stats,     read_blocks, write_blocks, write_deferred, sync_device};
+        start,        configure,      stop,        read_sector,  write_sector,
+        sectors,      allow,          allow_boot,  stats,        read_blocks,
+        write_blocks, write_deferred, sync_device, allow_journal};
     int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
     {

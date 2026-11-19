@@ -108,5 +108,7 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_shell_start(lume_counter_frequency(), false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");
+    if (!lume_storage_finish())
+        lume_fail("persistent data volume close");
     lume_stop();
 }

@@ -20,5 +20,6 @@ bool lume_sd_sync(void);
 uint64_t lume_sd_sectors(void);
 bool lume_sd_allow_volume(uint64_t first, uint64_t count);
 bool lume_sd_allow_boot_volume(uint64_t first, uint64_t count);
+bool lume_sd_allow_journal_volume(uint64_t first, uint64_t count);
 void lume_sd_stats(void);
 #endif

@@ -22,6 +22,7 @@
 #include "fd_publication.h"
 
 #define NODES 192u
+#define SHORT_STORAGE_INODE_BASE UINT32_C(0x8000)
 #define CAPACITY 4096u
 #define RAM_FILES 32u
 static unsigned char ram_data[RAM_FILES][CAPACITY];
@@ -353,7 +354,12 @@ static uint64_t node_identity(const struct node *node)
 
 static uint64_t node_inode(unsigned index)
 {
-    return nodes[index].storage_inode ? nodes[index].storage_inode : (uint64_t)index + 1;
+    uint64_t inode = nodes[index].storage_inode;
+    /* Keep small native inode identities representable by 16-bit ino_t. */
+    if (node_capacity < SHORT_STORAGE_INODE_BASE && inode >= LUME_STORAGE_INODE_BASE &&
+        inode - LUME_STORAGE_INODE_BASE <= UINT16_MAX - SHORT_STORAGE_INODE_BASE)
+        return SHORT_STORAGE_INODE_BASE + (inode - LUME_STORAGE_INODE_BASE);
+    return inode ? inode : (uint64_t)index + 1;
 }
 
 void lume_vfs_mapping_notify(void (*notify)(uint64_t, uint64_t, uint64_t))
@@ -2940,8 +2946,9 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
         }
         if (extended)
         {
+            /* FILES_GETDENTS consumers use this field as the next seek position. */
             struct lume_files_dirent entry = {
-                .inode = node_inode(i), .kind = nodes[i].kind, .name_bytes = (uint32_t)name_bytes};
+                .inode = d->offset, .kind = nodes[i].kind, .name_bytes = (uint32_t)name_bytes};
             copy(entry.name, name, name_bytes + 1);
             copy((unsigned char *)out + used, &entry, sizeof(entry));
         }
@@ -3010,6 +3017,7 @@ static int64_t stat_node(unsigned index, struct lume_stat *out)
         n->mode_set = true;
         native_aliases(n, changed, true);
         *out = metadata;
+        out->inode = node_inode(index);
         return mode;
     }
     *out = (struct lume_stat){node_inode(index), n->bytes, n->kind, 0};
@@ -3037,6 +3045,9 @@ int64_t lume_vfs_stat_mode(struct lume_files *f, uint64_t fd, struct lume_stat *
 
 int64_t lume_vfs_stat_inode(uint64_t inode, struct lume_stat *out)
 {
+    if (node_capacity < SHORT_STORAGE_INODE_BASE && inode >= SHORT_STORAGE_INODE_BASE &&
+        inode <= UINT16_MAX)
+        inode = LUME_STORAGE_INODE_BASE + (inode - SHORT_STORAGE_INODE_BASE);
     if (inode > UINT32_MAX)
     {
         for (unsigned i = 0; i < count; ++i)

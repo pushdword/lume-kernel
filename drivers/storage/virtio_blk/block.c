@@ -6,6 +6,7 @@
 #endif
 #include "lume/platform_driver.h"
 #include "lume/sd.h"
+#include "lume/storage.h"
 #include "lume/worker.h"
 #include "lume/counter.h"
 #include "lume/cpu.h"
@@ -13,6 +14,7 @@
 static struct lume_virtio device;
 static struct lume_virtqueue queue;
 static uint64_t capacity, allowed_first, allowed_count;
+static struct lume_volume journal_volume;
 
 #define BLOCK_REQUESTS 4u
 #define BLOCK_REQUEST_SECTORS LUME_SD_MAX_SECTORS
@@ -200,13 +202,11 @@ static bool read_sector(uint64_t sector, void *buffer)
     return cached_read(sector, 1, buffer);
 }
 
-static bool write_sector(uint64_t sector, const void *buffer)
+static bool write_allowed(uint64_t sector, unsigned count)
 {
-    if (!allowed_count || sector < allowed_first || sector - allowed_first >= allowed_count ||
-        !(device.features & (1u << 9)))
-        return false;
-    dirty = true;
-    return transfer(1, sector, 1, (void *)buffer) && flush();
+    struct lume_volume data = {allowed_first, allowed_count};
+    return (device.features & (1u << 9)) && (lume_volume_contains(&data, sector, count) ||
+                                             lume_volume_contains(&journal_volume, sector, count));
 }
 
 static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
@@ -223,9 +223,7 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
 {
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
-        count > capacity - sector || !allowed_count || sector < allowed_first ||
-        sector - allowed_first >= allowed_count ||
-        count > allowed_count - (sector - allowed_first) || !(device.features & (1u << 9)))
+        count > capacity - sector || !write_allowed(sector, count))
         return false;
     dirty = true;
     if (!transfer(1, sector, count, (void *)buffer))
@@ -237,6 +235,14 @@ static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
 static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
 {
     return write_deferred(sector, count, buffer) && flush();
+}
+
+static bool write_sector(uint64_t sector, const void *buffer)
+{
+    if (!write_allowed(sector, 1))
+        return false;
+    dirty = true;
+    return transfer(1, sector, 1, (void *)buffer) && flush();
 }
 
 static uint64_t sectors(void)
@@ -259,6 +265,18 @@ static bool allow_boot(uint64_t first, uint64_t count)
     (void)first;
     (void)count;
     return false;
+}
+
+static bool allow_journal(uint64_t first, uint64_t count)
+{
+    unsigned char mbr[512];
+    struct lume_volume allowed;
+    if (!allowed_count || journal_volume.count || !read_sector(0, mbr) ||
+        !lume_volume_journal_select(mbr, capacity, &allowed) || first != allowed.first ||
+        count != allowed.count)
+        return false;
+    journal_volume = allowed;
+    return true;
 }
 
 static bool start(uint64_t frequency)
@@ -289,7 +307,7 @@ static void stats(void)
 
 static const struct lume_platform_sd_ops operations = {
     start,      configure, stop,        read_sector,  write_sector,   sectors, allow,
-    allow_boot, stats,     read_blocks, write_blocks, write_deferred, flush};
+    allow_boot, stats,     read_blocks, write_blocks, write_deferred, flush,   allow_journal};
 
 static int module_start(struct lume_hardware *hardware, void *context)
 {
@@ -349,6 +367,7 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     lume_virtio_queue_release(&queue);
     memset(&device, 0, sizeof(device));
     capacity = allowed_first = allowed_count = 0;
+    journal_volume = (struct lume_volume){0};
     request_limit = 0;
     request_sectors = 0;
     dirty = transferring = false;

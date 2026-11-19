@@ -82,7 +82,7 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     lume_puts("LUME Q35 MODULES READY\n");
     const struct lume_storage_ops *storage = lume_storage_start();
     if (storage && !lume_vfs_mount_storage(storage))
-        lume_fail("persistent FAT32 volume");
+        lume_fail("persistent data volume");
     lume_value("PERSISTENT_VOLUME_READY", storage != NULL);
     bool network = LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY && lume_net_start();
     lume_value("NETWORK_READY", network);
@@ -92,6 +92,8 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_shell_start(lume_counter_frequency(), false))
         lume_fail("interactive shell");
     lume_puts("LUME INTERACTIVE CONSOLE FINISHED\n");
+    if (!lume_storage_finish())
+        lume_fail("persistent data volume close");
     lume_q35_hardware_stop();
     if (lume_platform_modules_stop())
         lume_fail("module shutdown");

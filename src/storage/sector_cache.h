@@ -62,19 +62,39 @@ static struct sector_cache_line *cache_victim(void)
     return oldest;
 }
 
-static bool cache_bit(const uint64_t *bits, unsigned sector)
+static unsigned cache_next_sector(const uint64_t *bits, unsigned first, unsigned end, bool set)
 {
-    return (bits[sector / 64] >> (sector % 64)) & 1;
+    while (first < end)
+    {
+        unsigned word = first / 64;
+        uint64_t matches = (set ? bits[word] : ~bits[word]) & (UINT64_MAX << (first % 64));
+        if (matches)
+        {
+            unsigned sector = word * 64 + (unsigned)__builtin_ctzll(matches);
+            return sector < end ? sector : end;
+        }
+        first = (word + 1) * 64;
+    }
+    return end;
 }
 
-static void cache_set(uint64_t *bits, unsigned sector)
+static void cache_change_range(uint64_t *bits, unsigned first, unsigned end, bool set)
 {
-    bits[sector / 64] |= UINT64_C(1) << (sector % 64);
-}
-
-static void cache_clear(uint64_t *bits, unsigned sector)
-{
-    bits[sector / 64] &= ~(UINT64_C(1) << (sector % 64));
+    while (first < end)
+    {
+        unsigned word = first / 64;
+        unsigned next = (word + 1) * 64;
+        if (next > end)
+            next = end;
+        uint64_t mask = UINT64_MAX << (first % 64);
+        if (next % 64)
+            mask &= (UINT64_C(1) << (next % 64)) - 1;
+        if (set)
+            bits[word] |= mask;
+        else
+            bits[word] &= ~mask;
+        first = next;
+    }
 }
 
 static void cache_schedule_writeback(void)
@@ -113,28 +133,20 @@ static bool cache_barrier(void)
 
 static bool cache_write_line(struct sector_cache_line *line)
 {
-    for (unsigned i = 0; i < SECTOR_CACHE_SECTORS;)
+    unsigned first = 0;
+    while ((first = cache_next_sector(line->dirty, first, SECTOR_CACHE_SECTORS, true)) <
+           SECTOR_CACHE_SECTORS)
     {
-        if (!cache_bit(line->dirty, i))
-        {
-            ++i;
-            continue;
-        }
-        unsigned end = i + 1;
-        while (end < SECTOR_CACHE_SECTORS && cache_bit(line->dirty, end))
-            ++end;
-        if (!lume_sd_write_deferred(line->first + i, end - i, line->data + i * 512u))
+        unsigned end = cache_next_sector(line->dirty, first, SECTOR_CACHE_SECTORS, false);
+        if (!lume_sd_write_deferred(line->first + first, end - first, line->data + first * 512u))
         {
             cache_retry_submitted();
             return false;
         }
-        for (unsigned sector = i; sector < end; ++sector)
-        {
-            cache_clear(line->dirty, sector);
-            cache_set(line->submitted, sector);
-        }
-        lume_worker_checkpoint((end - i) * 512u);
-        i = end;
+        cache_change_range(line->dirty, first, end, false);
+        cache_change_range(line->submitted, first, end, true);
+        lume_worker_checkpoint((end - first) * 512u);
+        first = end;
     }
     return true;
 }
@@ -313,16 +325,10 @@ static bool cache_read(uint64_t sector, unsigned count, unsigned char *out, uint
         unsigned fetch_end = sequential ? SECTOR_CACHE_SECTORS : end;
         if (fetch_end > limit - line->first)
             fetch_end = (unsigned)(limit - line->first);
-        for (unsigned i = offset; i < end;)
+        unsigned i = offset;
+        while ((i = cache_next_sector(line->valid, i, end, false)) < end)
         {
-            if (cache_bit(line->valid, i))
-            {
-                ++i;
-                continue;
-            }
-            unsigned last = i + 1;
-            while (last < fetch_end && !cache_bit(line->valid, last))
-                ++last;
+            unsigned last = cache_next_sector(line->valid, i, fetch_end, true);
             uint64_t start = line->first + i;
             unsigned char *data = line->data + i * 512u;
             bool success = lume_sd_read_blocks(start, last - i, data);
@@ -339,8 +345,7 @@ static bool cache_read(uint64_t sector, unsigned count, unsigned char *out, uint
             }
             if (!success)
                 return false;
-            for (unsigned j = i; j < last; ++j)
-                cache_set(line->valid, j);
+            cache_change_range(line->valid, i, last, true);
             i = last;
         }
         lume_worker_copy(out, line->data + offset * 512u, group * 512u);
@@ -386,12 +391,9 @@ static bool cache_write(uint64_t sector, unsigned count, const unsigned char *da
         if (group > count)
             group = count;
         lume_worker_copy(line->data + offset * 512u, data, group * 512u);
-        for (unsigned i = offset; i < offset + group; ++i)
-        {
-            cache_set(line->valid, i);
-            cache_set(line->dirty, i);
-            cache_clear(line->submitted, i);
-        }
+        cache_change_range(line->valid, offset, offset + group, true);
+        cache_change_range(line->dirty, offset, offset + group, true);
+        cache_change_range(line->submitted, offset, offset + group, false);
         cache_schedule_writeback();
         lume_worker_checkpoint(group * 512u);
         sector += group;
@@ -403,16 +405,20 @@ static bool cache_write(uint64_t sector, unsigned count, const unsigned char *da
 
 static void cache_invalidate(uint64_t sector, unsigned count)
 {
-    while (count--)
+    while (count)
     {
+        unsigned offset = (unsigned)(sector % SECTOR_CACHE_SECTORS);
+        unsigned group = SECTOR_CACHE_SECTORS - offset;
+        if (group > count)
+            group = count;
         struct sector_cache_line *line = cache_find(sector);
         if (line)
         {
-            unsigned offset = (unsigned)(sector - line->first);
-            cache_clear(line->valid, offset);
-            cache_clear(line->dirty, offset);
-            cache_clear(line->submitted, offset);
+            cache_change_range(line->valid, offset, offset + group, false);
+            cache_change_range(line->dirty, offset, offset + group, false);
+            cache_change_range(line->submitted, offset, offset + group, false);
         }
-        ++sector;
+        sector += group;
+        count -= group;
     }
 }

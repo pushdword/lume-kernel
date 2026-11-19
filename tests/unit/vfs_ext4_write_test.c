@@ -55,7 +55,8 @@ static void check_native(struct lume_files *files, const char *path, unsigned mo
 {
     struct lume_stat info;
     assert(lume_vfs_stat_at(files, LUME_FILES_AT_CWD, path, &info) == mode);
-    assert(info.inode > UINT32_MAX && info.size == bytes);
+    assert(info.inode >= 0x8000 && info.inode <= UINT16_MAX);
+    assert(info.size == bytes);
 }
 
 int main(int argc, char **argv)
@@ -115,7 +116,7 @@ int main(int argc, char **argv)
     check_native(&files, "/data/persist", 0100600, sizeof pattern);
     struct lume_stat first;
     assert(lume_vfs_stat(&files, (uint64_t)fd, &first) == 0);
-    assert(first.inode > UINT32_MAX);
+    assert(first.inode >= 0x8000 && first.inode <= UINT16_MAX);
     assert(!lume_vfs_rename(&files, "/data/persist", "/data/renamed"));
     assert(lume_vfs_pwrite(&files, (uint64_t)fd, "changed", 7, 17) == 7);
     memcpy(pattern + 17, "changed", 7);

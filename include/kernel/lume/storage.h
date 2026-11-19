@@ -8,6 +8,8 @@ struct lume_stat;
 
 typedef bool (*lume_storage_visit)(const char *, bool, uint64_t, void *);
 
+#define LUME_STORAGE_INODE_BASE UINT64_C(0x8000000000000000)
+
 enum
 {
     LUME_STORAGE_REPLACE_UNCHANGED,
@@ -73,6 +75,20 @@ struct lume_volume
     uint64_t first, count;
 };
 
+static inline bool lume_volume_contains(const struct lume_volume *volume, uint64_t sector,
+                                        unsigned count)
+{
+    return count && sector >= volume->first && sector - volume->first < volume->count &&
+           count <= volume->count - (sector - volume->first);
+}
+
+enum lume_volume_format
+{
+    LUME_VOLUME_NONE,
+    LUME_VOLUME_FAT32,
+    LUME_VOLUME_EXT4
+};
+
 #define LUME_PC_DISK_ID UINT32_C(0x364d554c)
 #define LUME_PC_DATA_FIRST UINT64_C(131072)
 #define LUME_Q35_DISK_ID UINT32_C(0x354d554c)
@@ -82,10 +98,17 @@ struct lume_volume
 #define LUME_CARD_DATA_FIRST (LUME_CARD_BOOT_FIRST + LUME_CARD_BOOT_SECTORS)
 
 bool lume_volume_select(const unsigned char mbr[512], uint64_t sectors, struct lume_volume *);
+enum lume_volume_format lume_volume_identify(const unsigned char mbr[512], uint64_t sectors,
+                                             struct lume_volume *);
 bool lume_volume_boot_select(const unsigned char mbr[512], uint64_t sectors, struct lume_volume *);
 bool lume_volume_alternate_boot_select(const unsigned char mbr[512], uint64_t sectors,
                                        struct lume_volume *);
+bool lume_volume_journal_select(const unsigned char mbr[512], uint64_t sectors,
+                                struct lume_volume *);
 const struct lume_storage_ops *lume_storage_start(void);
+bool lume_storage_is_ext4(void);
+/* Finish the data volume after the last VFS operation and before stopping the block device. */
+bool lume_storage_finish(void);
 /* Schedule expired partial-sector and metadata flushes on the serialized kernel worker. */
 void lume_storage_poll_background(void);
 #endif
