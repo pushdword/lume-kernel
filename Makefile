@@ -709,13 +709,13 @@ $(OUT)/tests/platform-driver$(HOSTEXE): tests/unit/platform_driver_test.c src/de
 .PHONY: check-ata-pio
 check-ata-pio: $(OUT)/tests/ata-pio$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/worker.h include/ddk/lume/irq.h
+$(OUT)/tests/ata-pio$(HOSTEXE): tests/arch/i686/ata_test.c drivers/storage/ata_pio/ata.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/worker.h include/ddk/lume/irq.h include/kernel/lume/pc_disk.h tests/fixtures/pc_disk_host.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) -DLUME_ARCH_I686=1 "$<" src/storage/volume.c -o "$@"
 check: check-ata-pio
 check-virtio-block-groups: $(OUT)/tests/virtio-block-groups$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/sd.h
+$(OUT)/tests/virtio-block-groups$(HOSTEXE): tests/platform/q35/block_groups_test.c drivers/storage/virtio_blk/block.c src/storage/volume.c include/kernel/lume/storage.h include/kernel/lume/platform_driver.h include/kernel/lume/sd.h include/kernel/lume/pc_disk.h tests/fixtures/pc_disk_host.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(Q35_TEST_CPPFLAGS) -DLUME_ARCH_AMD64=1 "$<" src/storage/volume.c -o "$@"
 check: check-virtio-block-groups

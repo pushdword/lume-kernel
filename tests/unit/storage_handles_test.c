@@ -625,6 +625,10 @@ static bool full_disk_failure(void)
 
 int main(void)
 {
+    lume_storage_installer_mode(true);
+    assert(lume_storage_is_installer() && !lume_storage_start());
+    assert(!reads && !writes);
+    lume_storage_installer_mode(false);
     const struct lume_storage_ops *ops = format(false);
     if (!ops || !ops->open || !ops->read_handle || !ops->write_handle || !ops->resize_handle ||
         !ops->close || !ops->sync_handle || !aliases(ops) || !limits(ops) || !interleaved(ops) ||

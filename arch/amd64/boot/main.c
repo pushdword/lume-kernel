@@ -7,6 +7,7 @@
 #include "lume/storage.h"
 #include "lume/platform_driver.h"
 #include "lume/boot.h"
+#include "lume/boot_mode.h"
 #include "lume/modules.h"
 #include "lume/display.h"
 #include "lume/usb.h"
@@ -14,7 +15,6 @@
 #include "lume/smp.h"
 #include "lume/worker.h"
 #include "lume/firmware.h"
-#include <string.h>
 static uint64_t program_memory;
 static unsigned program_pages;
 
@@ -49,24 +49,6 @@ static void *allocate_program(size_t bytes)
     return (void *)(uintptr_t)memory;
 }
 
-static bool persistent_boot(void)
-{
-    static const char expected[] = "persistent\n";
-    struct lume_files files;
-    if (!lume_files_init(&files))
-        lume_fail("boot mode initialization");
-    char mode[sizeof(expected)];
-    int64_t fd = lume_vfs_open(&files, "/etc/bootmode", LUME_O_RDONLY);
-    bool persistent = false;
-    if (fd >= 0)
-    {
-        int64_t bytes = lume_vfs_read(&files, (uint64_t)fd, mode, sizeof(mode));
-        persistent = bytes == sizeof(expected) - 1 && !memcmp(mode, expected, sizeof(expected) - 1);
-    }
-    lume_files_release(&files);
-    return persistent;
-}
-
 _Noreturn void lume_main(uint64_t info, uint64_t magic)
 {
     lume_amd64_context_start();
@@ -99,8 +81,10 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_vfs_mount_fat((const void *)(uintptr_t)memory.initrd_start,
                             (size_t)(memory.initrd_end - memory.initrd_start)))
         lume_fail("FAT32 application root");
-    bool ssd_boot = firmware_boot && persistent_boot();
-    bool storage_boot = ssd_boot || !firmware_boot;
+    bool installer = lume_boot_mode_is("installer\n");
+    lume_storage_installer_mode(installer);
+    bool ssd_boot = firmware_boot && lume_boot_mode_is("persistent\n");
+    bool storage_boot = !installer && (ssd_boot || !firmware_boot);
     lume_platform_firmware_configure(&memory);
     if (lume_q35_hardware_start())
         lume_fail("kernel module and hardware services");

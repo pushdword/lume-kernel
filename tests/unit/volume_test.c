@@ -144,6 +144,24 @@ int main(void)
 
 #if defined(LUME_ARCH_AMD64) || defined(LUME_ARCH_I686)
     memset(mbr, 0, sizeof(mbr));
+    mbr[0] = 0xeb;
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    const uint32_t install_first = LUME_INSTALL_DATA_FIRST;
+    const uint32_t install_sectors = 2 * install_first;
+    put(mbr + 440, LUME_INSTALL_DISK_ID);
+    entry(mbr + 446, false, install_first, install_sectors - install_first);
+    assert(lume_volume_identify(mbr, install_sectors, &volume) == LUME_VOLUME_FAT32);
+    assert(volume.first == install_first && volume.count == install_sectors - install_first);
+    assert(!lume_volume_select(mbr, install_sectors - 1, &volume));
+    assert(!lume_volume_select(mbr, install_sectors + 1, &volume));
+    mbr[450] = 0x83;
+    assert(!lume_volume_select(mbr, install_sectors, &volume));
+    mbr[450] = 0x0c;
+    mbr[466] = 0x83;
+    assert(!lume_volume_select(mbr, install_sectors, &volume));
+
+    memset(mbr, 0, sizeof(mbr));
 #if defined(LUME_ARCH_I686)
     mbr[0] = 0xeb;
     put(mbr + 440, LUME_PC_DISK_ID);

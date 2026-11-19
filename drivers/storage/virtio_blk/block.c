@@ -7,6 +7,7 @@
 #include "lume/platform_driver.h"
 #include "lume/sd.h"
 #include "lume/storage.h"
+#include "lume/pc_disk.h"
 #include "lume/worker.h"
 #include "lume/counter.h"
 #include "lume/cpu.h"
@@ -220,16 +221,21 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
     return true;
 }
 
-static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
+static bool write_device(uint64_t sector, unsigned count, const void *buffer)
 {
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS || sector >= capacity ||
-        count > capacity - sector || !write_allowed(sector, count))
+        count > capacity - sector)
         return false;
     dirty = true;
     if (!transfer(1, sector, count, (void *)buffer))
         return false;
     lume_worker_checkpoint(count * 512);
     return true;
+}
+
+static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
+{
+    return write_allowed(sector, count) && write_device(sector, count, buffer);
 }
 
 static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
@@ -309,6 +315,30 @@ static const struct lume_platform_sd_ops operations = {
     start,      configure, stop,        read_sector,  write_sector,   sectors, allow,
     allow_boot, stats,     read_blocks, write_blocks, write_deferred, flush,   allow_journal};
 
+static struct lume_pc_disk raw_disk;
+
+static int raw_read(struct lume_block *block, uint64_t sector, unsigned count, void *buffer)
+{
+    (void)block;
+    return read_blocks(sector, count, buffer) ? 0 : -LUME_EIO;
+}
+
+static int raw_write(struct lume_block *block, uint64_t sector, unsigned count, const void *buffer)
+{
+    if (!lume_storage_is_installer() || block->read_only)
+        return -LUME_EROFS;
+    return write_device(sector, count, buffer) ? 0 : -LUME_EIO;
+}
+
+static int raw_sync(struct lume_block *block)
+{
+    (void)block;
+    return flush() ? 0 : -LUME_EIO;
+}
+
+static const struct lume_block_ops raw_operations = {
+    .read = raw_read, .write = raw_write, .sync = raw_sync};
+
 static int module_start(struct lume_hardware *hardware, void *context)
 {
     read_cache_count = 0;
@@ -339,6 +369,12 @@ static int module_start(struct lume_hardware *hardware, void *context)
     if (!capacity)
         return -LUME_EIO;
     lume_virtio_ready(&device);
+    if (lume_storage_is_installer())
+    {
+        bool read_only = (device.features & (1u << 5)) || !(device.features & (1u << 9));
+        return lume_pc_disk_register(&raw_disk, "vda", capacity, LUME_SD_MAX_SECTORS,
+                                     &raw_operations, NULL, read_only);
+    }
     result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     binding->registered = !result;
     return result;
@@ -355,6 +391,9 @@ static int module_stop(struct lume_hardware *hardware, void *context)
         if (result)
             return result;
     }
+    int raw_result = lume_pc_disk_unregister(&raw_disk);
+    if (raw_result)
+        return raw_result;
     if ((dirty && !flush()) || !lume_virtio_reset(&device))
         return -LUME_EIO;
     if (binding->registered)

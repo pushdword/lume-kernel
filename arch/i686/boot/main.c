@@ -6,6 +6,7 @@
 #include "lume/display.h"
 #include "lume/pci.h"
 #include "lume/storage.h"
+#include "lume/boot_mode.h"
 #include "lume/serial.h"
 void lume_i686_context_start(void);
 int lume_pc_display_register(void);
@@ -72,6 +73,8 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
     if (!lume_vfs_mount_fat((const void *)(uintptr_t)memory.initrd_start,
                             (size_t)(memory.initrd_end - memory.initrd_start)))
         lume_fail("FAT32 application root");
+    bool installer = lume_boot_mode_is("installer\n");
+    lume_storage_installer_mode(installer);
     lume_platform_firmware_configure(&memory);
     if (lume_q35_hardware_start())
         lume_fail("PCI hardware services");
@@ -85,12 +88,12 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
         disk_result = lume_pc_ide_register();
     else if (!disk_result)
         lume_puts("LUME PC VIRTIO BLOCK READY\n");
-    if (disk_result)
+    if (disk_result && !installer)
         lume_fail("PC disk initialization");
-    const struct lume_storage_ops *storage = lume_storage_start();
-    if (!storage || !lume_vfs_mount_storage(storage))
+    const struct lume_storage_ops *storage = installer ? NULL : lume_storage_start();
+    if (!installer && (!storage || !lume_vfs_mount_storage(storage)))
         lume_fail("PC data volume");
-    lume_value("PERSISTENT_VOLUME_READY", 1);
+    lume_value("PERSISTENT_VOLUME_READY", storage != NULL);
     extern int lume_pc_entropy_start(void);
 #if defined(LUME_LINUX_BUILTIN)
     extern int lume_linux_virtio_rng_start(void);

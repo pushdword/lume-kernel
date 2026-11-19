@@ -93,6 +93,8 @@ enum lume_volume_format
 #define LUME_PC_DATA_FIRST UINT64_C(131072)
 #define LUME_Q35_DISK_ID UINT32_C(0x354d554c)
 #define LUME_Q35_EFI_DISK_ID UINT32_C(0x384d554c)
+#define LUME_INSTALL_DISK_ID UINT32_C(0x374d554c)
+#define LUME_INSTALL_DATA_FIRST UINT32_C(1048576)
 #define LUME_Q35_EFI_FIRST UINT64_C(2048)
 #define LUME_Q35_EFI_SECTORS UINT64_C(2097152)
 #define LUME_Q35_EFI_DATA_FIRST (LUME_Q35_EFI_FIRST + LUME_Q35_EFI_SECTORS)
@@ -110,6 +112,8 @@ bool lume_volume_alternate_boot_select(const unsigned char mbr[512], uint64_t se
 bool lume_volume_journal_select(const unsigned char mbr[512], uint64_t sectors,
                                 struct lume_volume *);
 const struct lume_storage_ops *lume_storage_start(void);
+void lume_storage_installer_mode(bool enable);
+bool lume_storage_is_installer(void);
 bool lume_storage_is_ext4(void);
 /* Finish the data volume after the last VFS operation and before stopping the block device. */
 bool lume_storage_finish(void);

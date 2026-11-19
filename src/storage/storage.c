@@ -1090,8 +1090,22 @@ bool lume_storage_finish(void)
     return true;
 }
 
+static bool installer_mode;
+
+void lume_storage_installer_mode(bool enable)
+{
+    installer_mode = enable;
+}
+
+bool lume_storage_is_installer(void)
+{
+    return installer_mode;
+}
+
 const struct lume_storage_ops *lume_storage_start(void)
 {
+    if (installer_mode)
+        return NULL;
     if (ext4_ops)
         return ext4_ops;
     if (program_cache_release && program_cache_release())

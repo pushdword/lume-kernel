@@ -213,6 +213,7 @@ int lume_platform_driver_register(unsigned kind, const void *ops, size_t bytes)
     return 0;
 }
 
+#include "../../fixtures/pc_disk_host.h"
 #include "../../../drivers/storage/ata_pio/ata.c"
 
 static void check_operation(void)
@@ -376,6 +377,28 @@ int main(void)
     deliver_irq = false;
     assert(registered->lume_sd_write_blocks(LUME_PC_DATA_FIRST, 2, group));
     assert(irq_waits > previous_waits && !failed && !operating);
+    cooperative = check_reentry = false;
+    command_delay = sector_delay = 0;
+    allowed_count = 0;
+    uint16_t *mbr = sector_data[0];
+    memset(mbr, 0, 512);
+    uint32_t install_count = total - LUME_INSTALL_DATA_FIRST;
+    assert(!registered->lume_sd_allow_volume(LUME_INSTALL_DATA_FIRST, install_count));
+    mbr[220] = (uint16_t)LUME_INSTALL_DISK_ID;
+    mbr[221] = LUME_INSTALL_DISK_ID >> 16;
+    mbr[223] = 0xfe00;
+    mbr[224] = 0xffff;
+    mbr[225] = 0xfe0c;
+    mbr[226] = 0xffff;
+    mbr[227] = (uint16_t)LUME_INSTALL_DATA_FIRST;
+    mbr[228] = LUME_INSTALL_DATA_FIRST >> 16;
+    mbr[229] = (uint16_t)install_count;
+    mbr[230] = install_count >> 16;
+    mbr[255] = 0xaa55;
+    assert(!registered->lume_sd_allow_volume(LUME_INSTALL_DATA_FIRST, install_count - 1));
+    assert(registered->lume_sd_allow_volume(LUME_INSTALL_DATA_FIRST, install_count));
+    assert(!registered->lume_sd_write(LUME_INSTALL_DATA_FIRST - 1, input));
+    assert(registered->lume_sd_write(LUME_INSTALL_DATA_FIRST, input));
     puts("PASS ATA PIO, cooperative deadline, controller ownership, bounds, flush and failure");
     return 0;
 }

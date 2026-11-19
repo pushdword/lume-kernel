@@ -3,6 +3,7 @@
 #include "lume/cpu.h"
 #include "lume/platform_driver.h"
 #include "lume/storage.h"
+#include "lume/pc_disk.h"
 #include "lume/sd.h"
 #include "lume/worker.h"
 #include "lume/abi.h"
@@ -118,12 +119,14 @@ static bool read_blocks_owned(uint64_t sector, unsigned count, void *buffer)
     return true;
 }
 
-static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buffer)
+static bool write_blocks_owned(uint64_t sector, unsigned count, const void *buffer, bool raw)
 {
     const struct lume_volume data = {allowed_first, allowed_count};
+    bool allowed = raw ? sector < capacity && count <= capacity - sector
+                       : lume_volume_contains(&data, sector, count) ||
+                             lume_volume_contains(&journal_volume, sector, count);
     if (!buffer || !count || count > LUME_SD_MAX_SECTORS ||
-        (!lume_volume_contains(&data, sector, count) &&
-         !lume_volume_contains(&journal_volume, sector, count)) ||
+        !allowed ||
         !select_sectors(sector, count, multiple_sectors > 1 ? 0xc5 : 0x30))
         return false;
     const unsigned char *in = buffer;
@@ -182,7 +185,7 @@ static bool write_blocks(uint64_t sector, unsigned count, const void *buffer)
     if (operating)
         return false;
     operating = true;
-    bool result = write_blocks_owned(sector, count, buffer) && flush_owned();
+    bool result = write_blocks_owned(sector, count, buffer, false) && flush_owned();
     operating = false;
     return result;
 }
@@ -192,7 +195,7 @@ static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
     if (operating)
         return false;
     operating = true;
-    bool result = write_blocks_owned(sector, count, buffer);
+    bool result = write_blocks_owned(sector, count, buffer, false);
     operating = false;
     return result;
 }
@@ -248,10 +251,11 @@ static uint64_t sectors(void)
 
 static bool allow(uint64_t first, uint64_t count)
 {
-    if (operating || failed || allowed_count || first != LUME_PC_DATA_FIRST || first >= capacity ||
-        !count || count > capacity - first)
+    if (operating || failed || allowed_count ||
+        (first != LUME_PC_DATA_FIRST && first != LUME_INSTALL_DATA_FIRST) ||
+        first >= capacity || !count || count > capacity - first)
         return false;
-    if (count != capacity - first)
+    if (first == LUME_INSTALL_DATA_FIRST || count != capacity - first)
     {
         unsigned char mbr[512];
         struct lume_volume allowed;
@@ -293,6 +297,36 @@ static void stats(void)
     lume_value("ATA_PIO_IRQ", interrupt_mode);
 }
 
+static struct lume_pc_disk raw_disk;
+
+static int raw_read(struct lume_block *block, uint64_t sector, unsigned count, void *buffer)
+{
+    (void)block;
+    return read_blocks(sector, count, buffer) ? 0 : -LUME_EIO;
+}
+
+static int raw_write(struct lume_block *block, uint64_t sector, unsigned count, const void *buffer)
+{
+    (void)block;
+    if (!lume_storage_is_installer())
+        return -LUME_EROFS;
+    if (operating)
+        return -LUME_EBUSY;
+    operating = true;
+    bool result = write_blocks_owned(sector, count, buffer, true);
+    operating = false;
+    return result ? 0 : -LUME_EIO;
+}
+
+static int raw_sync(struct lume_block *block)
+{
+    (void)block;
+    return sync_device() ? 0 : -LUME_EIO;
+}
+
+static const struct lume_block_ops raw_operations = {
+    .read = raw_read, .write = raw_write, .sync = raw_sync};
+
 static int register_owned(void)
 {
     lume_out8(CONTROL, 2);
@@ -328,7 +362,10 @@ static int register_owned(void)
         start,        configure,      stop,        read_sector,  write_sector,
         sectors,      allow,          allow_boot,  stats,        read_blocks,
         write_blocks, write_deferred, sync_device, allow_journal};
-    int result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
+    int result = lume_storage_is_installer()
+                     ? lume_pc_disk_register(&raw_disk, "hda", capacity, LUME_SD_MAX_SECTORS,
+                                             &raw_operations, NULL, false)
+                     : lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
     if (!result)
     {
         if (!interrupt_mode && lume_irq_available() &&

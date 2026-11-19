@@ -33,6 +33,7 @@ static int q35_module_pci(struct lume_hardware *hardware, uint16_t vendor, uint1
     return 0;
 }
 
+#include "../../fixtures/pc_disk_host.h"
 #include "../../../drivers/storage/virtio_blk/block.c"
 
 static struct lume_virtio_desc descriptors[32];

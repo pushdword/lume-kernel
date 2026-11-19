@@ -4,6 +4,7 @@
 #include "lume/platform_driver.h"
 #include "lume/devfs.h"
 #include "lume/storage.h"
+#include "lume/pc_disk.h"
 #include "lume/counter.h"
 #include "lume/cpu.h"
 #include "lume/sd.h"
@@ -18,6 +19,7 @@
 
 struct ahci_disk
 {
+    struct lume_pc_disk raw;
     volatile uint32_t *registers;
     uint64_t dma, sectors;
     unsigned sector_bytes;
@@ -31,8 +33,6 @@ static uint32_t pci_address;
 static struct ahci_disk *storage_disk;
 static struct lume_volume data_volume;
 static bool write_enabled;
-static struct lume_device raw_device;
-static struct lume_block raw_block;
 
 static bool wait_clear(volatile uint32_t *value, uint32_t mask)
 {
@@ -143,19 +143,24 @@ static bool flush(struct ahci_disk *disk)
     return !disk->failed && (!disk->flush || command(disk, 0xe7, 0, 0, NULL, false));
 }
 
-static const struct lume_block_ops raw_operations = {.read = raw_read};
-
-static int raw_start(struct lume_device *dev)
+static int raw_write(struct lume_block *block, uint64_t sector, unsigned count, const void *buffer)
 {
-    (void)dev;
-    return lume_devfs_register_block(&raw_block);
+    if (!lume_storage_is_installer())
+        return -LUME_EROFS;
+    struct ahci_disk *disk = block->context;
+    if (!command(disk, 0x35, sector, count, (void *)buffer, true))
+        return -LUME_EIO;
+    lume_worker_checkpoint(count * block->sector_bytes);
+    return 0;
 }
 
-static int raw_stop(struct lume_device *dev)
+static int raw_sync(struct lume_block *block)
 {
-    (void)dev;
-    return lume_devfs_unregister_block(&raw_block);
+    return flush(block->context) ? 0 : -LUME_EIO;
 }
+
+static const struct lume_block_ops raw_operations = {
+    .read = raw_read, .write = raw_write, .sync = raw_sync};
 
 static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 {
@@ -166,7 +171,7 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
     while (count)
     {
         unsigned chunk = count > AHCI_STORAGE_SECTORS ? AHCI_STORAGE_SECTORS : count;
-        if (raw_read(&raw_block, sector, chunk, target))
+        if (raw_read(&storage_disk->raw.block, sector, chunk, target))
             return false;
         target += chunk * 512u;
         sector += chunk;
@@ -336,7 +341,8 @@ static int select_storage_disk(struct ahci_disk *disk)
     if (!command(disk, 0x25, 0, 1, mbr, false))
         return 0;
     memcpy(&identity, mbr + 440, sizeof(identity));
-    if (identity != LUME_Q35_EFI_DISK_ID || !lume_volume_select(mbr, disk->sectors, &volume))
+    if ((identity != LUME_Q35_EFI_DISK_ID && identity != LUME_INSTALL_DISK_ID) ||
+        !lume_volume_select(mbr, disk->sectors, &volume))
         return 0;
     if (storage_disk)
         return -LUME_EBUSY;
@@ -376,31 +382,30 @@ static int module_start(struct lume_hardware *hardware, void *context)
     unsigned ports = AHCI_PORTS;
     if ((resource->size - 0x100) / 0x80 < ports)
         ports = (unsigned)((resource->size - 0x100) / 0x80);
+    bool installer = lume_storage_is_installer();
+    bool found = false;
     for (unsigned i = 0; i < ports; ++i)
     {
-        if (!(host[3] & (1u << i)) || !initialize(disks + i, i, (host[0] >> 31) != 0))
+        struct ahci_disk *disk = disks + i;
+        if (!(host[3] & (1u << i)) || !initialize(disk, i, (host[0] >> 31) != 0))
             continue;
-        result = select_storage_disk(disks + i);
+        found = true;
+        if (installer)
+            result = lume_pc_disk_register(&disk->raw, disk->name, disk->sectors,
+                                           AHCI_STORAGE_SECTORS, &raw_operations, disk, false);
+        else
+            result = select_storage_disk(disk);
         if (result)
             return result;
         lume_value("AHCI_DISK_PORT", i);
-        lume_value("AHCI_DISK_SECTORS", disks[i].sectors);
+        lume_value("AHCI_DISK_SECTORS", disk->sectors);
     }
+    if (installer)
+        return found ? 0 : -LUME_ENOENT;
     if (!storage_disk)
         return -LUME_ENOENT;
-    static const struct lume_driver_ops lifecycle = {.start = raw_start, .stop = raw_stop};
-    raw_device = (struct lume_device){.version = LUME_DDK_VERSION,
-                                     .class_id = LUME_DEVICE_BLOCK,
-                                     .name = storage_disk->name,
-                                     .ops = &lifecycle};
-    raw_block = (struct lume_block){.device = &raw_device,
-                                   .ops = &raw_operations,
-                                   .context = storage_disk,
-                                   .sectors = storage_disk->sectors,
-                                   .sector_bytes = 512,
-                                   .max_sectors = AHCI_STORAGE_SECTORS,
-                                   .read_only = true};
-    result = lume_device_attach(&raw_device);
+    result = lume_pc_disk_register(&storage_disk->raw, storage_disk->name, storage_disk->sectors,
+                                   AHCI_STORAGE_SECTORS, &raw_operations, storage_disk, true);
     if (result)
         return result;
     result = lume_platform_driver_register(LUME_PLATFORM_SD, &operations, sizeof(operations));
@@ -418,9 +423,9 @@ static int module_stop(struct lume_hardware *hardware, void *context)
         if (result)
             return result;
     }
-    if (raw_device.state != LUME_DEVICE_OFF)
+    for (unsigned i = 0; i < AHCI_PORTS; ++i)
     {
-        int result = lume_device_detach(&raw_device);
+        int result = lume_pc_disk_unregister(&disks[i].raw);
         if (result)
             return result;
     }
