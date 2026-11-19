@@ -22,7 +22,8 @@ enum
     LUME_SPAWN_SIGDEFAULT = 1u,
     LUME_SPAWN_SIGMASK = 2u,
     LUME_SPAWN_SETSID = 4u,
-    LUME_SPAWN_CLOEXEC_DEFAULT = 8u
+    LUME_SPAWN_CLOEXEC_DEFAULT = 8u,
+    LUME_SPAWN_DRIVER_ADMIN = 16u
 };
 
 /* Pointer fields contain unsigned virtual addresses. OPEN uses native Lume open flags.

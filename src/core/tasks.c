@@ -163,7 +163,13 @@ extern int lume_supervision_ready(unsigned, uint64_t);
 
 uint64_t lume_task_capabilities(unsigned pid)
 {
-    return pid && pid <= LUME_TASK_LIMIT ? capabilities[pid - 1] : 0;
+    if (!pid || pid > LUME_TASK_LIMIT)
+        return 0;
+    const struct lume_identity *identity = &tasks[pid - 1].files.identity;
+    uint64_t mask = capabilities[pid - 1];
+    if (identity->euid || identity->jailed)
+        mask &= ~(uint64_t)LUME_CAP_DRIVER_ADMIN;
+    return mask;
 }
 
 bool lume_task_capable(unsigned pid, uint64_t required)
@@ -1361,8 +1367,14 @@ static int start_program_with_scratch(struct lume_context *frame,
                 *(const struct lume_spawn_options_request *)(uintptr_t)LUME_CONTEXT_REG(frame, 0);
             if (options.reserved ||
                 (options.flags & ~(LUME_SPAWN_SIGDEFAULT | LUME_SPAWN_SIGMASK | LUME_SPAWN_SETSID |
-                                   LUME_SPAWN_CLOEXEC_DEFAULT)))
+                                   LUME_SPAWN_CLOEXEC_DEFAULT | LUME_SPAWN_DRIVER_ADMIN)))
                 return -LUME_EINVAL;
+            if (options.flags & LUME_SPAWN_DRIVER_ADMIN)
+            {
+                const struct lume_identity *identity = &tasks[owner].files.identity;
+                if (identity->euid || identity->jailed || !lume_supervision_manager(owner + 1))
+                    return -LUME_EPERM;
+            }
         }
         action_count = extended.count;
         if (action_count &&
@@ -1623,6 +1635,8 @@ static int start_program_with_scratch(struct lume_context *frame,
     process_exiting[child] = main_thread_done[child] = false;
     process_status[child] = 0;
     capabilities[child] = capabilities[owner] & ~(uint64_t)(LUME_CAP_SERVICE | LUME_CAP_SUPERVISOR);
+    if (options.flags & LUME_SPAWN_DRIVER_ADMIN)
+        capabilities[child] |= LUME_CAP_DRIVER_ADMIN;
     service_root[child] = lume_supervision_manager(owner + 1) ? child + 1 : service_root[owner];
     tasks[child].calls = tasks[child].exits = tasks[child].faults = tasks[child].preemptions = 0;
     parents[child] = owner;
