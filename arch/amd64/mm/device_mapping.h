@@ -1,12 +1,18 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define DEVICE_FIRST UINT64_C(0x9000000000)
 #define DEVICE_END UINT64_C(0x10000000000)
+#define PCI_MMIO_FIRST UINT64_C(0x80000000)
+#define PCI_MMIO_LEGACY_FIRST UINT64_C(0xc0000000)
+#define PCI_MMIO_END UINT64_C(0x100000000)
 #define FRAMEBUFFER_VA (DEVICE_END - UINT64_C(0x40000000))
 #define FRAMEBUFFER_BYTES UINT64_C(0x4000000)
 #define DEVICE_DIRECTORY_LIMIT 16u
 #define DEVICE_TABLE_LIMIT 64u
 #define DEVICE_BYTES ((uint64_t)DEVICE_TABLE_LIMIT * BLOCK)
 
+_Static_assert(PCI_MMIO_FIRST >= LUME_USER_LIMIT && PCI_MMIO_END <= LUME_LARGE_ELF_BASE &&
+                   PCI_MMIO_END <= LUME_HEAP_EXTENDED_BASE && PCI_MMIO_END <= LUME_THREAD_VM_BASE,
+               "32-bit PCI device mappings must exclude application address ranges");
 _Static_assert(DEVICE_FIRST >= LUME_THREAD_VM_LIMIT && DEVICE_FIRST >= LUME_HEAP_EXTENDED_LIMIT &&
                    DEVICE_FIRST >= LUME_LARGE_ELF_LIMIT && DEVICE_END <= LUME_VM_BASE &&
                    (DEVICE_FIRST >> 39) == 1 && ((DEVICE_END - 1) >> 39) == 1,
@@ -38,11 +44,17 @@ bool lume_mmu_device_prepare(uint64_t address, uint64_t bytes)
 {
     if (!bytes)
         return false;
-    if (address >= UINT64_C(0xc0000000) && address < UINT64_C(0x100000000))
-        return bytes <= UINT64_C(0x100000000) - address;
-    if (!device_initialized || address < DEVICE_FIRST || address >= FRAMEBUFFER_VA ||
-        bytes > FRAMEBUFFER_VA - address || bytes > DEVICE_BYTES)
+    if (address >= PCI_MMIO_LEGACY_FIRST && address < PCI_MMIO_END)
+        return bytes <= PCI_MMIO_END - address;
+    bool low = address >= PCI_MMIO_FIRST && address < PCI_MMIO_LEGACY_FIRST;
+    if (!device_initialized || bytes > DEVICE_BYTES)
         return false;
+    if (low ? bytes > PCI_MMIO_LEGACY_FIRST - address
+            : address < DEVICE_FIRST || address >= FRAMEBUFFER_VA ||
+                  bytes > FRAMEBUFFER_VA - address)
+        return false;
+    /* Firmware BARs below 3 GiB use the shared low device directory in each task. */
+    uint64_t *device_slots = low ? pdpt : device_pdpt;
     uint64_t first = address & ~UINT64_C(4095);
     uint64_t end = (address + bytes + 4095) & ~UINT64_C(4095);
     if (end - first > DEVICE_BYTES)
@@ -54,20 +66,25 @@ bool lume_mmu_device_prepare(uint64_t address, uint64_t bytes)
     for (uint64_t base = first & ~(BLOCK - 1); base < end; base += BLOCK)
     {
         unsigned index = (unsigned)((base >> 30) & 511);
-        uint64_t value = device_pdpt[index];
+        uint64_t value = device_slots[index];
         if (!value)
         {
+            if (low)
+                return false;
             if (previous != index)
                 ++needed_directories;
             ++needed_tables;
         }
         else
         {
-            if ((value & (PRESENT | USER | HUGE)) != PRESENT)
+            if ((value & (PRESENT | HUGE)) != PRESENT || (!low && (value & USER)))
                 return false;
             const uint64_t *directory = (const void *)(uintptr_t)(value & ADDRESS);
-            if (!directory[(base >> 21) & 511])
+            uint64_t entry = directory[(base >> 21) & 511];
+            if (!entry)
                 ++needed_tables;
+            else if ((entry & (PRESENT | USER | HUGE)) != PRESENT)
+                return false;
         }
         previous = index;
     }
@@ -77,16 +94,16 @@ bool lume_mmu_device_prepare(uint64_t address, uint64_t bytes)
     for (uint64_t base = first; base < end; base += 4096)
     {
         unsigned index = (unsigned)((base >> 30) & 511);
-        if (!device_pdpt[index])
+        if (!device_slots[index])
         {
             uint64_t value = table(device_directories[device_directory_count++], false);
-            device_pdpt[index] = value;
+            device_slots[index] = value;
             for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
                 for (unsigned view = 0; view < 2; ++view)
                     if (task_root[task][view][0])
                         task_device_pdpt[task][view][index] = value;
         }
-        uint64_t *directory = (void *)(uintptr_t)(device_pdpt[index] & ADDRESS);
+        uint64_t *directory = (void *)(uintptr_t)(device_slots[index] & ADDRESS);
         uint64_t *entry = directory + ((base >> 21) & 511);
         if (!*entry)
             *entry = table(device_pages[device_table_count++], false);
@@ -130,16 +147,18 @@ uintptr_t lume_mmu_framebuffer_map(uint64_t physical, uint64_t bytes)
 
 static bool device_mapping_present(uint64_t address)
 {
-    if (address >= UINT64_C(0xc0000000) && address < UINT64_C(0x100000000))
+    if (address >= PCI_MMIO_LEGACY_FIRST && address < PCI_MMIO_END)
         return true;
-    if (!device_initialized || address < DEVICE_FIRST || address >= FRAMEBUFFER_VA)
+    bool low = address >= PCI_MMIO_FIRST && address < PCI_MMIO_LEGACY_FIRST;
+    if (!device_initialized || (!low && (address < DEVICE_FIRST || address >= FRAMEBUFFER_VA)))
         return false;
-    uint64_t value = device_pdpt[(address >> 30) & 511];
-    if (!value)
+    const uint64_t *device_slots = low ? pdpt : device_pdpt;
+    uint64_t value = device_slots[(address >> 30) & 511];
+    if ((value & (PRESENT | HUGE)) != PRESENT)
         return false;
     const uint64_t *directory = (const void *)(uintptr_t)(value & ADDRESS);
     value = directory[(address >> 21) & 511];
-    if (!value)
+    if ((value & (PRESENT | USER | HUGE)) != PRESENT)
         return false;
     const uint64_t *pages = (const void *)(uintptr_t)(value & ADDRESS);
     value = pages[(address >> 12) & 511];

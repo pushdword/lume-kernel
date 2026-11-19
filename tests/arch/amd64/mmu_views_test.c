@@ -186,6 +186,7 @@ static void initialize_task(unsigned task)
     assert(task < 3 && !shared[task] && !sparse[task]);
     for (unsigned view = 0; view < 2; ++view)
     {
+        memcpy(task_pdpt[task][view], pdpt, sizeof(pdpt));
         task_root[task][view][0] = table(task_pdpt[task][view], true);
         memcpy(task_device_pdpt[task][view], device_pdpt, sizeof(device_pdpt));
         task_root[task][view][1] = table(task_device_pdpt[task][view], true);
@@ -395,6 +396,49 @@ static void check_device_mappings(void)
     puts("PASS supervisor-only PCI64 mappings preserve thread isolation and address-space swaps");
 }
 
+static void check_pci32_mappings(void)
+{
+    reset_fixture();
+    root[0] = table(pdpt, true);
+    pdpt[2] = table(directories[2], true);
+    initialize_task(0);
+
+    uint64_t bar = UINT64_C(0x81010000), physical;
+    uint64_t user = LUME_USER_BASE + 4096, page = UINT64_C(0x2000000);
+    assert(lume_mmu_map_user_jit(0, user, page, true, false));
+    assert(!lume_mmu_device_mapping(bar));
+    assert(lume_mmu_device_prepare(bar + 32, 4064));
+    assert(lume_mmu_device_prepare(bar, 4096));
+    assert(lume_mmu_device_mapping(bar) && lume_mmu_device_mapping(bar + 4095));
+    assert(!lume_mmu_device_mapping(bar - 1) && !lume_mmu_device_mapping(bar + 4096));
+    initialize_task(1);
+    assert(lume_mmu_translate((uintptr_t)root, bar + 32, true, false, false, &physical));
+    assert(physical == bar + 32);
+    for (unsigned task = 0; task < 2; ++task)
+        for (unsigned view = 0; view < 2; ++view)
+        {
+            uint64_t selected = lume_mmu_task_view_root(task, view);
+            assert(lume_mmu_translate(selected, bar + 32, true, false, false, &physical));
+            assert(physical == bar + 32);
+            assert(!lume_mmu_translate(selected, bar, false, true, false, &physical));
+            assert(!lume_mmu_translate(selected, bar, false, false, true, &physical));
+            assert(!lume_mmu_translate(selected, bar + 4096, false, false, false, &physical));
+        }
+    assert(lume_mmu_translate(lume_mmu_task_root(0), user + 32, true, true, false, &physical));
+    assert(physical == page + 32);
+    device_ram[0] = (struct lume_range){bar + 8192, 4096};
+    device_ram_count = 1;
+    assert(!lume_mmu_device_prepare(bar + 4096, 4097));
+    assert(!lume_mmu_device_mapping(bar + 4096));
+    assert(!lume_mmu_device_prepare(PCI_MMIO_LEGACY_FIRST - 1, 2));
+    assert(!lume_mmu_device_prepare(bar, 0));
+    uint64_t ecam = UINT64_C(0x82000000);
+    directories[2][(ecam >> 21) & 511] = ecam | PRESENT | WRITE | HUGE | NX | 0x18;
+    assert(!lume_mmu_device_prepare(ecam, 4096));
+    assert(!lume_mmu_device_mapping(ecam));
+    puts("PASS firmware PCI32 BARs map only supervisor pages and reject RAM and ECAM overlaps");
+}
+
 static void check_device_mapping_capacity(void)
 {
     reset_fixture();
@@ -429,6 +473,7 @@ int main(void)
     check_swap_release();
     check_shared_selection();
     check_device_mappings();
+    check_pci32_mappings();
     check_device_mapping_capacity();
     reset_fixture();
     puts("AMD64 page-table host checks passed: 9 cases");
