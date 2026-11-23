@@ -21,4 +21,5 @@ $(OUT)/lume-i686.bin: $(OUT)/lume.elf
 
 KERNEL_C += drivers/gpu/virtio_gpu/module.c
 KERNEL_C += drivers/storage/virtio_blk/block.c platform/q35/virtio.c
+KERNEL_C += drivers/net/virtio_net/net.c
 KERNEL_C += drivers/display/bochs_vbe/display.c

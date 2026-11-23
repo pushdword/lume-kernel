@@ -35,7 +35,8 @@ int main(void)
     for (unsigned i = 0; i < LUME_STACK_PAGES; ++i)
         pages[i] = (uintptr_t)memory[LUME_STACK_PAGES - i - 1];
     const char *arguments[LUME_ARG_MAX], *environment[LUME_ENV_MAX];
-    char option[60], setting[120];
+    char option[LUME_ARG_BYTES / LUME_ARG_MAX];
+    char setting[LUME_ENV_BYTES / LUME_ENV_MAX];
     memset(option, 'a', sizeof(option) - 1);
     option[sizeof(option) - 1] = 0;
     memset(setting, 'b', sizeof(setting) - 1);
@@ -69,5 +70,8 @@ int main(void)
     assert(!lume_stack_build(pages, 1, arguments, 0, 0, 1, &stack));
     assert(lume_stack_build(pages, 0, 0, 0, 0, 1, &stack));
     assert(!word(stack) && !word(stack + 8) && !word(stack + 16));
+    assert(lume_stack_build_exec(pages, 0, 0, LUME_ENV_MAX, environment, 1, true, &stack));
+    assert(!word(stack) && !word(stack + 8) && !word(stack + 16));
+    assert(word(stack + 56) == 23 && word(stack + 64) == 1 && !word(stack + 72));
     puts("PASS_USER_STACK arguments/environment/auxiliary/alignment/discontiguous pages/bounds");
 }

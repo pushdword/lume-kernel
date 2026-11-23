@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+
+#define LUME_EXT4_EXTENT_MAX_DEPTH 5u
+#define LUME_EXT4_MODE_FIFO 0x1000u
 
 enum
 {
@@ -12,7 +16,10 @@ enum
     LUME_EXT4_NOT_FOUND = -4,
     LUME_EXT4_NO_SPACE = -5,
     LUME_EXT4_EXISTS = -6,
-    LUME_EXT4_NOT_EMPTY = -7
+    LUME_EXT4_NOT_EMPTY = -7,
+    LUME_EXT4_LINK_LIMIT = -8,
+    LUME_EXT4_LINK_DIRECTORY = -9,
+    LUME_EXT4_TIME_RANGE = -10
 };
 
 /* The reader addresses bytes relative to one filesystem image. */
@@ -28,15 +35,23 @@ struct lume_ext4
     uint32_t dir_hash_seed[4], dir_hash_flags;
     uint16_t inode_bytes, descriptor_bytes;
     uint8_t dir_hash_version;
+    bool journal_indexed;
     uint32_t first_data_block;
+};
+
+struct lume_ext4_time
+{
+    int64_t seconds;
+    uint32_t nanoseconds;
 };
 
 struct lume_ext4_inode
 {
-    uint64_t bytes;
+    uint64_t bytes, sectors;
     uint32_t number, generation, flags, uid, gid;
-    uint16_t mode, inline_bytes;
+    uint16_t mode, inline_bytes, links;
     unsigned char block[60];
+    struct lume_ext4_time accessed, modified, changed;
 };
 
 struct lume_ext4_entry

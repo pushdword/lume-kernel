@@ -1,8 +1,10 @@
 #include "lume/vfs.h"
 #include "lume/external_file.h"
+#include "lume/file_access.h"
 #include "lume/wait.h"
 #include "lume/file_mode.h"
 #include "lume/files.h"
+#include "lume/vfs_paths.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -110,12 +112,59 @@ static void replace_files(void)
     lume_files_release(&files);
 }
 
+static void path_permissions(void)
+{
+    struct lume_files files;
+    lume_files_init(&files);
+    const int64_t cwd = LUME_FILES_AT_CWD;
+    const char *directory = "/tmp/access-check";
+    const char *path = "/tmp/access-check/private";
+    struct lume_file_mode_request request = {.version = LUME_FILE_MODE_VERSION,
+                                             .bytes = sizeof(request),
+                                             .mode = 0700,
+                                             .uid = UINT32_MAX,
+                                             .gid = UINT32_MAX};
+    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_MKDIR, &request, directory) == 0);
+    request.mode = 0600;
+    request.flags = LUME_O_WRONLY | LUME_O_CREAT;
+    int file = (int)lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, path);
+    T(file >= 0 && lume_vfs_close(&files, (unsigned)file) == 0);
+    int dir = (int)lume_vfs_open(&files, directory, LUME_O_RDONLY);
+    T(dir >= 0);
+    T(lume_vfs_symlink_at(&files, dir, "dangling", "missing") == 0);
+    T(lume_vfs_access_at(&files, dir, "dangling", 0, LUME_FILES_ACCESS_NOFOLLOW) == 0);
+    T(lume_vfs_access_at(&files, dir, "dangling", 0, 0) == -LUME_ENOENT);
+    T(lume_vfs_access_at(&files, dir, "private", 1, 0) == -LUME_EACCES);
+    T(lume_vfs_access_at(&files, cwd, "/", 2, 0) == -LUME_EROFS);
+    files.identity.uid = 1001;
+    T(lume_vfs_access_at(&files, dir, "private", 0, 0) == -LUME_EACCES);
+    T(lume_vfs_access_at(&files, cwd, path, 4, LUME_FILES_ACCESS_EFFECTIVE) == 0);
+    files.identity.uid = 0;
+    files.identity.euid = 1001;
+    T(lume_vfs_access_at(&files, cwd, path, 4, 0) == 0);
+    T(lume_vfs_access_at(&files, dir, "private", 4, LUME_FILES_ACCESS_EFFECTIVE) ==
+      -LUME_EACCES);
+    files.identity.euid = 0;
+    T(lume_vfs_remove(&files, path, false) == 0);
+    T(lume_vfs_remove(&files, "/tmp/access-check/dangling", false) == 0);
+    T(lume_vfs_close(&files, (unsigned)dir) == 0);
+    T(lume_vfs_remove(&files, directory, true) == 0);
+    lume_files_release(&files);
+}
+
 static void jail_directory(void)
 {
     struct lume_files files, inherited;
     lume_files_init(&files);
+    T(lume_vfs_chdir(&files, "/tmp") == 0);
+    T(lume_vfs_chroot(&files, "/.") == 0 && !files.identity.jailed);
+    T(!strcmp(lume_files_cwd(&files), "/tmp"));
+    files.identity.euid = 1001;
+    T(lume_vfs_chroot(&files, "/") == -LUME_EPERM);
+    files.identity.euid = 0;
     T(lume_vfs_mkdir(&files, "/tmp/jail-directory") == 0);
     T(lume_vfs_chroot(&files, "/tmp/jail-directory") == 0 && files.identity.jailed);
+    T(lume_vfs_chroot(&files, "/") == -LUME_EPERM);
     struct lume_file_mode_request request = {.version = LUME_FILE_MODE_VERSION,
                                              .bytes = sizeof(request),
                                              .mode = 0600,
@@ -180,7 +229,9 @@ static void jail_directory(void)
     T(fd == 3 && lume_vfs_getdents(&files, fd, &entry, sizeof(entry)) == 0);
     T(lume_vfs_close(&files, fd) == 0);
     files.identity.jailed = false;
-    T(lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/") == -LUME_EPERM);
+    fd = (int)lume_vfs_file_mode(&files, LUME_FILE_MODE_OPEN, &request, "/");
+    T(fd == 3 && lume_vfs_getdents(&files, fd, &entry, sizeof(entry)) > 0);
+    T(lume_vfs_close(&files, fd) == 0);
     files.identity.euid = 0;
     T(lume_vfs_remove(&files, "/tmp/jail-directory", true) == 0);
     lume_files_release(&files);
@@ -233,6 +284,92 @@ static void imported_directory_bounds(void)
     T(!strcmp(buffer.entries[0].name, "last"));
     T(lume_vfs_getdents(&files, fd, buffer.entries, sizeof(buffer.entries)) == 0);
     T(lume_vfs_close(&files, fd) == 0);
+    lume_files_release(&files);
+}
+
+static bool mount_policy_walk(lume_storage_visit visit, void *context)
+{
+    return visit("/data/bin", true, 0, context) &&
+           visit("/data/bin/app", false, 3, context);
+}
+
+static int mount_policy_metadata(const char *path, struct lume_stat *metadata,
+                                 struct lume_inode_access *access, struct lume_file_times *times)
+{
+    (void)times;
+    bool application = !strcmp(path, "/data/bin/app");
+    bool directory = !application;
+    *metadata = (struct lume_stat){.inode = LUME_STORAGE_INODE_BASE + (application ? 3 : 1),
+                                   .size = application ? 3 : 0,
+                                   .kind = directory ? LUME_NODE_DIR : LUME_NODE_FILE,
+                                   .links = 1};
+    *access = (struct lume_inode_access){.uid = application ? 41 : 0,
+                                         .gid = application ? 42 : 0,
+                                         .mode = (directory ? 0040755 : 0104755)};
+    return 0;
+}
+
+static int mount_policy_set_owner(const char *path, uint32_t uid, uint32_t gid)
+{
+    (void)path;
+    (void)uid;
+    (void)gid;
+    return -LUME_EOPNOTSUPP;
+}
+
+static int mount_policy_create(const char *path, unsigned kind,
+                               const struct lume_inode_access *access, uint64_t *inode)
+{
+    (void)path;
+    (void)kind;
+    (void)access;
+    (void)inode;
+    return -LUME_EOPNOTSUPP;
+}
+
+static const struct lume_storage_ops mount_policy_storage = {
+    .walk = mount_policy_walk,
+    .metadata = mount_policy_metadata,
+    .set_owner = mount_policy_set_owner,
+    .create_owned = mount_policy_create,
+};
+
+static void mount_policies(void)
+{
+    struct lume_files files;
+    struct lume_inode_access access;
+    size_t bytes = 0;
+
+    lume_vfs_init("ELF", 3);
+    T(!lume_vfs_mount_storage_flags(&mount_policy_storage, LUME_VFS_MOUNT_FLAGS << 1));
+    T(lume_vfs_mount_storage_flags(
+        &mount_policy_storage, LUME_VFS_MOUNT_NOSUID | LUME_VFS_MOUNT_NODEV));
+    lume_files_init(&files);
+    int object = lume_vfs_program_hold(&files, "/data/bin/app", &bytes);
+    T(object >= 0 && bytes == 3);
+    T(lume_vfs_exec_pin(object) == 0);
+    T(!lume_vfs_exec_access(object, "/data/bin/app", &access));
+    lume_vfs_exec_unpin(object);
+    lume_vfs_drop(object);
+    lume_files_release(&files);
+
+    lume_vfs_init("ELF", 3);
+    T(lume_vfs_mount_storage(&mount_policy_storage));
+    lume_files_init(&files);
+    object = lume_vfs_program_hold(&files, "/data/bin/app", &bytes);
+    T(object >= 0 && lume_vfs_exec_pin(object) == 0);
+    T(lume_vfs_exec_access(object, "/data/bin/app", &access));
+    T(access.uid == 41 && access.gid == 42 && access.mode == 04755);
+    lume_vfs_exec_unpin(object);
+    lume_vfs_drop(object);
+    lume_files_release(&files);
+
+    lume_vfs_init("ELF", 3);
+    T(lume_vfs_mount_storage_flags(&mount_policy_storage, LUME_VFS_MOUNT_NOEXEC));
+    lume_files_init(&files);
+    T(lume_vfs_program_hold(&files, "/data/bin/app", &bytes) == -LUME_EACCES);
+    const void *image = NULL;
+    T(lume_vfs_program(&files, "/data/bin/app", &image, &bytes) == -LUME_EACCES);
     lume_files_release(&files);
 }
 
@@ -299,8 +436,18 @@ int main(void)
     T(lume_vfs_chdir(&f, "/tmp/./../tmp/") == 0 && !strcmp(f.cwd, "/tmp"));
     T(!strcmp(g.cwd, "/"));
     T(lume_vfs_chdir(&f, "/etc/motd") == -LUME_ENOTDIR);
+    T(lume_vfs_mkdir(&f, "/tmp/held-directory") == 0);
+    int directory = (int)lume_vfs_open(&f, "/tmp/held-directory", LUME_O_RDONLY);
+    T(directory >= 0);
+    T(lume_vfs_rename(&f, "/tmp/held-directory", "/tmp/moved-directory") == 0);
+    T(lume_vfs_fchdir(&f, directory) == 0);
+    T(!strcmp(lume_files_cwd(&f), "/tmp/moved-directory"));
+    T(lume_vfs_close(&f, directory) == 0 && lume_vfs_fchdir(&f, directory) == -LUME_EBADF);
+    T(lume_vfs_chdir(&f, "/tmp") == 0);
+    T(lume_vfs_remove(&f, "/tmp/moved-directory", true) == 0);
     int fd = (int)lume_vfs_open(&f, "note", LUME_O_CREAT | LUME_O_RDWR);
     T(fd == 3);
+    T(lume_vfs_fchdir(&f, fd) == -LUME_ENOTDIR);
     T(lume_vfs_write(&f, fd, "abc", 3) == 3);
     T(lume_vfs_open_compat(&g, "/tmp/note", LUME_O_RDWR) == -LUME_EBUSY);
     T(lume_vfs_remove_compat(&g, "/tmp/note", false) == -LUME_EBUSY);
@@ -388,14 +535,29 @@ int main(void)
     T(lume_vfs_remove(&f, "/tmp", true) == -LUME_EROFS);
     fd = (int)lume_vfs_open(&f, "/tmp/shared", LUME_O_CREAT | LUME_O_RDWR);
     T(fd == 3 && lume_vfs_write(&f, fd, "abcdef", 6) == 6);
+    struct lume_fd_request available = {.version = LUME_FD_VERSION,
+                                        .bytes = sizeof(available),
+                                        .fd = fd};
+    T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == 0);
     T(lume_vfs_seek(&f, fd, 0, 0) == 0 && lume_vfs_dup2(&f, fd, 10) == 10);
+    T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == 6);
     T(lume_vfs_read(&f, fd, b, 2) == 2 && !memcmp(b, "ab", 2));
+    available.fd = 10;
+    T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == 4);
     T(lume_vfs_read(&f, 10, b, 2) == 2 && !memcmp(b, "cd", 2));
     struct lume_files inherited;
     lume_files_clone(&inherited, &f);
     T(lume_vfs_read(&inherited, fd, b, 2) == 2 && !memcmp(b, "ef", 2));
+    struct lume_fd_request close_extra = {.version = LUME_FD_VERSION,
+                                          .bytes = sizeof(close_extra),
+                                          .fd = fd + 1};
+    T(lume_vfs_fd_call(&f, LUME_FD_CLOSE_FROM, &close_extra) == 0);
+    T(lume_vfs_read(&f, 10, b, 1) == -LUME_EBADF);
+    T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == -LUME_EBADF);
+    T(lume_vfs_seek(&f, fd, 0, 0) == 0);
+    T(lume_vfs_read(&inherited, 10, b, 2) == 2 && !memcmp(b, "ab", 2));
     lume_files_release(&inherited);
-    T(lume_vfs_close(&f, fd) == 0 && lume_vfs_close(&f, 10) == 0);
+    T(lume_vfs_close(&f, fd) == 0);
     for (unsigned round = 0; round < 100; ++round)
     {
         struct lume_fd_request request = {.version = LUME_FD_VERSION,
@@ -405,6 +567,8 @@ int main(void)
         T(lume_vfs_fd_call(&f, LUME_FD_PIPE, &request) == 0);
         int reading = request.fd, writing = request.other;
         T(reading == 3 && writing == 4);
+        available.fd = reading;
+        T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == 0);
         T(lume_vfs_stat_mode(&f, reading, &st) == 0010600 && st.kind == LUME_NODE_PIPE);
         T(lume_vfs_read(&f, reading, b, 1) == -LUME_EAGAIN);
         T(lume_vfs_read(&f, writing, b, 1) == -LUME_EBADF);
@@ -427,10 +591,12 @@ int main(void)
         for (unsigned i = 0; i < sizeof(b); ++i)
             b[i] = (char)i;
         T(lume_vfs_write(&f, writing, b, sizeof(b)) == sizeof(b));
+        T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == sizeof(b));
         T(lume_wait_take(read_wait, 7));
         T(lume_vfs_write(&f, writing, b, 1) == -LUME_EAGAIN);
         char prefix[17];
         T(lume_vfs_read(&f, reading, prefix, sizeof(prefix)) == sizeof(prefix));
+        T(lume_vfs_fd_call(&f, LUME_FD_AVAILABLE, &available) == sizeof(b) - sizeof(prefix));
         T(!memcmp(prefix, b, sizeof(prefix)));
         T(lume_vfs_write(&f, writing, b, 32) == -LUME_EAGAIN);
         char non_atomic[LUME_PIPE_ATOMIC + 1] = {0};
@@ -458,6 +624,7 @@ int main(void)
     }
     closing_object_lifetime();
     replace_files();
+    path_permissions();
     jail_directory();
     recycled_nodes();
     /* Exhaust finite RAM nodes, independently of open descriptor limits. */
@@ -473,6 +640,7 @@ int main(void)
     }
     T(result == -LUME_ENOSPC);
     imported_directory_bounds();
+    mount_policies();
     printf("VFS RAM paths/fds/permissions/seek/directories/limits: %u checks PASS\n", checks);
     return 0;
 }

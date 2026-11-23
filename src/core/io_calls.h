@@ -1,4 +1,40 @@
+#include "lume/io_redirect.h"
+
 static bool kernel_regular_draining(void);
+static void signal_pipe(unsigned);
+static struct lume_fifo_open fifo_opens[LUME_TASK_LIMIT];
+
+static void kernel_fifo_cancel(unsigned task)
+{
+    struct lume_fifo_open *pending = &fifo_opens[task];
+    if (!pending->object)
+        return;
+    lume_wait_cancel(lume_vfs_fifo_open_queue(pending), task);
+    lume_vfs_fifo_open_cancel(&tasks[process_slot(task)].files, pending);
+}
+
+static bool kernel_fifo_block(unsigned task, int64_t *result)
+{
+    if (*result != LUME_IO_WAIT_FIFO)
+        return false;
+    struct lume_fifo_open *pending = &fifo_opens[task];
+    *result = lume_vfs_fifo_open_resume(&tasks[process_slot(task)].files, pending);
+    if (*result != LUME_IO_WAIT_FIFO)
+        return false;
+    if (!lume_wait_subscribe(lume_vfs_fifo_open_queue(pending), task))
+        lume_fail("FIFO open wait registration");
+    wake_at[task] = UINT64_MAX;
+    task_state_set(task, 4);
+    return true;
+}
+
+static int64_t kernel_io_result(unsigned task, int64_t result)
+{
+    if (result != LUME_IO_PIPE_NO_READERS)
+        return result;
+    signal_pipe(task);
+    return -LUME_EPIPE;
+}
 
 static bool kernel_pipe_buffer_busy(unsigned task, const struct lume_context *frame)
 {
@@ -128,7 +164,7 @@ static struct lume_context *kernel_pipe_result(struct lume_context *frame)
             return select_task((unsigned)next);
         return wait_ready_task();
     }
-    LUME_CONTEXT_REG(frame, 0) = (uint64_t)result;
+    LUME_CONTEXT_REG(frame, 0) = (uint64_t)kernel_io_result(task, result);
     return frame;
 }
 

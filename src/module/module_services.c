@@ -16,7 +16,8 @@ enum
     INTERRUPT_DOMAIN,
     DOMAIN_INTERRUPT,
     RUNNING_WORK,
-    ATTRIBUTE_GROUP
+    ATTRIBUTE_GROUP,
+    SHARED_INTERRUPT
 };
 
 static struct registration
@@ -158,6 +159,35 @@ int lume_module_irq_unregister(unsigned irq, void *context)
     uint64_t flags = lume_irq_save();
     struct registration *r = find(INTERRUPT, (void *)(uintptr_t)(irq + 1));
     int result = r ? lume_irq_unregister(irq, context) : -LUME_ENOENT;
+    if (!result)
+        release(r);
+    lume_irq_restore(flags);
+    return result;
+}
+
+int lume_module_irq_request_shared(unsigned irq, struct lume_irq_action *action,
+                                   lume_irq_shared_handler handler, void *context)
+{
+    if (!action || !handler || irq >= LUME_IRQ_LIMIT)
+        return -LUME_EINVAL;
+    uint64_t flags = lume_irq_save();
+    struct registration *r;
+    int result = reserve_key(SHARED_INTERRUPT, action, irq, (uintptr_t)handler, &r);
+    if (!result)
+    {
+        result = lume_irq_request_shared(irq, action, handler, context);
+        if (result)
+            release(r);
+    }
+    lume_irq_restore(flags);
+    return result;
+}
+
+int lume_module_irq_release_shared(unsigned irq, struct lume_irq_action *action)
+{
+    uint64_t flags = lume_irq_save();
+    struct registration *r = find_key(SHARED_INTERRUPT, action, irq);
+    int result = r ? lume_irq_release_shared(irq, action) : -LUME_ENOENT;
     if (!result)
         release(r);
     lume_irq_restore(flags);

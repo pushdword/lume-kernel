@@ -284,7 +284,7 @@ int lume_virtio_pci_take(struct lume_virtio_pci_queue *queue, unsigned *id, unsi
 
 unsigned lume_virtio_pci_interrupt(struct lume_virtio_pci *device)
 {
-    if (!device || device->failed || !device->isr.bytes)
+    if (!device || !device->isr.bytes)
         return 0;
     return device->io.read(device->io.context, device->isr.address, 1) & 3u;
 }

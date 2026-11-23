@@ -53,6 +53,13 @@ static bool kernel_wait[LUME_TASK_LIMIT], process_exiting[LUME_TASK_LIMIT];
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT];
 static bool context_replaced[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT], pipe_queue, pipe_peer_queue;
+static unsigned pipe_signal_count, pipe_signal_task;
+
+static void signal_pipe(unsigned task)
+{
+    ++pipe_signal_count;
+    pipe_signal_task = task;
+}
 static bool public_mode = true, account_inside;
 static bool active = true, pipe_locked, resident_ready;
 static bool process_stopped[LUME_TASK_LIMIT], main_thread_done[LUME_TASK_LIMIT];
@@ -577,6 +584,33 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *frame, u
     return override_result ? inline_result : block_pipe ? -LUME_EAGAIN : (int64_t)pid * 10;
 }
 
+int64_t lume_public_call_wait(struct lume_files *files, struct lume_context *frame, unsigned pid,
+                              struct lume_fifo_open *pending)
+{
+    assert(pending && !pending->object);
+    return lume_public_call(files, frame, pid);
+}
+
+struct lume_wait_queue *lume_vfs_fifo_open_queue(const struct lume_fifo_open *pending)
+{
+    (void)pending;
+    abort();
+}
+
+int64_t lume_vfs_fifo_open_resume(struct lume_files *files, struct lume_fifo_open *pending)
+{
+    (void)files;
+    (void)pending;
+    abort();
+}
+
+void lume_vfs_fifo_open_cancel(struct lume_files *files, struct lume_fifo_open *pending)
+{
+    (void)files;
+    (void)pending;
+    abort();
+}
+
 int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume_context *frame)
 {
     assert(current_task < LUME_TASK_LIMIT);
@@ -817,6 +851,7 @@ static void reset(void)
     active = resident_ready = terminal_pipe_descriptor = true;
     pipe_locked = false;
     resident_calls = 0;
+    pipe_signal_count = pipe_signal_task = 0;
     clock_reads = 0;
     resident_result = 17;
     memset(process_stopped, 0, sizeof(process_stopped));
@@ -1061,8 +1096,16 @@ static void inline_pipe_completion(void)
             assert(!memcmp(&call, &original, sizeof(call)));
             assert(executed[1] == 1 && !charges && !selections && progress == 1);
             assert(states[1] == 2 && !pipe_wait[1] && !pipe_queue.waiting);
+            assert(!pipe_signal_count);
             assert_filesystem_pending(&queue, &owner);
         }
+    filesystem_pending();
+    struct lume_context call = pipe_frame(true);
+    inline_frame = &call;
+    override_result = true;
+    inline_result = LUME_IO_PIPE_NO_READERS;
+    assert(kernel_pipe_result(&call) == &call && call.x[0] == (uint64_t)-LUME_EPIPE);
+    assert(pipe_signal_count == 1 && pipe_signal_task == 1);
 }
 
 static void directed_pipe_wake(void)
@@ -1323,6 +1366,8 @@ static void resident_pipe_completion(void)
     assert(!charges && !selections && !submissions && !resumes);
     resident_result = -LUME_EPIPE;
     assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && result == -LUME_EPIPE);
+    resident_result = LUME_IO_PIPE_NO_READERS;
+    assert(!lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && !pipe_signal_count);
     resident_result = 0;
     assert(lume_task_pipe_try(3, 3, 0x123000, 17, true, &result) && !result);
     resident_result = -LUME_EAGAIN;

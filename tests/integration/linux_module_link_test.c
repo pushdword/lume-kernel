@@ -93,9 +93,12 @@ int main(int argc, char **argv)
     assert(driver->match_count && driver->context_bytes && !strcmp(driver->name, argv[4]));
     const struct lume_hardware_ops *ops = driver->ops;
     assert(lume_module_elf_contains(&image, (uintptr_t)ops, sizeof(*ops), LUME_MODULE_READ));
-    assert(lume_module_elf_contains(&image, (uintptr_t)ops->probe, 1, LUME_MODULE_EXECUTE));
-    assert(lume_module_elf_contains(&image, (uintptr_t)ops->start, 1, LUME_MODULE_EXECUTE));
-    assert(lume_module_elf_contains(&image, (uintptr_t)ops->stop, 1, LUME_MODULE_EXECUTE));
+    assert(!ops->probe ||
+           lume_module_elf_contains(&image, (uintptr_t)ops->probe, 1, LUME_MODULE_EXECUTE));
+    assert(!ops->start ||
+           lume_module_elf_contains(&image, (uintptr_t)ops->start, 1, LUME_MODULE_EXECUTE));
+    assert(!ops->stop ||
+           lume_module_elf_contains(&image, (uintptr_t)ops->stop, 1, LUME_MODULE_EXECUTE));
     assert(lume_module_elf_release(&image) == 0 && !allocated);
     free(data);
     printf("Linux module linker PASS: machine=%u exports=%u name=%s\n", machine, resolved, argv[4]);

@@ -2,6 +2,7 @@
 #include "user_io_lifetime_test.c"
 #undef main
 #include "fd.h"
+#include "lume/io_redirect.h"
 #include "lume/wait.h"
 #include "lume/tty.h"
 
@@ -160,7 +161,7 @@ static void resident_pipes(void)
     CHECK(lume_vfs_fd_call(&files[0], LUME_FD_PIPE, &request) == 0);
     CHECK(lume_vfs_close(&files[0], request.fd) == 0);
     CHECK(lume_user_io_pipe_try(&files[0], 1, request.other, destination, 1, true, &transferred));
-    CHECK(transferred == -LUME_EPIPE);
+    CHECK(transferred == LUME_IO_PIPE_NO_READERS);
     CHECK(lume_user_io_pipe_try(&files[0], 1, request.other, 0, 0, true, &transferred));
     CHECK(transferred == 0);
     CHECK(lume_vfs_close(&files[0], request.other) == 0);

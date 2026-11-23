@@ -256,6 +256,7 @@ struct dns_req_entry
 {
     /* pointer to callback on DNS query done */
     dns_found_callback found;
+    dns_result_callback completed;
     /* argument passed to the callback function */
     void *arg;
 #if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING) != 0)
@@ -298,7 +299,7 @@ static err_t dns_lookup_local(const char *hostname, size_t hostnamelen,
 static void dns_recv(void *s, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
                      u16_t port);
 static void dns_check_entries(void);
-static void dns_call_found(u8_t idx, ip_addr_t *addr);
+static void dns_call_found(u8_t idx, ip_addr_t *addr, enum dns_result result);
 
 /*-----------------------------------------------------------------------------
  * Globals
@@ -844,7 +845,7 @@ static err_t dns_send(u8_t idx)
     {
         /* DNS server not valid anymore, e.g. PPP netif has been shut down */
         /* call specified callback function if provided */
-        dns_call_found(idx, NULL);
+        dns_call_found(idx, NULL, DNS_RESULT_RETRY);
         /* flush this entry */
         entry->state = DNS_STATE_UNUSED;
         return ERR_OK;
@@ -1030,6 +1031,18 @@ static u8_t dns_alloc_pcb(void)
 }
 #endif /* ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_RAND_SRC_PORT) != 0) */
 
+static void dns_complete_request(struct dns_req_entry *request, const char *name, ip_addr_t *addr,
+                                 enum dns_result result)
+{
+    if (request->completed)
+        request->completed(name, addr, result, request->arg);
+    else if (request->found)
+        request->found(name, addr, request->arg);
+
+    request->found = NULL;
+    request->completed = NULL;
+}
+
 /**
  * dns_call_found() - call the found callback and check if there are duplicate
  * entries for the given hostname. If there are any, their found callback will
@@ -1038,7 +1051,7 @@ static u8_t dns_alloc_pcb(void)
  * @param idx dns table index of the entry that is resolved or removed
  * @param addr IP address for the hostname (or NULL on error or memory shortage)
  */
-static void dns_call_found(u8_t idx, ip_addr_t *addr)
+static void dns_call_found(u8_t idx, ip_addr_t *addr, enum dns_result result)
 {
 #if ((LWIP_DNS_SECURE &                                                                            \
       (LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT)) != 0)
@@ -1065,19 +1078,13 @@ static void dns_call_found(u8_t idx, ip_addr_t *addr)
 #if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING) != 0)
     for (i = 0; i < DNS_MAX_REQUESTS; i++)
     {
-        if (dns_requests[i].found && (dns_requests[i].dns_table_idx == idx))
+        if (dns_requests[i].dns_table_idx == idx)
         {
-            (*dns_requests[i].found)(dns_table[idx].name, addr, dns_requests[i].arg);
-            /* flush this entry */
-            dns_requests[i].found = NULL;
+            dns_complete_request(&dns_requests[i], dns_table[idx].name, addr, result);
         }
     }
 #else
-    if (dns_requests[idx].found)
-    {
-        (*dns_requests[idx].found)(dns_table[idx].name, addr, dns_requests[idx].arg);
-    }
-    dns_requests[idx].found = NULL;
+    dns_complete_request(&dns_requests[idx], dns_table[idx].name, addr, result);
 #endif
 #if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_RAND_SRC_PORT) != 0)
     /* close the pcb used unless other request are using it */
@@ -1202,7 +1209,7 @@ static void dns_check_entry(u8_t i)
                 {
                     LWIP_DEBUGF(DNS_DEBUG, ("dns_check_entry: \"%s\": timeout\n", entry->name));
                     /* call specified callback function if provided */
-                    dns_call_found(i, NULL);
+                    dns_call_found(i, NULL, DNS_RESULT_RETRY);
                     /* flush this entry */
                     entry->state = DNS_STATE_UNUSED;
                     break;
@@ -1273,7 +1280,7 @@ static void dns_correct_response(u8_t idx, u32_t ttl)
     {
         entry->ttl = DNS_MAX_TTL;
     }
-    dns_call_found(idx, &entry->ipaddr);
+    dns_call_found(idx, &entry->ipaddr, DNS_RESULT_SUCCESS);
 
     if (entry->ttl == 0)
     {
@@ -1513,7 +1520,11 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
                 }
                 /* call callback to indicate error, clean up memory and return */
                 pbuf_free(p);
-                dns_call_found(i, NULL);
+                enum dns_result result = DNS_RESULT_RETRY;
+                if ((hdr.flags2 & DNS_FLAG2_ERR_MASK) == DNS_FLAG2_ERR_NAME &&
+                    !(hdr.flags1 & DNS_FLAG1_TRUNC))
+                    result = DNS_RESULT_NOT_FOUND;
+                dns_call_found(i, NULL, result);
                 dns_table[i].state = DNS_STATE_UNUSED;
                 return;
             }
@@ -1536,6 +1547,7 @@ ignore_packet:
  * @return err_t return code.
  */
 static err_t dns_enqueue(const char *name, size_t hostnamelen, dns_found_callback found,
+                         dns_result_callback completed,
                          void *callback_arg LWIP_DNS_ADDRTYPE_ARG(u8_t dns_addrtype)
                              LWIP_DNS_ISMDNS_ARG(u8_t is_mdns))
 {
@@ -1569,9 +1581,10 @@ static err_t dns_enqueue(const char *name, size_t hostnamelen, dns_found_callbac
             /* this is a duplicate entry, find a free request entry */
             for (r = 0; r < DNS_MAX_REQUESTS; r++)
             {
-                if (dns_requests[r].found == NULL)
+                if (dns_requests[r].found == NULL && dns_requests[r].completed == NULL)
                 {
                     dns_requests[r].found = found;
+                    dns_requests[r].completed = completed;
                     dns_requests[r].arg = callback_arg;
                     dns_requests[r].dns_table_idx = i;
                     LWIP_DNS_SET_ADDRTYPE(dns_requests[r].reqaddrtype, dns_addrtype);
@@ -1629,7 +1642,7 @@ static err_t dns_enqueue(const char *name, size_t hostnamelen, dns_found_callbac
     req = NULL;
     for (r = 0; r < DNS_MAX_REQUESTS; r++)
     {
-        if (dns_requests[r].found == NULL)
+        if (dns_requests[r].found == NULL && dns_requests[r].completed == NULL)
         {
             req = &dns_requests[r];
             break;
@@ -1656,6 +1669,7 @@ static err_t dns_enqueue(const char *name, size_t hostnamelen, dns_found_callbac
     LWIP_DNS_SET_ADDRTYPE(entry->reqaddrtype, dns_addrtype);
     LWIP_DNS_SET_ADDRTYPE(req->reqaddrtype, dns_addrtype);
     req->found = found;
+    req->completed = completed;
     req->arg = callback_arg;
     MEMCPY(entry->name, name, namelen);
     entry->name[namelen] = 0;
@@ -1668,6 +1682,7 @@ static err_t dns_enqueue(const char *name, size_t hostnamelen, dns_found_callbac
         LWIP_DEBUGF(DNS_DEBUG, ("dns_enqueue: \"%s\": failed to allocate a pcb\n", name));
         entry->state = DNS_STATE_UNUSED;
         req->found = NULL;
+        req->completed = NULL;
         return ERR_MEM;
     }
     LWIP_DEBUGF(DNS_DEBUG,
@@ -1714,22 +1729,8 @@ err_t dns_gethostbyname(const char *hostname, ip_addr_t *addr, dns_found_callbac
                                       LWIP_DNS_ADDRTYPE_DEFAULT);
 }
 
-/**
- * @ingroup dns
- * Like dns_gethostbyname, but returned address type can be controlled:
- * @param hostname the hostname that is to be queried
- * @param addr pointer to a ip_addr_t where to store the address if it is already
- *             cached in the dns_table (only valid if ERR_OK is returned!)
- * @param found a callback function to be called on success, failure or timeout (only if
- *              ERR_INPROGRESS is returned!)
- * @param callback_arg argument to pass to the callback function
- * @param dns_addrtype - LWIP_DNS_ADDRTYPE_IPV4_IPV6: try to resolve IPv4 first, try IPv6 if IPv4 fails only
- *                     - LWIP_DNS_ADDRTYPE_IPV6_IPV4: try to resolve IPv6 first, try IPv4 if IPv6 fails only
- *                     - LWIP_DNS_ADDRTYPE_IPV4: try to resolve IPv4 only
- *                     - LWIP_DNS_ADDRTYPE_IPV6: try to resolve IPv6 only
- */
-err_t dns_gethostbyname_addrtype(const char *hostname, ip_addr_t *addr, dns_found_callback found,
-                                 void *callback_arg, u8_t dns_addrtype)
+static err_t dns_resolve(const char *hostname, ip_addr_t *addr, dns_found_callback found,
+                         dns_result_callback completed, void *callback_arg, u8_t dns_addrtype)
 {
     size_t hostnamelen;
 #if LWIP_DNS_SUPPORT_MDNS_QUERIES
@@ -1826,9 +1827,36 @@ err_t dns_gethostbyname_addrtype(const char *hostname, ip_addr_t *addr, dns_foun
     }
 
     /* queue query with specified callback */
-    return dns_enqueue(hostname, hostnamelen, found,
+    return dns_enqueue(hostname, hostnamelen, found, completed,
                        callback_arg LWIP_DNS_ADDRTYPE_ARG(dns_addrtype)
                            LWIP_DNS_ISMDNS_ARG(is_mdns));
+}
+
+/**
+ * @ingroup dns
+ * Like dns_gethostbyname, but returned address type can be controlled:
+ * @param hostname the hostname that is to be queried
+ * @param addr pointer to a ip_addr_t where to store the address if it is already
+ *             cached in the dns_table (only valid if ERR_OK is returned!)
+ * @param found a callback function to be called on success, failure or timeout (only if
+ *              ERR_INPROGRESS is returned!)
+ * @param callback_arg argument to pass to the callback function
+ * @param dns_addrtype - LWIP_DNS_ADDRTYPE_IPV4_IPV6: try to resolve IPv4 first, try IPv6 if IPv4 fails only
+ *                     - LWIP_DNS_ADDRTYPE_IPV6_IPV4: try to resolve IPv6 first, try IPv4 if IPv6 fails only
+ *                     - LWIP_DNS_ADDRTYPE_IPV4: try to resolve IPv4 only
+ *                     - LWIP_DNS_ADDRTYPE_IPV6: try to resolve IPv6 only
+ */
+err_t dns_gethostbyname_addrtype(const char *hostname, ip_addr_t *addr, dns_found_callback found,
+                                 void *callback_arg, u8_t dns_addrtype)
+{
+    return dns_resolve(hostname, addr, found, NULL, callback_arg, dns_addrtype);
+}
+
+/* Report the result when an asynchronous lookup completes. */
+err_t dns_gethostbyname_result(const char *hostname, ip_addr_t *addr, dns_result_callback found,
+                               void *callback_arg)
+{
+    return dns_resolve(hostname, addr, NULL, found, callback_arg, LWIP_DNS_ADDRTYPE_DEFAULT);
 }
 
 #endif /* LWIP_DNS */

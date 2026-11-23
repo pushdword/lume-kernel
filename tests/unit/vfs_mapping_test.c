@@ -1,5 +1,6 @@
 #include "lume/vfs.h"
 #include "lume/external_file.h"
+#include "lume/file_mode.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +8,12 @@
 
 void lume_smp_wake(void)
 {
+}
+
+uint64_t lume_pages_alloc_span_uninitialized(unsigned pages)
+{
+    (void)pages;
+    return 0;
 }
 
 int lume_console_getc(void)
@@ -32,8 +39,21 @@ static void executable_reference(void)
     int fd = lume_vfs_open(&f, "/tmp/executable", LUME_O_CREAT | LUME_O_RDWR);
     T(fd >= 0 && lume_vfs_write(&f, fd, "program", 7) == 7);
     size_t bytes;
+    T(lume_vfs_program_hold(&f, "/tmp/executable", &bytes) == -LUME_EACCES);
+    f.identity.euid = 1000;
+    T(lume_vfs_program_hold(&f, "/tmp/executable", &bytes) == -LUME_EACCES);
+    f.identity.euid = 0;
+    struct lume_file_mode_request mode = {.version = LUME_FILE_MODE_VERSION,
+                                          .bytes = sizeof(mode),
+                                          .fd = fd,
+                                          .mode = 0755,
+                                          .uid = UINT32_MAX,
+                                          .gid = UINT32_MAX};
+    T(!lume_vfs_file_mode(&f, LUME_FILE_MODE_FD, &mode, NULL));
+    f.identity.euid = 1000;
     int held = lume_vfs_program_hold(&f, "/tmp/executable", &bytes);
     T(held >= 0 && bytes == 7 && lume_vfs_exec_pin(held) == -LUME_ETXTBSY);
+    f.identity.euid = 0;
     T(!lume_vfs_close(&f, fd));
     T(!lume_vfs_exec_pin(held));
     T(lume_vfs_open(&f, "/tmp/executable", LUME_O_WRONLY) == -LUME_ETXTBSY);

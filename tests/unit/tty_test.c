@@ -1,4 +1,6 @@
+#include "fd.h"
 #include "lume/external_file.h"
+#include "lume/file_access.h"
 #include "lume/tty_device.h"
 #include <assert.h>
 #include <stdio.h>
@@ -41,17 +43,32 @@ void lume_worker_copy(void *destination, const void *source, size_t bytes)
     memcpy(destination, source, bytes);
 }
 
-static int64_t (*stat_callback)(struct lume_files *, const char *, struct lume_stat *);
+static int64_t (*stat_callback)(struct lume_files *, const char *, uint32_t, struct lume_stat *,
+                                struct lume_inode_access *);
+static int (*open_callback)(struct lume_files *, const char *, uint64_t);
+static int (*access_callback)(struct lume_files *, const char *, const struct lume_inode_access *);
 
-void lume_vfs_terminal_stat(int64_t (*callback)(struct lume_files *, const char *,
-                                                struct lume_stat *))
+void lume_vfs_terminal_stat(int64_t (*callback)(struct lume_files *, const char *, uint32_t,
+                                                struct lume_stat *, struct lume_inode_access *))
 {
     stat_callback = callback;
 }
 
 void lume_vfs_terminal_open(int (*callback)(struct lume_files *, const char *, uint64_t))
 {
-    (void)callback;
+    open_callback = callback;
+}
+
+void lume_vfs_terminal_set_access(int (*callback)(struct lume_files *, const char *,
+                                                  const struct lume_inode_access *))
+{
+    access_callback = callback;
+}
+
+void lume_vfs_access_mode(struct lume_files *files, unsigned fd, unsigned mode)
+{
+    (void)files;
+    assert(fd < LUME_FD_MAX && descriptors[fd].ops && mode <= LUME_O_RDWR);
 }
 
 void lume_poll_source_reset(struct lume_poll_source *source)
@@ -83,6 +100,21 @@ void *lume_vfs_external(struct lume_files *files, unsigned fd, const struct lume
 {
     (void)files;
     return fd < LUME_FD_MAX && descriptors[fd].ops == ops ? descriptors[fd].context : NULL;
+}
+
+bool lume_vfs_console_terminal(struct lume_files *files, uint64_t fd)
+{
+    (void)files;
+    return fd == LUME_FD_MAX - 2;
+}
+
+int64_t lume_vfs_fd_call(struct lume_files *files, unsigned action, struct lume_fd_request *request)
+{
+    (void)files;
+    assert(action == LUME_FD_GETFD && request->version == LUME_FD_VERSION &&
+           request->bytes == sizeof(*request));
+    unsigned fd = (unsigned)request->fd;
+    return fd < LUME_FD_MAX && descriptors[fd].ops ? 0 : -LUME_EBADF;
 }
 
 int64_t lume_vfs_close(struct lume_files *files, uint64_t fd)
@@ -233,23 +265,56 @@ int main(void)
     struct lume_files files = {0};
     char buffer[128];
     struct lume_tty_request r = {.version = LUME_TTY_VERSION, .bytes = sizeof(r)};
+    const struct lume_file_ops nonterminal = {0};
+    r.fd = -1;
+    assert(lume_tty_call(&files, 7, LUME_TTY_GET, &r) == -LUME_EBADF);
+    assert(lume_tty_call(&files, 7, LUME_TTY_ISATTY, &r) == -LUME_EBADF);
+    r.fd = LUME_FD_MAX - 1;
+    descriptors[r.fd].ops = &nonterminal;
+    assert(lume_tty_call(&files, 7, LUME_TTY_GET, &r) == -LUME_ENOTTY);
+    assert(lume_tty_call(&files, 7, LUME_TTY_ISATTY, &r) == -LUME_ENOTTY);
+    descriptors[r.fd].ops = NULL;
+    assert(lume_tty_call(&files, 7, LUME_TTY_GET, &r) == -LUME_EBADF);
+    r.fd = LUME_FD_MAX - 2;
+    assert(!lume_tty_call(&files, 7, LUME_TTY_ISATTY, &r));
     for (unsigned iteration = 0; iteration < 3; ++iteration)
     {
         assert(!lume_tty_call(&files, 7, LUME_TTY_CREATE, &r));
         unsigned master = r.fd, slave = r.other;
         void *m = descriptors[master].context, *s = descriptors[slave].context;
         struct lume_stat named, opened_metadata;
-        assert(stat_callback && stat_callback(&files, "/dev/pts/0", &named) == 0020600);
+        struct lume_inode_access access;
+        assert(stat_callback &&
+               stat_callback(&files, "/dev/pts/0", files.identity.euid, &named, &access) == 0020600);
+        assert(!access.uid && !access.gid);
         assert(!descriptors[slave].ops->stat(s, &opened_metadata));
         assert(named.inode == opened_metadata.inode && named.kind == LUME_NODE_CHAR);
-        assert(stat_callback(&files, "/dev/pts/0x", &named) == -LUME_ENOENT);
-        assert(stat_callback(&files, "/other", &named) == -LUME_ENOSYS);
+        assert(stat_callback(&files, "/dev/pts/0x", files.identity.euid, &named, &access) ==
+               -LUME_ENOENT);
+        assert(stat_callback(&files, "/other", files.identity.euid, &named, &access) ==
+               -LUME_ENOSYS);
         files.identity.euid = 42;
-        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_EACCES);
+        assert(stat_callback(&files, "/dev/pts/0", files.identity.euid, &named, &access) ==
+               -LUME_EACCES);
         files.identity.euid = 0;
         files.identity.jailed = true;
-        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_ENOENT);
+        assert(stat_callback(&files, "/dev/pts/0", files.identity.euid, &named, &access) ==
+               -LUME_ENOENT);
         files.identity.jailed = false;
+        const struct lume_inode_access change = {1200, 1400, 0620};
+        assert(!access_callback(&files, "/dev/pts/0", &change));
+        assert(stat_callback(&files, "/dev/pts/0", files.identity.euid, &named, &access) ==
+               0020620);
+        assert(access.uid == 1200 && access.gid == 1400);
+        assert(descriptors[slave].ops->stat_access(s, &opened_metadata, &access) == 0020620);
+        assert(access.uid == 1200 && access.gid == 1400);
+        files.identity.euid = 1500;
+        files.identity.egid = 1400;
+        assert(open_callback(&files, "/dev/pts/0", LUME_O_RDWR) == -LUME_EACCES);
+        int group_writer = open_callback(&files, "/dev/pts/0", LUME_O_WRONLY);
+        assert(group_writer >= 0 && !lume_vfs_close(&files, (unsigned)group_writer));
+        assert(access_callback(&files, "/dev/pts/0", &change) == -LUME_EPERM);
+        files.identity.euid = files.identity.egid = 0;
         assert(tty_read(s, buffer, sizeof(buffer)) == -LUME_EAGAIN);
         assert(tty_write(m, "abc\177d\r", 6) == 6);
         assert(tty_read(s, buffer, sizeof(buffer)) == 4 && !memcmp(buffer, "abd\n", 4));
@@ -293,7 +358,8 @@ int main(void)
         assert(!lume_tty_call(&files, 7, LUME_TTY_FLUSH, &r));
         unsigned count = signal_count;
         assert(!lume_vfs_close(&files, master));
-        assert(stat_callback(&files, "/dev/pts/0", &named) == -LUME_ENOENT);
+        assert(stat_callback(&files, "/dev/pts/0", files.identity.euid, &named, &access) ==
+               -LUME_ENOENT);
         assert(signal_count == count + 1 && last_signal == 1);
         assert((tty_poll(s) & LUME_POLLHUP) && tty_read(s, buffer, sizeof(buffer)) == 0);
         assert(tty_write(s, "x", 1) == -LUME_EPIPE);

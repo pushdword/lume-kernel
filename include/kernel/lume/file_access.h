@@ -1,5 +1,6 @@
 #ifndef LUME_FILE_ACCESS_H
 #define LUME_FILE_ACCESS_H
+#include <stdbool.h>
 #include <stdint.h>
 
 struct lume_identity;
@@ -32,4 +33,5 @@ int lume_file_access(const struct lume_identity *, const struct lume_inode_acces
 /* Removal requires parent write/search permission and honors its sticky bit. */
 int lume_file_remove_access(const struct lume_identity *, const struct lume_inode_access *,
                             uint32_t, unsigned);
+bool lume_file_group_member(const struct lume_identity *, uint32_t gid, bool real_ids);
 #endif

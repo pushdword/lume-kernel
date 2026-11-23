@@ -50,14 +50,20 @@ static inline bool lume_arch_permission_fault(uint64_t cause)
     return (cause & 255) == 14 && (cause & 0x100);
 }
 
-static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer)
+static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer,
+                                       bool extended)
 {
     extern bool lume_user_buffer(uint64_t, uint64_t, bool);
     uint64_t sp = (c->sp & ~UINT64_C(15)) - 20;
-    if (c->sp < 20 || !lume_user_buffer(sp, 8, true))
+    if (c->sp < 20 || !lume_user_buffer(sp, extended ? 16 : 8, true))
         return false;
     *(uint32_t *)(uintptr_t)sp = (uint32_t)restorer;
     *(uint32_t *)(uintptr_t)(sp + 4) = (uint32_t)c->reg[0];
+    if (extended)
+    {
+        *(uint32_t *)(uintptr_t)(sp + 8) = 0;
+        *(uint32_t *)(uintptr_t)(sp + 12) = 0;
+    }
     c->syscall_pc = 0;
     c->sp = sp;
     c->pc = handler;

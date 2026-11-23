@@ -17,7 +17,8 @@ enum lume_tty_action
     LUME_TTY_FLUSH,
     LUME_TTY_AVAILABLE,
     LUME_TTY_NAME,
-    LUME_TTY_OPEN
+    LUME_TTY_OPEN,
+    LUME_TTY_ISATTY
 };
 
 enum

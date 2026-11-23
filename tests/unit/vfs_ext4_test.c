@@ -1,3 +1,4 @@
+#include "lume/file_access.h"
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define main ext4_reader_fixture_main
 #include "ext4_test.c"
@@ -8,6 +9,8 @@
 #include "lume/file_mode.h"
 #include "lume/vfs_paths.h"
 #include "lume/files_call.h"
+
+static int64_t files_request(struct lume_files *, unsigned, struct lume_files_request *);
 
 static unsigned write_checks, deny_write_check;
 
@@ -97,10 +100,15 @@ static void in_memory(void)
     inode(12, 0100640, 5, 9);
     inode(13, 0040750, 1024, 10);
     inode(14, 0100600, 5, 9);
+    unsigned char *fifo = image + 4096 + (15 - 1) * 128;
+    put16(fifo, 0010640);
+    put16(fifo + 0x1a, 1);
     memset(image + 8216, 0, 1000);
     entry(image + 8216, 12, 16, "hello");
     entry(image + 8232, 12, 16, "alias");
-    entry(image + 8248, 2, 968, "nested");
+    entry(image + 8248, 2, 16, "nested");
+    entry(image + 8264, 15, 952, "fifo");
+    image[8264 + 7] = 5;
     entry(image + 10240, 13, 12, ".");
     entry(image + 10252, 2, 12, "..");
     entry(image + 10264, 14, 1000, "child");
@@ -113,11 +121,14 @@ static void in_memory(void)
     struct lume_stat before, after;
     int64_t original_mode = lume_vfs_stat_path(&files, "/", &before);
     assert(original_mode > 0);
-    assert(!lume_vfs_mount_storage(ops));
+    assert(lume_vfs_mount_storage(ops));
     assert(lume_vfs_stat_path(&files, "/", &after) == original_mode);
     assert(before.inode == after.inode);
-    assert(lume_vfs_stat_path(&files, "/data", &after) == -LUME_ENOENT);
-    assert(lume_vfs_stat_path(&files, "/data/hello", &after) == -LUME_ENOENT);
+    assert(lume_vfs_stat_path(&files, "/data", &after) == 0040755);
+    check_file(&files, "/data/hello", "hello", 5, 0100640);
+    lume_files_release(&files);
+    lume_vfs_init(NULL, 0);
+    assert(lume_files_init(&files));
     put32(image + 8248, 13);
     assert(lume_vfs_mount_storage(ops));
     assert(!lume_vfs_mount_storage(ops));
@@ -128,20 +139,53 @@ static void in_memory(void)
     assert(lume_vfs_stat_path(&files, "/data/alias", &after) == 0100640);
     assert(before.inode == after.inode);
     assert(lume_vfs_stat_path(&files, "/data/Hello", &after) == -LUME_ENOENT);
+    assert(lume_vfs_stat_path(&files, "/data/fifo", &after) == 0010640);
+    assert(after.kind == LUME_NODE_PIPE && !after.size && after.links == 1);
+    uint64_t fifo_inode = after.inode;
     int64_t fd = lume_vfs_open(&files, "/data", LUME_O_RDONLY);
     assert(fd >= 0);
     struct lume_dirent entries[8];
     int64_t bytes = lume_vfs_getdents(&files, (uint64_t)fd, entries, sizeof entries);
-    assert(bytes == 3 * sizeof entries[0]);
+    assert(bytes == 4 * sizeof entries[0]);
     unsigned matches = 0;
-    for (unsigned i = 0; i != 3; ++i)
+    bool found_fifo = false;
+    for (unsigned i = 0; i != 4; ++i)
+    {
         if (!strcmp(entries[i].name, "hello") || !strcmp(entries[i].name, "alias"))
         {
             assert(entries[i].inode == before.inode);
             ++matches;
         }
-    assert(matches == 2);
+        if (!strcmp(entries[i].name, "fifo"))
+            found_fifo = entries[i].kind == LUME_NODE_PIPE && entries[i].inode == fifo_inode;
+    }
+    assert(matches == 2 && found_fifo);
+    assert(lume_vfs_seek(&files, (uint64_t)fd, 0, 0) == 0);
+    struct lume_files_dirent_posix posix;
+    assert(lume_vfs_getdents_posix(&files, (uint64_t)fd, &posix, sizeof posix) == sizeof posix);
+    assert(!strcmp(posix.name, ".") && posix.position == LUME_FILES_DIR_AFTER_DOT);
+    assert(lume_vfs_getdents_posix(&files, (uint64_t)fd, &posix, sizeof posix) == sizeof posix);
+    assert(!strcmp(posix.name, "..") && posix.position == LUME_FILES_DIR_AFTER_DOTDOT);
+    uint64_t previous = 0;
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        assert(lume_vfs_getdents_posix(&files, (uint64_t)fd, &posix, sizeof posix) ==
+               sizeof posix);
+        assert(posix.inode && posix.position > previous &&
+               posix.position < LUME_FILES_DIR_AFTER_DOT);
+        previous = posix.position;
+    }
+    assert(lume_vfs_getdents_posix(&files, (uint64_t)fd, &posix, sizeof posix) == 0);
     assert(lume_vfs_close(&files, (uint64_t)fd) == 0);
+    const char fifo_name[] = "/tmp/new-fifo";
+    struct lume_files_request fifo_request = {
+        .path = (uintptr_t)fifo_name, .fd = LUME_FILES_AT_CWD, .mode = 0666};
+    files.identity.umask = 0027;
+    assert(!files_request(&files, LUME_FILES_MKFIFO, &fifo_request));
+    assert(files_request(&files, LUME_FILES_MKFIFO, &fifo_request) == -LUME_EEXIST);
+    assert(lume_vfs_stat_path(&files, fifo_name, &after) == 0010640);
+    assert(after.kind == LUME_NODE_PIPE && !after.size && after.links == 1);
+    assert(!lume_vfs_remove(&files, fifo_name, false));
     check_volume(&files);
     void *handle;
     assert(ops->open("/data/hello", LUME_O_RDONLY, &handle) == 0);
@@ -153,10 +197,10 @@ static void in_memory(void)
     assert(ops->read_handle(handle, 0, output, 5) == -LUME_EIO);
     fail_read = 0;
     assert(ops->close(handle) == 0);
-    unsigned mode;
-    assert(ops->metadata("/data/../hello", &after, &mode) == -LUME_EINVAL);
-    assert(ops->metadata("/database/hello", &after, &mode) == -LUME_ENOENT);
-    assert(ops->metadata("/data/hello/child", &after, &mode) == -LUME_ENOTDIR);
+    struct lume_inode_access access;
+    assert(ops->metadata("/data/../hello", &after, &access, NULL) == -LUME_EINVAL);
+    assert(ops->metadata("/database/hello", &after, &access, NULL) == -LUME_ENOENT);
+    assert(ops->metadata("/data/hello/child", &after, &access, NULL) == -LUME_ENOTDIR);
     assert(ops->write("/data/hello", 0, "x", 1) == -LUME_EROFS);
     assert(ops->create("/data/new", false) == -LUME_EROFS);
     assert(ops->remove("/data/hello") == -LUME_EROFS);
@@ -170,7 +214,7 @@ static int64_t files_request(struct lume_files *files, unsigned operation,
 {
     request->version = LUME_FILES_VERSION;
     request->bytes = sizeof(*request);
-    return lume_files_call(files, operation, (uintptr_t)request, sizeof(*request));
+    return lume_files_call(files, operation, (uintptr_t)request, sizeof(*request), NULL);
 }
 
 static void check_links(struct lume_files *files, unsigned mode)
@@ -236,6 +280,16 @@ static void check_links(struct lume_files *files, unsigned mode)
     request.flags = LUME_FILES_STAT_NOFOLLOW;
     assert(files_request(files, LUME_FILES_STAT, &request) == 0120777);
     assert(link.kind == LUME_NODE_LINK);
+    struct lume_files_stat_allocation allocated;
+    request.buffer = (uintptr_t)&allocated;
+    request.count = sizeof allocated;
+    assert(files_request(files, LUME_FILES_STAT, &request) == 0120777);
+    assert(allocated.metadata.stat.size == 7 && allocated.allocation.block_bytes >= 1024);
+    assert(!allocated.allocation.sectors);
+    request.flags = 0;
+    assert(files_request(files, LUME_FILES_STAT, &request) == (0100000u | mode));
+    assert(allocated.metadata.stat.size == 11 && allocated.allocation.block_bytes >= 1024);
+    assert(allocated.allocation.sectors == allocated.allocation.block_bytes / 512);
     request.buffer = request.count = 0;
     request.flags = LUME_FILES_OPEN_NOFOLLOW;
     assert(files_request(files, LUME_FILES_OPEN, &request) == -LUME_ELOOP);

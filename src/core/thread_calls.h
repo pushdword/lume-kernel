@@ -370,33 +370,29 @@ static struct lume_context *thread_call(struct lume_context *frame)
             }
             uint64_t base = LUME_USER_STACK, bytes = LUME_STACK_PAGES * UINT64_C(4096);
             unsigned guard = 0;
-            if (thread_slots[target].thread)
+            if (thread_slots[target].thread && thread_pages[target])
             {
-#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
-    defined(LUME_ARCH_I686)
-                if (!thread_pages[target])
-                {
-                    if (!lume_vm_thread_bounds(owner, target, &base, &bytes))
-                    {
-                        LUME_CONTEXT_REG(frame, 0) = (uint64_t)-3;
-                        return frame;
-                    }
-                }
-                else
-#endif
-                {
-                    uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
-                    uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
+                uint64_t align = images[owner].tls_align ? images[owner].tls_align : 16;
+                uint64_t tls_size = lume_arch_tls_size(images[owner].tls_size, align);
 #if defined(LUME_ARCH_AMD64)
-                    tls_size += 16;
+                tls_size += 16;
 #endif
-                    unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
-                    base = LUME_THREAD_BASE + (uint64_t)target * 0x100000 +
-                           (uint64_t)(tls_pages + 2) * 4096;
-                    bytes = (uint64_t)(thread_pages[target] - tls_pages - 1) * 4096;
-                }
+                unsigned tls_pages = (unsigned)((tls_size + 4095) / 4096);
+                base = LUME_THREAD_BASE + (uint64_t)target * 0x100000 +
+                       (uint64_t)(tls_pages + 2) * 4096;
+                bytes = (uint64_t)(thread_pages[target] - tls_pages - 1) * 4096;
                 guard = 4096;
             }
+#if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
+    defined(LUME_ARCH_I686)
+            else if (lume_vm_thread_bounds(owner, target, &base, &bytes))
+                guard = 4096;
+            else if (thread_slots[target].thread)
+            {
+                LUME_CONTEXT_REG(frame, 0) = (uint64_t)-3;
+                return frame;
+            }
+#endif
             user->address = base;
             user->stack_bytes = bytes;
             user->argument = guard;

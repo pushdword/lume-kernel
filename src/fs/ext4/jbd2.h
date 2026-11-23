@@ -6,6 +6,9 @@
 #define EXT4_HAS_JOURNAL UINT32_C(0x4)
 #define EXT4_NEEDS_RECOVERY UINT32_C(0x4)
 #define EXT4_FAST_COMMIT UINT32_C(0x400)
+#define EXT4_ORPHAN_FILE UINT32_C(0x1000)
+#define EXT4_ORPHAN_PRESENT UINT32_C(0x10000)
+#define EXT4_SB_LAST_ORPHAN 0xe8u
 
 enum
 {
@@ -28,6 +31,8 @@ typedef int (*lume_ext4_fast_visitor)(struct lume_ext4_writer *, unsigned, const
 
 int lume_ext4_jbd2_open(struct lume_ext4_writer *, const unsigned char *, const unsigned char *,
                         bool);
+int lume_ext4_journal_map(struct lume_ext4_writer *, uint32_t, uint64_t *, unsigned *);
+bool lume_ext4_journal_overlaps(const struct lume_ext4_writer *, uint64_t, uint64_t);
 bool lume_ext4_jbd2_publish(struct lume_ext4_writer *, unsigned);
 bool lume_ext4_jbd2_publish_inode(struct lume_ext4_writer *, uint32_t, const unsigned char *,
                                   unsigned);

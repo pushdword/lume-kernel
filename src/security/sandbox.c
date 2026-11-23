@@ -244,7 +244,8 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
                    : -LUME_EPERM;
     case LUME_SYS_FILES:
         return action == LUME_FILES_OPEN || action == LUME_FILES_STAT ||
-                       action == LUME_FILES_CHDIR || action == LUME_FILES_GETCWD ||
+                       action == LUME_FILES_CHDIR || action == LUME_FILES_FCHDIR ||
+                       action == LUME_FILES_GETCWD ||
                        action == LUME_FILES_GETDENTS || action == LUME_FILES_FD_PATH ||
                        action == LUME_FILES_CANONICAL || action == LUME_FILES_VOLUME ||
                        action == LUME_FILES_READLINK ||
@@ -261,6 +262,7 @@ int lume_sandbox_check(struct lume_files *files, unsigned pid, const struct lume
     case LUME_SYS_SIGNAL:
         return action == LUME_SIGNAL_ACTION || action == LUME_SIGNAL_MASK ||
                        action == LUME_SIGNAL_TRY_WAIT || action == LUME_SIGNAL_WAIT ||
+                       action == LUME_SIGNAL_PENDING ||
                        action == LUME_SIGNAL_RETURN || action == LUME_SIGNAL_TIMER ||
                        action == LUME_SIGNAL_PARENT || action == LUME_SIGNAL_GROUP ||
                        action == LUME_SIGNAL_SESSION

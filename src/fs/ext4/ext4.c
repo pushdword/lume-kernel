@@ -7,6 +7,7 @@
 
 #define EXTENTS UINT32_C(0x80000)
 #define METADATA_CSUM UINT32_C(0x400)
+#define HUGE_FILE UINT32_C(0x8)
 #define CSUM_SEED UINT32_C(0x2000)
 #define BIT64 UINT32_C(0x80)
 
@@ -263,11 +264,15 @@ static int open_filesystem(struct lume_ext4 *fs, lume_ext4_read_bytes read, void
         return LUME_EXT4_INVALID;
     uint32_t incompat = le32(s + 0x60), ro = le32(s + 0x64);
     uint32_t features = UINT32_C(0x22c2) | EXT4_LARGE_DIR | (pending ? EXT4_NEEDS_RECOVERY : 0);
+    uint32_t ro_features = UINT32_C(0x256b) | (pending ? EXT4_ORPHAN_PRESENT : 0);
     bool recovery = (incompat & EXT4_NEEDS_RECOVERY) != 0;
-    if (recovery != pending || (incompat & ~features) || (ro & ~UINT32_C(0x256b)) ||
+    if (recovery != pending || (incompat & ~features) || (ro & ~ro_features) ||
         (pending && (!(le32(s + 0x5c) & EXT4_HAS_JOURNAL) || !(ro & METADATA_CSUM))))
         return LUME_EXT4_UNSUPPORTED;
-    if (le16(s + 0x3a) != 1 || le32(s + 0x48) != 0 || le32(s + 0xe8))
+    if ((ro & EXT4_ORPHAN_PRESENT) && !(le32(s + 0x5c) & EXT4_ORPHAN_FILE))
+        return LUME_EXT4_INVALID;
+    uint32_t orphan = le32(s + EXT4_SB_LAST_ORPHAN);
+    if (le16(s + 0x3a) != 1 || le32(s + 0x48) != 0 || (!pending && orphan))
         return LUME_EXT4_UNSUPPORTED;
     if ((incompat & CSUM_SEED) && !(ro & METADATA_CSUM))
         return LUME_EXT4_INVALID;
@@ -288,6 +293,8 @@ static int open_filesystem(struct lume_ext4 *fs, lume_ext4_read_bytes read, void
     }
     uint32_t first = le32(s + 0x14), per_group = le32(s + 0x20);
     uint32_t inodes = le32(s), inode_group = le32(s + 0x28);
+    if (orphan && (orphan < le32(s + 0x54) || orphan > inodes))
+        return LUME_EXT4_INVALID;
     uint16_t inode_bytes = le16(s + 0x58);
     uint16_t descriptor = (incompat & BIT64) ? le16(s + 0xfe) : 32;
     if (first != (shift == 0) || blocks <= first || blocks > bytes / block_bytes || !per_group ||
@@ -323,6 +330,8 @@ static int open_filesystem(struct lume_ext4 *fs, lume_ext4_read_bytes read, void
             (incompat & CSUM_SEED) ? le32(s + 0x270) : lume_ext4_crc32c(UINT32_MAX, s + 0x68, 16),
         .dir_hash_seed = {le32(s + 0xec), le32(s + 0xf0), le32(s + 0xf4), le32(s + 0xf8)},
         .dir_hash_flags = le32(s + 0x160),
+        .journal_indexed = (le32(s + 0x5c) & EXT4_HAS_JOURNAL) && le32(s + 0xe0) &&
+                           s[0xfd] == 1 && le16(s + 0x112),
         .inode_bytes = inode_bytes,
         .descriptor_bytes = descriptor,
         .first_data_block = first};
@@ -339,6 +348,14 @@ int lume_ext4_open_pending(struct lume_ext4 *fs, lume_ext4_read_bytes read, void
                            uint64_t bytes, void *scratch, size_t scratch_bytes)
 {
     return open_filesystem(fs, read, context, bytes, scratch, scratch_bytes, true);
+}
+
+static struct lume_ext4_time inode_time(const unsigned char *raw, unsigned low, unsigned extra,
+                                        unsigned extra_bytes)
+{
+    uint32_t high = extra_bytes >= extra + 4 - 128 ? le32(raw + extra) : 0;
+    int64_t seconds = (int32_t)le32(raw + low) + (int64_t)(high & 3u) * INT64_C(4294967296);
+    return (struct lume_ext4_time){.seconds = seconds, .nanoseconds = high >> 2};
 }
 
 int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume_ext4_inode *inode,
@@ -392,21 +409,31 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
             return LUME_EXT4_INVALID;
     }
     uint16_t mode = le16(s);
+    unsigned type = mode & 0xf000;
     uint32_t flags = le32(s + 0x20);
-    if (((mode & 0xf000) != 0x8000 && (mode & 0xf000) != 0x4000 && (mode & 0xf000) != 0xa000) ||
+    if ((type != 0x8000 && type != 0x4000 && type != 0xa000 && type != LUME_EXT4_MODE_FIFO) ||
         (flags & ~(EXTENTS | EXT4_INDEX_INODE)))
         return LUME_EXT4_UNSUPPORTED;
     if (((flags & EXTENTS) && !(fs->incompat & 0x40)) ||
-        ((flags & EXT4_INDEX_INODE) && ((mode & 0xf000) != 0x4000 || !(fs->compat & 0x20))))
+        ((flags & EXT4_INDEX_INODE) && (type != 0x4000 || !(fs->compat & 0x20))) ||
+        (type == LUME_EXT4_MODE_FIFO && (flags || le32(s + 4) || le32(s + 0x6c))))
         return LUME_EXT4_INVALID;
+    uint64_t sectors = le32(s + 0x1c);
+    if (fs->ro_compat & HUGE_FILE)
+        sectors |= (uint64_t)le16(s + 0x74) << 32;
     *inode =
         (struct lume_ext4_inode){.bytes = (uint64_t)le32(s + 4) | (uint64_t)le32(s + 0x6c) << 32,
+                                 .sectors = sectors,
                                  .number = number,
                                  .generation = generation,
                                  .flags = flags,
                                  .uid = (uint32_t)le16(s + 2) | (uint32_t)le16(s + 0x78) << 16,
                                  .gid = (uint32_t)le16(s + 0x18) | (uint32_t)le16(s + 0x7a) << 16,
-                                 .mode = mode};
+                                 .mode = mode,
+                                 .links = le16(s + 0x1a),
+                                 .accessed = inode_time(s, 0x8, 0x8c, extra),
+                                 .modified = inode_time(s, 0x10, 0x88, extra),
+                                 .changed = inode_time(s, 0xc, 0x84, extra)};
     if (inode->bytes > (UINT64_C(1) << 32) * fs->block_bytes)
         return LUME_EXT4_UNSUPPORTED;
     if (!(flags & EXTENTS))
@@ -418,9 +445,8 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
     }
     for (unsigned i = 0; i != sizeof inode->block; ++i)
         inode->block[i] = s[0x28 + i];
-    if ((mode & 0xf000) == 0xa000)
+    if (type == 0xa000)
     {
-        uint64_t sectors = (uint64_t)le32(s + 0x1c) | (uint64_t)le16(s + 0x74) << 32;
         uint64_t acl = (uint64_t)le32(s + 0x68) | (uint64_t)le16(s + 0x76) << 32;
         uint64_t ea_sectors = acl ? fs->block_bytes / 512 : 0;
         if (!inode->bytes || inode->bytes >= fs->block_bytes || sectors < ea_sectors ||
@@ -539,7 +565,7 @@ static int extent_window(const struct lume_ext4 *fs, const struct lume_ext4_inod
     const unsigned char *node = inode->block;
     size_t bytes = sizeof inode->block;
     unsigned expected_depth = le16(node + 6);
-    if (expected_depth > 5)
+    if (expected_depth > LUME_EXT4_EXTENT_MAX_DEPTH)
         return LUME_EXT4_UNSUPPORTED;
     uint64_t limit = UINT64_C(1) << 32;
     for (;;)

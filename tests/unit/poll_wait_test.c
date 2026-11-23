@@ -36,7 +36,8 @@ static struct
     bool thread;
     unsigned process;
 } thread_slots[LUME_TASK_LIMIT];
-static struct poll_wait_state poll_waits[LUME_TASK_LIMIT];
+static struct poll_wait_state poll_storage[LUME_TASK_LIMIT];
+static struct poll_wait_state *poll_waits = poll_storage;
 static unsigned states[LUME_TASK_LIMIT], parents[LUME_TASK_LIMIT], exit_signals[LUME_TASK_LIMIT];
 #include "task_state.h"
 static bool pipe_wait[LUME_TASK_LIMIT], input_wait[LUME_TASK_LIMIT], kernel_wait[LUME_TASK_LIMIT];
@@ -45,8 +46,14 @@ static bool process_stopped[LUME_TASK_LIMIT], process_adopted[LUME_TASK_LIMIT];
 static unsigned child_events[LUME_TASK_LIMIT], stop_signals[LUME_TASK_LIMIT];
 static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static uint64_t wake_at[LUME_TASK_LIMIT];
-static bool vm_fault_wait[LUME_TASK_LIMIT], vm_fault_ready[LUME_TASK_LIMIT];
+static bool vm_fault_wait[LUME_TASK_LIMIT];
 static struct lume_wait_queue *pipe_queues[LUME_TASK_LIMIT];
+static struct lume_fifo_open fifo_opens[LUME_TASK_LIMIT];
+
+static void kernel_fifo_cancel(unsigned task)
+{
+    fifo_opens[task] = (struct lume_fifo_open){0};
+}
 static struct lume_wait_queue queue;
 static uint32_t watched[LUME_TASK_LIMIT];
 static struct lume_context suspended;
@@ -141,6 +148,12 @@ void lume_smp_wake(void)
     ++ipis;
 }
 
+static void lume_smp_wake_count(unsigned count, unsigned allowed)
+{
+    assert(count && allowed);
+    lume_smp_wake();
+}
+
 static void lume_watchdog_progress(void)
 {
     ++progress;
@@ -197,6 +210,13 @@ static struct lume_context *finish_program(unsigned status)
     return NULL;
 }
 
+static struct lume_context *thread_finish(uint64_t result)
+{
+    assert(!result && thread_slots[current_task].thread);
+    task_state_set(current_task, 0);
+    return NULL;
+}
+
 static void request_exit(unsigned owner, unsigned status)
 {
     assert(expected_exit_status && status == expected_exit_status && owner < LUME_TASK_LIMIT);
@@ -204,8 +224,10 @@ static void request_exit(unsigned owner, unsigned status)
     ++exit_requests;
 }
 
-static bool lume_context_signal(struct lume_context *frame, uint64_t handler, uint64_t restorer)
+static bool lume_context_signal(struct lume_context *frame, uint64_t handler, uint64_t restorer,
+                                bool extended)
 {
+    (void)extended;
     frame->pc = handler;
     frame->x[30] = restorer;
     return true;
@@ -290,7 +312,7 @@ bool lume_vm_code_address(unsigned task, uint64_t address)
 
 static bool task_signal_pending(unsigned owner)
 {
-    return (signals[owner].pending & ~signals[owner].mask) != 0;
+    return (signal_pending_bits(&signals[owner]) & ~signals[owner].mask) != 0;
 }
 
 static uint64_t thread_realtime_deadline[LUME_TASK_LIMIT];
@@ -409,7 +431,9 @@ static void reset(void)
     memset(tasks, 0, sizeof(tasks));
     memset(signals, 0, sizeof(signals));
     memset(thread_slots, 0, sizeof(thread_slots));
-    memset(poll_waits, 0, sizeof(poll_waits));
+    memset(poll_storage, 0, sizeof(poll_storage));
+    memset(exit_signals, 0, sizeof(exit_signals));
+    memset(fifo_opens, 0, sizeof(fifo_opens));
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
         task_state_set(i, 0);
     memset(pipe_wait, 0, sizeof(pipe_wait));
@@ -1153,11 +1177,50 @@ static void check_shared_words(void)
     }
 }
 
+static void check_pipe_signal(void)
+{
+    reset();
+    task_state_set(0, 1);
+    task_state_set(1, 2);
+    thread_slots[1].thread = true;
+    current_task = 1;
+    struct signal_action *action = &signals[0].action[SIGNAL_PIPE];
+    *action = (struct signal_action){.handler = 0x2000, .restorer = 0x3000};
+    uint32_t bit = UINT32_C(1) << SIGNAL_PIPE;
+    signals[1].mask = bit;
+    signal_pipe(1);
+    assert(!signal_pending_bits(&signals[0]) && signals[1].directed_pending == bit);
+    struct lume_signal_request waited = {
+        .version = LUME_SIGNAL_VERSION, .bytes = sizeof(waited), .mask = bit};
+    assert(!signal_wait_take(1, 0, &waited) && waited.number == SIGNAL_PIPE);
+    signals[0].mask = bit;
+    signal_pipe(0);
+    waited.number = 0;
+    assert(signal_wait_take(1, 0, &waited) == -LUME_EAGAIN);
+    assert(!signal_wait_take(0, 0, &waited) && waited.number == SIGNAL_PIPE);
+    signals[1].mask = 0;
+    signal_pipe(1);
+    struct lume_context frame = {.pc = 0x1000, .x = {(uint64_t)-LUME_EPIPE}};
+    assert(lume_tasks_deliver_signals(&frame) == &frame && frame.pc == 0x2000);
+    assert(frame.x[0] == SIGNAL_PIPE && !signals[0].depth && signals[1].depth == 1);
+    frame.x[0] = LUME_SIGNAL_RETURN;
+    assert(signal_call(&frame, 0) == -LUME_EPIPE && frame.pc == 0x1000);
+    *action = (struct signal_action){.handler = 1};
+    signal_pipe(1);
+    assert(!signal_pending_bits(&signals[1]));
+    *action = (struct signal_action){0};
+    expected_exit_status = 128 + SIGNAL_PIPE;
+    signal_pipe(1);
+    assert(!lume_tasks_deliver_signals(&frame) && exit_requests == 1);
+    assert(exit_signals[0] == SIGNAL_PIPE && !exit_signals[1]);
+}
+
 int main(void)
 {
     check_waits();
     check_nonblocking();
     check_signals();
+    check_pipe_signal();
     check_futex_signal();
     check_console();
     check_tty_read_wait();

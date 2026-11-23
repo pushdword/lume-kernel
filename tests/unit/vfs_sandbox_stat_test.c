@@ -1,3 +1,4 @@
+#include "lume/file_access.h"
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define main vfs_unrestricted_fixture_main
 #include "vfs_test.c"
@@ -54,8 +55,10 @@ static bool link_walk(lume_storage_visit visit, void *context)
     return true;
 }
 
-static int link_metadata(const char *path, struct lume_stat *out, unsigned *mode)
+static int link_metadata(const char *path, struct lume_stat *out, struct lume_inode_access *access,
+                         struct lume_file_times *times)
 {
+    (void)times;
     for (unsigned i = 0; i < sizeof link_entries / sizeof *link_entries; ++i)
         if (!strcmp(path, link_entries[i].path))
         {
@@ -63,9 +66,9 @@ static int link_metadata(const char *path, struct lume_stat *out, unsigned *mode
                 .inode = UINT64_C(0x100000000) + i,
                 .size = link_entries[i].target ? strlen(link_entries[i].target) : 0,
                 .kind = link_entries[i].kind};
-            *mode = out->kind == LUME_NODE_LINK  ? 0120777
-                    : out->kind == LUME_NODE_DIR ? 0040755
-                                                 : 0100644;
+            *access = (struct lume_inode_access){
+                .mode = out->kind == LUME_NODE_LINK ? 0120777
+                        : out->kind == LUME_NODE_DIR ? 0040755 : 0100644};
             return 0;
         }
     return -LUME_ENOENT;
@@ -95,6 +98,13 @@ static void symlink_authority(struct lume_files *owner)
     restricted.identity.sandbox_profile = LUME_SANDBOX_NETWORK;
     struct lume_stat status;
     char target[64];
+    T(lume_vfs_symlink_at(owner, LUME_FILES_AT_CWD, "/tmp/stat-root/ram-link", "private") == 0);
+    T(lume_vfs_readlink_at(owner, LUME_FILES_AT_CWD, "/tmp/stat-root/ram-link", target,
+                           sizeof target) == 7);
+    T(!memcmp(target, "private", 7));
+    T(lume_vfs_readlink_at(&restricted, LUME_FILES_AT_CWD, "/tmp/stat-root/ram-link", target,
+                           sizeof target) == -LUME_EPERM);
+    T(lume_vfs_open(&restricted, "/tmp/stat-root/ram-link", LUME_O_RDONLY) == -LUME_EPERM);
     T(lume_vfs_stat_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/good", &status) ==
       0100644);
     T(lume_vfs_lstat_at(&restricted, LUME_FILES_AT_CWD, "/data/share/fonts/escape", &status) ==
@@ -108,6 +118,7 @@ static void symlink_authority(struct lume_files *owner)
       -LUME_ELOOP);
     T(lume_vfs_readlink_at(&restricted, LUME_FILES_AT_CWD, "/tmp/stat-root/private", target,
                            sizeof target) == -LUME_EPERM);
+    T(lume_vfs_remove(owner, "/tmp/stat-root/ram-link", false) == 0);
     lume_files_release(&restricted);
 }
 

@@ -2,14 +2,21 @@
 #include "htree.h"
 #include "jbd2.h"
 #include "lume/ext4_write.h"
+#include "lume/file_access.h"
 #include <string.h>
 
 #define EXTENTS UINT32_C(0x80000)
 #define CSUM UINT32_C(0x400)
 #define BIT64 UINT32_C(0x80)
 #define JOURNAL_DEVICE UINT32_C(0x8)
+#define EXT4_EXT_ATTR UINT32_C(0x8)
+#define EXT4_XATTR_MAGIC UINT32_C(0xea020000)
+#define EXT4_XATTR_MAX_REFS 1024u
 #define EXTENT_BYTES 12u
 #define INLINE_EXTENTS 4u
+#define BG_INODE_UNINIT 1u
+#define BG_BLOCK_UNINIT 2u
+#define BG_INODE_ZEROED 4u
 
 _Static_assert(LUME_EXT4_WRITE_BLOCKS <= UINT8_MAX &&
                    !(LUME_EXT4_WRITE_BLOCKS & (LUME_EXT4_WRITE_BLOCKS - 1)),
@@ -19,8 +26,7 @@ enum
 {
     DATA,
     EXTENT_LEAF,
-    EXTENT_INDEX,
-    INODE,
+    INODE = EXTENT_LEAF + LUME_EXT4_EXTENT_MAX_DEPTH + 1,
     DIRECTORY,
     BITMAP,
     DESCRIPTOR
@@ -55,6 +61,11 @@ static uint32_t number_checksum(uint32_t value, uint32_t number)
     return lume_ext4_crc32c(value, raw, sizeof raw);
 }
 
+static uint32_t block_checksum_seed(uint32_t seed, uint64_t block)
+{
+    return number_checksum(number_checksum(seed, (uint32_t)block), (uint32_t)(block >> 32));
+}
+
 static uint32_t inode_seed(const struct lume_ext4_writer *w, uint32_t number,
                            const unsigned char *inode)
 {
@@ -74,14 +85,6 @@ static unsigned extent_tail(const unsigned char *node)
 static unsigned extent_capacity(const struct lume_ext4 *fs)
 {
     return (fs->block_bytes - EXTENT_BYTES - 4) / EXTENT_BYTES;
-}
-
-static size_t extent_range_slots(const struct lume_ext4 *fs)
-{
-    if (!(fs->incompat & 0x40))
-        return 0;
-    size_t slots = LUME_EXT4_WRITE_BLOCKS * extent_capacity(fs);
-    return fs->blocks < slots ? (size_t)fs->blocks : slots;
 }
 
 static unsigned char *transaction_scratch(const struct lume_ext4_writer *w)
@@ -151,6 +154,21 @@ static unsigned char *bytes(struct lume_ext4_writer *w, uint64_t number)
 {
     struct lume_ext4_write_block *entry = stage_block(w, number, true);
     return entry ? entry->data : NULL;
+}
+
+static const unsigned char *extent_view(struct lume_ext4_writer *w, uint64_t block, unsigned depth)
+{
+    struct lume_ext4_write_block *entry = cached_block(w, block);
+    if (entry)
+        return entry->data;
+    unsigned size = w->fs->block_bytes;
+    unsigned char *node = transaction_scratch(w) + (size_t)depth * size;
+    if (w->fs->read(w->fs->context, block * size, node, size))
+    {
+        fail(w, LUME_EXT4_IO);
+        return NULL;
+    }
+    return node;
 }
 
 static void changed(struct lume_ext4_writer *w, unsigned char *data, unsigned phase)
@@ -287,7 +305,8 @@ static bool data_range(struct lume_ext4_writer *w, uint64_t first, uint64_t coun
     unsigned reserved = first_reserved(w, first);
     if (!count || first < w->fs->first_data_block || first >= w->fs->blocks ||
         count > w->fs->blocks - first ||
-        (reserved < w->reserved_count && w->reserved[reserved].first < first + count))
+        (reserved < w->reserved_count && w->reserved[reserved].first < first + count) ||
+        lume_ext4_journal_overlaps(w, first, count))
     {
         fail(w, LUME_EXT4_INVALID);
         return false;
@@ -297,9 +316,15 @@ static bool data_range(struct lume_ext4_writer *w, uint64_t first, uint64_t coun
 
 static void add_reserved(struct lume_ext4_writer *w, uint64_t first, uint64_t blocks)
 {
-    if (first >= w->fs->blocks || blocks > w->fs->blocks - first)
+    if (first >= w->fs->blocks || blocks > w->fs->blocks - first ||
+        lume_ext4_journal_overlaps(w, first, blocks))
     {
         fail(w, LUME_EXT4_INVALID);
+        return;
+    }
+    if (w->reserved_count == sizeof(w->reserved) / sizeof(w->reserved[0]))
+    {
+        fail(w, LUME_EXT4_UNSUPPORTED);
         return;
     }
     unsigned i = w->reserved_count++;
@@ -311,6 +336,12 @@ static void add_reserved(struct lume_ext4_writer *w, uint64_t first, uint64_t bl
     w->reserved[i] = (struct lume_ext4_reserved_range){first, first + blocks};
 }
 
+static unsigned inode_table_blocks(const struct lume_ext4 *fs)
+{
+    return ((uint64_t)fs->inodes_per_group * fs->inode_bytes + fs->block_bytes - 1) /
+           fs->block_bytes;
+}
+
 static bool metadata_layout(struct lume_ext4_writer *w)
 {
     unsigned char *s = super(w);
@@ -319,9 +350,7 @@ static bool metadata_layout(struct lume_ext4_writer *w)
     uint64_t descriptors =
         ((uint64_t)w->fs->groups * w->fs->descriptor_bytes + w->fs->block_bytes - 1) /
         w->fs->block_bytes;
-    uint64_t table_blocks =
-        ((uint64_t)w->fs->inodes_per_group * w->fs->inode_bytes + w->fs->block_bytes - 1) /
-        w->fs->block_bytes;
+    unsigned table_blocks = inode_table_blocks(w->fs);
     for (unsigned i = 0; i < w->fs->groups && !w->error; ++i)
     {
         unsigned char *g = group(w, i);
@@ -375,18 +404,15 @@ static void seal_bitmap(struct lume_ext4_writer *w, unsigned char *g, const unsi
         put16(g + (inode ? 0x3a : 0x38), value >> 16);
 }
 
-static unsigned char *bitmap(struct lume_ext4_writer *w, unsigned char *g, bool inode)
+static bool verify_bitmap(struct lume_ext4_writer *w, const unsigned char *g,
+                          const unsigned char *map, bool inode)
 {
-    struct lume_ext4_write_block *entry = bitmap_block(w, g, inode, true);
-    if (!entry)
-        return NULL;
-    if ((w->fs->ro_compat & CSUM) && !entry->bitmap_verified)
+    if (w->fs->ro_compat & CSUM)
     {
         unsigned low = inode ? 0x1a : 0x18, high = inode ? 0x3a : 0x38;
         uint32_t expected = get16(g + low);
-        uint32_t actual =
-            lume_ext4_crc32c(w->fs->checksum_seed, entry->data,
-                             (inode ? w->fs->inodes_per_group : w->blocks_per_group) / 8);
+        uint32_t actual = lume_ext4_crc32c(
+            w->fs->checksum_seed, map, (inode ? w->fs->inodes_per_group : w->blocks_per_group) / 8);
         if (w->fs->descriptor_bytes >= 64)
             expected |= (uint32_t)get16(g + high) << 16;
         else
@@ -394,10 +420,18 @@ static unsigned char *bitmap(struct lume_ext4_writer *w, unsigned char *g, bool 
         if (expected != actual)
         {
             fail(w, LUME_EXT4_INVALID);
-            return NULL;
+            return false;
         }
-        entry->bitmap_verified = true;
     }
+    return true;
+}
+
+static unsigned char *bitmap(struct lume_ext4_writer *w, unsigned char *g, bool inode)
+{
+    struct lume_ext4_write_block *entry = bitmap_block(w, g, inode, true);
+    if (!entry || (!entry->bitmap_verified && !verify_bitmap(w, g, entry->data, inode)))
+        return NULL;
+    entry->bitmap_verified = true;
     return entry->data;
 }
 
@@ -440,14 +474,10 @@ static void reserve_bits(unsigned char *map, uint64_t group_start, unsigned coun
 static bool initialize_bitmap(struct lume_ext4_writer *w, unsigned number, unsigned char *g,
                               bool inode)
 {
-    unsigned flag = inode ? 1 : 2;
-    if (!(get16(g + 0x12) & flag))
+    unsigned flag = inode ? BG_INODE_UNINIT : BG_BLOCK_UNINIT;
+    unsigned flags = get16(g + 0x12);
+    if (!(flags & flag))
         return true;
-    if (inode && (!(get16(g + 0x12) & 4) || number == 0))
-    {
-        fail(w, LUME_EXT4_UNSUPPORTED);
-        return false;
-    }
     struct lume_ext4_write_block *entry = bitmap_block(w, g, inode, false);
     if (!entry)
         return false;
@@ -478,8 +508,17 @@ static bool initialize_bitmap(struct lume_ext4_writer *w, unsigned number, unsig
         fail(w, LUME_EXT4_INVALID);
         return false;
     }
+    if (inode)
+    {
+        set_group_count(w, g, 0x1c, 0x32, per_group);
+        if (!(flags & BG_INODE_ZEROED))
+        {
+            w->zero_inode_tables[number / 64] |= UINT64_C(1) << (number % 64);
+            flags |= BG_INODE_ZEROED;
+        }
+    }
     entry->bitmap_verified = true;
-    put16(g + 0x12, get16(g + 0x12) & ~flag);
+    put16(g + 0x12, flags & ~flag);
     changed(w, map, BITMAP);
     changed(w, g, DESCRIPTOR);
     uint64_t *dirty = inode ? w->dirty_inode_maps : w->dirty_block_maps;
@@ -652,7 +691,7 @@ static void release_range(struct lume_ext4_writer *w, bool inode, uint64_t value
         unsigned char *g = group(w, number);
         if (!g)
             return;
-        if (get16(g + 0x12) & (inode ? 1 : 2))
+        if (get16(g + 0x12) & (inode ? BG_INODE_UNINIT : BG_BLOCK_UNINIT))
         {
             fail(w, LUME_EXT4_INVALID);
             return;
@@ -678,11 +717,12 @@ static unsigned char *inode_slot(struct lume_ext4_writer *w, uint32_t number)
         fail(w, LUME_EXT4_INVALID);
         return NULL;
     }
-    unsigned char *g = group(w, (number - 1) / w->fs->inodes_per_group);
+    unsigned group_number = (number - 1) / w->fs->inodes_per_group;
+    unsigned char *g = group(w, group_number);
     if (!g)
         return NULL;
     uint64_t table = address(w, g, 8, 0x28);
-    if (!table || table >= w->fs->blocks ||
+    if ((get16(g + 0x12) & BG_INODE_UNINIT) || !table || table >= w->fs->blocks ||
         (uint64_t)w->fs->inodes_per_group * w->fs->inode_bytes >
             (w->fs->blocks - table) * w->fs->block_bytes)
     {
@@ -691,8 +731,15 @@ static unsigned char *inode_slot(struct lume_ext4_writer *w, uint32_t number)
     }
     uint64_t offset = table * w->fs->block_bytes +
                       (uint64_t)((number - 1) % w->fs->inodes_per_group) * w->fs->inode_bytes;
-    unsigned char *p = bytes(w, offset / w->fs->block_bytes);
-    return p ? p + offset % w->fs->block_bytes : NULL;
+    uint64_t block = offset / w->fs->block_bytes;
+    bool zero = (w->zero_inode_tables[group_number / 64] & (UINT64_C(1) << (group_number % 64))) &&
+                !cached_block(w, block);
+    struct lume_ext4_write_block *entry = stage_block(w, block, !zero);
+    if (!entry)
+        return NULL;
+    if (zero)
+        memset(entry->data, 0, w->fs->block_bytes);
+    return entry->data + offset % w->fs->block_bytes;
 }
 
 static uint32_t inode_checksum(struct lume_ext4_writer *w, uint32_t number, unsigned char *p)
@@ -712,13 +759,14 @@ static uint32_t inode_checksum(struct lume_ext4_writer *w, uint32_t number, unsi
     return value;
 }
 
-static unsigned char *checked_inode(struct lume_ext4_writer *w, uint32_t number)
+static unsigned char *checked_inode(struct lume_ext4_writer *w, uint32_t number,
+                                    bool allow_unlinked)
 {
     unsigned char *p = inode_slot(w, number);
     if (!p)
         return NULL;
     unsigned extra = w->fs->inode_bytes > 128 ? get16(p + 0x80) : 0;
-    if ((extra & 3) || extra > w->fs->inode_bytes - 128 || !get16(p + 0x1a))
+    if ((extra & 3) || extra > w->fs->inode_bytes - 128 || (!allow_unlinked && !get16(p + 0x1a)))
         goto invalid;
     if (w->fs->ro_compat & CSUM)
     {
@@ -744,7 +792,7 @@ static unsigned char *inode(struct lume_ext4_writer *w, uint32_t number)
         fail(w, LUME_EXT4_INVALID);
         return NULL;
     }
-    return checked_inode(w, number);
+    return checked_inode(w, number, false);
 }
 
 static void seal_extent_children(struct lume_ext4_writer *w, const unsigned char *parent,
@@ -764,7 +812,7 @@ static void seal_extent_children(struct lume_ext4_writer *w, const unsigned char
             continue;
         if (depth > 1)
             seal_extent_children(w, node, depth - 1, seed);
-        if (entry->dirty && entry->phase == (depth == 1 ? EXTENT_LEAF : EXTENT_INDEX))
+        if (entry->dirty && entry->phase == EXTENT_LEAF + depth - 1)
         {
             unsigned tail = extent_tail(node);
             put32(node + tail, lume_ext4_crc32c(seed, node, tail));
@@ -778,7 +826,8 @@ static void seal_inode(struct lume_ext4_writer *w, uint32_t number, unsigned cha
     {
         const unsigned char *root = p + 0x28;
         unsigned count = get16(root + 2), depth = get16(root + 6);
-        if ((get32(p + 0x20) & EXTENTS) && ((depth == 1 || depth == 2) && count <= INLINE_EXTENTS))
+        if ((get32(p + 0x20) & EXTENTS) && depth && depth <= LUME_EXT4_EXTENT_MAX_DEPTH &&
+            count <= INLINE_EXTENTS)
             seal_extent_children(w, root, depth, inode_seed(w, number, p));
         uint32_t value = inode_checksum(w, number, p);
         put16(p + 0x7c, value);
@@ -804,6 +853,16 @@ static uint64_t sectors(const unsigned char *p)
     return get32(p + 0x1c) | (uint64_t)get16(p + 0x74) << 32;
 }
 
+static uint64_t inode_xattr_block(const unsigned char *p)
+{
+    return get32(p + 0x68) | (uint64_t)get16(p + 0x76) << 32;
+}
+
+static unsigned inode_xattr_sectors(const struct lume_ext4_writer *w, const unsigned char *p)
+{
+    return inode_xattr_block(p) ? w->fs->block_bytes / 512 : 0;
+}
+
 static void sector_delta(struct lume_ext4_writer *w, unsigned char *p, int change)
 {
     uint64_t old = sectors(p);
@@ -821,8 +880,24 @@ static void sector_delta(struct lume_ext4_writer *w, unsigned char *p, int chang
 struct allocation_check
 {
     const unsigned char *map;
+    unsigned char *read_buffer;
     unsigned group;
 };
+
+static const unsigned char *allocation_bitmap(struct lume_ext4_writer *w, unsigned char *g,
+                                              unsigned char *buffer)
+{
+    uint64_t block = address(w, g, 0, 0x20);
+    if (!buffer || cached_block(w, block))
+        return bitmap(w, g, false);
+    unsigned size = w->fs->block_bytes;
+    if (w->fs->read(w->fs->context, block * size, buffer, size))
+    {
+        fail(w, LUME_EXT4_IO);
+        return NULL;
+    }
+    return verify_bitmap(w, g, buffer, false) ? buffer : NULL;
+}
 
 static bool allocated_range(struct lume_ext4_writer *w, struct allocation_check *check,
                             uint64_t first, unsigned count)
@@ -838,12 +913,12 @@ static bool allocated_range(struct lume_ext4_writer *w, struct allocation_check 
             unsigned char *g = group(w, number);
             if (!g)
                 return false;
-            if (get16(g + 0x12) & 2)
+            if (get16(g + 0x12) & BG_BLOCK_UNINIT)
             {
                 fail(w, LUME_EXT4_INVALID);
                 return false;
             }
-            check->map = bitmap(w, g, false);
+            check->map = allocation_bitmap(w, g, check->read_buffer);
             if (!check->map)
                 return false;
             check->group = number;
@@ -862,6 +937,91 @@ static bool allocated_range(struct lume_ext4_writer *w, struct allocation_check 
     return !w->error;
 }
 
+static uint32_t xattr_checksum(const struct lume_ext4_writer *w, uint64_t block, unsigned char *data)
+{
+    uint32_t stored = get32(data + 0x10);
+    put32(data + 0x10, 0);
+    uint32_t seed = block_checksum_seed(w->fs->checksum_seed, block);
+    uint32_t checksum = lume_ext4_crc32c(seed, data, w->fs->block_bytes);
+    put32(data + 0x10, stored);
+    return checksum;
+}
+
+static bool xattr_entries_valid(const unsigned char *data, unsigned bytes)
+{
+    unsigned first_value = bytes;
+    for (unsigned offset = 32; offset + 4 <= first_value;)
+    {
+        const unsigned char *entry = data + offset;
+        if (!get32(entry))
+            return true;
+        unsigned entry_bytes = (16u + entry[0] + 3) & ~3u;
+        if (entry_bytes > first_value - offset - 4 || get32(entry + 4))
+            return false;
+        unsigned value = get16(entry + 2);
+        uint32_t length = get32(entry + 8);
+        if (length)
+        {
+            if ((value & 3) || value < offset + entry_bytes + 4 || value >= bytes ||
+                length > bytes - value || ((length + 3) & ~3u) > bytes - value)
+                return false;
+            if (value < first_value)
+                first_value = value;
+        }
+        offset += entry_bytes;
+    }
+    return false;
+}
+
+static unsigned char *checked_xattr_block(struct lume_ext4_writer *w, uint64_t block)
+{
+    if (!(w->fs->compat & EXT4_EXT_ATTR))
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return NULL;
+    }
+    struct allocation_check check = {0};
+    if (!allocated_range(w, &check, block, 1))
+        return NULL;
+    unsigned char *data = bytes(w, block);
+    if (!data)
+        return NULL;
+    uint32_t refs = get32(data + 4);
+    bool checksummed = (w->fs->ro_compat & CSUM) != 0;
+    if (get32(data) != EXT4_XATTR_MAGIC || !refs || refs > EXT4_XATTR_MAX_REFS ||
+        get32(data + 8) != 1 ||
+        (checksummed && xattr_checksum(w, block, data) != get32(data + 0x10)) ||
+        !xattr_entries_valid(data, w->fs->block_bytes))
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return NULL;
+    }
+    return data;
+}
+
+static void release_xattr(struct lume_ext4_writer *w, unsigned char *raw)
+{
+    uint64_t block = inode_xattr_block(raw);
+    if (!block || w->error)
+        return;
+    unsigned char *data = checked_xattr_block(w, block);
+    if (!data)
+        return;
+    uint32_t refs = get32(data + 4);
+    if (refs == 1)
+        release(w, false, block);
+    else
+    {
+        put32(data + 4, refs - 1);
+        if (w->fs->ro_compat & CSUM)
+            put32(data + 0x10, xattr_checksum(w, block, data));
+        changed(w, data, INODE);
+    }
+    put32(raw + 0x68, 0);
+    put16(raw + 0x76, 0);
+    sector_delta(w, raw, -1);
+}
+
 static uint64_t extent_physical(const unsigned char *entry)
 {
     return get32(entry + 8) | (uint64_t)get16(entry + 6) << 32;
@@ -878,6 +1038,16 @@ static unsigned extent_length(const unsigned char *entry)
     return length > 32768 ? length - 32768 : length;
 }
 
+struct extent_check
+{
+    struct allocation_check allocation;
+    uint64_t seen_groups[LUME_EXT4_GROUP_WORDS];
+    uint64_t logical_limit, logical_end, allocated, acl;
+    uint32_t seed;
+    unsigned reserve_end;
+    bool regular;
+};
+
 static void sift_ranges(uint64_t *ranges, unsigned root, unsigned count)
 {
     uint64_t value = ranges[root];
@@ -893,7 +1063,6 @@ static void sift_ranges(uint64_t *ranges, unsigned root, unsigned count)
     ranges[root] = value;
 }
 
-/* Ranges store the physical block in the upper 48 bits and the length below it. */
 static void sort_ranges(uint64_t *ranges, unsigned count)
 {
     for (unsigned i = count / 2; i;)
@@ -907,138 +1076,154 @@ static void sort_ranges(uint64_t *ranges, unsigned count)
     }
 }
 
-static const unsigned char *check_extent_node(struct lume_ext4_writer *w,
-                                              struct allocation_check *check,
-                                              const unsigned char *index, unsigned depth,
-                                              uint32_t seed, uint64_t acl)
+static bool range_already_seen(const unsigned char *map, unsigned first, unsigned end)
 {
-    uint64_t child = extent_child(index);
-    if (!child || child == acl || !allocated_range(w, check, child, 1))
-        goto invalid;
-    const unsigned char *node = bytes(w, child);
-    if (!node)
-        return NULL;
-    unsigned count = get16(node + 2), capacity = get16(node + 4), tail = extent_tail(node);
-    if (get16(node) != 0xf30a || get16(node + 6) != depth || !count || count > capacity ||
-        capacity > extent_capacity(w->fs) || get32(index) != get32(node + EXTENT_BYTES))
-        goto invalid;
-    if ((w->fs->ro_compat & CSUM) && lume_ext4_crc32c(seed, node, tail) != get32(node + tail))
-        goto invalid;
-    return node;
+    while (first < end)
+    {
+        unsigned start = first % 32;
+        unsigned count = 32 - start;
+        if (count > end - first)
+            count = end - first;
+        uint32_t mask = UINT32_MAX >> (32 - count);
+        if ((get32(map + (first - start) / 8) >> start) & mask)
+            return true;
+        first += count;
+    }
+    return false;
+}
+
+static bool claim_extent_blocks(struct lume_ext4_writer *w, struct extent_check *check,
+                                uint64_t first, unsigned count)
+{
+    if ((check->acl >= first && check->acl - first < count) ||
+        !allocated_range(w, &check->allocation, first, count))
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return false;
+    }
+    unsigned blocks = count;
+    check->allocated += blocks;
+    uint64_t relative = first - w->fs->first_data_block;
+    unsigned char *maps = check->allocation.read_buffer + w->fs->block_bytes;
+    while (count)
+    {
+        unsigned group = (unsigned)(relative / w->blocks_per_group);
+        unsigned bit = (unsigned)(relative % w->blocks_per_group);
+        unsigned length = w->blocks_per_group - bit;
+        if (length > count)
+            length = count;
+        unsigned char *map = maps + (size_t)group * w->fs->block_bytes;
+        uint64_t mark = UINT64_C(1) << (group % 64);
+        if (!(check->seen_groups[group / 64] & mark))
+        {
+            memset(map, 0, w->fs->block_bytes);
+            check->seen_groups[group / 64] |= mark;
+        }
+        if (range_already_seen(map, bit, bit + length))
+        {
+            fail(w, LUME_EXT4_INVALID);
+            return false;
+        }
+        assign_bits(map, bit, bit + length, true);
+        relative += length;
+        count -= length;
+    }
+    if (check->reserve_end)
+    {
+        if (w->reserved_count >= check->reserve_end)
+        {
+            fail(w, LUME_EXT4_UNSUPPORTED);
+            return false;
+        }
+        add_reserved(w, first, blocks);
+    }
+    return true;
+}
+
+static bool check_extent_tree(struct lume_ext4_writer *w, struct extent_check *check,
+                              const unsigned char *node, unsigned depth)
+{
+    unsigned count = get16(node + 2);
+    for (unsigned i = 1; i <= count; ++i)
+    {
+        const unsigned char *entry = node + i * EXTENT_BYTES;
+        if (depth)
+        {
+            uint64_t block = extent_child(entry);
+            if (!claim_extent_blocks(w, check, block, 1))
+                return false;
+            const unsigned char *child = extent_view(w, block, depth - 1);
+            if (!child)
+                return false;
+            unsigned used = get16(child + 2), capacity = get16(child + 4);
+            if (get16(child) != 0xf30a || get16(child + 6) != depth - 1 || !used ||
+                used > capacity || capacity > extent_capacity(w->fs) ||
+                get32(entry) != get32(child + EXTENT_BYTES))
+                goto invalid;
+            if ((w->fs->ro_compat & CSUM) &&
+                lume_ext4_crc32c(check->seed, child, extent_tail(child)) !=
+                    get32(child + extent_tail(child)))
+                goto invalid;
+            if (!check_extent_tree(w, check, child, depth - 1))
+                return false;
+        }
+        else
+        {
+            uint64_t logical = get32(entry);
+            unsigned length = extent_length(entry);
+            bool unwritten = extent_unwritten(entry);
+            uint64_t limit = unwritten ? UINT64_C(1) << 32 : check->logical_limit;
+            if (!length || logical < check->logical_end || logical + length > limit ||
+                (unwritten && !check->regular))
+                goto invalid;
+            if (!claim_extent_blocks(w, check, extent_physical(entry), length))
+                return false;
+            check->logical_end = logical + length;
+        }
+    }
+    return true;
 invalid:
     fail(w, LUME_EXT4_INVALID);
-    return NULL;
+    return false;
 }
 
 static bool extent_layout(struct lume_ext4_writer *w, uint32_t number, const unsigned char *p,
-                          uint64_t logical_limit, uint64_t acl, uint64_t *allocated)
+                          uint64_t logical_limit, uint64_t acl, uint64_t *allocated, bool reserve)
 {
     const unsigned char *root = p + 0x28;
-    unsigned root_count = get16(root + 2), depth = get16(root + 6);
-    if (get16(root) != 0xf30a || get16(root + 4) != INLINE_EXTENTS || root_count > INLINE_EXTENTS ||
-        (depth && !root_count))
-        goto invalid;
-    if (depth > 2)
-        goto unsupported;
-    struct allocation_check check = {0};
-    uint64_t children[LUME_EXT4_WRITE_BLOCKS];
-    unsigned child_count = 0;
-    uint32_t seed = inode_seed(w, number, p);
-    /* Keep range verification off the kernel worker stack. */
-    uintptr_t scratch = (uintptr_t)transaction_scratch(w);
-    size_t alignment = _Alignof(uint64_t);
-    uint64_t *ranges = (void *)((scratch + alignment - 1) & ~(uintptr_t)(alignment - 1));
-    size_t slots = extent_range_slots(w->fs);
-    uint64_t logical_end = 0, physical_end = 0;
-    unsigned used = 0;
-    bool ordered = true;
-    for (unsigned branch = 0; branch < (depth == 2 ? root_count : 1); ++branch)
+    unsigned count = get16(root + 2), depth = get16(root + 6);
+    if (!(w->fs->incompat & 0x40) || get16(root) != 0xf30a || get16(root + 4) != INLINE_EXTENTS ||
+        count > INLINE_EXTENTS || depth > LUME_EXT4_EXTENT_MAX_DEPTH || (depth && !count))
     {
-        const unsigned char *parent = root;
-        if (depth == 2)
-        {
-            if (child_count == LUME_EXT4_WRITE_BLOCKS)
-                goto unsupported;
-            const unsigned char *index = root + (branch + 1) * EXTENT_BYTES;
-            parent = check_extent_node(w, &check, index, 1, seed, acl);
-            if (!parent)
-                return false;
-            children[child_count++] = extent_child(index);
-        }
-        unsigned leaves = depth ? get16(parent + 2) : 1;
-        for (unsigned leaf = 0; leaf < leaves; ++leaf)
-        {
-            const unsigned char *node = root;
-            if (depth)
-            {
-                if (child_count == LUME_EXT4_WRITE_BLOCKS)
-                    goto unsupported;
-                const unsigned char *index = parent + (leaf + 1) * EXTENT_BYTES;
-                node = check_extent_node(w, &check, index, 0, seed, acl);
-                if (!node)
-                    return false;
-                children[child_count++] = extent_child(index);
-            }
-            unsigned count = get16(node + 2);
-            for (unsigned i = 0; i < count; ++i)
-            {
-                const unsigned char *entry = node + (i + 1) * EXTENT_BYTES;
-                uint64_t logical = get32(entry), physical = extent_physical(entry);
-                unsigned length = extent_length(entry);
-                bool unwritten = extent_unwritten(entry);
-                if (unwritten && (get16(p) & 0xf000) != 0x8000)
-                    goto invalid;
-                uint64_t end = unwritten ? UINT64_C(1) << 32 : logical_limit;
-                if (!length || logical < logical_end || logical + length > end ||
-                    (acl >= physical && acl - physical < length) || used == slots)
-                    goto invalid;
-                ranges[used++] = physical << 16 | length;
-                ordered &= physical >= physical_end;
-                physical_end = physical + length;
-                logical_end = logical + length;
-                *allocated += length;
-            }
-        }
+        fail(w, LUME_EXT4_INVALID);
+        return false;
     }
-    if (!ordered)
-        sort_ranges(ranges, used);
-    sort_ranges(children, child_count);
-    for (unsigned i = 1; i < child_count; ++i)
-        if (children[i - 1] == children[i])
-            goto invalid;
-    unsigned child = 0;
-    for (unsigned i = 0; i < used;)
-    {
-        uint64_t first = ranges[i] >> 16, end = first + (uint16_t)ranges[i];
-        ++i;
-        while (i < used && (ranges[i] >> 16) == end)
-            end += (uint16_t)ranges[i++];
-        while (child < child_count && children[child] < first)
-            ++child;
-        if ((child < child_count && children[child] < end) ||
-            (i < used && (ranges[i] >> 16) < end) ||
-            !allocated_range(w, &check, first, (unsigned)(end - first)))
-            goto invalid;
-    }
-    *allocated += child_count;
-    return !w->error;
-unsupported:
-    fail(w, LUME_EXT4_UNSUPPORTED);
-    return false;
-invalid:
-    fail(w, LUME_EXT4_INVALID);
-    return false;
+    unsigned char *bitmap_scratch =
+        transaction_scratch(w) + LUME_EXT4_EXTENT_MAX_DEPTH * w->fs->block_bytes;
+    struct extent_check check = {.allocation.read_buffer = bitmap_scratch,
+                                 .logical_limit = logical_limit,
+                                 .acl = acl,
+                                 .seed = inode_seed(w, number, p),
+                                 .reserve_end =
+                                     reserve ? w->reserved_count + LUME_EXT4_ORPHAN_RANGES : 0,
+                                 .regular = (get16(p) & 0xf000) == 0x8000};
+    if (!check_extent_tree(w, &check, root, depth))
+        return false;
+    *allocated = check.allocated;
+    return true;
 }
 
-static bool layout(struct lume_ext4_writer *w, uint32_t number, const unsigned char *p)
+static bool check_layout(struct lume_ext4_writer *w, uint32_t number, const unsigned char *p,
+                         bool truncate_pending)
 {
     uint32_t flags = get32(p + 0x20);
     uint64_t allocated = 0;
-    uint64_t acl = get32(p + 0x68) | (uint64_t)get16(p + 0x76) << 32;
+    uint64_t acl = inode_xattr_block(p);
     uint64_t maximum = (flags & EXTENTS) ? (UINT64_C(1) << 32) : 12;
     if (size(p) > maximum * w->fs->block_bytes || (size(p) > INT32_MAX && !(w->fs->ro_compat & 2)))
         goto unsupported;
-    uint64_t logical_limit = (size(p) + w->fs->block_bytes - 1) / w->fs->block_bytes;
+    uint64_t logical_limit =
+        truncate_pending ? maximum : (size(p) + w->fs->block_bytes - 1) / w->fs->block_bytes;
     if (flags & ~(EXTENTS | EXT4_INDEX_INODE))
         goto unsupported;
     if ((flags & EXT4_INDEX_INODE) &&
@@ -1046,9 +1231,7 @@ static bool layout(struct lume_ext4_writer *w, uint32_t number, const unsigned c
         goto invalid;
     if (flags & EXTENTS)
     {
-        if (!(w->fs->incompat & 0x40))
-            goto invalid;
-        if (!extent_layout(w, number, p, logical_limit, acl, &allocated))
+        if (!extent_layout(w, number, p, logical_limit, acl, &allocated, false))
             return false;
     }
     else
@@ -1089,6 +1272,11 @@ invalid:
     return false;
 }
 
+static bool layout(struct lume_ext4_writer *w, uint32_t number, const unsigned char *p)
+{
+    return check_layout(w, number, p, false);
+}
+
 static unsigned char *extent_node(struct lume_ext4_writer *w, unsigned char *root, unsigned leaf)
 {
     return get16(root + 6) ? bytes(w, extent_child(root + (leaf + 1) * EXTENT_BYTES)) : root;
@@ -1114,42 +1302,62 @@ static unsigned extent_leaf_slot(const unsigned char *root, uint32_t logical)
     return at ? at - 1 : 0;
 }
 
-/* The extent nodes were checked before any tree modifications. */
-static unsigned char *extent_parent(struct lume_ext4_writer *w, unsigned char *root,
-                                    unsigned branch)
+struct extent_level
 {
-    return get16(root + 6) == 2 ? extent_node(w, root, branch) : root;
-}
+    unsigned char *node;
+    unsigned slot;
+};
 
 struct extent_position
 {
-    unsigned char *parent, *node, *entry;
-    unsigned branch, leaf, slot;
+    struct extent_level level[LUME_EXT4_EXTENT_MAX_DEPTH + 1];
+    unsigned depth, slot;
+    unsigned char *node, *entry;
 };
+
+/* The extent nodes were checked before any tree modifications. */
+static bool find_extent_path(struct lume_ext4_writer *w, unsigned char *root, uint32_t logical,
+                             struct extent_position *path)
+{
+    path->depth = get16(root + 6);
+    if (path->depth > LUME_EXT4_EXTENT_MAX_DEPTH)
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return false;
+    }
+    unsigned char *node = root;
+    for (unsigned level = 0; level < path->depth; ++level)
+    {
+        unsigned slot = extent_leaf_slot(node, logical);
+        path->level[level] = (struct extent_level){node, slot};
+        node = extent_node(w, node, slot);
+        if (!node)
+            return false;
+    }
+    path->level[path->depth].node = node;
+    path->node = node;
+    path->slot = extent_slot(node, logical);
+    path->entry = NULL;
+    return true;
+}
 
 static uint64_t mapping(struct lume_ext4_writer *w, unsigned char *p, uint32_t logical,
                         struct extent_position *position)
 {
     if (!(get32(p + 0x20) & EXTENTS))
         return logical < 12 ? get32(p + 0x28 + logical * 4) : 0;
-    unsigned char *root = p + 0x28;
-    unsigned branch = get16(root + 6) == 2 ? extent_leaf_slot(root, logical) : 0;
-    unsigned char *parent = extent_parent(w, root, branch);
-    if (!parent)
+    struct extent_position path;
+    if (!find_extent_path(w, p + 0x28, logical, &path) || !path.slot)
         return 0;
-    unsigned leaf = extent_leaf_slot(parent, logical);
-    unsigned char *node = extent_node(w, parent, leaf);
-    if (!node)
-        return 0;
-    unsigned slot = extent_slot(node, logical);
-    if (!slot)
-        return 0;
-    unsigned char *entry = node + slot * EXTENT_BYTES;
+    unsigned char *entry = path.node + path.slot * EXTENT_BYTES;
     uint32_t offset = logical - get32(entry);
     if (offset >= extent_length(entry))
         return 0;
     if (position)
-        *position = (struct extent_position){parent, node, entry, branch, leaf, slot};
+    {
+        path.entry = entry;
+        *position = path;
+    }
     return extent_physical(entry) + offset;
 }
 
@@ -1169,27 +1377,21 @@ static void write_index(unsigned char *index, const unsigned char *node, uint64_
     put16(index + 10, 0);
 }
 
-static void change_extent_parent(struct lume_ext4_writer *w, unsigned char *root,
-                                 unsigned char *parent, unsigned branch)
+static void change_extent_path(struct lume_ext4_writer *w, const struct extent_position *path,
+                               unsigned level)
 {
-    if (parent != root)
+    while (level)
     {
-        put32(root + (branch + 1) * EXTENT_BYTES, get32(parent + EXTENT_BYTES));
-        changed(w, parent, EXTENT_INDEX);
-    }
-}
-
-static void change_leaf(struct lume_ext4_writer *w, unsigned char *root, unsigned char *parent,
-                        unsigned branch, unsigned leaf, unsigned char *node)
-{
-    unsigned char *index = parent + (leaf + 1) * EXTENT_BYTES;
-    uint32_t key = get32(node + EXTENT_BYTES);
-    if (get32(index) != key)
-    {
+        unsigned char *node = path->level[level].node;
+        changed(w, node, EXTENT_LEAF + get16(node + 6));
+        const struct extent_level *parent = path->level + level - 1;
+        unsigned char *index = parent->node + (parent->slot + 1) * EXTENT_BYTES;
+        uint32_t key = get32(node + EXTENT_BYTES);
+        if (get32(index) == key)
+            break;
         put32(index, key);
-        change_extent_parent(w, root, parent, branch);
+        --level;
     }
-    changed(w, node, EXTENT_LEAF);
 }
 
 static void insert_extent(unsigned char *node, unsigned at, const unsigned char *entry)
@@ -1219,103 +1421,73 @@ static unsigned char *new_extent_node(struct lume_ext4_writer *w, unsigned char 
     return node;
 }
 
-static unsigned char *promote_extent_root(struct lume_ext4_writer *w, unsigned char *p,
-                                          uint64_t goal)
+static void insert_extent_path(struct lume_ext4_writer *w, unsigned char *p,
+                               const struct extent_position *path, unsigned level, unsigned at,
+                               const unsigned char *entry, uint64_t goal)
 {
-    unsigned char *root = p + 0x28;
-    unsigned depth = get16(root + 6), count = get16(root + 2);
-    uint64_t child;
-    unsigned char *node = new_extent_node(w, p, goal, depth, &child);
-    if (!node)
-        return NULL;
-    memcpy(node + EXTENT_BYTES, root + EXTENT_BYTES, count * EXTENT_BYTES);
-    put16(node + 2, count);
-    memset(root + EXTENT_BYTES, 0, INLINE_EXTENTS * EXTENT_BYTES);
-    put16(root + 2, 1);
-    put16(root + 6, depth + 1);
-    write_index(root + EXTENT_BYTES, node, child);
-    if (depth)
-        changed(w, node, EXTENT_INDEX);
-    return node;
-}
-
-static unsigned char *split_extent_index(struct lume_ext4_writer *w, unsigned char *p,
-                                         unsigned char *parent, unsigned *branch, unsigned *leaf,
-                                         uint64_t goal)
-{
-    unsigned char *root = p + 0x28;
-    unsigned branches = get16(root + 2);
-    if (branches == INLINE_EXTENTS)
+    unsigned char *node = path->level[level].node;
+    unsigned count = get16(node + 2), depth = get16(node + 6);
+    if (count < get16(node + 4))
+    {
+        insert_extent(node, at, entry);
+        change_extent_path(w, path, level);
+        return;
+    }
+    if (!level && depth == LUME_EXT4_EXTENT_MAX_DEPTH)
     {
         fail(w, LUME_EXT4_UNSUPPORTED);
-        return NULL;
+        return;
     }
     uint64_t child;
-    unsigned char *right = new_extent_node(w, p, goal, 1, &child);
+    unsigned char *right = new_extent_node(w, p, goal, depth, &child);
     if (!right)
-        return NULL;
-    unsigned count = get16(parent + 2);
-    unsigned left = *leaf == count - 1 ? count - 1 : count / 2;
-    unsigned moved = count - left;
-    unsigned char *start = parent + (left + 1) * EXTENT_BYTES;
-    memcpy(right + EXTENT_BYTES, start, moved * EXTENT_BYTES);
-    memset(start, 0, moved * EXTENT_BYTES);
-    put16(parent + 2, left);
-    put16(right + 2, moved);
-    changed(w, parent, EXTENT_INDEX);
-    changed(w, right, EXTENT_INDEX);
-    unsigned char *index = root + (*branch + 2) * EXTENT_BYTES;
-    if (*branch + 1 < branches)
-        memmove(index + EXTENT_BYTES, index, (branches - *branch - 1) * EXTENT_BYTES);
-    write_index(index, right, child);
-    put16(root + 2, branches + 1);
-    if (*leaf < left)
-        return parent;
-    ++*branch;
-    *leaf -= left;
-    return right;
-}
+        return;
+    if (!level)
+    {
+        memcpy(right + EXTENT_BYTES, node + EXTENT_BYTES, count * EXTENT_BYTES);
+        put16(right + 2, count);
+        insert_extent(right, at, entry);
+        memset(node + EXTENT_BYTES, 0, INLINE_EXTENTS * EXTENT_BYTES);
+        put16(node + 2, 1);
+        put16(node + 6, depth + 1);
+        write_index(node + EXTENT_BYTES, right, child);
+        changed(w, right, EXTENT_LEAF + depth);
+        return;
+    }
 
-static unsigned char *split_extents(struct lume_ext4_writer *w, unsigned char *p,
-                                    unsigned char *parent, unsigned char *node, unsigned branch,
-                                    unsigned *leaf, unsigned *at, uint64_t goal)
-{
-    uint64_t child;
-    unsigned char *right = new_extent_node(w, p, goal, 0, &child);
-    if (!right)
-        return NULL;
-    unsigned char *index = parent + (*leaf + 2) * EXTENT_BYTES;
-    unsigned nodes = get16(parent + 2), count = get16(node + 2);
-    /* An append can keep the old leaf full. Interior inserts divide its entries. */
-    unsigned left = *at == count ? count : count / 2, moved = count - left;
+    /* Keep a full leaf on append. Index splits keep one existing entry on the right. */
+    unsigned left = at == count ? count - (depth != 0) : count / 2;
+    unsigned moved = count - left;
+    unsigned char *start = node + (left + 1) * EXTENT_BYTES;
     if (moved)
     {
-        unsigned char *start = node + (left + 1) * EXTENT_BYTES;
         memcpy(right + EXTENT_BYTES, start, moved * EXTENT_BYTES);
         memset(start, 0, moved * EXTENT_BYTES);
         put16(node + 2, left);
         put16(right + 2, moved);
-        changed(w, node, EXTENT_LEAF);
-        changed(w, right, EXTENT_LEAF);
     }
-    if (*leaf + 1 < nodes)
-        memmove(index + EXTENT_BYTES, index, (nodes - *leaf - 1) * EXTENT_BYTES);
+    if (at < left)
+        insert_extent(node, at, entry);
+    else
+        insert_extent(right, at - left, entry);
+    if (moved || at < left)
+        change_extent_path(w, path, level);
+    changed(w, right, EXTENT_LEAF + depth);
+    unsigned char index[EXTENT_BYTES];
     write_index(index, right, child);
-    put16(parent + 2, nodes + 1);
-    change_extent_parent(w, p + 0x28, parent, branch);
-    if (*at < left || !left)
-        return node;
-    *at -= left;
-    ++*leaf;
-    return right;
+    insert_extent_path(w, p, path, level - 1, path->level[level - 1].slot + 1, index, goal);
 }
 
 /* Carry one entry across each full leaf between the insertion and a free slot. */
-static bool redistribute_extent(struct lume_ext4_writer *w, unsigned char *root,
-                                unsigned char *parent, unsigned branch, unsigned leaf, unsigned at,
-                                unsigned char *entry)
+static bool redistribute_extent(struct lume_ext4_writer *w, struct extent_position *path,
+                                unsigned at, unsigned char *entry)
 {
+    struct extent_level *parent_level = path->level + path->depth - 1;
+    unsigned char *parent = parent_level->node;
+    unsigned leaf = parent_level->slot;
     unsigned count = get16(parent + 2);
+    if (count > LUME_EXT4_WRITE_BLOCKS - w->used)
+        return false;
     unsigned char *nodes[LUME_EXT4_WRITE_BLOCKS];
     for (unsigned i = 0; i < count; ++i)
     {
@@ -1344,11 +1516,13 @@ static bool redistribute_extent(struct lume_ext4_writer *w, unsigned char *root,
     for (int i = (int)leaf;; i += step)
     {
         unsigned char *node = nodes[i], *first = node + EXTENT_BYTES;
+        parent_level->slot = (unsigned)i;
+        path->level[path->depth].node = node;
         unsigned used = get16(node + 2);
         if (used < get16(node + 4))
         {
             insert_extent(node, at, entry);
-            change_leaf(w, root, parent, branch, (unsigned)i, node);
+            change_extent_path(w, path, path->depth);
             return true;
         }
         unsigned char displaced[EXTENT_BYTES];
@@ -1371,7 +1545,7 @@ static bool redistribute_extent(struct lume_ext4_writer *w, unsigned char *root,
             continue;
         }
         memcpy(entry, displaced, EXTENT_BYTES);
-        change_leaf(w, root, parent, branch, (unsigned)i, node);
+        change_extent_path(w, path, path->depth);
         at = step > 0 ? 0 : get16(nodes[i - 1] + 2);
     }
 }
@@ -1387,16 +1561,11 @@ static void add_mapping(struct lume_ext4_writer *w, unsigned char *p, uint32_t l
             put32(p + 0x28 + logical * 4, (uint32_t)physical);
         return;
     }
-    unsigned char *root = p + 0x28;
-    unsigned branch = get16(root + 6) == 2 ? extent_leaf_slot(root, logical) : 0;
-    unsigned char *parent = extent_parent(w, root, branch);
-    if (!parent)
+    struct extent_position path;
+    if (!find_extent_path(w, p + 0x28, logical, &path))
         return;
-    unsigned leaf = extent_leaf_slot(parent, logical);
-    unsigned char *node = extent_node(w, parent, leaf);
-    if (!node)
-        return;
-    unsigned count = get16(node + 2), at = extent_slot(node, logical);
+    unsigned char *node = path.node;
+    unsigned count = get16(node + 2), at = path.slot;
     unsigned char *left = node + at * EXTENT_BYTES, *right = left + EXTENT_BYTES;
     unsigned left_length = at ? extent_length(left) : 0;
     unsigned right_length = at < count ? extent_length(right) : 0;
@@ -1427,31 +1596,17 @@ static void add_mapping(struct lume_ext4_writer *w, unsigned char *p, uint32_t l
     {
         unsigned char entry[EXTENT_BYTES];
         write_extent(entry, logical, length + flag, physical);
-        if (count == get16(node + 4))
+        if (path.depth && count == get16(node + 4))
         {
-            if (node == root)
-                node = promote_extent_root(w, p, physical + 1);
-            else
-            {
-                if (get16(parent + 2) == get16(parent + 4))
-                {
-                    if (redistribute_extent(w, root, parent, branch, leaf, at, entry) || w->error)
-                        return;
-                    parent = parent == root
-                                 ? promote_extent_root(w, p, physical + 1)
-                                 : split_extent_index(w, p, parent, &branch, &leaf, physical + 1);
-                    if (!parent)
-                        return;
-                }
-                node = split_extents(w, p, parent, node, branch, &leaf, &at, physical + 1);
-            }
-            if (!node)
+            unsigned char *parent = path.level[path.depth - 1].node;
+            if (get16(parent + 2) == get16(parent + 4) &&
+                (redistribute_extent(w, &path, at, entry) || w->error))
                 return;
         }
-        insert_extent(node, at, entry);
+        insert_extent_path(w, p, &path, path.depth, at, entry, physical + 1);
+        return;
     }
-    if (node != root)
-        change_leaf(w, root, parent, branch, leaf, node);
+    change_extent_path(w, &path, path.depth);
 }
 
 /* An unwritten allocation already owns the blocks. Only change their extent state. */
@@ -1459,14 +1614,12 @@ static void initialize_extent_block(struct lume_ext4_writer *w, unsigned char *p
                                     const struct extent_position *pos, uint32_t logical,
                                     uint64_t physical)
 {
-    unsigned char *root = p + 0x28;
     unsigned char *entry = pos->entry;
     unsigned prefix = logical - get32(entry), suffix = extent_length(entry) - prefix - 1;
     if (prefix)
     {
         put16(entry + 4, 32768 + prefix);
-        if (pos->node != root)
-            change_leaf(w, root, pos->parent, pos->branch, pos->leaf, pos->node);
+        change_extent_path(w, pos, pos->depth);
         add_mapping(w, p, logical, physical, 1, false);
         if (suffix && !w->error)
             add_mapping(w, p, logical + 1, physical + 1, suffix, true);
@@ -1475,8 +1628,7 @@ static void initialize_extent_block(struct lume_ext4_writer *w, unsigned char *p
     if (suffix)
     {
         write_extent(entry, logical + 1, 32768 + suffix, physical + 1);
-        if (pos->node != root)
-            change_leaf(w, root, pos->parent, pos->branch, pos->leaf, pos->node);
+        change_extent_path(w, pos, pos->depth);
         add_mapping(w, p, logical, physical, 1, false);
         return;
     }
@@ -1493,8 +1645,7 @@ static void initialize_extent_block(struct lume_ext4_writer *w, unsigned char *p
     }
     else
         put16(entry + 4, 1);
-    if (pos->node != root)
-        change_leaf(w, root, pos->parent, pos->branch, pos->leaf, pos->node);
+    change_extent_path(w, pos, pos->depth);
 }
 
 static unsigned char *payload(struct lume_ext4_writer *w, unsigned char *p, uint32_t logical,
@@ -1583,122 +1734,105 @@ static bool trim_extent_node(struct lume_ext4_writer *w, unsigned char *p, unsig
     return trimmed;
 }
 
-static void collapse_extent_indexes(struct lume_ext4_writer *w, unsigned char *p)
+static void release_extent_subtree(struct lume_ext4_writer *w, unsigned char *p, uint64_t block,
+                                   unsigned depth)
+{
+    const unsigned char *node = extent_view(w, block, depth);
+    if (!node)
+        return;
+    unsigned count = get16(node + 2);
+    for (unsigned i = 1; i <= count && !w->error; ++i)
+    {
+        const unsigned char *entry = node + i * EXTENT_BYTES;
+        if (depth)
+            release_extent_subtree(w, p, extent_child(entry), depth - 1);
+        else
+        {
+            unsigned length = extent_length(entry);
+            release_range(w, false, extent_physical(entry), length);
+            sector_delta(w, p, -(int)length);
+        }
+    }
+    release(w, false, block);
+    sector_delta(w, p, -1);
+}
+
+static bool trim_extent_tree(struct lume_ext4_writer *w, unsigned char *p, unsigned char *node,
+                             unsigned depth, uint64_t keep)
+{
+    if (!depth)
+        return trim_extent_node(w, p, node, keep);
+    unsigned original = get16(node + 2), count = original;
+    while (count && !w->error)
+    {
+        unsigned char *entry = node + count * EXTENT_BYTES;
+        uint64_t block = extent_child(entry);
+        if (get32(entry) < keep)
+        {
+            unsigned char *child = bytes(w, block);
+            if (child && trim_extent_tree(w, p, child, depth - 1, keep))
+                changed(w, child, EXTENT_LEAF + depth - 1);
+            break;
+        }
+        release_extent_subtree(w, p, block, depth - 1);
+        memset(entry, 0, EXTENT_BYTES);
+        put16(node + 2, --count);
+    }
+    return count != original;
+}
+
+static void collapse_extent_root(struct lume_ext4_writer *w, unsigned char *p)
 {
     unsigned char *root = p + 0x28;
-    unsigned branches = get16(root + 2), leaves = 0;
-    unsigned char indexes[INLINE_EXTENTS * EXTENT_BYTES];
-    for (unsigned i = 0; i < branches; ++i)
+    unsigned depth = get16(root + 6);
+    while (depth && !w->error)
     {
-        const unsigned char *parent = extent_parent(w, root, i);
-        if (!parent)
-            return;
-        unsigned count = get16(parent + 2);
-        if (count > INLINE_EXTENTS - leaves)
-            return;
-        memcpy(indexes + leaves * EXTENT_BYTES, parent + EXTENT_BYTES, count * EXTENT_BYTES);
-        leaves += count;
+        unsigned children = get16(root + 2), count = 0;
+        unsigned char entries[INLINE_EXTENTS * EXTENT_BYTES];
+        for (unsigned i = 1; i <= children; ++i)
+        {
+            uint64_t block = extent_child(root + i * EXTENT_BYTES);
+            const unsigned char *node = extent_view(w, block, depth - 1);
+            if (!node)
+                return;
+            unsigned used = get16(node + 2);
+            if (used > INLINE_EXTENTS - count)
+                return;
+            memcpy(entries + count * EXTENT_BYTES, node + EXTENT_BYTES, used * EXTENT_BYTES);
+            count += used;
+        }
+        for (unsigned i = 1; i <= children; ++i)
+        {
+            release(w, false, extent_child(root + i * EXTENT_BYTES));
+            sector_delta(w, p, -1);
+        }
+        memset(root + EXTENT_BYTES, 0, INLINE_EXTENTS * EXTENT_BYTES);
+        memcpy(root + EXTENT_BYTES, entries, count * EXTENT_BYTES);
+        put16(root + 2, count);
+        depth = count ? depth - 1 : 0;
+        put16(root + 6, depth);
     }
-    for (unsigned i = 1; i <= branches; ++i)
-    {
-        release(w, false, extent_child(root + i * EXTENT_BYTES));
-        sector_delta(w, p, -1);
-    }
-    memset(root + EXTENT_BYTES, 0, INLINE_EXTENTS * EXTENT_BYTES);
-    memcpy(root + EXTENT_BYTES, indexes, leaves * EXTENT_BYTES);
-    put16(root + 2, leaves);
-    put16(root + 6, 1);
 }
 
 static void trim_extents(struct lume_ext4_writer *w, unsigned char *p, uint64_t keep)
 {
     unsigned char *root = p + 0x28;
-    unsigned depth = get16(root + 6);
-    if (!depth)
-    {
-        trim_extent_node(w, p, root, keep);
+    trim_extent_tree(w, p, root, get16(root + 6), keep);
+    collapse_extent_root(w, p);
+}
+
+static void zero_tail(struct lume_ext4_writer *w, unsigned char *p, uint64_t length)
+{
+    unsigned block_bytes = w->fs->block_bytes;
+    unsigned tail = (unsigned)(length % block_bytes);
+    if (!tail)
         return;
-    }
-    unsigned branches = depth == 2 ? get16(root + 2) : 1;
-    unsigned char *trimmed_leaf = NULL, *trimmed_parent = NULL;
-    while (branches && !w->error)
+    unsigned char *data = payload(w, p, (uint32_t)(length / block_bytes), false, false);
+    if (data)
     {
-        unsigned char *parent = extent_parent(w, root, branches - 1);
-        if (!parent)
-            return;
-        unsigned leaves = get16(parent + 2), original = leaves;
-        while (leaves && !w->error)
-        {
-            unsigned char *last = extent_node(w, parent, leaves - 1);
-            if (!last)
-                return;
-            bool trimmed = trim_extent_node(w, p, last, keep);
-            if (w->error)
-                return;
-            if (get16(last + 2))
-            {
-                if (trimmed)
-                    trimmed_leaf = last;
-                break;
-            }
-            unsigned char *index = parent + leaves * EXTENT_BYTES;
-            release(w, false, extent_child(index));
-            sector_delta(w, p, -1);
-            memset(index, 0, EXTENT_BYTES);
-            put16(parent + 2, --leaves);
-        }
-        if (leaves || depth == 1)
-        {
-            if (leaves != original)
-                trimmed_parent = parent;
-            break;
-        }
-        unsigned char *index = root + branches * EXTENT_BYTES;
-        release(w, false, extent_child(index));
-        sector_delta(w, p, -1);
-        memset(index, 0, EXTENT_BYTES);
-        put16(root + 2, --branches);
+        memset(data + tail, 0, block_bytes - tail);
+        changed(w, data, DATA);
     }
-    if (w->error)
-        return;
-    if (depth == 2)
-        collapse_extent_indexes(w, p);
-    if (w->error)
-        return;
-    if (get16(root + 6) == 2)
-    {
-        if (trimmed_parent)
-            change_extent_parent(w, root, trimmed_parent, branches - 1);
-        if (trimmed_leaf)
-            changed(w, trimmed_leaf, EXTENT_LEAF);
-        return;
-    }
-    unsigned leaves = get16(root + 2), count = 0;
-    unsigned char inline_entries[INLINE_EXTENTS * EXTENT_BYTES];
-    for (unsigned i = 0; i < leaves; ++i)
-    {
-        const unsigned char *node = extent_node(w, root, i);
-        if (!node)
-            return;
-        unsigned entries = get16(node + 2);
-        if (entries > INLINE_EXTENTS - count)
-        {
-            if (trimmed_leaf)
-                changed(w, trimmed_leaf, EXTENT_LEAF);
-            return;
-        }
-        memcpy(inline_entries + count * EXTENT_BYTES, node + EXTENT_BYTES, entries * EXTENT_BYTES);
-        count += entries;
-    }
-    for (unsigned i = 1; i <= leaves; ++i)
-    {
-        release(w, false, extent_child(root + i * EXTENT_BYTES));
-        sector_delta(w, p, -1);
-    }
-    memset(root + EXTENT_BYTES, 0, INLINE_EXTENTS * EXTENT_BYTES);
-    memcpy(root + EXTENT_BYTES, inline_entries, count * EXTENT_BYTES);
-    put16(root + 2, count);
-    put16(root + 6, 0);
 }
 
 static void resize(struct lume_ext4_writer *w, unsigned char *p, uint64_t length)
@@ -1726,17 +1860,8 @@ static void resize(struct lume_ext4_writer *w, unsigned char *p, uint64_t length
                 put32(p + 0x28 + i * 4, 0);
             }
     }
-    uint64_t tail = length < old ? length : old;
-    if (tail % w->fs->block_bytes && length != old)
-    {
-        unsigned char *data = payload(w, p, (uint32_t)(tail / w->fs->block_bytes), false, false);
-        if (data)
-        {
-            memset(data + tail % w->fs->block_bytes, 0,
-                   w->fs->block_bytes - tail % w->fs->block_bytes);
-            changed(w, data, DATA);
-        }
-    }
+    if (length != old)
+        zero_tail(w, p, length < old ? length : old);
     set_size(p, length);
     stamp(w, p);
 }
@@ -1785,8 +1910,47 @@ static bool begin(struct lume_ext4_writer *w)
     memset(w->checked_groups, 0, sizeof w->checked_groups);
     memset(w->dirty_block_maps, 0, sizeof w->dirty_block_maps);
     memset(w->dirty_inode_maps, 0, sizeof w->dirty_inode_maps);
+    memset(w->zero_inode_tables, 0, sizeof w->zero_inode_tables);
     w->staging_full = false;
     return true;
+}
+
+static bool prepare_inode_tables(struct lume_ext4_writer *w)
+{
+    unsigned block_bytes = w->fs->block_bytes;
+    unsigned blocks = inode_table_blocks(w->fs);
+    unsigned batch = w->journal.blocks ? 128u * 1024 / block_bytes : 1;
+    if (batch > blocks)
+        batch = blocks;
+    unsigned char *zero = transaction_scratch(w);
+    bool written = false;
+    unsigned words = (w->fs->groups + 63) / 64;
+    for (unsigned word = 0; word < words; ++word)
+    {
+        uint64_t tables = w->zero_inode_tables[word];
+        while (tables)
+        {
+            unsigned bit = (unsigned)__builtin_ctzll(tables);
+            tables &= tables - 1;
+            unsigned char *g = group(w, word * 64 + bit);
+            if (!g)
+                return false;
+            uint64_t first = address(w, g, 8, 0x28);
+            if (!written)
+                memset(zero, 0, (size_t)batch * block_bytes);
+            for (unsigned offset = 0; offset < blocks;)
+            {
+                unsigned count = blocks - offset < batch ? blocks - offset : batch;
+                if (w->write(w->fs->context, (first + offset) * block_bytes,
+                             zero, (size_t)count * block_bytes))
+                    return false;
+                offset += count;
+            }
+            written = true;
+        }
+    }
+    /* The table must be durable before publishing the descriptor and any new inodes. */
+    return !written || !w->flush(w->fs->context);
 }
 
 static bool write_phase(struct lume_ext4_writer *w, unsigned phase, bool *written)
@@ -1832,12 +1996,13 @@ static bool write_journal_home(struct lume_ext4_writer *w, unsigned char *s, uns
 
 static unsigned fast_inode_length(const struct lume_ext4_writer *w, const unsigned char *p)
 {
-    if (!p || !w->journal.fast_first || w->fs->inode_bytes > 512)
+    if (!p || !w->journal.fast_first || w->fs->inode_bytes > 512 || !get16(p + 0x1a))
         return 0;
     unsigned mode = get16(p) & 0xf000;
     uint32_t flags = get32(p + 0x20);
+    /* A full commit preserves external attribute block accounting during replay. */
     if ((mode != 0x8000 && mode != 0x4000) || !(flags & EXTENTS) ||
-        (flags & ~(EXTENTS | EXT4_INDEX_INODE)) || get32(p + 0x68) || get16(p + 0x76))
+        (flags & ~(EXTENTS | EXT4_INDEX_INODE)) || inode_xattr_block(p))
         return 0;
     unsigned length = 128u + (w->fs->inode_bytes > 128 ? get16(p + 0x80) : 0);
     if (length > w->fs->inode_bytes || length + 32 > w->fs->block_bytes)
@@ -1874,7 +2039,8 @@ static bool commit_journaled(struct lume_ext4_writer *w, unsigned char *s, uint3
     put32(s + 0x60, recovering);
     seal_super(w, s);
     bool data = false;
-    if (!write_phase(w, DATA, &data) || (data && w->flush(w->fs->context)))
+    if (!prepare_inode_tables(w) || !write_phase(w, DATA, &data) ||
+        (data && w->flush(w->fs->context)))
         return false;
     unsigned length = fast_inode_length(w, inode);
     if (!(length ? lume_ext4_jbd2_publish_inode(w, number, inode, length)
@@ -1889,7 +2055,7 @@ static bool commit_direct(struct lume_ext4_writer *w, unsigned char *s)
 {
     w->dirty = true;
     put16(s + 0x3a, 0);
-    if (!super_barrier(w, s))
+    if (!prepare_inode_tables(w) || !super_barrier(w, s))
         return false;
     for (unsigned phase = DATA; phase <= DESCRIPTOR; ++phase)
     {
@@ -1908,7 +2074,7 @@ static int finish_inode(struct lume_ext4_writer *w, uint32_t number, const unsig
     if (!s)
         return w->error;
     put32(s + 0x30, w->timestamp);
-    bool committed = w->journal.count ? commit_journaled(w, s, number, p) : commit_direct(w, s);
+    bool committed = w->journal.blocks ? commit_journaled(w, s, number, p) : commit_direct(w, s);
     if (!committed)
     {
         w->faulted = true;
@@ -1931,11 +2097,20 @@ static size_t fast_workspace_bytes(const struct lume_ext4 *fs)
                : 0;
 }
 
+static size_t journal_bitmap_bytes(const struct lume_ext4 *fs)
+{
+    return (size_t)((fs->blocks + 31) / 32) * 4;
+}
+
 size_t lume_ext4_writer_bytes(const struct lume_ext4 *fs)
 {
     if (!fs || (fs->block_bytes != 1024 && fs->block_bytes != 2048 && fs->block_bytes != 4096))
         return 0;
-    size_t scratch = extent_range_slots(fs) * sizeof(uint64_t) + _Alignof(uint64_t) - 1;
+    if (fs->journal_indexed && (fs->groups > LUME_EXT4_WRITE_GROUPS || fs->blocks > UINT32_MAX))
+        return 0;
+    size_t scratch = 0;
+    if ((fs->incompat & 0x40) && fs->groups <= LUME_EXT4_WRITE_GROUPS)
+        scratch = (size_t)(LUME_EXT4_EXTENT_MAX_DEPTH + 1 + fs->groups) * fs->block_bytes;
     if (scratch < 2 * fs->block_bytes)
         scratch = 2 * fs->block_bytes;
     if (fs->compat & EXT4_DIR_INDEX)
@@ -1950,51 +2125,180 @@ size_t lume_ext4_writer_bytes(const struct lume_ext4 *fs)
         if (journal > scratch)
             scratch = journal;
     }
-    return (size_t)LUME_EXT4_WRITE_BLOCKS * fs->block_bytes + scratch + fast_workspace_bytes(fs);
+    size_t journal_tree =
+        fs->journal_indexed ? fs->block_bytes + journal_bitmap_bytes(fs) : 0;
+    return (size_t)LUME_EXT4_WRITE_BLOCKS * fs->block_bytes + scratch + journal_tree +
+           fast_workspace_bytes(fs);
 }
 
-static int journal_extents(struct lume_ext4_writer *w, const unsigned char *root, uint64_t length)
+static bool extent_intersects(const unsigned char *entry, uint64_t first, uint64_t count)
 {
-    unsigned count = get16(root + 2);
-    if (get16(root) != 0xf30a || get16(root + 4) != INLINE_EXTENTS || get16(root + 6) || !count ||
-        count > LUME_EXT4_JOURNAL_EXTENTS)
-        return LUME_EXT4_UNSUPPORTED;
-    uint32_t end = 0;
-    for (unsigned i = 0; i < count; ++i)
+    uint64_t physical = extent_physical(entry);
+    return physical < first + count && first < physical + extent_length(entry);
+}
+
+bool lume_ext4_journal_overlaps(const struct lume_ext4_writer *w, uint64_t first, uint64_t count)
+{
+    const struct lume_ext4_journal *j = &w->journal;
+    if (!count || !j->blocks || j->external)
+        return false;
+    if (j->owned)
+        return range_already_seen(j->owned, (unsigned)first, (unsigned)(first + count));
+    unsigned entries = get16(j->root + 2);
+    for (unsigned i = 1; i <= entries; ++i)
+        if (extent_intersects(j->root + i * EXTENT_BYTES, first, count))
+            return true;
+    return false;
+}
+
+static int journal_node(struct lume_ext4_writer *w, uint64_t block, unsigned depth,
+                         unsigned char *buffer)
+{
+    unsigned bytes = w->fs->block_bytes;
+    if (!block || block >= w->fs->blocks)
+        return LUME_EXT4_INVALID;
+    if (w->fs->read(w->fs->context, block * bytes, buffer, bytes))
+        return LUME_EXT4_IO;
+    unsigned entries = get16(buffer + 2), capacity = get16(buffer + 4);
+    if (get16(buffer) != 0xf30a || get16(buffer + 6) != depth || !entries ||
+        entries > capacity || capacity > extent_capacity(w->fs))
+        return LUME_EXT4_INVALID;
+    unsigned tail = extent_tail(buffer);
+    return lume_ext4_crc32c(w->journal.extent_seed, buffer, tail) == get32(buffer + tail)
+               ? 0
+               : LUME_EXT4_INVALID;
+}
+
+static bool claim_journal_range(struct lume_ext4_writer *w, uint64_t first, unsigned count)
+{
+    if (first <= w->fs->first_data_block || !data_range(w, first, count))
+        return false;
+    if (w->journal.owned)
     {
-        const unsigned char *entry = root + (i + 1) * EXTENT_BYTES;
+        unsigned start = (unsigned)first, end = start + count;
+        if (range_already_seen(w->journal.owned, start, end))
+            return false;
+        assign_bits(w->journal.owned, start, end, true);
+    }
+    return true;
+}
+
+static int journal_extent_tree(struct lume_ext4_writer *w, const unsigned char *node,
+                                unsigned depth, uint32_t limit, uint32_t *end)
+{
+    unsigned entries = get16(node + 2);
+    for (unsigned i = 1; i <= entries; ++i)
+    {
+        const unsigned char *entry = node + i * EXTENT_BYTES;
+        if (get32(entry) != *end)
+            return LUME_EXT4_INVALID;
+        if (depth)
+        {
+            uint64_t child = extent_child(entry);
+            if (!claim_journal_range(w, child, 1))
+                return LUME_EXT4_INVALID;
+            unsigned char *buffer =
+                transaction_scratch(w) + (size_t)(depth - 1) * w->fs->block_bytes;
+            int result = journal_node(w, child, depth - 1, buffer);
+            if (!result)
+                result = journal_extent_tree(w, buffer, depth - 1, limit, end);
+            if (result)
+                return result;
+            continue;
+        }
         uint64_t physical = extent_physical(entry);
         unsigned blocks = extent_length(entry);
-        if (get32(entry) != end || extent_unwritten(entry) || physical <= w->fs->first_data_block ||
-            !data_range(w, physical, blocks))
+        if (!blocks || blocks > limit - *end || extent_unwritten(entry) ||
+            !claim_journal_range(w, physical, blocks))
             return LUME_EXT4_INVALID;
-        uint32_t previous = 0;
-        for (unsigned k = 0; k < i; ++k)
+        if (!w->journal.owned)
         {
-            const struct lume_ext4_journal_extent *e = &w->journal.extent[k];
-            if (physical < e->physical + e->end - previous && e->physical < physical + blocks)
-                return LUME_EXT4_INVALID;
-            previous = e->end;
+            for (unsigned previous = 1; previous < i; ++previous)
+                if (extent_intersects(node + previous * EXTENT_BYTES, physical, blocks))
+                    return LUME_EXT4_INVALID;
         }
-        end += blocks;
-        w->journal.extent[i] = (struct lume_ext4_journal_extent){physical, end};
+        *end += blocks;
     }
-    if (length != (uint64_t)end * w->fs->block_bytes)
+    return 0;
+}
+
+int lume_ext4_journal_map(struct lume_ext4_writer *w, uint32_t logical, uint64_t *physical,
+                          unsigned *count)
+{
+    struct lume_ext4_journal *j = &w->journal;
+    if (logical >= j->blocks)
         return LUME_EXT4_INVALID;
+    if (j->external)
+    {
+        *physical = logical;
+        *count = j->blocks - logical;
+        return 0;
+    }
+    const unsigned char *node = j->root;
+    for (unsigned depth = get16(node + 6); depth; --depth)
+    {
+        unsigned slot = extent_slot(node, logical);
+        if (!slot)
+            return LUME_EXT4_INVALID;
+        uint64_t child = extent_child(node + slot * EXTENT_BYTES);
+        if (!j->cached_extent || j->cached_extent != child)
+        {
+            j->cached_extent = 0;
+            int result = journal_node(w, child, depth - 1, j->extent_buffer);
+            if (result)
+                return result;
+            j->cached_extent = child;
+        }
+        node = j->extent_buffer;
+    }
+    unsigned slot = extent_slot(node, logical);
+    if (!slot)
+        return LUME_EXT4_INVALID;
+    const unsigned char *entry = node + slot * EXTENT_BYTES;
+    uint32_t offset = logical - get32(entry);
+    unsigned blocks = extent_length(entry);
+    if (offset >= blocks)
+        return LUME_EXT4_INVALID;
+    *physical = extent_physical(entry) + offset;
+    *count = blocks - offset;
+    return 0;
+}
+
+static int journal_extents(struct lume_ext4_writer *w, const unsigned char *root, uint64_t length,
+                           uint32_t generation)
+{
+    unsigned entries = get16(root + 2), depth = get16(root + 6);
+    if (get16(root) != 0xf30a || get16(root + 4) != INLINE_EXTENTS || !entries ||
+        entries > INLINE_EXTENTS || depth > LUME_EXT4_EXTENT_MAX_DEPTH ||
+        (depth && !w->journal.owned))
+        return LUME_EXT4_UNSUPPORTED;
+    unsigned bytes = w->fs->block_bytes;
+    uint64_t blocks = length / bytes;
+    if (length % bytes || !blocks || blocks > UINT32_MAX)
+        return LUME_EXT4_INVALID;
+    w->journal.extent_seed =
+        number_checksum(number_checksum(w->fs->checksum_seed, 8), generation);
+    uint32_t end = 0;
+    int result = journal_extent_tree(w, root, depth, (uint32_t)blocks, &end);
+    if (result || end != blocks)
+        return result ? result : LUME_EXT4_INVALID;
+    memcpy(w->journal.root, root, sizeof w->journal.root);
+    w->journal.blocks = end;
     w->journal.io = (struct lume_ext4_journal_io){.read = w->fs->read,
                                                   .write = w->write,
                                                   .flush = w->flush,
                                                   .context = w->fs->context,
                                                   .bytes = w->fs->bytes};
-    w->journal.superblock = w->journal.extent[0].physical;
-    w->journal.count = count;
-    return 0;
+    unsigned span;
+    return lume_ext4_journal_map(w, 0, &w->journal.superblock, &span);
 }
 
-static bool writer_profile(const struct lume_ext4 *fs)
+static bool writer_profile(const struct lume_ext4 *fs, bool recovery)
 {
-    uint32_t supported = fs->compat & EXT4_HAS_JOURNAL ? 0x123c | EXT4_FAST_COMMIT : 0x238;
-    return !(fs->compat & ~supported) && !(fs->ro_compat & ~UINT32_C(0x46b)) &&
+    uint32_t supported =
+        fs->compat & EXT4_HAS_JOURNAL ? 0x23c | EXT4_FAST_COMMIT | EXT4_ORPHAN_FILE : 0x238;
+    uint32_t ro_features = UINT32_C(0x46b) | (recovery ? EXT4_ORPHAN_PRESENT : 0);
+    return !(fs->compat & ~supported) && !(fs->ro_compat & ~ro_features) &&
            fs->descriptor_bytes <= 64 && fs->groups <= LUME_EXT4_WRITE_GROUPS;
 }
 
@@ -2010,6 +2314,13 @@ static void initialize_writer(struct lume_ext4_writer *w, struct lume_ext4 *fs,
     size_t fast = fast_workspace_bytes(fs);
     if (fast)
         w->fast_buffer = w->memory + required - fast;
+    if (fs->journal_indexed)
+    {
+        size_t map = journal_bitmap_bytes(fs);
+        w->journal.owned = w->memory + required - fast - map;
+        w->journal.extent_buffer = w->journal.owned - fs->block_bytes;
+        memset(w->journal.owned, 0, map);
+    }
 }
 
 static int open_external_journal(struct lume_ext4_writer *w, const unsigned char *s,
@@ -2043,9 +2354,8 @@ static int open_external_journal(struct lume_ext4_writer *w, const unsigned char
 
     w->journal.io = *io;
     w->journal.superblock = superblock;
-    w->journal.count = 1;
+    w->journal.blocks = blocks;
     w->journal.external = true;
-    w->journal.extent[0] = (struct lume_ext4_journal_extent){.end = blocks};
     return lume_ext4_jbd2_open(w, uuid, s + 0x68, pending);
 }
 
@@ -2057,42 +2367,29 @@ static int open_internal_journal(struct lume_ext4_writer *w, const unsigned char
     unsigned char *g = group(w, 0);
     if (!g)
         return w->error;
-    if (get16(g + 0x12) & 1)
+    if (get16(g + 0x12) & BG_INODE_UNINIT)
         return LUME_EXT4_INVALID;
     const unsigned char *map = bitmap(w, g, true);
     if (!map)
         return w->error;
     if (!(map[0] & 0x80))
         return LUME_EXT4_INVALID;
-    const unsigned char *p = checked_inode(w, number);
+    const unsigned char *p = checked_inode(w, number, false);
     if (!p)
         return w->error;
     const unsigned char *root = p + 0x28;
-    if (get32(p + 0x20) != EXTENTS || get16(root + 6))
+    if (get32(p + 0x20) != EXTENTS)
         return LUME_EXT4_UNSUPPORTED;
     if ((get16(p) & 0xf000) != 0x8000 || get16(p + 0x1a) != 1 || get32(p + 0x68) ||
         get16(p + 0x76) || size(p) % w->fs->block_bytes)
         return LUME_EXT4_INVALID;
     if (!layout(w, number, p))
         return w->error;
-    int result = journal_extents(w, root, size(p));
-    if (result)
-        return result;
     if (s[0xfd] != 1 || memcmp(root, s + 0x10c, 60) ||
         size(p) != (get32(s + 0x14c) | (uint64_t)get32(s + 0x148) << 32))
         return LUME_EXT4_UNSUPPORTED;
-    result = lume_ext4_jbd2_open(w, s + 0x68, NULL, false);
-    if (result)
-        return result;
-    unsigned count = w->journal.count;
-    /* The journal must stay outside the allocator and every file mapping. */
-    for (unsigned i = 0, first = 0; i < count; ++i)
-    {
-        const struct lume_ext4_journal_extent *extent = &w->journal.extent[i];
-        add_reserved(w, extent->physical, extent->end - first);
-        first = extent->end;
-    }
-    return w->error;
+    int result = journal_extents(w, root, size(p), get32(p + 0x64));
+    return result ? result : lume_ext4_jbd2_open(w, s + 0x68, NULL, false);
 }
 
 static int load_metadata(struct lume_ext4_writer *w, unsigned char *s, bool recovery)
@@ -2113,13 +2410,23 @@ static int load_metadata(struct lume_ext4_writer *w, unsigned char *s, bool reco
         if (!g)
             return w->error;
         unsigned flags = get16(g + 0x12);
-        if ((flags & ~7u) || ((flags & 1) && !(flags & 4)))
+        if ((flags & ~(BG_INODE_UNINIT | BG_BLOCK_UNINIT | BG_INODE_ZEROED)) ||
+            ((flags & (BG_INODE_UNINIT | BG_INODE_ZEROED)) == BG_INODE_UNINIT &&
+             !(fs->ro_compat & CSUM)))
             return LUME_EXT4_UNSUPPORTED;
         uint32_t blocks = group_count(w, g, 0xc, 0x2c);
         uint32_t inodes = group_count(w, g, 0xe, 0x2e);
-        if (blocks > w->blocks_per_group || inodes > fs->inodes_per_group ||
-            group_count(w, g, 0x10, 0x30) > fs->inodes_per_group)
+        uint32_t dirs = group_count(w, g, 0x10, 0x30);
+        if (blocks > w->blocks_per_group || inodes > fs->inodes_per_group || dirs > fs->inodes_per_group)
             return LUME_EXT4_INVALID;
+        if (flags & BG_INODE_UNINIT)
+        {
+            uint64_t start = (uint64_t)i * fs->inodes_per_group;
+            uint64_t remaining = fs->inodes - start;
+            unsigned valid = remaining < fs->inodes_per_group ? (unsigned)remaining : fs->inodes_per_group;
+            if (!i || start + 1 < w->first_inode || inodes != valid || dirs)
+                return LUME_EXT4_INVALID;
+        }
         free_blocks += blocks;
         free_inodes += inodes;
     }
@@ -2150,12 +2457,13 @@ int lume_ext4_writer_open(struct lume_ext4_writer *w, struct lume_ext4 *fs,
     if (!w || !required || !fs->read || !write || !flush || !memory || length < required)
         return LUME_EXT4_INVALID;
     initialize_writer(w, fs, write, flush, memory, required);
-    if (!writer_profile(fs))
+    if (!writer_profile(fs, false))
         return LUME_EXT4_UNSUPPORTED;
     unsigned char *s = super(w);
     if (!s)
         return w->error;
-    if (get16(s + 0x3a) != 1 || get32(s + 0xe8) || (get32(s + 0x60) & EXT4_NEEDS_RECOVERY) ||
+    if (get16(s + 0x3a) != 1 || get32(s + EXT4_SB_LAST_ORPHAN) ||
+        (get32(s + 0x60) & EXT4_NEEDS_RECOVERY) ||
         ((fs->ro_compat & CSUM) && lume_ext4_crc32c(UINT32_MAX, s, 0x3fc) != get32(s + 0x3fc)))
         return LUME_EXT4_INVALID;
     int metadata = load_metadata(w, s, false);
@@ -2184,11 +2492,302 @@ static int open_recovery_journal(struct lume_ext4_writer *w, const unsigned char
     /* Allocation maps and inode tables may have been interrupted during checkpointing.
      * The ext4 superblock checksum protects the backed-up journal extent root. */
     uint64_t length = get32(s + 0x14c) | (uint64_t)get32(s + 0x148) << 32;
-    int result = journal_extents(w, s + 0x10c, length);
+    uint32_t generation = 0;
+    if (get16(s + 0x112))
+    {
+        struct lume_ext4_inode inode;
+        int status = lume_ext4_inode_get(w->fs, 8, &inode, transaction_scratch(w),
+                                         w->fs->block_bytes);
+        if (!status)
+        {
+            if ((inode.mode & 0xf000) != 0x8000 || inode.flags != EXTENTS || inode.links != 1 ||
+                inode.bytes != length || memcmp(inode.block, s + 0x10c, sizeof inode.block))
+                return LUME_EXT4_INVALID;
+            generation = inode.generation;
+        }
+        else if (status != LUME_EXT4_INVALID)
+            return status;
+        /* Index checksums must verify with generation zero when inode metadata is invalid. */
+    }
+    int result = journal_extents(w, s + 0x10c, length, generation);
     return result ? result : lume_ext4_jbd2_open(w, s + 0x68, NULL, true);
 }
 
 static int recover_fast(struct lume_ext4_writer *, unsigned char *);
+
+struct orphan_file
+{
+    uint32_t number, seed;
+    uint64_t blocks;
+    unsigned char mapping[0x64];
+};
+
+static bool inode_allocated(struct lume_ext4_writer *w, uint32_t number, bool claim);
+static unsigned entry_type(unsigned mode);
+
+static int open_orphan_file(struct lume_ext4_writer *w, const unsigned char *s,
+                            struct orphan_file *file)
+{
+    uint32_t number = get32(s + 0x280);
+    if (!inode_allocated(w, number, false))
+        return w->error ? w->error : LUME_EXT4_INVALID;
+    unsigned char *raw = inode(w, number);
+    if (!raw)
+        return w->error;
+    unsigned block_bytes = w->fs->block_bytes;
+    uint64_t length = size(raw);
+    uint64_t blocks = length / block_bytes;
+    if ((get16(raw) & 0xf000) != 0x8000 || get16(raw + 0x1a) != 1 ||
+        get32(raw + 0x20) != EXTENTS || get32(raw + 0x68) || get16(raw + 0x76) || !length ||
+        length % block_bytes || blocks > (UINT64_C(1) << 32))
+        return LUME_EXT4_INVALID;
+    uint64_t allocated;
+    if (!extent_layout(w, number, raw, blocks, 0, &allocated, true))
+        return w->error;
+    if (allocated * (block_bytes / 512) != sectors(raw))
+        return LUME_EXT4_INVALID;
+    file->number = number;
+    file->seed = inode_seed(w, number, raw);
+    file->blocks = blocks;
+    memcpy(file->mapping, raw, sizeof file->mapping);
+    return 0;
+}
+
+static uint64_t orphan_mapping(struct lume_ext4_writer *w, struct orphan_file *file,
+                               uint32_t logical)
+{
+    struct extent_position position;
+    uint64_t physical = mapping(w, file->mapping, logical, &position);
+    if (!physical || extent_unwritten(position.entry))
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return 0;
+    }
+    return physical;
+}
+
+static uint32_t orphan_checksum(const struct orphan_file *file, uint64_t physical,
+                                const unsigned char *data, unsigned bytes)
+{
+    return lume_ext4_crc32c(block_checksum_seed(file->seed, physical), data, bytes);
+}
+
+static int scan_orphan_file(struct lume_ext4_writer *w, struct orphan_file *file, bool *active)
+{
+    unsigned tail = w->fs->block_bytes - 8;
+    for (uint64_t i = 0; i < file->blocks; ++i)
+    {
+        uint64_t physical = orphan_mapping(w, file, (uint32_t)i);
+        const unsigned char *data = physical ? extent_view(w, physical, 0) : NULL;
+        if (!data)
+            return w->error;
+        if (get32(data + tail) != UINT32_C(0x0b10ca04) ||
+            get32(data + tail + 4) != orphan_checksum(file, physical, data, tail))
+            return LUME_EXT4_INVALID;
+        for (unsigned offset = 0; offset < tail; offset += 4)
+        {
+            uint32_t number = get32(data + offset);
+            if (!number)
+                continue;
+            if (number < w->first_inode || number > w->fs->inodes || number == file->number)
+                return LUME_EXT4_INVALID;
+            *active = true;
+        }
+    }
+    return 0;
+}
+
+static unsigned char *orphan_inode(struct lume_ext4_writer *w, uint32_t number,
+                                   uint32_t file_inode)
+{
+    if (number < w->first_inode || number == file_inode || !inode_allocated(w, number, false))
+    {
+        fail(w, LUME_EXT4_INVALID);
+        return NULL;
+    }
+    return checked_inode(w, number, true);
+}
+
+static int recover_orphan_inode(struct lume_ext4_writer *w, uint32_t number, unsigned char *raw)
+{
+    unsigned mode = get16(raw) & 0xf000;
+    bool linked = get16(raw + 0x1a) != 0;
+    if (!entry_type(mode) || (linked && mode != 0x8000))
+        return LUME_EXT4_UNSUPPORTED;
+    unsigned attr_sectors = inode_xattr_sectors(w, raw);
+    bool inline_inode =
+        mode == LUME_EXT4_MODE_FIFO || (mode == 0xa000 && sectors(raw) == attr_sectors);
+    if (inline_inode)
+    {
+        if (get32(raw + 0x20) || sectors(raw) != attr_sectors ||
+            size(raw) > (mode == 0xa000 ? 60u : 0u))
+            return LUME_EXT4_INVALID;
+        set_size(raw, 0);
+    }
+    else
+    {
+        if (!check_layout(w, number, raw, true))
+            return w->error;
+        resize(w, raw, linked ? size(raw) : 0);
+        if (linked)
+            zero_tail(w, raw, size(raw));
+    }
+    if (linked)
+        put32(raw + 0x14, 0);
+    else
+    {
+        release_xattr(w, raw);
+        if (w->error)
+            return w->error;
+        put32(raw + 0x14, w->timestamp ? w->timestamp : 1);
+        release(w, true, number);
+        if (mode == 0x4000)
+        {
+            unsigned group_number = (number - 1) / w->fs->inodes_per_group;
+            unsigned char *g = group(w, group_number);
+            if (!g)
+                return w->error;
+            uint32_t dirs = group_count(w, g, 0x10, 0x30);
+            if (!dirs)
+                return LUME_EXT4_INVALID;
+            set_group_count(w, g, 0x10, 0x30, dirs - 1);
+            seal_group(w, group_number, g);
+        }
+    }
+    if (!w->error)
+        seal_inode(w, number, raw);
+    return w->error;
+}
+
+static int recover_orphan_file(struct lume_ext4_writer *w, struct orphan_file *file)
+{
+    unsigned tail = w->fs->block_bytes - 8;
+    for (uint64_t i = 0; i < file->blocks; ++i)
+    {
+        (void)begin(w);
+        uint64_t physical = orphan_mapping(w, file, (uint32_t)i);
+        const unsigned char *data = physical ? extent_view(w, physical, 0) : NULL;
+        if (!data)
+            return w->error;
+        for (unsigned offset = 0; offset < tail; offset += 4)
+        {
+            uint32_t number = get32(data + offset);
+            if (!number)
+                continue;
+            (void)begin(w);
+            unsigned char *pending = bytes(w, physical);
+            if (!pending)
+                return w->error;
+            unsigned char *raw = orphan_inode(w, number, file->number);
+            int result = raw ? recover_orphan_inode(w, number, raw) : w->error;
+            if (result)
+                return result;
+            /* The inode and its orphan slot must be committed together. */
+            put32(pending + offset, 0);
+            put32(pending + tail + 4, orphan_checksum(file, physical, pending, tail));
+            changed(w, pending, INODE);
+            result = finish(w);
+            if (result)
+                return result;
+            data = pending;
+        }
+    }
+    return 0;
+}
+
+static int scan_orphan_chain(struct lume_ext4_writer *w, uint32_t number, uint32_t file_inode,
+                             uint32_t target, uint32_t *predecessor)
+{
+    uint32_t anchor = number;
+    uint32_t previous = 0;
+    uint64_t interval = 1, links = 0;
+    bool found = false;
+    while (number)
+    {
+        (void)begin(w);
+        const unsigned char *raw = orphan_inode(w, number, file_inode);
+        if (!raw)
+            return w->error;
+        if (number == target)
+        {
+            *predecessor = previous;
+            found = true;
+        }
+        previous = number;
+        number = get32(raw + 0x14);
+        if (number == anchor)
+            return LUME_EXT4_INVALID;
+        /* Compare against anchors spaced at powers of two to detect cycles. */
+        if (++links == interval)
+        {
+            anchor = number;
+            interval *= 2;
+            links = 0;
+        }
+    }
+    return !target || found ? 0 : LUME_EXT4_NOT_FOUND;
+}
+
+static int recover_orphan_chain(struct lume_ext4_writer *w, uint32_t number, uint32_t file_inode)
+{
+    while (number)
+    {
+        (void)begin(w);
+        unsigned char *s = super(w);
+        unsigned char *raw = s ? orphan_inode(w, number, file_inode) : NULL;
+        if (!raw)
+            return w->error;
+        uint32_t next = get32(raw + 0x14);
+        int result = recover_orphan_inode(w, number, raw);
+        if (result)
+            return result;
+        /* Advance the head in the transaction that updates the inode. */
+        put32(s + EXT4_SB_LAST_ORPHAN, next);
+        result = finish(w);
+        if (result)
+            return result;
+        number = next;
+    }
+    return 0;
+}
+
+int lume_ext4_reap_inode(struct lume_ext4_writer *w, const struct lume_ext4_inode *file)
+{
+    if (!file || !file->number)
+        return LUME_EXT4_INVALID;
+    if (!begin(w))
+        return LUME_EXT4_IO;
+    unsigned char *s = super(w);
+    if (!s)
+        return w->error;
+    uint32_t file_inode = w->fs->compat & EXT4_ORPHAN_FILE ? get32(s + 0x280) : 0;
+    uint32_t previous = 0;
+    int result =
+        scan_orphan_chain(w, get32(s + EXT4_SB_LAST_ORPHAN), file_inode, file->number, &previous);
+    if (result)
+        return result;
+    (void)begin(w);
+    s = super(w);
+    unsigned char *raw = s ? orphan_inode(w, file->number, file_inode) : NULL;
+    if (!raw)
+        return w->error;
+    if (get32(raw + 0x64) != file->generation || get16(raw + 0x1a) ||
+        (get16(raw) & 0xf000) != 0x8000)
+        return LUME_EXT4_INVALID;
+    uint32_t next = get32(raw + 0x14);
+    if (previous)
+    {
+        unsigned char *entry = orphan_inode(w, previous, file_inode);
+        if (!entry)
+            return w->error;
+        put32(entry + 0x14, next);
+        seal_inode(w, previous, entry);
+    }
+    else
+        put32(s + EXT4_SB_LAST_ORPHAN, next);
+    result = recover_orphan_inode(w, file->number, raw);
+    return result ? result : finish(w);
+}
 
 int lume_ext4_recover(struct lume_ext4_writer *w, struct lume_ext4 *fs, lume_ext4_write_bytes write,
                       lume_ext4_flush flush, void *memory, size_t length,
@@ -2198,7 +2797,7 @@ int lume_ext4_recover(struct lume_ext4_writer *w, struct lume_ext4 *fs, lume_ext
     if (!w || !required || !fs->read || !write || !flush || !memory || length < required)
         return LUME_EXT4_INVALID;
     if (!(fs->incompat & EXT4_NEEDS_RECOVERY) || !(fs->compat & EXT4_HAS_JOURNAL) ||
-        !(fs->ro_compat & CSUM) || !writer_profile(fs))
+        !(fs->ro_compat & CSUM) || !writer_profile(fs, true))
         return LUME_EXT4_UNSUPPORTED;
     initialize_writer(w, fs, write, flush, memory, required);
     unsigned char *s = super(w);
@@ -2206,7 +2805,7 @@ int lume_ext4_recover(struct lume_ext4_writer *w, struct lume_ext4 *fs, lume_ext
         return w->error;
     if (lume_ext4_crc32c(UINT32_MAX, s, 0x3fc) != get32(s + 0x3fc))
         return LUME_EXT4_INVALID;
-    if (get16(s + 0x3a) != 1 || get32(s + 0x60) != fs->incompat || get32(s + 0xe8))
+    if (get16(s + 0x3a) != 1 || get32(s + 0x60) != fs->incompat)
         return LUME_EXT4_UNSUPPORTED;
 
     int result = open_recovery_journal(w, s, journal);
@@ -2217,15 +2816,17 @@ int lume_ext4_recover(struct lume_ext4_writer *w, struct lume_ext4 *fs, lume_ext
     if (result)
         return result;
     bool fast = w->journal.fast_committed > w->journal.fast_first;
-    unsigned first = 0;
-    for (unsigned i = 0; !w->journal.external && i < w->journal.count; ++i)
+    bool orphan_present = (fs->ro_compat & EXT4_ORPHAN_PRESENT) != 0;
+    uint32_t orphan_head = get32(s + EXT4_SB_LAST_ORPHAN);
+    struct orphan_file file;
+    bool active_orphans = false;
+    if (orphan_present)
     {
-        const struct lume_ext4_journal_extent *extent = &w->journal.extent[i];
-        if (!data_range(w, extent->physical, extent->end - first))
-            return w->error;
-        if (fast)
-            add_reserved(w, extent->physical, extent->end - first);
-        first = extent->end;
+        result = open_orphan_file(w, s, &file);
+        if (!result)
+            result = scan_orphan_file(w, &file, &active_orphans);
+        if (result)
+            return result;
     }
     if (fast)
     {
@@ -2233,9 +2834,30 @@ int lume_ext4_recover(struct lume_ext4_writer *w, struct lume_ext4 *fs, lume_ext
         if (result)
             return result;
     }
+    uint32_t file_inode = fs->compat & EXT4_ORPHAN_FILE ? get32(s + 0x280) : 0;
+    bool cleanup = orphan_head || active_orphans;
+    /* Keep recovery enabled while reusing the checkpointed journal for orphan cleanup. */
+    if (cleanup && !super_barrier(w, s))
+        return LUME_EXT4_IO;
     if (w->journal.start && !lume_ext4_jbd2_checkpoint(w))
         return LUME_EXT4_IO;
+    if (cleanup)
+    {
+        w->active = w->dirty = true;
+        result = scan_orphan_chain(w, orphan_head, file_inode, 0, NULL);
+        if (!result)
+            result = recover_orphan_chain(w, orphan_head, file_inode);
+        if (!result && active_orphans)
+            result = recover_orphan_file(w, &file);
+        w->active = false;
+        if (result)
+            return result;
+        s = super(w);
+        if (!s)
+            return w->error;
+    }
     put32(s + 0x60, fs->incompat & ~EXT4_NEEDS_RECOVERY);
+    put32(s + 0x64, fs->ro_compat & ~EXT4_ORPHAN_PRESENT);
     return super_barrier(w, s) ? 0 : LUME_EXT4_IO;
 }
 
@@ -2251,13 +2873,26 @@ int lume_ext4_writer_close(struct lume_ext4_writer *w)
         unsigned char *s = super(w);
         if (!s)
             return w->error;
-        if (w->journal.count)
+        uint32_t orphan = get32(s + EXT4_SB_LAST_ORPHAN);
+        if (orphan)
+        {
+            uint32_t file_inode = w->fs->compat & EXT4_ORPHAN_FILE ? get32(s + 0x280) : 0;
+            int result = scan_orphan_chain(w, orphan, file_inode, 0, NULL);
+            if (!result)
+                result = recover_orphan_chain(w, orphan, file_inode);
+            if (result)
+                return result;
+            s = super(w);
+            if (!s)
+                return w->error;
+        }
+        if (w->journal.blocks)
             put32(s + 0x60, w->fs->incompat);
         else
             put16(s + 0x3a, 1);
         if (!super_barrier(w, s))
         {
-            if (w->journal.count)
+            if (w->journal.blocks)
                 put32(s + 0x60, w->fs->incompat | EXT4_NEEDS_RECOVERY);
             else
                 put16(s + 0x3a, 0);
@@ -2272,6 +2907,24 @@ io:
     return LUME_EXT4_IO;
 }
 
+static unsigned char *file_inode_for_io(struct lume_ext4_writer *w, uint32_t number,
+                                        const uint32_t *generation)
+{
+    if (!generation)
+        return inode(w, number);
+    unsigned char *raw =
+        number < w->first_inode ? inode(w, number) : checked_inode(w, number, true);
+    if (!raw)
+        return NULL;
+    if (get32(raw + 0x64) != *generation ||
+        (!get16(raw + 0x1a) && !inode_allocated(w, number, false)))
+    {
+        fail(w, LUME_EXT4_NOT_FOUND);
+        return NULL;
+    }
+    return raw;
+}
+
 static int write_file(struct lume_ext4_writer *w, uint32_t number, const uint32_t *generation,
                       uint64_t offset, const void *data, size_t length)
 {
@@ -2279,11 +2932,9 @@ static int write_file(struct lume_ext4_writer *w, uint32_t number, const uint32_
         return LUME_EXT4_IO;
     if ((!data && length) || offset > UINT64_MAX - length)
         return LUME_EXT4_INVALID;
-    unsigned char *p = inode(w, number);
+    unsigned char *p = file_inode_for_io(w, number, generation);
     if (!p)
         return w->error;
-    if (generation && get32(p + 0x64) != *generation)
-        return LUME_EXT4_NOT_FOUND;
     if ((get16(p) & 0xf000) != 0x8000 || !layout(w, number, p))
         return w->error ? w->error : LUME_EXT4_INVALID;
     if (!length)
@@ -2363,11 +3014,9 @@ static int resize_file(struct lume_ext4_writer *w, uint32_t number, const uint32
 {
     if (!begin(w))
         return LUME_EXT4_IO;
-    unsigned char *p = inode(w, number);
+    unsigned char *p = file_inode_for_io(w, number, generation);
     if (!p)
         return w->error;
-    if (generation && get32(p + 0x64) != *generation)
-        return LUME_EXT4_NOT_FOUND;
     if ((get16(p) & 0xf000) != 0x8000 || !layout(w, number, p))
         return w->error ? w->error : LUME_EXT4_INVALID;
     unsigned char old_mapping[60];
@@ -2396,12 +3045,79 @@ int lume_ext4_mode(struct lume_ext4_writer *w, uint32_t number, unsigned mode)
 {
     if (!begin(w))
         return LUME_EXT4_IO;
-    if (mode & ~0777u)
+    if (mode & ~07777u)
         return LUME_EXT4_INVALID;
     unsigned char *p = inode(w, number);
     if (!p)
         return w->error;
-    put16(p, (get16(p) & ~0777u) | mode);
+    put16(p, (get16(p) & ~07777u) | mode);
+    change_time(w, p);
+    seal_inode(w, number, p);
+    return finish_inode(w, number, p);
+}
+
+static bool set_inode_time(unsigned char *raw, unsigned low, unsigned high, unsigned extra_bytes,
+                           const struct lume_ext4_time *time)
+{
+    if (!time)
+        return true;
+    bool extended = extra_bytes >= high + 4 - 128;
+    int64_t maximum = extended ? INT64_C(15032385535) : INT32_MAX;
+    if (time->seconds < INT32_MIN || time->seconds > maximum || time->nanoseconds >= 1000000000)
+        return false;
+    uint32_t base = (uint32_t)time->seconds;
+    put32(raw + low, base);
+    if (extended)
+    {
+        uint32_t epoch = (uint32_t)((time->seconds - (int32_t)base) >> 32);
+        put32(raw + high, (time->nanoseconds << 2) | epoch);
+    }
+    return true;
+}
+
+int lume_ext4_times(struct lume_ext4_writer *w, uint32_t number, const struct lume_ext4_time *access,
+                    const struct lume_ext4_time *modification, const struct lume_ext4_time *change)
+{
+    if (!begin(w))
+        return LUME_EXT4_IO;
+    if (!access && !modification)
+        return 0;
+    unsigned char *raw = inode(w, number);
+    if (!raw)
+        return w->error;
+    unsigned extra = w->fs->inode_bytes > 128 ? get16(raw + 0x80) : 0;
+    if (!set_inode_time(raw, 0x8, 0x8c, extra, access) ||
+        !set_inode_time(raw, 0x10, 0x88, extra, modification) ||
+        !set_inode_time(raw, 0xc, 0x84, extra, change))
+        return LUME_EXT4_TIME_RANGE;
+    seal_inode(w, number, raw);
+    return finish_inode(w, number, raw);
+}
+
+static void store_inode_owner(unsigned char *p, uint32_t uid, uint32_t gid)
+{
+    if (uid != UINT32_MAX)
+    {
+        put16(p + 2, (uint16_t)uid);
+        put16(p + 0x78, (uint16_t)(uid >> 16));
+    }
+    if (gid != UINT32_MAX)
+    {
+        put16(p + 0x18, (uint16_t)gid);
+        put16(p + 0x7a, (uint16_t)(gid >> 16));
+    }
+}
+
+int lume_ext4_owner(struct lume_ext4_writer *w, uint32_t number, uint32_t uid, uint32_t gid)
+{
+    if (!begin(w))
+        return LUME_EXT4_IO;
+    unsigned char *p = inode(w, number);
+    if (!p)
+        return w->error;
+    store_inode_owner(p, uid, gid);
+    if ((get16(p) & 0170000u) == 0100000u && (uid != UINT32_MAX || gid != UINT32_MAX))
+        put16(p, get16(p) & ~06000u);
     change_time(w, p);
     seal_inode(w, number, p);
     return finish_inode(w, number, p);
@@ -3037,13 +3753,36 @@ static int initialize_new_directory(struct lume_ext4_writer *w, uint32_t parent,
     return w->error;
 }
 
-int lume_ext4_create(struct lume_ext4_writer *w, uint32_t parent, const char *name, bool directory,
-                     uint32_t *out)
+static unsigned entry_type(unsigned mode)
+{
+    switch (mode)
+    {
+    case 0x8000:
+        return 1;
+    case 0x4000:
+        return 2;
+    case LUME_EXT4_MODE_FIFO:
+        return 5;
+    case 0xa000:
+        return 7;
+    default:
+        return 0;
+    }
+}
+
+static int create_owned(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                        unsigned mode, const struct lume_inode_access *access,
+                        const char *target, uint32_t *out)
 {
     if (!begin(w))
         return LUME_EXT4_IO;
-    if (!valid_name(name) || !out)
+    if (!valid_name(name) || !out || !access || (access->mode & ~07777u) ||
+        access->uid == UINT32_MAX || access->gid == UINT32_MAX)
         return LUME_EXT4_INVALID;
+    size_t target_bytes = target ? strlen(target) : 0;
+    if (target && (!target_bytes || target_bytes >= w->fs->block_bytes))
+        return LUME_EXT4_INVALID;
+    bool inline_link = target && target_bytes < 60;
     unsigned char *p = mutable_directory(w, parent);
     if (!p)
         return w->error;
@@ -3056,15 +3795,17 @@ int lume_ext4_create(struct lume_ext4_writer *w, uint32_t parent, const char *na
     if (!raw)
         return w->error;
     uint32_t generation = get32(raw + 0x64) + 1;
+    bool directory = mode == 0x4000;
     memset(raw, 0, w->fs->inode_bytes);
-    put16(raw, directory ? 0040755 : 0100644);
+    put16(raw, mode | access->mode);
+    store_inode_owner(raw, access->uid, access->gid);
     put16(raw + 0x1a, directory ? 2 : 1);
     put32(raw + 0x64, generation ? generation : 1);
     if (w->fs->inode_bytes > 128)
         put16(raw + 0x80, w->extra_bytes);
     stamp(w, raw);
     put32(raw + 8, w->timestamp);
-    if (w->fs->incompat & 0x40)
+    if (mode != LUME_EXT4_MODE_FIFO && !inline_link && (w->fs->incompat & 0x40))
     {
         put32(raw + 0x20, EXTENTS);
         put16(raw + 0x28, 0xf30a);
@@ -3076,12 +3817,83 @@ int lume_ext4_create(struct lume_ext4_writer *w, uint32_t parent, const char *na
         if (result)
             return result;
     }
+    if (target)
+    {
+        unsigned char *data = inline_link ? raw + 0x28 : payload(w, raw, 0, true, false);
+        if (!data)
+            return w->error;
+        memcpy(data, target, target_bytes + 1);
+        if (!inline_link)
+            changed(w, data, DATA);
+        set_size(raw, target_bytes);
+    }
     seal_inode(w, number, raw);
-    add_entry(w, parent, p, name, number, directory ? 2 : 1);
+    add_entry(w, parent, p, name, number, entry_type(mode));
     int result = finish(w);
     if (!result)
         *out = number;
     return result;
+}
+
+int lume_ext4_create_owned(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                           bool directory, const struct lume_inode_access *access, uint32_t *out)
+{
+    return create_owned(w, parent, name, directory ? 0x4000 : 0x8000, access, NULL, out);
+}
+
+int lume_ext4_create_fifo(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                          const struct lume_inode_access *access, uint32_t *out)
+{
+    return create_owned(w, parent, name, LUME_EXT4_MODE_FIFO, access, NULL, out);
+}
+
+int lume_ext4_symlink(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                      const char *target, const struct lume_inode_access *access, uint32_t *out)
+{
+    if (!target)
+        return LUME_EXT4_INVALID;
+    return create_owned(w, parent, name, 0xa000, access, target, out);
+}
+
+int lume_ext4_create(struct lume_ext4_writer *w, uint32_t parent, const char *name, bool directory,
+                     uint32_t *out)
+{
+    const struct lume_inode_access access = {.mode = directory ? 0755 : 0644};
+    return lume_ext4_create_owned(w, parent, name, directory, &access, out);
+}
+
+int lume_ext4_link(struct lume_ext4_writer *w, uint32_t number, uint32_t parent, const char *name)
+{
+    if (!begin(w))
+        return LUME_EXT4_IO;
+    if (!valid_name(name) || !number)
+        return LUME_EXT4_INVALID;
+    unsigned char *p = mutable_directory(w, parent);
+    if (!p)
+        return w->error;
+    if (find_entry(w, parent, p, name, NULL))
+        return LUME_EXT4_EXISTS;
+    if (w->error)
+        return w->error;
+    unsigned char *raw = inode(w, number);
+    if (!raw)
+        return w->error;
+    unsigned mode = get16(raw) & 0xf000;
+    unsigned type = entry_type(mode);
+    if (mode == 0x4000)
+        return LUME_EXT4_LINK_DIRECTORY;
+    if (number < w->first_inode || !type)
+        return LUME_EXT4_UNSUPPORTED;
+    unsigned links = get16(raw + 0x1a);
+    if (!links)
+        return LUME_EXT4_INVALID;
+    if (links >= 65000)
+        return LUME_EXT4_LINK_LIMIT;
+    put16(raw + 0x1a, (uint16_t)(links + 1));
+    change_time(w, raw);
+    seal_inode(w, number, raw);
+    add_entry(w, parent, p, name, number, type);
+    return finish(w);
 }
 
 static bool empty_directory(struct lume_ext4_writer *w, uint32_t number, unsigned char *raw,
@@ -3154,7 +3966,7 @@ static bool empty_directory(struct lume_ext4_writer *w, uint32_t number, unsigne
 }
 
 static int remove_named(struct lume_ext4_writer *w, uint32_t parent, unsigned char *p,
-                        const char *name)
+                        const char *name, bool keep_open)
 {
     uint32_t number = find_entry(w, parent, p, name, NULL);
     if (!number)
@@ -3166,10 +3978,14 @@ static int remove_named(struct lume_ext4_writer *w, uint32_t parent, unsigned ch
         return w->error;
     unsigned mode = get16(raw) & 0xf000;
     bool directory = mode == 0x4000;
-    if ((mode != 0x8000 && mode != 0xa000 && !directory) || get32(raw + 0x68) || get16(raw + 0x76))
+    bool fifo = mode == LUME_EXT4_MODE_FIFO;
+    if (!entry_type(mode))
         return LUME_EXT4_UNSUPPORTED;
-    bool fast = mode == 0xa000 && !sectors(raw);
-    if (!fast && !layout(w, number, raw))
+    unsigned attr_sectors = inode_xattr_sectors(w, raw);
+    if (fifo && (sectors(raw) != attr_sectors || size(raw) || get32(raw + 0x20)))
+        return LUME_EXT4_INVALID;
+    bool inline_inode = fifo || (mode == 0xa000 && sectors(raw) == attr_sectors);
+    if (!inline_inode && !layout(w, number, raw))
         return w->error;
     if (directory &&
         (!empty_directory(w, number, raw, parent) || get16(raw + 0x1a) != 2 || get16(p + 0x1a) < 3))
@@ -3178,12 +3994,29 @@ static int remove_named(struct lume_ext4_writer *w, uint32_t parent, unsigned ch
     if (!directory && links > 1)
     {
         put16(raw + 0x1a, links - 1);
-        put32(raw + 0xc, w->timestamp);
+        change_time(w, raw);
+    }
+    else if (keep_open)
+    {
+        if (mode != 0x8000)
+            return LUME_EXT4_INVALID;
+        unsigned char *s = super(w);
+        if (!s)
+            return w->error;
+        put32(raw + 0x14, get32(s + EXT4_SB_LAST_ORPHAN));
+        put16(raw + 0x1a, 0);
+        change_time(w, raw);
+        put32(s + EXT4_SB_LAST_ORPHAN, number);
     }
     else
     {
-        if (!fast)
+        if (w->fast_replay && inode_xattr_block(raw))
+            return LUME_EXT4_UNSUPPORTED;
+        if (!inline_inode)
             resize(w, raw, 0);
+        release_xattr(w, raw);
+        if (w->error)
+            return w->error;
         put16(raw + 0x1a, 0);
         put32(raw + 0x14, w->timestamp ? w->timestamp : 1);
         set_size(raw, 0);
@@ -3207,7 +4040,8 @@ static int remove_named(struct lume_ext4_writer *w, uint32_t parent, unsigned ch
     return w->error;
 }
 
-int lume_ext4_remove(struct lume_ext4_writer *w, uint32_t parent, const char *name)
+static int unlink_named(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                        bool keep_open)
 {
     if (!begin(w))
         return LUME_EXT4_IO;
@@ -3216,8 +4050,18 @@ int lume_ext4_remove(struct lume_ext4_writer *w, uint32_t parent, const char *na
     unsigned char *p = mutable_directory(w, parent);
     if (!p)
         return w->error;
-    int result = remove_named(w, parent, p, name);
+    int result = remove_named(w, parent, p, name, keep_open);
     return result ? result : finish(w);
+}
+
+int lume_ext4_remove(struct lume_ext4_writer *w, uint32_t parent, const char *name)
+{
+    return unlink_named(w, parent, name, false);
+}
+
+int lume_ext4_unlink_open(struct lume_ext4_writer *w, uint32_t parent, const char *name)
+{
+    return unlink_named(w, parent, name, true);
 }
 
 static bool descendant(struct lume_ext4_writer *w, uint32_t parent, uint32_t number)
@@ -3245,7 +4089,7 @@ static bool descendant(struct lume_ext4_writer *w, uint32_t parent, uint32_t num
 }
 
 static int rename_entry(struct lume_ext4_writer *w, uint32_t parent, const char *name,
-                        uint32_t destination, const char *target, bool replace)
+                        uint32_t destination, const char *target, bool replace, bool keep_target)
 {
     if (!begin(w))
         return LUME_EXT4_IO;
@@ -3271,16 +4115,17 @@ static int rename_entry(struct lume_ext4_writer *w, uint32_t parent, const char 
     if (!raw)
         return w->error;
     unsigned mode = get16(raw) & 0xf000;
-    if (mode != 0x8000 && mode != 0xa000 && mode != 0x4000)
+    unsigned type = entry_type(mode);
+    if (!type)
         return LUME_EXT4_UNSUPPORTED;
     if (previous)
     {
         unsigned char *replaced = inode(w, previous);
         if (!replaced)
             return w->error;
-        if ((get16(replaced) & 0xf000) != mode)
+        if (((get16(replaced) & 0xf000) == 0x4000) != (mode == 0x4000))
             return LUME_EXT4_INVALID;
-        int result = remove_named(w, destination, to, target);
+        int result = remove_named(w, destination, to, target, keep_target);
         if (result)
             return result;
     }
@@ -3311,7 +4156,7 @@ static int rename_entry(struct lume_ext4_writer *w, uint32_t parent, const char 
     }
     put32(raw + 0xc, w->timestamp);
     seal_inode(w, number, raw);
-    add_entry(w, destination, to, target, number, mode == 0x4000 ? 2 : mode == 0xa000 ? 7 : 1);
+    add_entry(w, destination, to, target, number, type);
     remove_entry(w, parent, from, name);
     return finish(w);
 }
@@ -3319,13 +4164,19 @@ static int rename_entry(struct lume_ext4_writer *w, uint32_t parent, const char 
 int lume_ext4_rename(struct lume_ext4_writer *w, uint32_t parent, const char *name,
                      uint32_t destination, const char *target)
 {
-    return rename_entry(w, parent, name, destination, target, false);
+    return rename_entry(w, parent, name, destination, target, false, false);
 }
 
 int lume_ext4_replace(struct lume_ext4_writer *w, uint32_t parent, const char *name,
                       uint32_t destination, const char *target)
 {
-    return rename_entry(w, parent, name, destination, target, true);
+    return rename_entry(w, parent, name, destination, target, true, false);
+}
+
+int lume_ext4_replace_open(struct lume_ext4_writer *w, uint32_t parent, const char *name,
+                            uint32_t destination, const char *target)
+{
+    return rename_entry(w, parent, name, destination, target, true, true);
 }
 
 static void claim_fast_blocks(struct lume_ext4_writer *w, uint64_t first, unsigned count)
@@ -3355,36 +4206,43 @@ static void claim_fast_blocks(struct lume_ext4_writer *w, uint64_t first, unsign
 static bool next_extent(struct lume_ext4_writer *w, unsigned char *root, uint32_t logical,
                         struct extent_position *position)
 {
-    unsigned depth = get16(root + 6);
-    unsigned branches = depth == 2 ? get16(root + 2) : 1;
-    unsigned branch = depth == 2 ? extent_leaf_slot(root, logical) : 0;
-    for (; branch < branches && !w->error; ++branch)
+    if (!find_extent_path(w, root, logical, position))
+        return false;
+    unsigned char *node = position->node;
+    unsigned slot = position->slot;
+    if (slot)
     {
-        unsigned char *parent = extent_parent(w, root, branch);
-        if (!parent)
-            return false;
-        unsigned leaves = depth ? get16(parent + 2) : 1;
-        for (unsigned leaf = extent_leaf_slot(parent, logical); leaf < leaves && !w->error; ++leaf)
-        {
-            unsigned char *node = extent_node(w, parent, leaf);
-            if (!node)
-                return false;
-            unsigned count = get16(node + 2), slot = extent_slot(node, logical);
-            if (slot && (uint64_t)get32(node + slot * EXTENT_BYTES) +
-                                extent_length(node + slot * EXTENT_BYTES) <=
-                            logical)
-                ++slot;
-            if (!slot)
-                slot = 1;
-            if (slot <= count)
-            {
-                *position = (struct extent_position){parent, node, node + slot * EXTENT_BYTES,
-                                                     branch, leaf, slot};
-                return true;
-            }
-        }
+        const unsigned char *entry = node + slot * EXTENT_BYTES;
+        if ((uint64_t)get32(entry) + extent_length(entry) <= logical)
+            ++slot;
     }
-    return false;
+    else
+        slot = 1;
+
+    if (slot > get16(node + 2))
+    {
+        unsigned level = position->depth;
+        do
+        {
+            if (!level)
+                return false;
+            const struct extent_level *parent = position->level + --level;
+            if (parent->slot + 1 < get16(parent->node + 2))
+            {
+                uint32_t next = get32(parent->node + (parent->slot + 2) * EXTENT_BYTES);
+                if (!find_extent_path(w, root, next, position))
+                    return false;
+                node = position->node;
+                slot = 1;
+                break;
+            }
+        } while (level);
+        if (slot > get16(node + 2))
+            return false;
+    }
+    position->slot = slot;
+    position->entry = node + slot * EXTENT_BYTES;
+    return true;
 }
 
 static void erase_extent_entry(unsigned char *node, unsigned slot)
@@ -3399,31 +4257,21 @@ static void erase_extent_entry(unsigned char *node, unsigned slot)
 static void erase_extent(struct lume_ext4_writer *w, unsigned char *p,
                          const struct extent_position *position)
 {
-    unsigned char *root = p + 0x28, *node = position->node, *parent = position->parent;
+    unsigned level = position->depth;
+    unsigned char *node = position->node;
     erase_extent_entry(node, position->slot);
-    if (node == root)
-        return;
-    if (get16(node + 2))
+    while (level && !get16(node + 2) && !w->error)
     {
-        change_leaf(w, root, parent, position->branch, position->leaf, node);
-        return;
+        const struct extent_level *parent = position->level + --level;
+        node = parent->node;
+        release(w, false, extent_child(node + (parent->slot + 1) * EXTENT_BYTES));
+        sector_delta(w, p, -1);
+        erase_extent_entry(node, parent->slot + 1);
     }
-    release(w, false, extent_child(parent + (position->leaf + 1) * EXTENT_BYTES));
-    sector_delta(w, p, -1);
-    erase_extent_entry(parent, position->leaf + 1);
-    if (parent != root)
-    {
-        if (get16(parent + 2))
-            change_extent_parent(w, root, parent, position->branch);
-        else
-        {
-            release(w, false, extent_child(root + (position->branch + 1) * EXTENT_BYTES));
-            sector_delta(w, p, -1);
-            erase_extent_entry(root, position->branch + 1);
-        }
-    }
-    if (!get16(root + 2))
-        put16(root + 6, 0);
+    if (level)
+        change_extent_path(w, position, level);
+    else if (!get16(node + 2))
+        put16(node + 6, 0);
 }
 
 static void forget_fast_range(struct lume_ext4_writer *w, unsigned char *p, uint32_t from,
@@ -3455,18 +4303,14 @@ static void forget_fast_range(struct lume_ext4_writer *w, unsigned char *p, uint
         if (prefix)
         {
             put16(entry + 4, prefix + flag);
-            if (position.node != root)
-                change_leaf(w, root, position.parent, position.branch, position.leaf,
-                            position.node);
+            change_extent_path(w, &position, position.depth);
             if (suffix)
                 add_mapping(w, p, (uint32_t)end, physical + length - suffix, suffix, unwritten);
         }
         else if (suffix)
         {
             write_extent(entry, (uint32_t)end, suffix + flag, physical + length - suffix);
-            if (position.node != root)
-                change_leaf(w, root, position.parent, position.branch, position.leaf,
-                            position.node);
+            change_extent_path(w, &position, position.depth);
         }
         else
             erase_extent(w, p, &position);
@@ -3485,11 +4329,11 @@ static int replay_fast_range(struct lume_ext4_writer *w, unsigned tag, const uns
     unsigned char *raw = inode(w, number);
     if (!raw)
         return w->error;
-    if (!(get32(raw + 0x20) & EXTENTS) || get16(raw + 0x2e) > 2)
+    if (!(get32(raw + 0x20) & EXTENTS))
         return LUME_EXT4_UNSUPPORTED;
     uint64_t allocated = 0;
     uint64_t acl = get32(raw + 0x68) | (uint64_t)get16(raw + 0x76) << 32;
-    if (!extent_layout(w, number, raw, UINT64_C(1) << 32, acl, &allocated))
+    if (!extent_layout(w, number, raw, UINT64_C(1) << 32, acl, &allocated, false))
         return w->error;
     if (add)
     {
@@ -3515,7 +4359,7 @@ static int replay_fast_range(struct lume_ext4_writer *w, unsigned tag, const uns
     return w->error;
 }
 
-static bool fast_inode_allocated(struct lume_ext4_writer *w, uint32_t number, bool claim)
+static bool inode_allocated(struct lume_ext4_writer *w, uint32_t number, bool claim)
 {
     if (!number || number > w->fs->inodes || (number != 2 && number < w->first_inode))
     {
@@ -3525,7 +4369,8 @@ static bool fast_inode_allocated(struct lume_ext4_writer *w, uint32_t number, bo
     unsigned group_number = (number - 1) / w->fs->inodes_per_group;
     unsigned bit = (number - 1) % w->fs->inodes_per_group;
     unsigned char *g = group(w, group_number);
-    if (!g || (claim ? !initialize_bitmap(w, group_number, g, true) : (get16(g + 0x12) & 1)))
+    if (!g || (claim ? !initialize_bitmap(w, group_number, g, true)
+                     : (get16(g + 0x12) & BG_INODE_UNINIT)))
         return false;
     unsigned char *map = bitmap(w, g, true);
     if (!map)
@@ -3548,31 +4393,38 @@ static int replay_fast_inode(struct lume_ext4_writer *w, const unsigned char *da
     unsigned extra = length > 128 ? get16(logged + 0x80) : 0;
     if ((extra & 3) || length != 128 + extra || extra > w->fs->inode_bytes - 128u)
         return LUME_EXT4_INVALID;
-    bool short_link = mode == 0xa000 && !sectors(logged) && size(logged) <= 60;
+    uint64_t xattr = inode_xattr_block(logged);
+    unsigned attr_sectors = inode_xattr_sectors(w, logged);
+    bool short_link = mode == 0xa000 && sectors(logged) == attr_sectors && size(logged) <= 60;
     if ((mode != 0x4000 && mode != 0x8000 && !short_link) ||
-        (flags & ~(EXTENTS | EXT4_INDEX_INODE)) || (short_link ? flags != 0 : !(flags & EXTENTS)) ||
-        (get32(logged + 0x68) || get16(logged + 0x76)))
+        (flags & ~(EXTENTS | EXT4_INDEX_INODE)) || (short_link ? flags != 0 : !(flags & EXTENTS)))
         return LUME_EXT4_UNSUPPORTED;
     unsigned links = get16(logged + 0x1a);
-    bool existing = fast_inode_allocated(w, number, links != 0);
+    bool existing = inode_allocated(w, number, links != 0);
     if (w->error)
         return w->error;
     if (!links)
         return existing ? LUME_EXT4_UNSUPPORTED : 0;
-    unsigned char *raw = existing ? checked_inode(w, number) : inode_slot(w, number);
+    unsigned char *raw = existing ? checked_inode(w, number, false) : inode_slot(w, number);
     if (!raw)
         return w->error;
     uint64_t allocated = existing ? sectors(raw) : 0;
     if (existing)
     {
         if ((get16(raw) & 0xf000) != mode || get32(raw + 0x20) != flags ||
-            get32(raw + 0x64) != get32(logged + 0x64) || get32(raw + 0x68) || get16(raw + 0x76) ||
-            (short_link && allocated))
+            get32(raw + 0x64) != get32(logged + 0x64) || inode_xattr_block(raw) != xattr ||
+            (short_link && allocated != attr_sectors))
+            return LUME_EXT4_UNSUPPORTED;
+        unsigned old_extra = w->fs->inode_bytes > 128 ? get16(raw + 0x80) : 0;
+        unsigned body = 128 + old_extra;
+        /* An inode record cannot move attributes stored after its extra fields. */
+        if (extra != old_extra && body + 4 <= w->fs->inode_bytes &&
+            get32(raw + body) == EXT4_XATTR_MAGIC)
             return LUME_EXT4_UNSUPPORTED;
     }
     else
     {
-        if (flags & EXT4_INDEX_INODE)
+        if (xattr || (flags & EXT4_INDEX_INODE))
             return LUME_EXT4_UNSUPPORTED;
         memset(raw, 0, w->fs->inode_bytes);
         if (!short_link)
@@ -3607,10 +4459,10 @@ static int replay_fast_name(struct lume_ext4_writer *w, unsigned tag, const unsi
     if (w->error)
         return w->error;
     if (tag == LUME_EXT4_FC_UNLINK)
-        return current == number ? remove_named(w, parent, p, name) : 0;
+        return current == number ? remove_named(w, parent, p, name, false) : 0;
     if (current)
         return current == number ? 0 : LUME_EXT4_INVALID;
-    if (!fast_inode_allocated(w, number, false))
+    if (!inode_allocated(w, number, false))
         return w->error ? w->error : LUME_EXT4_INVALID;
     unsigned char *raw = inode(w, number);
     if (!raw)
@@ -3679,12 +4531,16 @@ static int validate_fast_inode(struct lume_ext4_writer *w, unsigned tag, const u
     if (tag == LUME_EXT4_FC_INODE || tag == LUME_EXT4_FC_ADD_RANGE || tag == LUME_EXT4_FC_DEL_RANGE)
     {
         uint32_t number = get32(data);
-        if (!fast_inode_allocated(w, number, false))
+        if (!inode_allocated(w, number, false))
             return w->error;
         unsigned char *raw = inode(w, number);
         if (!raw)
             return w->error;
-        if ((get16(raw) & 0xf000) == 0xa000 && !sectors(raw) && size(raw) <= 60)
+        uint64_t xattr = inode_xattr_block(raw);
+        if (xattr && !checked_xattr_block(w, xattr))
+            return w->error;
+        if ((get16(raw) & 0xf000) == 0xa000 && sectors(raw) == inode_xattr_sectors(w, raw) &&
+            size(raw) <= 60)
             return 0;
         if (!layout(w, number, raw))
             return w->error;
@@ -3710,6 +4566,8 @@ static int recover_fast(struct lume_ext4_writer *w, unsigned char *s)
     if (w->error)
         return w->error;
     seal_super(w, s);
+    if (!prepare_inode_tables(w))
+        return LUME_EXT4_IO;
     result = lume_ext4_jbd2_publish_recovery(w);
     if (result)
         return result;

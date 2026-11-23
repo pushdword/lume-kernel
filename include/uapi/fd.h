@@ -32,7 +32,9 @@ enum
     LUME_FD_WAIT,
     LUME_FD_PATH,
     LUME_FD_EVENTFD,
-    LUME_FD_BLOCK_SECTOR_SIZE
+    LUME_FD_BLOCK_SECTOR_SIZE,
+    LUME_FD_CLOSE_FROM,
+    LUME_FD_AVAILABLE
 };
 
 enum
@@ -59,7 +61,9 @@ enum
  * exact destination. SPAWN reads the 20-byte lume_spawn_request from buffer and inherits
  * descriptors without CLOEXEC. SPAWN and SPAWN_ENV retain their TTY-only initialization in the
  * older syscall interface. GETFD and SETFD use CLOEXEC. GETFL and SETFL use NONBLOCK, which is
- * shared by duplicated descriptors. Unused flags, buffer, count and timeout fields must be
+ * shared by duplicated descriptors. CLOSE_FROM closes descriptors starting at fd.
+ * AVAILABLE returns the unread byte count for regular files and pipes, capped at INT32_MAX.
+ * Unused flags, buffer, count and timeout fields must be
  * zero. */
 struct lume_fd_request
 {

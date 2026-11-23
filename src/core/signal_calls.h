@@ -1,8 +1,9 @@
 #include "signal_mask.h"
 #include "signal_wait.h"
 #define SIGNAL_UNMASKABLE LUME_SIGNAL_UNMASKABLE
-#define SIGNAL_ACTION_FLAGS ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 6))
+#define SIGNAL_ACTION_FLAGS ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 6))
 #define SIGNAL_DEPTH 4u
+#define SIGNAL_PIPE 13u
 
 static struct signal_state
 {
@@ -12,12 +13,17 @@ static struct signal_state
         uint32_t mask, flags;
     } action[LUME_SIGNAL_COUNT];
 
-    uint32_t pending, mask, wait_mask;
+    uint32_t pending, directed_pending, mask, wait_mask;
     uint64_t deadline, interval, epoch;
     unsigned session, group, depth;
     struct lume_context saved[SIGNAL_DEPTH];
     uint32_t saved_mask[SIGNAL_DEPTH];
 } signals[LUME_TASK_LIMIT];
+
+static uint32_t signal_pending_bits(const struct signal_state *state)
+{
+    return state->pending | state->directed_pending;
+}
 
 static void signal_thread_initialize(unsigned child, unsigned creator)
 {
@@ -47,6 +53,21 @@ static void signal_wait_cancel_process(unsigned owner)
             signal_wait_cancel(task);
 }
 
+static int64_t signal_wait_take(unsigned task, unsigned owner, struct lume_signal_request *request)
+{
+    struct signal_state *waiting = &signals[task];
+    uint32_t pending = waiting->directed_pending | signals[owner].pending;
+    int64_t result = signal_try_wait(&pending, waiting->mask, request);
+    if (!result)
+    {
+        uint32_t bit = UINT32_C(1) << request->number;
+        uint32_t *source = waiting->directed_pending & bit ? &waiting->directed_pending
+                                                         : &signals[owner].pending;
+        *source &= ~bit;
+    }
+    return result;
+}
+
 static bool signal_wake_waiter(unsigned owner)
 {
     for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
@@ -56,7 +77,7 @@ static bool signal_wake_waiter(unsigned owner)
             continue;
         struct lume_signal_request request = {
             .version = LUME_SIGNAL_VERSION, .bytes = sizeof(request), .mask = waiting->wait_mask};
-        if (signal_try_wait(&signals[owner].pending, waiting->mask, &request))
+        if (signal_wait_take(task, owner, &request))
             continue;
         waiting->wait_mask = 0;
         LUME_CONTEXT_REG(&tasks[task].context, 0) = request.number;
@@ -79,6 +100,19 @@ static bool signal_ignored(unsigned owner, unsigned number)
                                          number == 23 || number == 28));
 }
 
+static void signal_pipe(unsigned task)
+{
+    unsigned owner = process_slot(task);
+    struct signal_state *target = &signals[task];
+    if (!signal_pending_keep(SIGNAL_PIPE, signals[owner].action[SIGNAL_PIPE].handler, target->mask))
+        return;
+    task_query_revoke(owner);
+    uint32_t bit = UINT32_C(1) << SIGNAL_PIPE;
+    target->directed_pending |= bit;
+    if (!(target->mask & bit))
+        ++target->epoch;
+}
+
 static bool signal_default_stop(unsigned owner, unsigned number)
 {
     return number == 17 || (!signals[owner].action[number].handler &&
@@ -87,7 +121,7 @@ static bool signal_default_stop(unsigned owner, unsigned number)
 
 static uint32_t signal_interrupt_pending(unsigned owner)
 {
-    uint32_t pending = signals[owner].pending & ~signals[owner].mask;
+    uint32_t pending = signal_pending_bits(&signals[owner]) & ~signals[owner].mask;
     const unsigned stops[] = {17, 18, 21, 22};
     for (unsigned i = 0; i < sizeof(stops) / sizeof(*stops); ++i)
         if (signal_default_stop(owner, stops[i]))
@@ -153,8 +187,9 @@ static void signal_queue(unsigned owner, unsigned number)
             lume_smp_wake();
             return;
         }
+        bool fifo_open = fifo_opens[owner].object != 0;
         bool restart = (stopping || (s->action[number].flags & (1u << 3))) &&
-                       (pipe_wait[owner] || states[owner] == 3);
+                       (fifo_open || pipe_wait[owner] || states[owner] == 3);
         signal_wait_cancel(owner);
         poll_interrupt(owner, &tasks[owner].context);
         stream_cancel(owner);
@@ -163,8 +198,10 @@ static void signal_queue(unsigned owner, unsigned number)
         service_wait_cancel(owner);
         if (pipe_wait[owner] && !restart)
             LUME_CONTEXT_PC(&tasks[owner].context) += LUME_SYSCALL_INSTRUCTION_BYTES;
-        if (states[owner] == 3 && restart)
+        if ((states[owner] == 3 || fifo_open) && restart)
             LUME_CONTEXT_PC(&tasks[owner].context) -= LUME_SYSCALL_INSTRUCTION_BYTES;
+        if (fifo_open)
+            kernel_fifo_cancel(owner);
         lume_wait_cancel(pipe_queues[owner], owner);
         pipe_queues[owner] = 0;
         pipe_wait[owner] = input_wait[owner] = false;
@@ -204,7 +241,7 @@ static void signal_inherit(unsigned child, unsigned parent, bool exec)
         s->mask = p->mask;
         s->session = p->session ? p->session : 1;
         s->group = p->group ? p->group : 1;
-        s->pending = 0;
+        s->pending = s->directed_pending = 0;
         s->epoch = 0;
         s->deadline = s->interval = 0;
         if (!exec)
@@ -229,9 +266,11 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     if (thread_slots[current_task].thread)
     {
         if (operation != LUME_SIGNAL_MASK && operation != LUME_SIGNAL_TRY_WAIT &&
-            operation != LUME_SIGNAL_SEND)
+            operation != LUME_SIGNAL_PENDING && operation != LUME_SIGNAL_SEND &&
+            operation != LUME_SIGNAL_ACTION &&
+            operation != LUME_SIGNAL_RETURN)
             return -LUME_ENOSYS;
-        if (operation != LUME_SIGNAL_SEND)
+        if (operation != LUME_SIGNAL_SEND && operation != LUME_SIGNAL_ACTION)
             s = &signals[current_task];
     }
     if (operation == LUME_SIGNAL_RETURN)
@@ -251,10 +290,20 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
         return -LUME_EINVAL;
     if (operation == LUME_SIGNAL_TRY_WAIT)
     {
-        int64_t result = signal_try_wait(&signals[owner].pending, s->mask, &r);
+        int64_t result = signal_wait_take(current_task, owner, &r);
         if (!result)
             *out = r;
         return result;
+    }
+    if (operation == LUME_SIGNAL_PENDING)
+    {
+        if (r.number || r.flags || r.handler || r.restorer || r.delay_ms || r.interval_ms || r.mask ||
+            r.operation || r.pid || r.group)
+            return -LUME_EINVAL;
+        out->mask = signal_pending_bits(s) & s->mask;
+        if (s != &signals[owner])
+            out->mask |= signals[owner].pending & s->mask;
+        return 0;
     }
     if (operation == LUME_SIGNAL_ACTION)
     {
@@ -274,7 +323,13 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
             s->action[r.number] =
                 (struct signal_action){r.handler, r.restorer, r.mask & ~SIGNAL_UNMASKABLE, r.flags};
             if (signal_ignored(owner, r.number))
-                s->pending &= ~(1u << r.number);
+            {
+                uint32_t bit = UINT32_C(1) << r.number;
+                s->pending &= ~bit;
+                for (unsigned task = 0; task < LUME_TASK_LIMIT; ++task)
+                    if (states[task] && process_slot(task) == owner)
+                        signals[task].directed_pending &= ~bit;
+            }
         }
         out->handler = old.handler;
         out->restorer = old.restorer;
@@ -284,7 +339,7 @@ static int64_t signal_call(struct lume_context *frame, unsigned owner)
     }
     if (operation == LUME_SIGNAL_MASK)
     {
-        int64_t result = signal_mask_update(&s->mask, s->pending, s->epoch, &r);
+        int64_t result = signal_mask_update(&s->mask, signal_pending_bits(s), s->epoch, &r);
         if (!result)
             *out = r;
         return result;
@@ -372,7 +427,7 @@ static struct lume_context *signal_wait_call(struct lume_context *frame, unsigne
     }
     struct lume_signal_request request = {
         .version = LUME_SIGNAL_VERSION, .bytes = sizeof(request), .mask = (uint32_t)selected};
-    int64_t result = signal_try_wait(&signals[owner].pending, waiting->mask, &request);
+    int64_t result = signal_wait_take(current_task, owner, &request);
     if (result != -LUME_EAGAIN)
     {
         LUME_CONTEXT_REG(frame, 0) = result ? (uint64_t)result : request.number;
@@ -394,6 +449,15 @@ static struct lume_context *signal_dispatch_call(struct lume_context *frame, uns
     return kernel_buffer_failure(frame, signal_call(frame, owner));
 }
 
+static struct lume_context *signal_terminate(unsigned owner, unsigned number)
+{
+    exit_signals[owner] = number;
+    if (current_task == owner)
+        return finish_program(128 + number);
+    request_exit(owner, 128 + number);
+    return thread_finish(0);
+}
+
 struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
 {
     if (!frame || !active || !public_mode || (LUME_CONTEXT_STATUS(frame) & 15) ||
@@ -407,16 +471,19 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
         sched_charge(&policy, lume_cpu_index(), now());
         return lume_tasks_deliver_signals(wait_ready_task());
     }
-    if (thread_slots[current_task].thread)
-        return frame;
-    struct signal_state *s = &signals[owner];
-    uint32_t pending = s->pending & ~s->mask;
+    struct signal_state *s = &signals[current_task];
+    uint32_t pending = signal_pending_bits(s) & ~s->mask;
     for (unsigned number = 1; number < LUME_SIGNAL_COUNT; ++number)
         if (pending & (1u << number))
         {
             task_query_revoke(owner);
-            struct signal_action action = s->action[number];
-            s->pending &= ~(1u << number);
+            struct signal_action *disposition = &signals[owner].action[number];
+            struct signal_action action = *disposition;
+            uint32_t bit = UINT32_C(1) << number;
+            if (s->directed_pending & bit)
+                s->directed_pending &= ~bit;
+            else
+                s->pending &= ~bit;
             if (signal_ignored(owner, number))
                 continue;
             if (number == 17 || (!action.handler && (number == 18 || number == 21 || number == 22)))
@@ -436,26 +503,20 @@ struct lume_context *lume_tasks_deliver_signals(struct lume_context *frame)
                 sched_charge(&policy, lume_cpu_index(), now());
                 return lume_tasks_deliver_signals(wait_ready_task());
             }
-            poll_interrupt(owner, frame);
+            poll_interrupt(current_task, frame);
             if (!action.handler || number == 9 || s->depth == SIGNAL_DEPTH)
-            {
-                exit_signals[owner] = number;
-                struct lume_context *next = finish_program(128 + number);
-                return lume_tasks_deliver_signals(next);
-            }
+                return lume_tasks_deliver_signals(signal_terminate(owner, number));
             s->saved[s->depth] = *frame;
             s->saved_mask[s->depth++] = s->mask;
             s->mask |= action.mask;
             if (!(action.flags & (1u << 6)))
                 s->mask |= 1u << number;
             if (action.flags & (1u << 2))
-                s->action[number] = (struct signal_action){0};
+                *disposition = (struct signal_action){0};
             LUME_CONTEXT_REG(frame, 0) = number;
-            if (!lume_context_signal(frame, action.handler, action.restorer))
-            {
-                exit_signals[owner] = 11;
-                return lume_tasks_deliver_signals(finish_program(139));
-            }
+            if (!lume_context_signal(frame, action.handler, action.restorer,
+                                     (action.flags & (1u << 4)) != 0))
+                return lume_tasks_deliver_signals(signal_terminate(owner, 11));
             return frame;
         }
     return frame;

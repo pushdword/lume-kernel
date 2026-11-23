@@ -22,6 +22,7 @@ enum
     LUME_ENOENT = 2,
     LUME_EINTR = 4,
     LUME_EIO = 5,
+    LUME_ENXIO = 6,
     LUME_EBADF = 9,
     LUME_EAGAIN = 11,
     LUME_ENOMEM = 12,
@@ -29,6 +30,7 @@ enum
     LUME_EFAULT = 14,
     LUME_EBUSY = 16,
     LUME_EEXIST = 17,
+    LUME_EXDEV = 18,
     LUME_ENOTDIR = 20,
     LUME_EISDIR = 21,
     LUME_EINVAL = 22,
@@ -38,6 +40,7 @@ enum
     LUME_ENOSPC = 28,
     LUME_ESPIPE = 29,
     LUME_EROFS = 30,
+    LUME_EMLINK = 31,
     LUME_EPIPE = 32,
     LUME_ENAMETOOLONG = 36,
     LUME_ENOSYS = 38,
@@ -76,8 +79,8 @@ enum
     LUME_EINPROGRESS = 115
 };
 
-#define LUME_ARG_MAX 256u
-#define LUME_ARG_BYTES 16384u
+#define LUME_ARG_MAX 512u
+#define LUME_ARG_BYTES 32768u
 #define LUME_ENV_MAX 64u
 #define LUME_ENV_BYTES 8192u
 
@@ -123,7 +126,7 @@ enum
 struct lume_stat
 {
     uint64_t inode, size;
-    uint32_t kind, reserved;
+    uint32_t kind, links;
 };
 
 struct lume_dirent

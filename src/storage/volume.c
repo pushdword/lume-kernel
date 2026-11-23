@@ -121,13 +121,16 @@ enum lume_volume_format lume_volume_identify(const unsigned char p[512], uint64_
 #if defined(LUME_ARCH_AMD64)
     if (u32(p + 440) == LUME_Q35_EFI_DISK_ID)
     {
-        uint64_t first = LUME_Q35_EFI_DATA_FIRST;
-        if (sectors > UINT32_MAX || sectors < first + 65536 || !empty(p, 440) ||
-            p[444] || p[445] || !empty(p + 478, 32) ||
+        const uint32_t first = LUME_Q35_EFI_DATA_FIRST;
+        uint32_t count = u32(p + 474);
+        uint64_t end = (uint64_t)first + count;
+        if (sectors > UINT32_MAX || !empty(p, 440) || p[444] || p[445] || count < 65536 ||
+            end > sectors || !empty(p + 494, 16) ||
             !typed_partition(p + 446, true, 0xef, LUME_Q35_EFI_FIRST, LUME_Q35_EFI_SECTORS) ||
-            !typed_partition(p + 462, false, 0x83, (uint32_t)first, (uint32_t)(sectors - first)))
+            !typed_partition(p + 462, false, 0x83, first, count) ||
+            (empty(p + 478, 16) ? end != sectors : !journal_partition(p + 478, sectors, end).count))
             return LUME_VOLUME_NONE;
-        *out = (struct lume_volume){first, sectors - first};
+        *out = (struct lume_volume){first, count};
         return LUME_VOLUME_EXT4;
     }
     if (u32(p + 440) == LUME_Q35_DISK_ID)
@@ -188,7 +191,8 @@ bool lume_volume_journal_select(const unsigned char p[512], uint64_t sectors,
     if (lume_volume_identify(p, sectors, &data) != LUME_VOLUME_EXT4)
         return false;
     const unsigned char *entry = p + 462;
-    if (u32(p + 440) == LUME_CARD_DISK_ID)
+    uint32_t identity = u32(p + 440);
+    if (identity == LUME_CARD_DISK_ID || identity == LUME_Q35_EFI_DISK_ID)
     {
         if (!empty(p + 494, 16))
             return false;

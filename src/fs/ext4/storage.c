@@ -1,3 +1,4 @@
+#include "lume/file_access.h"
 #include "lume/ext4_storage.h"
 #include "lume/abi.h"
 #include "lume/files.h"
@@ -11,7 +12,7 @@ static unsigned char scratch[4096];
 static bool active;
 static struct lume_ext4_writer *writer;
 static uint64_t mount_id, content_generation;
-static uint32_t (*timestamp)(void *);
+static int (*timestamp)(void *, struct lume_file_time *);
 static int (*cache_owner)(void);
 
 struct ext4_handle
@@ -19,9 +20,26 @@ struct ext4_handle
     struct lume_ext4_inode inode;
     uint64_t generation;
     struct ext4_handle *next;
+    bool detached;
 };
 
 static struct ext4_handle *handles;
+static int mutation(void);
+
+static bool inode_is_open(uint32_t number)
+{
+    for (const struct ext4_handle *handle = handles; handle; handle = handle->next)
+        if (handle->inode.number == number)
+            return true;
+    return false;
+}
+
+static void detach_handles(uint32_t number)
+{
+    for (struct ext4_handle *handle = handles; handle; handle = handle->next)
+        if (handle->inode.number == number)
+            handle->detached = true;
+}
 
 static bool writer_faulted(void)
 {
@@ -44,6 +62,12 @@ static int error_code(int error)
         return -LUME_EEXIST;
     case LUME_EXT4_NOT_EMPTY:
         return -LUME_ENOTEMPTY;
+    case LUME_EXT4_LINK_LIMIT:
+        return -LUME_EMLINK;
+    case LUME_EXT4_LINK_DIRECTORY:
+        return -LUME_EPERM;
+    case LUME_EXT4_TIME_RANGE:
+        return -LUME_EOVERFLOW;
     default:
         return -LUME_EIO;
     }
@@ -92,7 +116,26 @@ static uint64_t inode_key(const struct lume_ext4_inode *inode)
     return LUME_STORAGE_INODE_BASE + inode->number;
 }
 
-static int metadata(const char *path, struct lume_stat *out, unsigned *mode)
+static int allocation(uint64_t key, struct lume_file_allocation *out)
+{
+    if (key <= LUME_STORAGE_INODE_BASE || key - LUME_STORAGE_INODE_BASE > UINT32_MAX)
+        return -LUME_EINVAL;
+    struct lume_ext4_inode inode;
+    int result = lume_ext4_inode_get(&filesystem, (uint32_t)(key - LUME_STORAGE_INODE_BASE),
+                                    &inode, scratch, sizeof scratch);
+    if (result)
+    {
+        if (writer && result == LUME_EXT4_IO)
+            writer->faulted = true;
+        return error_code(result);
+    }
+    *out = (struct lume_file_allocation){.sectors = inode.sectors,
+                                         .block_bytes = filesystem.block_bytes};
+    return 0;
+}
+
+static int metadata(const char *path, struct lume_stat *out, struct lume_inode_access *access,
+                    struct lume_file_times *times)
 {
     struct lume_ext4_inode inode;
     int result = resolve(path, &inode);
@@ -102,12 +145,21 @@ static int metadata(const char *path, struct lume_stat *out, unsigned *mode)
             writer->faulted = true;
         return result;
     }
+    unsigned mode = inode.mode & 0xf000;
     *out = (struct lume_stat){.inode = inode_key(&inode),
                               .size = inode.bytes,
-                              .kind = (inode.mode & 0xf000) == 0x4000   ? LUME_NODE_DIR
-                                      : (inode.mode & 0xf000) == 0xa000 ? LUME_NODE_LINK
-                                                                        : LUME_NODE_FILE};
-    *mode = inode.mode;
+                              .links = inode.links,
+                              .kind = mode == 0x4000                ? LUME_NODE_DIR
+                                      : mode == 0xa000              ? LUME_NODE_LINK
+                                      : mode == LUME_EXT4_MODE_FIFO ? LUME_NODE_PIPE
+                                                                    : LUME_NODE_FILE};
+    *access = (struct lume_inode_access){inode.uid, inode.gid, inode.mode};
+    if (times)
+        *times = (struct lume_file_times){
+            .access = {inode.accessed.seconds, inode.accessed.nanoseconds, 0},
+            .modification = {inode.modified.seconds, inode.modified.nanoseconds, 0},
+            .change = {inode.changed.seconds, inode.changed.nanoseconds, 0},
+        };
     return 0;
 }
 
@@ -129,6 +181,45 @@ static int readlink_path(const char *path, void *out, size_t bytes)
         return -LUME_EINVAL;
     result = lume_ext4_readlink(&filesystem, &inode, out, bytes, scratch, sizeof scratch);
     return result < 0 ? error_code(result) : result;
+}
+
+static int next_entry(const char *path, uint64_t *cursor, struct lume_storage_dirent *out)
+{
+    if (!cursor || !out)
+        return -LUME_EINVAL;
+    struct lume_ext4_inode directory;
+    int result = resolve(path, &directory);
+    if (result)
+        return result;
+    if ((directory.mode & 0xf000) != 0x4000)
+        return -LUME_ENOTDIR;
+    for (;;)
+    {
+        struct lume_ext4_entry entry;
+        result = lume_ext4_readdir(&filesystem, &directory, cursor, &entry, scratch, sizeof scratch);
+        if (result <= 0)
+            return result ? error_code(result) : 0;
+        if (!strcmp(entry.name, ".") || !strcmp(entry.name, ".."))
+            continue;
+        struct lume_ext4_inode inode;
+        result = lume_ext4_inode_get(&filesystem, entry.inode, &inode, scratch, sizeof scratch);
+        if (result)
+        {
+            if (writer && result == LUME_EXT4_IO)
+                writer->faulted = true;
+            return error_code(result);
+        }
+        unsigned mode = inode.mode & 0xf000;
+        *out = (struct lume_storage_dirent){
+            .inode = inode_key(&inode),
+            .kind = mode == 0x4000                ? LUME_NODE_DIR
+                    : mode == 0xa000              ? LUME_NODE_LINK
+                    : mode == LUME_EXT4_MODE_FIFO ? LUME_NODE_PIPE
+                                                  : LUME_NODE_FILE,
+        };
+        memcpy(out->name, entry.name, strlen(entry.name) + 1);
+        return 1;
+    }
 }
 
 static bool walk(lume_storage_visit visit, void *context)
@@ -227,6 +318,7 @@ static int open_handle(const char *path, unsigned flags, void **out)
     handle->inode = inode;
     handle->generation = content_generation;
     handle->next = handles;
+    handle->detached = false;
     handles = handle;
     *out = handle;
     return 0;
@@ -243,7 +335,8 @@ static int refresh_handle(struct ext4_handle *handle)
         lume_ext4_inode_get(&filesystem, handle->inode.number, &inode, scratch, sizeof scratch);
     if (result)
         return error_code(result);
-    if (inode.generation != handle->inode.generation || (inode.mode & 0xf000) != 0x8000)
+    if (inode.generation != handle->inode.generation || (inode.mode & 0xf000) != 0x8000 ||
+        (!inode.links && !handle->detached))
         return -LUME_ENOENT;
     handle->inode = inode;
     handle->generation = content_generation;
@@ -267,16 +360,24 @@ static int read_handle(void *value, uint64_t offset, void *out, size_t bytes)
     return result ? error_code(result) : (int)bytes;
 }
 
-static int close_handle(void *handle)
+static int close_handle(void *value)
 {
+    struct ext4_handle *handle = value;
     struct ext4_handle **at = &handles;
     while (*at && *at != handle)
         at = &(*at)->next;
     if (!*at)
         return -LUME_EBADF;
     *at = (*at)->next;
+    int result = 0;
+    if (handle->detached && !inode_is_open(handle->inode.number))
+    {
+        result = mutation();
+        if (!result)
+            result = error_code(lume_ext4_reap_inode(writer, &handle->inode));
+    }
     lume_kernel_free(handle);
-    return 0;
+    return result;
 }
 
 static int read_path(const char *path, uint64_t offset, void *out, size_t bytes)
@@ -301,9 +402,9 @@ static int mutation(void)
     ++content_generation;
     if (timestamp)
     {
-        uint32_t seconds = timestamp(filesystem.context);
-        if (seconds)
-            writer->timestamp = seconds;
+        struct lume_file_time now;
+        if (!timestamp(filesystem.context, &now) && now.seconds > 0 && now.seconds <= UINT32_MAX)
+            writer->timestamp = (uint32_t)now.seconds;
     }
     return 0;
 }
@@ -379,7 +480,37 @@ static int parent(const char *path, struct lume_ext4_inode *inode, const char **
     return 0;
 }
 
+static int create_owned(const char *path, unsigned kind, const struct lume_inode_access *access,
+                        uint64_t *identity)
+{
+    if (kind != LUME_NODE_FILE && kind != LUME_NODE_DIR && kind != LUME_NODE_PIPE)
+        return -LUME_EOPNOTSUPP;
+    int result = mutation();
+    if (result)
+        return result;
+    struct lume_ext4_inode inode;
+    const char *name;
+    result = parent(path, &inode, &name);
+    uint32_t created;
+    if (!result)
+        result = error_code(kind == LUME_NODE_PIPE
+                                ? lume_ext4_create_fifo(writer, inode.number, name, access, &created)
+                                : lume_ext4_create_owned(writer, inode.number, name,
+                                                         kind == LUME_NODE_DIR, access, &created));
+    if (!result)
+        *identity = LUME_STORAGE_INODE_BASE + created;
+    return result;
+}
+
 static int create(const char *path, bool directory)
+{
+    const struct lume_inode_access access = {.mode = directory ? 0755 : 0644};
+    uint64_t identity;
+    return create_owned(path, directory ? LUME_NODE_DIR : LUME_NODE_FILE, &access, &identity);
+}
+
+static int symlink_path(const char *path, const char *target, const struct lume_inode_access *access,
+                        uint64_t *identity)
 {
     int result = mutation();
     if (result)
@@ -388,8 +519,11 @@ static int create(const char *path, bool directory)
     const char *name;
     result = parent(path, &inode, &name);
     uint32_t created;
-    return result ? result
-                  : error_code(lume_ext4_create(writer, inode.number, name, directory, &created));
+    if (!result)
+        result = error_code(lume_ext4_symlink(writer, inode.number, name, target, access, &created));
+    if (!result)
+        *identity = LUME_STORAGE_INODE_BASE + created;
+    return result;
 }
 
 static int remove_path(const char *path)
@@ -404,10 +538,35 @@ static int remove_path(const char *path)
         result = resolve(path, &target);
     if (result)
         return result;
-    for (const struct ext4_handle *handle = handles; handle; handle = handle->next)
-        if (handle->inode.number == target.number)
-            return -LUME_EBUSY;
-    return error_code(lume_ext4_remove(writer, inode.number, name));
+    bool keep = target.links == 1 && (target.mode & 0xf000) == 0x8000 &&
+                inode_is_open(target.number);
+    result = error_code(keep ? lume_ext4_unlink_open(writer, inode.number, name)
+                             : lume_ext4_remove(writer, inode.number, name));
+    if (!result && keep)
+        detach_handles(target.number);
+    return result;
+}
+
+static int remove_state(const char *path, unsigned *state)
+{
+    int result = remove_path(path);
+    *state = !result            ? LUME_STORAGE_NAMESPACE_COMMITTED
+             : writer_faulted() ? LUME_STORAGE_NAMESPACE_UNCERTAIN
+                                : LUME_STORAGE_NAMESPACE_UNCHANGED;
+    return result;
+}
+
+static int link_path(const char *from, const char *to)
+{
+    int result = mutation();
+    if (result)
+        return result;
+    struct lume_ext4_inode source, destination;
+    const char *name;
+    result = resolve(from, &source);
+    if (!result)
+        result = parent(to, &destination, &name);
+    return result ? result : error_code(lume_ext4_link(writer, source.number, destination.number, name));
 }
 
 static int rename_path(const char *from, const char *to)
@@ -445,19 +604,27 @@ static int replace_path(const char *from, const char *to, unsigned *state)
     result = parent(from, &source, &name);
     if (!result)
         result = parent(to, &destination, &target);
+    bool keep = false;
     if (!result)
     {
         int found = resolve(to, &previous);
         if (found && found != -LUME_ENOENT)
             result = found;
-        if (!found)
-            for (const struct ext4_handle *handle = handles; handle; handle = handle->next)
-                if (handle->inode.number == previous.number)
-                    result = -LUME_EBUSY;
+        if (!found && previous.links == 1 && (previous.mode & 0xf000) == 0x8000 &&
+            inode_is_open(previous.number))
+        {
+            struct lume_ext4_inode incoming;
+            result = resolve(from, &incoming);
+            keep = !result && incoming.number != previous.number;
+        }
     }
     if (!result)
-        result =
-            error_code(lume_ext4_replace(writer, source.number, name, destination.number, target));
+        result = error_code(keep ? lume_ext4_replace_open(writer, source.number, name,
+                                                         destination.number, target)
+                                 : lume_ext4_replace(writer, source.number, name,
+                                                     destination.number, target));
+    if (!result && keep)
+        detach_handles(previous.number);
     *state = !result            ? LUME_STORAGE_NAMESPACE_COMMITTED
              : writer_faulted() ? LUME_STORAGE_NAMESPACE_UNCERTAIN
                                 : LUME_STORAGE_NAMESPACE_UNCHANGED;
@@ -472,6 +639,46 @@ static int set_mode(const char *path, unsigned mode)
     struct lume_ext4_inode inode;
     result = resolve(path, &inode);
     return result ? result : error_code(lume_ext4_mode(writer, inode.number, mode));
+}
+
+static int set_owner(const char *path, uint32_t uid, uint32_t gid)
+{
+    int result = mutation();
+    if (result)
+        return result;
+    struct lume_ext4_inode inode;
+    result = resolve(path, &inode);
+    return result ? result : error_code(lume_ext4_owner(writer, inode.number, uid, gid));
+}
+
+static int set_times(const char *path, const struct lume_file_time times[2])
+{
+    int result = mutation();
+    if (result)
+        return result;
+    struct lume_ext4_inode inode;
+    result = resolve(path, &inode);
+    if (result)
+        return result;
+    struct lume_file_time clock;
+    int sampled = timestamp ? timestamp(filesystem.context, &clock) : -LUME_EAGAIN;
+    struct lume_ext4_time now = {.seconds = writer->timestamp};
+    if (!sampled)
+        now = (struct lume_ext4_time){clock.seconds, clock.nanoseconds};
+    struct lume_ext4_time values[2];
+    const struct lume_ext4_time *updates[2] = {NULL, NULL};
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        if (times[i].nanoseconds == LUME_FILE_TIME_OMIT)
+            continue;
+        if (times[i].nanoseconds == LUME_FILE_TIME_NOW && sampled)
+            return sampled;
+        values[i] = times[i].nanoseconds == LUME_FILE_TIME_NOW
+                        ? now
+                        : (struct lume_ext4_time){times[i].seconds, times[i].nanoseconds};
+        updates[i] = &values[i];
+    }
+    return error_code(lume_ext4_times(writer, inode.number, updates[0], updates[1], &now));
 }
 
 static int sync_handle(void *handle)
@@ -526,6 +733,7 @@ static void program_cache_owner(int (*release)(void))
 }
 
 static const struct lume_storage_ops operations = {.walk = walk,
+                                                   .next = next_entry,
                                                    .create = create,
                                                    .truncate = mutate,
                                                    .read = read_path,
@@ -544,7 +752,8 @@ static const struct lume_storage_ops operations = {.walk = walk,
                                                    .program_cache_owner = program_cache_owner,
                                                    .metadata = metadata,
                                                    .read_only = true,
-                                                   .readlink = readlink_path};
+                                                   .readlink = readlink_path,
+                                                   .allocation = allocation};
 
 int lume_ext4_storage_open(lume_ext4_read_bytes read, void *context, uint64_t bytes,
                            const struct lume_storage_ops **out)
@@ -621,8 +830,14 @@ int lume_ext4_storage_open_write(const struct lume_ext4_storage_io *io,
     mutable_operations = operations;
     mutable_operations.read_only = false;
     mutable_operations.rename_state = rename_state;
+    mutable_operations.remove_state = remove_state;
     mutable_operations.replace = replace_path;
     mutable_operations.set_mode = set_mode;
+    mutable_operations.set_owner = set_owner;
+    mutable_operations.create_owned = create_owned;
+    mutable_operations.link = link_path;
+    mutable_operations.set_times = set_times;
+    mutable_operations.symlink = symlink_path;
     *out = &mutable_operations;
     return 0;
 }

@@ -32,6 +32,7 @@ static volatile uint32_t *host;
 static uint32_t pci_address;
 static struct ahci_disk *storage_disk;
 static struct lume_volume data_volume;
+static struct lume_volume journal_volume;
 static bool write_enabled;
 
 static bool wait_clear(volatile uint32_t *value, uint32_t mask)
@@ -182,9 +183,8 @@ static bool read_blocks(uint64_t sector, unsigned count, void *buffer)
 
 static bool write_deferred(uint64_t sector, unsigned count, const void *buffer)
 {
-    if (!write_enabled || !count || sector < data_volume.first ||
-        sector - data_volume.first >= data_volume.count ||
-        count > data_volume.count - (sector - data_volume.first))
+    if (!write_enabled || (!lume_volume_contains(&data_volume, sector, count) &&
+                           !lume_volume_contains(&journal_volume, sector, count)))
         return false;
     const unsigned char *source = buffer;
     while (count)
@@ -255,6 +255,18 @@ static bool allow_boot(uint64_t first, uint64_t count)
     return false;
 }
 
+static bool allow_journal(uint64_t first, uint64_t count)
+{
+    unsigned char mbr[512];
+    struct lume_volume allowed;
+    if (!write_enabled || journal_volume.count || !read_sector(0, mbr) ||
+        !lume_volume_journal_select(mbr, sectors(), &allowed) || first != allowed.first ||
+        count != allowed.count)
+        return false;
+    journal_volume = allowed;
+    return true;
+}
+
 static void stats(void)
 {
     lume_value("AHCI_STORAGE_SECTORS", sectors());
@@ -274,6 +286,7 @@ static const struct lume_platform_sd_ops operations = {
     .lume_sd_write_blocks = write_blocks,
     .lume_sd_write_deferred = write_deferred,
     .lume_sd_sync = stop,
+    .lume_sd_allow_journal_volume = allow_journal,
 };
 
 static bool initialize(struct ahci_disk *disk, unsigned index, bool wide)
@@ -448,6 +461,7 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     }
     storage_disk = NULL;
     data_volume = (struct lume_volume){0};
+    journal_volume = (struct lume_volume){0};
     write_enabled = false;
     return 0;
 }

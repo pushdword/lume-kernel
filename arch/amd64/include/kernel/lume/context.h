@@ -35,7 +35,8 @@ static inline bool lume_arch_permission_fault(uint64_t cause)
     return (cause & 255) == 14 && (cause & 0x100);
 }
 
-static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer)
+static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer,
+                                       bool extended)
 {
     /* The red zone belongs to the interrupted function. */
     uint64_t sp = ((c->sp - 128) & ~UINT64_C(15)) - 8;
@@ -43,6 +44,8 @@ static inline bool lume_context_signal(struct lume_context *c, uint64_t handler,
     if (c->sp < 136 || !lume_user_buffer(sp, 8, true))
         return false;
     *(uint64_t *)(uintptr_t)sp = restorer;
+    if (extended)
+        LUME_CONTEXT_REG(c, 1) = LUME_CONTEXT_REG(c, 2) = 0;
     c->sp = sp;
     c->pc = handler;
     return true;

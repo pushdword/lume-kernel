@@ -28,6 +28,7 @@ struct device
 {
     const char *name;
     void *driver_data;
+    u64 dma_mask, coherent_dma_mask;
 
     struct
     {

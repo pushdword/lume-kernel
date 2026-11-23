@@ -7,6 +7,10 @@ PLATFORM_dma := platform/raspberrypi5/dma.c
 PLATFORM_uart := drivers/serial/pl011/uart.c drivers/serial/pl011/rp1_irq.c
 PLATFORM_sd := drivers/storage/sdhci/sd.c
 PLATFORM_usb := drivers/usb/xhci/usb.c drivers/usb/xhci/usb_descriptors.c drivers/input/usb_hid/hid_keyboard.c
+ifeq ($(LINUX_DRIVERS),1)
+PLATFORM_usb += $(LINUX_COMPAT_USB) drivers/linux/usb_hid.c drivers/linux/usb_storage.c drivers/linux/usb_audio.c
+$(addprefix $(OUT)/lkm/obj/,$(addsuffix .o,$(LINUX_COMPAT_USB) drivers/linux/usb_hid.c drivers/linux/usb_storage.c drivers/linux/usb_audio.c drivers/usb/xhci/usb.c)): CPPFLAGS += $(LINUX_COMPAT_CPPFLAGS) -DLUME_LINUX_USB_HID=1 -DLUME_LINUX_USB_STORAGE=1 -DLUME_LINUX_USB_AUDIO=1
+endif
 PLATFORM_display := drivers/display/rp1_dsi/display.c src/terminal/terminal.c src/terminal/font5x7.c src/terminal/font8x16.c
 PLATFORM_entropy := drivers/random/rng200/entropy.c
 PLATFORM_ENTROPY_WRAPPER := platform/raspberrypi5/modules/entropy.c
@@ -107,7 +111,7 @@ $(OUT)/modules/rp1-cpufan.lkm: $(OUT)/lkm/obj/$(CPUFAN_MODULE_SOURCE).o
 .PHONY: check-rp1-cpufan
 check-rp1-cpufan: $(OUT)/tests/rp1-cpufan$(HOSTEXE)
 	env "$<"
-CPUFAN_TEST_SOURCES := src/device/hardware.c src/device/resource.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+CPUFAN_TEST_SOURCES := src/device/hardware.c src/device/resource.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/rp1-cpufan$(HOSTEXE): tests/unit/rp1_cpufan_test.c $(CPUFAN_MODULE_SOURCE) $(CPUFAN_MODULE_HEADERS) $(CPUFAN_TEST_SOURCES) $(OUT)/ddk/include/lume/module_build.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -idirafter $(OUT)/ddk/include "$<" $(CPUFAN_TEST_SOURCES) src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c -o "$@"

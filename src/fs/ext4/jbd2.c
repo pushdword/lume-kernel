@@ -10,7 +10,9 @@
 #define JBD2_REVOKE_BLOCK 5u
 #define JBD2_REVOKE 1u
 #define JBD2_64BIT 2u
+#define JBD2_CSUM_V2 8u
 #define JBD2_CSUM_V3 16u
+#define JBD2_CSUM (JBD2_CSUM_V2 | JBD2_CSUM_V3)
 #define JBD2_FAST_COMMIT 32u
 #define JBD2_ESCAPE 1u
 #define JBD2_SAME_UUID 2u
@@ -20,6 +22,11 @@
 static uint32_t get_be32(const unsigned char *p)
 {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static unsigned get_be16(const unsigned char *p)
+{
+    return (unsigned)p[0] << 8 | p[1];
 }
 
 static uint32_t get_le32(const unsigned char *p)
@@ -38,6 +45,12 @@ static void put_be32(unsigned char *p, uint32_t value)
     p[1] = (unsigned char)(value >> 16);
     p[2] = (unsigned char)(value >> 8);
     p[3] = (unsigned char)value;
+}
+
+static void put_be16(unsigned char *p, unsigned value)
+{
+    p[0] = (unsigned char)(value >> 8);
+    p[1] = (unsigned char)value;
 }
 
 static void put_le16(unsigned char *p, unsigned value)
@@ -81,18 +94,19 @@ int lume_ext4_jbd2_open(struct lume_ext4_writer *w, const unsigned char *uuid,
     j->start = get_be32(s + 0x1c);
     if (get_be32(s + 4) != JBD2_SUPER_V2 || (!pending && j->start) || get_be32(s + 0x20) ||
         get_be32(s + 0x24) ||
-        (features & ~(JBD2_REVOKE | JBD2_64BIT | JBD2_CSUM_V3 | JBD2_FAST_COMMIT)) ||
+        (features & ~(JBD2_REVOKE | JBD2_64BIT | JBD2_CSUM | JBD2_FAST_COMMIT)) ||
         get_be32(s + 0x2c) || get_be32(s + 0x40) != 1 || get_be32(s + 0x44) ||
         (w->fs->blocks > (UINT64_C(1) << 32) && !(features & JBD2_64BIT)))
         return LUME_EXT4_UNSUPPORTED;
-    if ((features & JBD2_CSUM_V3) && (s[0x50] != 4 || get_be32(s + 0xfc) != super_checksum(s)))
+    if ((features & JBD2_CSUM) == JBD2_CSUM ||
+        ((features & JBD2_CSUM) && (s[0x50] != 4 || get_be32(s + 0xfc) != super_checksum(s))))
         return LUME_EXT4_INVALID;
     if (user && memcmp(s + 0x100, user, 16))
         return LUME_EXT4_INVALID;
     j->first = get_be32(s + 0x14);
     j->end = get_be32(s + 0x10);
     uint32_t fast_blocks = get_be32(s + 0x54);
-    if (j->end > j->extent[j->count - 1].end || ((features & JBD2_FAST_COMMIT) && !fast_blocks))
+    if (j->end > j->blocks || ((features & JBD2_FAST_COMMIT) && !fast_blocks))
         return LUME_EXT4_INVALID;
     if (fast_blocks)
     {
@@ -129,7 +143,7 @@ static bool write_journal_super(struct lume_ext4_writer *w, uint32_t start)
     put_be32(s + 0x28, start ? j->features : j->features & ~JBD2_FAST_COMMIT);
     if (!start)
         put_be32(s + 0x58, j->head);
-    if (j->features & JBD2_CSUM_V3)
+    if (j->features & JBD2_CSUM)
         put_be32(s + 0xfc, super_checksum(s));
     size_t bytes = w->fs->block_bytes;
     return !j->io.write(j->io.context, j->superblock * bytes, s, bytes) &&
@@ -150,16 +164,14 @@ static bool transfer_log(struct lume_ext4_writer *w, uint32_t logical, unsigned 
     unsigned char *buffer = j->window;
     while (count)
     {
-        unsigned index = 0;
-        while (logical >= j->extent[index].end)
-            ++index;
-        uint32_t start = index ? j->extent[index - 1].end : 0;
-        unsigned span = j->extent[index].end - logical;
+        uint64_t physical;
+        unsigned span;
+        if (lume_ext4_journal_map(w, logical, &physical, &span))
+            return false;
         if (span > j->end - logical)
             span = j->end - logical;
         if (span > count)
             span = count;
-        uint64_t physical = j->extent[index].physical + logical - start;
         size_t bytes = (size_t)span * w->fs->block_bytes;
         uint64_t offset = physical * w->fs->block_bytes;
         if (write ? j->io.write(j->io.context, offset, buffer, bytes)
@@ -174,12 +186,20 @@ static bool transfer_log(struct lume_ext4_writer *w, uint32_t logical, unsigned 
     return true;
 }
 
+static unsigned journal_tag_bytes(uint32_t features)
+{
+    if (features & JBD2_CSUM_V3)
+        return 16;
+    /* A v2 tag adds two bytes to the legacy layout. */
+    return 8 + (features & JBD2_64BIT ? 4 : 0) + (features & JBD2_CSUM_V2 ? 2 : 0);
+}
+
 static unsigned serialize(struct lume_ext4_writer *w, unsigned data_phase)
 {
     struct lume_ext4_journal *j = &w->journal;
     unsigned bytes = w->fs->block_bytes;
-    bool checksum = (j->features & JBD2_CSUM_V3) != 0;
-    unsigned tag_bytes = checksum ? 16 : (j->features & JBD2_64BIT) ? 12 : 8;
+    bool checksum = (j->features & JBD2_CSUM) != 0;
+    unsigned tag_bytes = journal_tag_bytes(j->features);
     unsigned descriptor_tail = bytes - (checksum ? 4 : 0);
     const unsigned char *uuid = journal_super(w) + 0x30;
     unsigned char *next = j->window;
@@ -215,7 +235,13 @@ static unsigned serialize(struct lume_ext4_writer *w, unsigned data_phase)
         if (j->features & JBD2_64BIT)
             put_be32(tag + 8, (uint32_t)(entry->number >> 32));
         if (checksum)
-            put_be32(tag + 12, lume_ext4_crc32c(payload_seed, next, bytes));
+        {
+            uint32_t sum = lume_ext4_crc32c(payload_seed, next, bytes);
+            if (j->features & JBD2_CSUM_V3)
+                put_be32(tag + 12, sum);
+            else
+                put_be16(tag + 4, sum);
+        }
         last = tag;
         tag += tag_bytes;
         if (first)
@@ -290,19 +316,6 @@ bool lume_ext4_jbd2_checkpoint(struct lume_ext4_writer *w)
     return write_journal_super(w, 0);
 }
 
-static bool journal_address(const struct lume_ext4_journal *j, uint64_t physical)
-{
-    uint32_t start = 0;
-    for (unsigned i = 0; i < j->count; ++i)
-    {
-        const struct lume_ext4_journal_extent *e = &j->extent[i];
-        if (physical >= e->physical && physical - e->physical < e->end - start)
-            return true;
-        start = e->end;
-    }
-    return false;
-}
-
 static bool valid_checksum(unsigned char *p, unsigned bytes, unsigned offset, uint32_t seed)
 {
     uint32_t stored = get_be32(p + offset);
@@ -314,10 +327,11 @@ static bool valid_checksum(unsigned char *p, unsigned bytes, unsigned offset, ui
 
 static bool same_super(const unsigned char *current, const unsigned char *logged)
 {
-    /* Keep geometry and features fixed. Linux also journals the last mount path. */
+    /* Geometry and features stay fixed while the orphan head and mount path can change. */
     return !memcmp(current, logged, 0xc) && !memcmp(current + 0x14, logged + 0x14, 0x30 - 0x14) &&
            !memcmp(current + 0x34, logged + 0x34, 0x88 - 0x34) &&
-           !memcmp(current + 0xc8, logged + 0xc8, 0x158 - 0xc8) &&
+           !memcmp(current + 0xc8, logged + 0xc8, EXT4_SB_LAST_ORPHAN - 0xc8) &&
+           !memcmp(current + 0xec, logged + 0xec, 0x158 - 0xec) &&
            !memcmp(current + 0x15c, logged + 0x15c, 0x3fc - 0x15c);
 }
 
@@ -329,9 +343,11 @@ static bool replay_super(const struct lume_ext4 *fs, const unsigned char *curren
     unsigned tail = fs->block_bytes - offset - 1024;
     unsigned char *s = data + offset;
     uint64_t free = get_le32(s + 0xc);
+    uint32_t orphan = get_le32(s + EXT4_SB_LAST_ORPHAN);
     if (fs->incompat & 0x80)
         free |= (uint64_t)get_le32(s + 0x158) << 32;
     return free <= fs->blocks && get_le32(s + 0x10) <= fs->inodes &&
+           (!orphan || (orphan >= get_le32(s + 0x54) && orphan <= fs->inodes)) &&
            !memcmp(before, data, offset) && !memcmp(current + 1024, s + 1024, tail) &&
            same_super(current, s) && lume_ext4_crc32c(UINT32_MAX, s, 0x3fc) == get_le32(s + 0x3fc);
 }
@@ -404,7 +420,7 @@ static bool valid_target(const struct replay *r, uint64_t physical)
 {
     const struct lume_ext4_writer *w = r->writer;
     return physical >= w->fs->first_data_block && physical < w->fs->blocks &&
-           (w->journal.external || !journal_address(&w->journal, physical));
+           !lume_ext4_journal_overlaps(w, physical, 1);
 }
 
 static struct revoke_entry *revoke_slot(const struct replay *r, uint64_t physical)
@@ -427,7 +443,7 @@ static int revoke_record(struct replay *r, unsigned char *record, unsigned trans
     const struct lume_ext4_journal *j = &w->journal;
     unsigned size = j->features & JBD2_64BIT ? 8 : 4;
     unsigned bytes = w->fs->block_bytes;
-    bool checksum = (j->features & JBD2_CSUM_V3) != 0;
+    bool checksum = (j->features & JBD2_CSUM) != 0;
     unsigned end = get_be32(record + 12);
     if (!(j->features & JBD2_REVOKE))
         return LUME_EXT4_INVALID;
@@ -494,6 +510,16 @@ static bool valid_payload(struct replay *r, uint64_t physical, unsigned char *pa
     return valid;
 }
 
+static bool valid_tag_checksum(uint32_t features, const unsigned char *tag, uint32_t seed,
+                               const void *payload, size_t bytes)
+{
+    if (!(features & JBD2_CSUM))
+        return true;
+    uint32_t sum = lume_ext4_crc32c(seed, payload, bytes);
+    return features & JBD2_CSUM_V3 ? get_be32(tag + 12) == sum
+                                   : get_be16(tag + 4) == (uint16_t)sum;
+}
+
 static int descriptor_record(struct replay *r, unsigned char *record, unsigned *position,
                              unsigned limit, unsigned transaction, enum replay_pass pass,
                              bool *damaged)
@@ -501,20 +527,20 @@ static int descriptor_record(struct replay *r, unsigned char *record, unsigned *
     const struct lume_ext4_writer *w = r->writer;
     const struct lume_ext4_journal *j = &w->journal;
     unsigned bytes = w->fs->block_bytes;
-    bool checksum = (j->features & JBD2_CSUM_V3) != 0;
+    bool checksum = (j->features & JBD2_CSUM) != 0;
     if (!r->verified_window && checksum && !valid_checksum(record, bytes, bytes - 4, j->seed))
         return LUME_EXT4_INVALID;
 
     /* Loading payloads can replace the read window. */
     memcpy(r->descriptor, record, bytes);
-    unsigned tag_size = checksum ? 16 : (j->features & JBD2_64BIT) ? 12 : 8;
+    unsigned tag_size = journal_tag_bytes(j->features);
     unsigned tail = bytes - (checksum ? 4 : 0);
     const unsigned char *uuid = journal_super(r->writer) + 0x30;
     uint32_t seed = checksum ? lume_ext4_crc32c(j->seed, r->descriptor + 8, 4) : 0;
     for (unsigned offset = 12; offset + tag_size <= tail;)
     {
         const unsigned char *tag = r->descriptor + offset;
-        uint32_t flags = get_be32(tag + 4);
+        uint32_t flags = j->features & JBD2_CSUM_V2 ? get_be16(tag + 6) : get_be32(tag + 4);
         offset += tag_size;
         if (flags & ~(JBD2_ESCAPE | JBD2_LAST_TAG | JBD2_SAME_UUID))
             return LUME_EXT4_UNSUPPORTED;
@@ -547,7 +573,7 @@ static int descriptor_record(struct replay *r, unsigned char *record, unsigned *
             int result = read_log(r, payload_position, &payload);
             if (result)
                 return result;
-            if ((checksum && get_be32(tag + 12) != lume_ext4_crc32c(seed, payload, bytes)) ||
+            if (!valid_tag_checksum(j->features, tag, seed, payload, bytes) ||
                 !valid_payload(r, physical, payload, escaped))
                 *damaged = true;
         }
@@ -559,7 +585,7 @@ static int descriptor_record(struct replay *r, unsigned char *record, unsigned *
             if (result)
                 return result;
             if (!r->verified_window &&
-                ((checksum && get_be32(tag + 12) != lume_ext4_crc32c(seed, payload, bytes)) ||
+                (!valid_tag_checksum(j->features, tag, seed, payload, bytes) ||
                  !valid_payload(r, physical, payload, escaped)))
                 return LUME_EXT4_INVALID;
             result = queue_home(r, physical, payload, escaped);
@@ -582,21 +608,16 @@ struct committed_log
 static int fast_block_io(struct lume_ext4_writer *w, uint32_t logical, bool write)
 {
     struct lume_ext4_journal *j = &w->journal;
-    uint32_t first = 0;
-    for (unsigned i = 0; i < j->count; ++i)
-    {
-        const struct lume_ext4_journal_extent *extent = j->extent + i;
-        if (logical < extent->end)
-        {
-            size_t bytes = w->fs->block_bytes;
-            uint64_t offset = (extent->physical + (logical - first)) * bytes;
-            int result = write ? j->io.write(j->io.context, offset, w->fast_buffer, bytes)
-                               : j->io.read(j->io.context, offset, w->fast_buffer, bytes);
-            return result ? LUME_EXT4_IO : 0;
-        }
-        first = extent->end;
-    }
-    return LUME_EXT4_INVALID;
+    uint64_t physical;
+    unsigned span;
+    int result = lume_ext4_journal_map(w, logical, &physical, &span);
+    if (result)
+        return result;
+    size_t bytes = w->fs->block_bytes;
+    uint64_t offset = physical * bytes;
+    result = write ? j->io.write(j->io.context, offset, w->fast_buffer, bytes)
+                   : j->io.read(j->io.context, offset, w->fast_buffer, bytes);
+    return result ? LUME_EXT4_IO : 0;
 }
 
 bool lume_ext4_jbd2_publish_inode(struct lume_ext4_writer *w, uint32_t number,
@@ -744,7 +765,7 @@ static int scan_log(struct replay *r, unsigned limit, enum replay_pass pass,
             result = revoke_record(r, record, transaction, pass);
             break;
         case JBD2_COMMIT:
-            if (damaged || (!r->verified_window && (j->features & JBD2_CSUM_V3) &&
+            if (damaged || (!r->verified_window && (j->features & JBD2_CSUM) &&
                             !valid_checksum(record, bytes, 0x10, j->seed)))
                 return LUME_EXT4_INVALID;
             if (pass == SCAN_LOG)

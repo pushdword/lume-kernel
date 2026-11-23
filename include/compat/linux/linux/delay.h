@@ -4,7 +4,10 @@
 #include <linux/types.h>
 #define HZ 1000ul
 unsigned long lume_linux_jiffies(void);
+uint64_t lume_linux_microseconds(void);
 #define jiffies lume_linux_jiffies()
 #define time_before(a, b) ((long)((unsigned long)(a) - (unsigned long)(b)) < 0)
 void usleep_range(unsigned long, unsigned long);
+void msleep(unsigned);
+unsigned long msleep_interruptible(unsigned);
 #endif

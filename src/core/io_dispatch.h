@@ -133,7 +133,8 @@ static void kernel_call(void *context)
 {
     struct kernel_io_lane *lane = context;
     unsigned task = lane->owner, process = process_slot(task);
-    extern int64_t lume_public_call(struct lume_files *, struct lume_context *, unsigned);
+    extern int64_t lume_public_call_wait(struct lume_files *, struct lume_context *, unsigned,
+                                         struct lume_fifo_open *);
     /* Each retired description yields admission before the original operation begins. */
     if (lane == &kernel_lanes[LUME_WORK_STORAGE] && lume_vfs_reap_pending())
     {
@@ -174,7 +175,8 @@ static void kernel_call(void *context)
         : (LUME_CONTEXT_REG(&tasks[task].context, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_NET &&
            LUME_CONTEXT_REG(&tasks[task].context, 0) == LUME_NET_DNS)
             ? dns_attempt(task)
-            : lume_public_call(&tasks[process].files, &tasks[task].context, process + 1);
+            : lume_public_call_wait(&tasks[process].files, &tasks[task].context, process + 1,
+                                    &fifo_opens[task]);
     kernel_fd_timing_complete(task, false, began);
 }
 
@@ -232,6 +234,7 @@ static void kernel_cancel(unsigned task)
     }
     if (!kernel_task_active(task))
     {
+        kernel_fifo_cancel(task);
         stream_cancel(task);
         netctl_cancel(task);
         dns_cancel(task);
@@ -576,6 +579,13 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
             /* Cancellation advances every resource queue generation for this task. */
             bool cancelled =
                 lane->cancel_generation != kernel_lanes[LUME_WORK_NETWORK].queue.generation[owner];
+            if (lane->result == LUME_IO_WAIT_FIFO &&
+                (cancelled || process_exiting[process_slot(owner)] || task_signal_pending(owner) ||
+                 task_signal_pending(process_slot(owner))))
+            {
+                kernel_fifo_cancel(owner);
+                lane->result = -LUME_EINTR;
+            }
             bool socket_call =
                 LUME_CONTEXT_REG(frame, LUME_CONTEXT_SYSCALL_REGISTER) == LUME_SYS_SOCKET &&
                 (LUME_CONTEXT_REG(frame, 0) == LUME_SOCKET_SEND_MESSAGE ||
@@ -637,11 +647,12 @@ static void kernel_step_selected(bool admit, unsigned selected_domain)
                       (netctl_waits[owner].active && netctl_waits[owner].pending) ||
                       (dns_waits[owner].active && dns_waits[owner].pending)))
                 task_state_set(owner, 4);
-            else if (lane->launch || !kernel_pipe_block(owner, frame, lane->result))
+            else if (lane->launch || (!kernel_fifo_block(owner, &lane->result) &&
+                                      !kernel_pipe_block(owner, frame, lane->result)))
             {
                 kernel_socket_network[owner] = false;
                 if (!context_replaced[owner])
-                    LUME_CONTEXT_REG(frame, 0) = (uint64_t)lane->result;
+                    LUME_CONTEXT_REG(frame, 0) = (uint64_t)kernel_io_result(owner, lane->result);
                 task_state_set(owner, 1);
                 sched_wake(&policy, owner, unit, 0);
             }

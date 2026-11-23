@@ -45,10 +45,10 @@ int main(void)
                                           .uid = UINT32_MAX,
                                           .gid = UINT32_MAX};
     T(lume_vfs_file_mode(&parent, LUME_FILE_MODE_PATH, &mode, "/tmp/credential-binary") ==
-      -LUME_EINVAL);
+      -LUME_EOPNOTSUPP);
     mode.mode = 02755;
     T(lume_vfs_file_mode(&parent, LUME_FILE_MODE_PATH, &mode, "/tmp/credential-binary") ==
-      -LUME_EINVAL);
+      -LUME_EOPNOTSUPP);
     parent.fd[fd].flags = LUME_FD_CLOEXEC;
     parent.identity.uid = 1000;
     parent.identity.euid = 2000;
@@ -68,7 +68,7 @@ int main(void)
     lume_files_inherit(&executed, &parent);
     T(!memcmp(&executed.identity, &original, sizeof(original)));
     T(executed.fd[fd].object == -1);
-    lume_credential_exec(&executed.identity);
+    lume_credential_exec(&executed.identity, NULL);
     T(executed.identity.uid == 1000 && executed.identity.euid == 2000 &&
       executed.identity.suid == 2000);
     T(executed.identity.gid == 10 && executed.identity.egid == 20 && executed.identity.sgid == 20);

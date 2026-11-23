@@ -27,7 +27,8 @@ enum
     LUME_SIGNAL_SET_SESSION,
     LUME_SIGNAL_SET_GROUP,
     LUME_SIGNAL_TRY_WAIT,
-    LUME_SIGNAL_WAIT
+    LUME_SIGNAL_WAIT,
+    LUME_SIGNAL_PENDING
 };
 
 struct lume_signal_request

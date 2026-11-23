@@ -150,6 +150,7 @@ int main(void)
     queue.elements[0] = (struct lume_virtio_pci_used){0, 65};
     queue.used[1] = 1;
     assert(lume_virtio_pci_take(&queue, &id, &bytes) == -LUME_EIO && device.failed);
+    assert(lume_virtio_pci_interrupt(&device) == 1);
     assert(!lume_virtio_pci_reset(&device) && device.reset_complete);
     assert(lume_virtio_pci_submit(&queue, 0) == -LUME_EINVAL);
     io = initialize(&fixture);

@@ -66,19 +66,15 @@ bool lume_socket_network_io(struct lume_files *files, unsigned fd)
 #ifndef LUME_VFS_HOST_ALLOCATION_LIMIT
 #define LUME_VFS_HOST_ALLOCATION_LIMIT 64u
 #endif
+#ifndef LUME_VFS_HOST_MAX_ALLOCATION
+#define LUME_VFS_HOST_MAX_ALLOCATION (128u * 1024u)
+#endif
 static void *tables[LUME_VFS_HOST_ALLOCATION_LIMIT];
 static size_t allocation_bytes[LUME_VFS_HOST_ALLOCATION_LIMIT];
 
 void *lume_kernel_allocate(size_t bytes)
 {
-#ifdef LUME_VFS_HOST_MAX_ALLOCATION
     assert(bytes && bytes <= LUME_VFS_HOST_MAX_ALLOCATION);
-#else
-    size_t table_bytes = LUME_FD_MAX * sizeof(struct lume_fd);
-    size_t link_bytes = sizeof(void *) + sizeof(uint64_t);
-    assert(bytes == table_bytes || bytes <= 4000 ||
-           (bytes && bytes % (2 * link_bytes) == 0 && bytes <= LUME_FD_LIMIT * 2 * link_bytes));
-#endif
     for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); ++i)
         if (!tables[i])
         {

@@ -13,6 +13,14 @@ enum
 };
 
 typedef void (*lume_irq_handler)(unsigned, void *);
+typedef bool (*lume_irq_shared_handler)(unsigned, void *);
+
+struct lume_irq_action
+{
+    struct lume_irq_action *next;
+    lume_irq_shared_handler handler;
+    void *context;
+};
 
 struct lume_irq_controller
 {
@@ -75,6 +83,11 @@ int lume_irq_register(unsigned, unsigned trigger, lume_irq_handler, void *);
  * the scheduler lock. They cannot call kernel services. Unregister masks the line
  * and returns EBUSY until active handlers have released their retained context. */
 int lume_irq_register_async(unsigned, unsigned trigger, lume_irq_handler, void *);
+/* Shared level handlers run under the scheduler lock. Return true after acknowledging
+ * the device. The first request unmasks the line and the last release masks it.
+ * Keep the initially zeroed action alive until release returns successfully. */
+int lume_irq_request_shared(unsigned, struct lume_irq_action *, lume_irq_shared_handler, void *);
+int lume_irq_release_shared(unsigned, struct lume_irq_action *);
 int lume_irq_enable(unsigned, bool);
 int lume_irq_unregister(unsigned, void *context);
 bool lume_irq_dispatch(unsigned token);

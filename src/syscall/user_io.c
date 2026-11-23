@@ -4,12 +4,18 @@
 #include "lume/kernel_memory.h"
 #include "lume/vfs.h"
 #include "lume/file_io.h"
+#include "lume/io_redirect.h"
 #include "lume/tty.h"
 #include <string.h>
 
 static unsigned active_buffers;
 #define SMALL_IO_BYTES 512u
 #define STAGING_SLOTS 4u
+
+static int64_t pipe_write_result(int64_t result, bool pipe_write)
+{
+    return pipe_write && result == -LUME_EPIPE ? LUME_IO_PIPE_NO_READERS : result;
+}
 
 static struct
 {
@@ -65,7 +71,7 @@ static bool pipe_resident(struct lume_files *files, unsigned pid, uint64_t fd, u
     int64_t accepted = lume_vfs_pipe_accept(files, fd, bytes, writing);
     if (accepted <= 0)
     {
-        *result = accepted;
+        *result = pipe_write_result(accepted, writing);
         return true;
     }
     bytes = (uint64_t)accepted;
@@ -80,6 +86,7 @@ static bool pipe_resident(struct lume_files *files, unsigned pid, uint64_t fd, u
         resident_copy(physical, buffer, (size_t)bytes, false);
     *result = writing ? lume_vfs_write(files, fd, buffer, bytes)
                       : lume_vfs_read(files, fd, buffer, bytes);
+    *result = pipe_write_result(*result, writing);
     if (*result > (int64_t)bytes)
         lume_fail("pipe transfer exceeds request");
     if (!writing && *result > 0)
@@ -137,7 +144,7 @@ int64_t lume_user_io_call(struct lume_files *files, unsigned pid, uint64_t fd, u
             lume_vfs_pipe_grow(files, fd, requested);
         int64_t accepted = lume_vfs_pipe_accept(files, fd, requested, writing);
         if (accepted <= 0)
-            return accepted;
+            return pipe_write_result(accepted, writing);
         bytes = (uint64_t)accepted;
     }
     /* At most one bounded buffer is retained by each admitted operation. The
@@ -187,7 +194,7 @@ out:
     if (buffer != local)
         staging_release(buffer, slot);
     --active_buffers;
-    return result;
+    return pipe_write_result(result, pipe && writing);
 }
 
 int64_t lume_user_io_vector_call(struct lume_files *files, unsigned pid, uint64_t fd,
@@ -203,6 +210,7 @@ int64_t lume_user_io_vector_call(struct lume_files *files, unsigned pid, uint64_
         return status;
     if (metadata_stat.kind == LUME_NODE_CHAR || metadata_stat.kind == LUME_NODE_SOCKET)
         return -LUME_EOPNOTSUPP;
+    bool pipe = lume_vfs_pipe_io(files, fd);
     struct lume_io_vector local_vectors[8], *vectors = local_vectors;
     struct lume_user_buffer_token local_tokens[8] = {0}, *tokens = local_tokens;
     struct lume_user_buffer_token metadata = {0};
@@ -245,7 +253,6 @@ int64_t lume_user_io_vector_call(struct lume_files *files, unsigned pid, uint64_
     }
     uint64_t requested = total > LUME_FILE_IO_MAX ? LUME_FILE_IO_MAX : total;
     uint64_t bytes = requested;
-    bool pipe = lume_vfs_pipe_io(files, fd);
     if (pipe)
     {
         if (writing)
@@ -364,5 +371,5 @@ out:
         lume_kernel_free(tokens);
     if (vectors != local_vectors)
         lume_kernel_free(vectors);
-    return result;
+    return pipe_write_result(result, pipe && writing);
 }

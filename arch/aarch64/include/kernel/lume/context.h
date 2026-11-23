@@ -37,8 +37,11 @@ static inline bool lume_arch_permission_fault(uint64_t cause)
     return (cause >> 26) == 0x24 && (cause & 63) == 15;
 }
 
-static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer)
+static inline bool lume_context_signal(struct lume_context *c, uint64_t handler, uint64_t restorer,
+                                       bool extended)
 {
+    if (extended)
+        LUME_CONTEXT_REG(c, 1) = LUME_CONTEXT_REG(c, 2) = 0;
     LUME_CONTEXT_REG(c, LUME_CONTEXT_LINK_REGISTER) = restorer;
     LUME_CONTEXT_PC(c) = handler;
     return true;

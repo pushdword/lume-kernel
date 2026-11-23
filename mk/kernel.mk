@@ -31,6 +31,7 @@ KERNEL_C_aarch64 := \
     platform/raspberrypi5/fdt.c \
     platform/raspberrypi5/fdt_irq.c \
     src/security/file_modes.c \
+    src/security/file_access.c \
     platform/raspberrypi5/hardware_platform.c \
     platform/raspberrypi5/firmware.c \
     src/mm/heap.c \

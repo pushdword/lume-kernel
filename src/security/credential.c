@@ -2,6 +2,7 @@
 #include "lume/vfs.h"
 #include "lume/credential.h"
 #include "lume/credentials.h"
+#include "lume/file_access.h"
 #include <string.h>
 
 static bool permitted(unsigned value, unsigned real, unsigned effective, unsigned saved)
@@ -9,10 +10,18 @@ static bool permitted(unsigned value, unsigned real, unsigned effective, unsigne
     return value == UINT32_MAX || value == real || value == effective || value == saved;
 }
 
-void lume_credential_exec(struct lume_identity *id)
+bool lume_credential_exec(struct lume_identity *id, const struct lume_inode_access *image)
 {
+    if (image && !id->jailed && !id->sandbox_profile)
+    {
+        if ((image->mode & 04000u) && image->uid <= LUME_ID_MAX)
+            id->euid = image->uid;
+        if ((image->mode & 02000u) && image->gid <= LUME_ID_MAX)
+            id->egid = image->gid;
+    }
     id->suid = id->euid;
     id->sgid = id->egid;
+    return id->uid != id->euid || id->gid != id->egid;
 }
 
 static int change_ids(struct lume_identity *id, unsigned operation,

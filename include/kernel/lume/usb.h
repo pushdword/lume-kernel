@@ -11,7 +11,15 @@ struct lume_usb_interface
     bool keyboard, hub, mouse;
 };
 
+struct lume_usb_endpoint
+{
+    uint8_t configuration, interface, alternate, address, attributes, interval;
+    uint8_t interface_class, interface_subclass, interface_protocol;
+    uint16_t packet;
+};
+
 #define LUME_USB_INPUTS 4u
+#define LUME_USB_ENDPOINTS 16u
 #if defined(LUME_ARCH_AMD64)
 #define LUME_XHCI_HOSTS 4u
 bool lume_usb_configure_pci(unsigned index, uint64_t base, uint64_t size, uint32_t parent,
@@ -29,6 +37,8 @@ struct lume_usb_configuration
     bool hub;
     unsigned inputs;
     struct lume_usb_interface input[LUME_USB_INPUTS];
+    unsigned endpoints;
+    struct lume_usb_endpoint endpoint[LUME_USB_ENDPOINTS];
 };
 
 bool lume_usb_configuration_inputs(const uint8_t *, size_t, struct lume_usb_configuration *);

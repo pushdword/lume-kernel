@@ -17,9 +17,14 @@ static void scheduler_task_changed(unsigned task);
 #undef SCHED_TASK_CHANGED
 #include "lume/service.h"
 #include "lume/net.h"
+#if defined(LUME_ARCH_I686)
+#include "lume/netif.h"
+#endif
 #include "lume/storage.h"
 #include "lume/boot_storage.h"
 #include "lume/heap.h"
+#include "lume/irq.h"
+#include "lume/ticket_lock.h"
 #include "lume/vm.h"
 #include "lume/kernel_memory.h"
 #include "lume/user_stack.h"
@@ -34,6 +39,7 @@ static void scheduler_task_changed(unsigned task);
 #include "lume/supervision.h"
 #include "lume/signal.h"
 #include "lume/credentials.h"
+#include "lume/file_access.h"
 #include "lume/process.h"
 #include "lume/tty_device.h"
 #include "lume/user_io.h"
@@ -67,6 +73,38 @@ static unsigned states[SCHED_TASKS];
 #include "task_state.h"
 #undef TASK_STATE_CHANGED
 static char executable_paths[LUME_TASK_LIMIT][LUME_PATH_MAX];
+static char *extended_executable_paths[LUME_TASK_LIMIT];
+static struct lume_ticket_lock executable_path_lock;
+
+static const char *executable_path(unsigned task)
+{
+    return extended_executable_paths[task] ? extended_executable_paths[task]
+                                           : executable_paths[task];
+}
+
+static char *copy_extended_executable_path(const char *path)
+{
+    size_t bytes = strlen(path) + 1;
+    char *copy = lume_kernel_allocate(bytes);
+    if (copy)
+        memcpy(copy, path, bytes);
+    return copy;
+}
+
+static void store_executable_path(unsigned task, const char *path, char *extended)
+{
+    uint64_t flags = lume_irq_save();
+    uint32_t ticket = lume_ticket_reserve(&executable_path_lock);
+    while (!lume_ticket_ready(&executable_path_lock, ticket))
+        __atomic_signal_fence(__ATOMIC_ACQUIRE);
+    char *previous = extended_executable_paths[task];
+    extended_executable_paths[task] = extended;
+    if (!extended)
+        memcpy(executable_paths[task], path, strlen(path) + 1);
+    lume_ticket_release(&executable_path_lock, ticket);
+    lume_irq_restore(flags);
+    lume_kernel_free(previous);
+}
 
 static struct cpu_state
 {
@@ -132,6 +170,7 @@ static bool kernel_wait[LUME_TASK_LIMIT];
 static unsigned kernel_deferred;
 #include "io_domains.h"
 static struct thread_state thread_slots[LUME_TASK_LIMIT];
+static unsigned next_process_slot = 1;
 static uint64_t thread_waiting[LUME_TASK_LIMIT], futex_address[LUME_TASK_LIMIT];
 static unsigned thread_pages[LUME_TASK_LIMIT];
 static bool thread_exit_pending[LUME_TASK_LIMIT];
@@ -741,7 +780,7 @@ static void detach_program(unsigned task)
 static void reclaim_program(unsigned task)
 {
     kernel_files_closed[task] = false;
-    executable_paths[task][0] = 0;
+    store_executable_path(task, "", NULL);
     lume_vm_release(task);
     lume_heap_release(task + 1);
     lume_elf_release(&images[task]);
@@ -993,7 +1032,7 @@ released:
 
 static bool task_signal_pending(unsigned owner)
 {
-    return (signals[owner].pending & ~signals[owner].mask) != 0;
+    return (signal_pending_bits(&signals[owner]) & ~signals[owner].mask) != 0;
 }
 
 static void task_query_publish(const struct lume_context *frame)
@@ -1290,13 +1329,121 @@ struct program_launch_scratch
 {
     struct lume_spawn_action actions[LUME_SPAWN_ACTION_MAX];
     char action_paths[LUME_SPAWN_ACTION_MAX][LUME_PATH_MAX];
-    char path[LUME_PATH_MAX], executable[LUME_PATH_MAX];
+    char path[LUME_FILES_PATH_MAX], executable[LUME_FILES_PATH_MAX];
     char arguments[LUME_ARG_BYTES], environment[LUME_ENV_BYTES];
     uint64_t pointers[LUME_ARG_MAX + 1];
     unsigned offsets[LUME_ARG_MAX], env_offsets[LUME_ENV_MAX];
     unsigned reserved_child;
     const char *argument_pointers[LUME_ARG_MAX], *environment_pointers[LUME_ENV_MAX];
 };
+
+static int script_arguments(int file, size_t size, const char *path, unsigned depth,
+                            struct program_launch_scratch *scratch, unsigned *argc,
+                            unsigned *used)
+{
+    enum { HEADER_BYTES = 256, SCRIPT_DEPTH = 4 };
+    char line[HEADER_BYTES + 1], script[LUME_FILES_PATH_MAX];
+    size_t limit = size < HEADER_BYTES ? size : HEADER_BYTES;
+    if (limit < 2)
+        return -LUME_ENOEXEC;
+    int64_t bytes = lume_vfs_pread_object(file, 0, line, limit);
+    if (bytes < 0)
+        return (int)bytes;
+    if ((size_t)bytes != limit)
+        return -LUME_EIO;
+    if (line[0] != '#' || line[1] != '!')
+        return -LUME_ENOEXEC;
+    if (depth == SCRIPT_DEPTH)
+        return -LUME_ELOOP;
+
+    char *end = memchr(line, '\n', limit);
+    if (!end && size > limit)
+        return -LUME_ENOEXEC;
+    if (!end)
+        end = line + limit;
+    if (memchr(line, 0, (size_t)(end - line)))
+        return -LUME_ENOEXEC;
+    if (end[-1] == '\r')
+        --end;
+    while (end > line + 2 && (end[-1] == ' ' || end[-1] == '\t'))
+        --end;
+    *end = 0;
+
+    char *interpreter = line + 2;
+    while (*interpreter == ' ' || *interpreter == '\t')
+        ++interpreter;
+    if (!*interpreter)
+        return -LUME_ENOEXEC;
+    char *option = interpreter;
+    while (*option && *option != ' ' && *option != '\t')
+        ++option;
+    size_t interpreter_bytes = (size_t)(option - interpreter) + 1;
+    if (interpreter_bytes > sizeof(script))
+        return -LUME_ENAMETOOLONG;
+    if (*option)
+    {
+        *option++ = 0;
+        while (*option == ' ' || *option == '\t')
+            ++option;
+    }
+    size_t option_bytes = *option ? strlen(option) + 1 : 0;
+    size_t script_bytes = strlen(path) + 1;
+    size_t prefix = interpreter_bytes + option_bytes + script_bytes;
+    unsigned extra = option_bytes ? 2 : 1;
+    unsigned first = *argc > 1 ? scratch->offsets[1] : *used;
+    unsigned tail = *used - first;
+    if (*argc > LUME_ARG_MAX - extra || prefix + tail > LUME_ARG_BYTES)
+        return -LUME_E2BIG;
+    memcpy(script, path, script_bytes);
+
+    char *arguments = scratch->arguments;
+    unsigned *offsets = scratch->offsets;
+    memmove(arguments + prefix, arguments + first, tail);
+    for (unsigned i = *argc - 1; i > 0; --i)
+        offsets[i + extra] = offsets[i] - first + (unsigned)prefix;
+    offsets[0] = 0;
+    memcpy(arguments, interpreter, interpreter_bytes);
+    if (option_bytes)
+    {
+        offsets[1] = (unsigned)interpreter_bytes;
+        memcpy(arguments + interpreter_bytes, option, option_bytes);
+    }
+    offsets[extra] = (unsigned)(interpreter_bytes + option_bytes);
+    memcpy(arguments + offsets[extra], script, script_bytes);
+    *argc += extra;
+    *used = (unsigned)prefix + tail;
+    return 0;
+}
+
+static int hold_program_image(struct lume_files *files, struct program_launch_scratch *scratch,
+                              unsigned *argc, unsigned used, struct lume_elf_plan *plan,
+                              bool *interpreted)
+{
+    const char *path = scratch->path;
+    for (unsigned depth = 0;; ++depth)
+    {
+        size_t bytes;
+        int file = lume_vfs_program_hold(files, path, &bytes);
+        if (file < 0)
+            return file;
+        int error = lume_vfs_exec_pin(file);
+        if (!error)
+        {
+            if (lume_elf_plan_file(file, bytes, plan))
+                return file;
+            error = script_arguments(file, bytes, path, depth, scratch, argc, &used);
+            lume_vfs_exec_unpin(file);
+        }
+        lume_vfs_drop(file);
+        if (error)
+            return error;
+        *interpreted = true;
+        path = scratch->arguments;
+        error = lume_vfs_canonical_long(files, path, scratch->executable);
+        if (error)
+            return error;
+    }
+}
 
 static int start_program_with_scratch(struct lume_context *frame,
                                       struct program_launch_scratch *scratch)
@@ -1318,13 +1465,9 @@ static int start_program_with_scratch(struct lume_context *frame,
                 return -LUME_EBUSY;
     if (!replacing && !process_quota(owner))
         return -LUME_EAGAIN;
-    for (unsigned i = 1; i < LUME_TASK_LIMIT; ++i)
-        if (i != 2 && thread_slot_available(thread_slots, states, i))
-        {
-            child = i;
-            break;
-        }
-    if (child == LUME_TASK_LIMIT || !thread_slot_reserve(thread_slots, states, child, owner))
+    child = thread_slot_reserve_next(thread_slots, states, LUME_TASK_LIMIT, 2, owner,
+                                     &next_process_slot);
+    if (child == LUME_TASK_LIMIT)
         return -LUME_EAGAIN;
     scratch->reserved_child = child;
     struct lume_run_request request = {.path = LUME_CONTEXT_REG(frame, 0),
@@ -1365,10 +1508,27 @@ static int start_program_with_scratch(struct lume_context *frame,
                 return -LUME_EFAULT;
             options =
                 *(const struct lume_spawn_options_request *)(uintptr_t)LUME_CONTEXT_REG(frame, 0);
-            if (options.reserved ||
+            if (options.process_group < 0 ||
+                (!(options.flags & LUME_SPAWN_SETPGROUP) && options.process_group) ||
+                ((options.flags & LUME_SPAWN_SETPGROUP) &&
+                 (options.flags & LUME_SPAWN_SETSID)) ||
                 (options.flags & ~(LUME_SPAWN_SIGDEFAULT | LUME_SPAWN_SIGMASK | LUME_SPAWN_SETSID |
-                                   LUME_SPAWN_CLOEXEC_DEFAULT | LUME_SPAWN_DRIVER_ADMIN)))
+                                   LUME_SPAWN_CLOEXEC_DEFAULT | LUME_SPAWN_DRIVER_ADMIN |
+                                   LUME_SPAWN_SETPGROUP)))
                 return -LUME_EINVAL;
+            if ((options.flags & LUME_SPAWN_SETPGROUP) && options.process_group)
+            {
+                bool found = false;
+                unsigned session = signals[owner].session ? signals[owner].session : 1;
+                for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
+                    if (states[i] && !thread_slots[i].thread &&
+                        (signals[i].group ? signals[i].group : 1) ==
+                            (unsigned)options.process_group &&
+                        (signals[i].session ? signals[i].session : 1) == session)
+                        found = true;
+                if (!found)
+                    return -LUME_EPERM;
+            }
             if (options.flags & LUME_SPAWN_DRIVER_ADMIN)
             {
                 const struct lume_identity *identity = &tasks[owner].files.identity;
@@ -1408,7 +1568,7 @@ static int start_program_with_scratch(struct lume_context *frame,
     unsigned used = 0, n;
     int error = user_string(request.path, path, sizeof(scratch->path), &n);
     if (error)
-        return error;
+        return error == -LUME_E2BIG ? -LUME_ENAMETOOLONG : error;
     uint64_t argv = request.argv;
     if (!lume_user_buffer(argv, (argc + 1u) * sizeof(uintptr_t), false))
         return -LUME_EFAULT;
@@ -1448,7 +1608,6 @@ static int start_program_with_scratch(struct lume_context *frame,
             return error;
         env_used += n;
     }
-    size_t bytes;
     if (asynchronous && !inherit)
     {
         if (!lume_files_init(&tasks[child].files))
@@ -1505,31 +1664,46 @@ static int start_program_with_scratch(struct lume_context *frame,
         }
     }
     bool child_snapshot = false;
-    int program_file = -1;
-    bool program_pinned = false;
-    error = lume_vfs_canonical(&tasks[child].files, path, executable);
+    bool interpreted = false;
+    int program_file;
+    struct lume_elf_plan plan;
+    error = lume_vfs_canonical_long(&tasks[child].files, path, executable);
     if (!error)
     {
         if (actions_call && !replacing)
             child_snapshot = kernel_child_snapshot_begin();
-        program_file = lume_vfs_program_hold(&tasks[child].files, path, &bytes);
-        error = program_file < 0 ? program_file : lume_vfs_exec_pin(program_file);
-        program_pinned = !error;
+        program_file = hold_program_image(&tasks[child].files, scratch, &argc, used, &plan,
+                                          &interpreted);
+        if (program_file < 0)
+            error = program_file;
     }
-    struct lume_elf_plan plan;
-    if (!error && !lume_elf_plan_file(program_file, bytes, &plan))
-        error = -LUME_ENOEXEC;
     if (error)
     {
-        if (program_pinned)
-            lume_vfs_exec_unpin(program_file);
-        if (program_file >= 0)
-            lume_vfs_drop(program_file);
         if (child_snapshot)
             kernel_child_snapshot_end();
         lume_files_release(&tasks[child].files);
         return error;
     }
+    char *recorded_path = NULL;
+    if (strlen(executable) >= LUME_PATH_MAX)
+    {
+        recorded_path = copy_extended_executable_path(executable);
+        if (!recorded_path)
+        {
+            if (child_snapshot)
+                kernel_child_snapshot_end();
+            lume_vfs_exec_unpin(program_file);
+            lume_vfs_drop(program_file);
+            lume_files_release(&tasks[child].files);
+            return -LUME_ENOMEM;
+        }
+    }
+    struct lume_inode_access access;
+    bool image_access = !interpreted && lume_vfs_exec_access(program_file, executable, &access);
+    struct lume_identity *identity = &tasks[child].files.identity;
+    const struct lume_identity *old_identity = &tasks[owner].files.identity;
+    bool secure_exec = lume_credential_exec(identity, image_access ? &access : NULL) ||
+                       identity->euid != old_identity->euid || identity->egid != old_identity->egid;
     uint64_t cache_before = lume_vm_cache_pages();
     uint64_t program_before = lume_pages_free();
     uint64_t program_epoch = kernel_parallel_epoch;
@@ -1562,8 +1736,9 @@ static int start_program_with_scratch(struct lume_context *frame,
     for (unsigned i = 0; i < request.envc; ++i)
         environment_pointers[i] = environment + env_offsets[i];
     struct lume_context *c = &tasks[child].context;
-    if (!lume_stack_build(tasks[child].stack, argc, argument_pointers, request.envc,
-                          environment_pointers, images[child].entry, &LUME_CONTEXT_SP(c)))
+    if (!lume_stack_build_exec(tasks[child].stack, argc, argument_pointers, request.envc,
+                               environment_pointers, images[child].entry, secure_exec,
+                               &LUME_CONTEXT_SP(c)))
         goto fail;
     LUME_CONTEXT_PC(c) = images[child].entry;
     LUME_CONTEXT_STATUS(c) = LUME_CONTEXT_USER_STATUS;
@@ -1572,7 +1747,6 @@ static int start_program_with_scratch(struct lume_context *frame,
         for (unsigned i = 0; i < LUME_FD_MAX; ++i)
             if (tasks[child].files.fd[i].flags & LUME_FD_CLOEXEC)
                 (void)lume_vfs_close(&tasks[child].files, i);
-    lume_credential_exec(&tasks[child].files.identity);
     if (replacing)
     {
         if (lume_vfs_exec_callbacks(&tasks[owner].files))
@@ -1591,7 +1765,7 @@ static int start_program_with_scratch(struct lume_context *frame,
     defined(LUME_ARCH_I686)
         lume_mmu_jit_copy(owner, child);
 #endif
-        memcpy(executable_paths[owner], executable, sizeof(scratch->executable));
+        store_executable_path(owner, executable, recorded_path);
         struct lume_elf_image image = images[owner];
         images[owner] = images[child];
         images[child] = image;
@@ -1609,6 +1783,8 @@ static int start_program_with_scratch(struct lume_context *frame,
         lume_vfs_process_exec(&tasks[owner].files, owner + 1);
         lume_files_release(&tasks[owner].files);
         lume_files_move(&tasks[owner].files, &tasks[child].files);
+        if (secure_exec)
+            capabilities[owner] = 0;
         tasks[owner].context = tasks[child].context;
         LUME_CONTEXT_TLS(&tasks[owner].context) = owner + 1;
         kernel_image_commit_end();
@@ -1634,8 +1810,9 @@ static int start_program_with_scratch(struct lume_context *frame,
     thread_new(thread_slots, child, child, false);
     process_exiting[child] = main_thread_done[child] = false;
     process_status[child] = 0;
-    capabilities[child] = capabilities[owner] & ~(uint64_t)(LUME_CAP_SERVICE | LUME_CAP_SUPERVISOR);
-    if (options.flags & LUME_SPAWN_DRIVER_ADMIN)
+    capabilities[child] =
+        secure_exec ? 0 : capabilities[owner] & ~(uint64_t)(LUME_CAP_SERVICE | LUME_CAP_SUPERVISOR);
+    if (!secure_exec && (options.flags & LUME_SPAWN_DRIVER_ADMIN))
         capabilities[child] |= LUME_CAP_DRIVER_ADMIN;
     service_root[child] = lume_supervision_manager(owner + 1) ? child + 1 : service_root[owner];
     tasks[child].calls = tasks[child].exits = tasks[child].faults = tasks[child].preemptions = 0;
@@ -1650,12 +1827,14 @@ static int start_program_with_scratch(struct lume_context *frame,
         signals[child].mask = options.signal_mask & ~SIGNAL_UNMASKABLE;
     if (options.flags & LUME_SPAWN_SETSID)
         signals[child].session = signals[child].group = child + 1;
+    else if (options.flags & LUME_SPAWN_SETPGROUP)
+        signals[child].group = options.process_group ? (unsigned)options.process_group : child + 1;
     user_ticks[child] = kernel_ticks[child] = 0;
     lock_ticks[child] = 0;
     dispatches[child] = 0;
     core_masks[child] = 0;
     owned[child] = true;
-    memcpy(executable_paths[child], executable, sizeof(scratch->executable));
+    store_executable_path(child, executable, recorded_path);
     const char *name = path;
     for (const char *p = path; *p; ++p)
         if (*p == '/')
@@ -1702,6 +1881,7 @@ fail:
     if (kernel_parallel_epoch == program_epoch &&
         lume_pages_free() + lume_vm_cache_pages() != program_before + cache_before + files_pages)
         lume_fail("failed program page leak");
+    lume_kernel_free(recorded_path);
     return load_error;
 }
 
@@ -1739,7 +1919,7 @@ static void copy_program_pages(void *context)
 
 static int fork_program(struct lume_context *frame)
 {
-    unsigned owner = process_slot(current_task), child = LUME_TASK_LIMIT;
+    unsigned caller = current_task, owner = process_slot(caller), child = LUME_TASK_LIMIT;
     if (!process_quota(owner))
         return -LUME_EAGAIN;
     if (LUME_CONTEXT_REG(frame, 0) || LUME_CONTEXT_REG(frame, 1) || LUME_CONTEXT_REG(frame, 2) ||
@@ -1747,14 +1927,24 @@ static int fork_program(struct lume_context *frame)
         return -LUME_EINVAL;
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
     {
-        if (thread_slots[i].thread && states[i] && process_slot(i) == owner)
+        if (thread_pages[i] && thread_slots[i].thread && states[i] && process_slot(i) == owner)
             return -LUME_EBUSY;
-        if (i && i != 2 && thread_slot_available(thread_slots, states, i) &&
-            child == LUME_TASK_LIMIT)
-            child = i;
     }
-    if (child == LUME_TASK_LIMIT || !thread_slot_reserve(thread_slots, states, child, owner))
+    child = thread_slot_reserve_next(thread_slots, states, LUME_TASK_LIMIT, 2, owner,
+                                     &next_process_slot);
+    if (child == LUME_TASK_LIMIT)
         return -LUME_EAGAIN;
+    const char *path = executable_path(owner);
+    char *recorded_path = NULL;
+    if (strlen(path) >= LUME_PATH_MAX)
+    {
+        recorded_path = copy_extended_executable_path(path);
+        if (!recorded_path)
+        {
+            thread_slots[child].reservation = 0;
+            return -LUME_ENOMEM;
+        }
+    }
     memset(&tasks[child], 0, sizeof(tasks[child]));
     kernel_memory_release[child] = KERNEL_MEMORY_LIVE;
     kernel_socket_network[child] = false;
@@ -1771,7 +1961,7 @@ static int fork_program(struct lume_context *frame)
         goto fail;
     lume_mmu_unmap_user(child, LUME_USER_BASE);
     if (!lume_elf_clone(child, &images[owner], &images[child]) || !lume_heap_clone(owner, child) ||
-        !lume_vm_clone(owner, child))
+        !lume_vm_clone(owner, child, caller))
         goto fail;
     struct program_page_copy copy = {
         .pages = {{tasks[owner].data, tasks[child].data}},
@@ -1798,7 +1988,7 @@ static int fork_program(struct lume_context *frame)
     tasks[child].context = *frame;
 #if defined(__aarch64__) || defined(LUME_ARCH_AARCH64) || defined(LUME_ARCH_AMD64) ||              \
     defined(LUME_ARCH_I686)
-    lume_mmu_jit_copy(child, current_task);
+    lume_mmu_jit_copy(child, caller);
 #endif
     LUME_CONTEXT_REG(&tasks[child].context, 0) = 0;
     thread_new(thread_slots, child, child, false);
@@ -1808,8 +1998,16 @@ static int fork_program(struct lume_context *frame)
     service_root[child] = service_root[owner];
     parents[child] = owner;
     signal_inherit(child, owner, false);
+    if (caller != owner)
+    {
+        struct signal_state *source = &signals[caller], *target = &signals[child];
+        target->mask = source->mask;
+        target->depth = source->depth;
+        memcpy(target->saved, source->saved, sizeof(target->saved));
+        memcpy(target->saved_mask, source->saved_mask, sizeof(target->saved_mask));
+    }
     memcpy(task_names[child], task_names[owner], sizeof(task_names[child]));
-    memcpy(executable_paths[child], executable_paths[owner], sizeof(executable_paths[child]));
+    store_executable_path(child, path, recorded_path);
     user_ticks[child] = kernel_ticks[child] = lock_ticks[child] = 0;
     dispatches[child] = core_masks[child] = 0;
     owned[child] = true;
@@ -1830,6 +2028,7 @@ fail:
         if (tasks[child].stack[i])
             (void)lume_page_free(tasks[child].stack[i]);
     thread_slots[child].reservation = 0;
+    lume_kernel_free(recorded_path);
     return -LUME_ENOMEM;
 }
 
@@ -2263,7 +2462,7 @@ struct lume_context *lume_tasks_sync(struct lume_context *frame, uint64_t esr, u
         }
         if (!terminal_wait && LUME_CONTEXT_REG(frame, 2) == 1 &&
             (LUME_CONTEXT_REG(frame, 1) != signals[process].epoch ||
-             (signals[process].pending & ~signals[process].mask)))
+             task_signal_pending(process)))
         {
             LUME_CONTEXT_REG(frame, 0) = (uint64_t)-4;
             return frame;
@@ -2614,6 +2813,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
     shell_script = script;
     shell_calls = 0;
     child_running = false;
+    next_process_slot = 1;
     total_user_ticks = total_kernel_ticks = total_idle_ticks = 0;
     account_running = account_inside = false;
     memset(task_memory_waiters, 0, sizeof(task_memory_waiters));
@@ -2644,6 +2844,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         kernel_vm_storage[i] = false;
         kernel_retry_launch[i] = false;
         pipe_queues[i] = 0;
+        fifo_opens[i] = (struct lume_fifo_open){0};
         capabilities[i] = 0;
     }
     for (unsigned i = 0; i < LUME_TASK_LIMIT; ++i)
@@ -2666,6 +2867,7 @@ bool lume_shell_start(uint64_t frequency, bool script)
         task_state_set(i, 0);
     tasks[0].context = (struct lume_context){0};
     thread_new(thread_slots, 0, 0, false);
+    signals[0] = (struct signal_state){.session = 1, .group = 1};
     capabilities[0] = LUME_CAP_NET_ADMIN | LUME_CAP_BOOT_UPDATE | LUME_CAP_DRIVER_ADMIN |
                       LUME_CAP_HW_DIAGNOSTIC | LUME_CAP_SERVICE_CONTROL | LUME_CAP_CLOCK_ADMIN;
     tasks[0].calls = tasks[0].exits = tasks[0].faults = tasks[0].preemptions = 0;
@@ -2699,12 +2901,20 @@ bool lume_shell_start(uint64_t frequency, bool script)
     sched_wake(&policy, 0, unit, 0);
     bool services = !script && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY;
 #if defined(LUME_ARCH_I686)
-    services = false;
+    services = services && lume_netif_count();
 #endif
     if (services)
     {
-        if (lume_vfs_program(&tasks[0].files, "/bin/netd", &elf, &bytes))
+        int result = lume_vfs_program(&tasks[0].files, "/bin/netd", &elf, &bytes);
+#if defined(LUME_ARCH_I686)
+        if (result == -LUME_ENOENT)
+            services = false;
+#endif
+        if (result && services)
             return false;
+    }
+    if (services)
+    {
         tasks[2].context = (struct lume_context){0};
         thread_new(thread_slots, 2, 2, false);
         tasks[2].data = lume_page_alloc(0);
@@ -2843,11 +3053,16 @@ int64_t lume_task_executable(unsigned pid, char *output, size_t bytes)
     if (!pid || pid > LUME_TASK_LIMIT || !states[pid - 1])
         return -3;
     unsigned owner = process_slot(pid - 1);
-    size_t length = strlen(executable_paths[owner]);
-    if (!length)
-        return -LUME_ENOENT;
-    if (bytes <= length)
-        return -LUME_E2BIG;
-    memcpy(output, executable_paths[owner], length + 1);
-    return (int64_t)length;
+    uint64_t flags = lume_irq_save();
+    uint32_t ticket = lume_ticket_reserve(&executable_path_lock);
+    while (!lume_ticket_ready(&executable_path_lock, ticket))
+        __atomic_signal_fence(__ATOMIC_ACQUIRE);
+    const char *path = executable_path(owner);
+    size_t length = strlen(path);
+    int64_t result = !length ? -LUME_ENOENT : bytes <= length ? -LUME_E2BIG : (int64_t)length;
+    if (result >= 0)
+        memcpy(output, path, length + 1);
+    lume_ticket_release(&executable_path_lock, ticket);
+    lume_irq_restore(flags);
+    return result;
 }

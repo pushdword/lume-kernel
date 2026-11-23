@@ -26,6 +26,27 @@ static inline bool thread_slot_reserve(struct thread_state *table, const unsigne
     return true;
 }
 
+static inline unsigned thread_slot_reserve_next(struct thread_state *table,
+                                                const unsigned *states, unsigned count,
+                                                unsigned excluded, unsigned owner, unsigned *next)
+{
+    unsigned cursor = *next;
+    if (!cursor || cursor >= count)
+        cursor = 1;
+    for (unsigned examined = 1; examined < count; ++examined)
+    {
+        unsigned slot = cursor;
+        cursor = cursor + 1 == count ? 1 : cursor + 1;
+        if (slot != excluded && thread_slot_reserve(table, states, slot, owner))
+        {
+            *next = cursor;
+            return slot;
+        }
+    }
+    *next = cursor;
+    return count;
+}
+
 static uint64_t thread_id(const struct thread_state *table, unsigned slot)
 {
     return table[slot].generation * 256 + slot + 1;

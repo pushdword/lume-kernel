@@ -12,7 +12,11 @@ struct open_file
     uint32_t flags;
     unsigned directory_authority_generation;
     bool closing, deferred_close;
-    uint64_t offset;
+    union
+    {
+        uint64_t offset;
+        uint64_t fifo_writer_epoch;
+    };
     struct lume_fat_cursor fat_cursor;
     const struct lume_file_ops *external;
     void *context;

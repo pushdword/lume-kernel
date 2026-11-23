@@ -59,9 +59,9 @@ static int64_t copy_path(const struct lume_files_request *request, const char *p
 }
 
 int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t address,
-                        uint64_t bytes)
+                        uint64_t bytes, struct lume_fifo_open *pending)
 {
-    if (operation > LUME_FILES_READLINK || bytes != sizeof(struct lume_files_request))
+    if (operation > LUME_FILES_FCHDIR || bytes != sizeof(struct lume_files_request))
         return -LUME_EINVAL;
     if (address > UINTPTR_MAX || bytes > UINTPTR_MAX - address ||
         !lume_user_buffer(address, bytes, false))
@@ -73,6 +73,11 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
     char first[LUME_FILES_PATH_MAX], second[LUME_FILES_PATH_MAX];
     switch (operation)
     {
+    case LUME_FILES_FCHDIR:
+        if (request.path || request.path2 || request.buffer || request.count || request.fd2 ||
+            request.flags || request.mode || request.descriptor_flags)
+            return -LUME_EINVAL;
+        return lume_vfs_fchdir(files, (uint64_t)request.fd);
     case LUME_FILES_GETCWD:
         if (request.path || request.path2 || request.fd || request.fd2 || request.flags ||
             request.mode || request.descriptor_flags)
@@ -87,7 +92,8 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         return result ? result : copy_path(&request, first);
     }
     case LUME_FILES_GETDENTS:
-        if (request.path || request.path2 || request.fd2 || request.flags || request.mode ||
+        if (request.path || request.path2 || request.fd2 ||
+            (request.flags & ~(uint64_t)LUME_FILES_GETDENTS_POSIX) || request.mode ||
             request.descriptor_flags || request.count > LUME_FILE_IO_MAX)
             return -LUME_EINVAL;
         if (request.fd < 0 || request.fd >= LUME_FD_MAX)
@@ -95,13 +101,19 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         if (request.buffer > UINTPTR_MAX || request.count > UINTPTR_MAX - request.buffer ||
             !lume_user_buffer(request.buffer, request.count, true))
             return -LUME_EFAULT;
+        if (request.flags & LUME_FILES_GETDENTS_POSIX)
+            return lume_vfs_getdents_posix(files, (uint64_t)request.fd,
+                                         (void *)(uintptr_t)request.buffer, request.count);
         return lume_vfs_getdents_long(files, (uint64_t)request.fd,
                                       (void *)(uintptr_t)request.buffer, request.count);
     case LUME_FILES_STAT:
     {
         if (request.path2 || request.fd2 || request.mode || request.descriptor_flags ||
             (request.flags & ~(uint64_t)(LUME_FILES_STAT_NOFOLLOW | LUME_FILES_STAT_EMPTY_PATH)) ||
-            request.count != sizeof(struct lume_stat))
+            (request.count != sizeof(struct lume_stat) &&
+             request.count != sizeof(struct lume_files_stat) &&
+             request.count != sizeof(struct lume_files_stat_times) &&
+             request.count != sizeof(struct lume_files_stat_allocation)))
             return -LUME_EINVAL;
         int result = path_string(request.path, second);
         if (result)
@@ -109,6 +121,15 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         if (request.buffer > UINTPTR_MAX || request.count > UINTPTR_MAX - request.buffer ||
             !lume_user_buffer(request.buffer, request.count, true))
             return -LUME_EFAULT;
+        if (request.count == sizeof(struct lume_files_stat_allocation))
+            return lume_vfs_stat_allocation(files, request.fd, second, (unsigned)request.flags,
+                                             (void *)(uintptr_t)request.buffer);
+        if (request.count == sizeof(struct lume_files_stat_times))
+            return lume_vfs_stat_times(files, request.fd, second, (unsigned)request.flags,
+                                       (void *)(uintptr_t)request.buffer);
+        if (request.count == sizeof(struct lume_files_stat))
+            return lume_vfs_stat_extended(files, request.fd, second, (unsigned)request.flags,
+                                          (void *)(uintptr_t)request.buffer);
         if (!second[0] && (request.flags & LUME_FILES_STAT_EMPTY_PATH))
         {
             if (request.fd == LUME_FILES_AT_CWD)
@@ -122,6 +143,17 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         return request.flags & LUME_FILES_STAT_NOFOLLOW
                    ? lume_vfs_lstat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer)
                    : lume_vfs_stat_at(files, request.fd, second, (void *)(uintptr_t)request.buffer);
+    }
+    case LUME_FILES_ACCESS:
+    {
+        if (request.path2 || request.fd2 || request.buffer || request.count ||
+            request.descriptor_flags || (request.mode & ~7u) ||
+            (request.flags & ~(uint64_t)(LUME_FILES_ACCESS_NOFOLLOW | LUME_FILES_ACCESS_EFFECTIVE)))
+            return -LUME_EINVAL;
+        int result = path_string(request.path, second);
+        return result ? result
+                      : lume_vfs_access_at(files, request.fd, second, request.mode,
+                                            (unsigned)request.flags);
     }
     case LUME_FILES_READLINK:
     {
@@ -154,7 +186,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
     case LUME_FILES_VOLUME:
     {
         if (request.path2 || request.fd2 || request.mode || request.descriptor_flags ||
-            (request.flags & ~(uint64_t)LUME_FILES_VOLUME_FD) ||
+            (request.flags & ~(uint64_t)(LUME_FILES_VOLUME_FD | LUME_FILES_VOLUME_QUERY_PERMISSIONS)) ||
             request.count != sizeof(struct lume_files_volume) ||
             ((request.flags & LUME_FILES_VOLUME_FD) && request.path))
             return -LUME_EINVAL;
@@ -175,6 +207,8 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         }
         if (result)
             return result;
+        if (!(request.flags & LUME_FILES_VOLUME_QUERY_PERMISSIONS))
+            volume.flags &= ~(uint32_t)LUME_FILES_VOLUME_NATIVE_PERMISSIONS;
         if (!lume_user_buffer(request.buffer, request.count, true))
             return -LUME_EFAULT;
         memcpy((void *)(uintptr_t)request.buffer, &volume, sizeof(volume));
@@ -202,17 +236,79 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         return operation == LUME_FILES_RENAME ? lume_vfs_rename(files, first, second)
                                               : lume_vfs_replace(files, first, second);
     }
+    case LUME_FILES_LINK:
+    {
+        if (request.buffer || request.count || request.mode || request.descriptor_flags ||
+            (request.flags & ~(uint64_t)LUME_FILES_LINK_FOLLOW))
+            return -LUME_EINVAL;
+        int result = path_string(request.path, first);
+        if (!result)
+            result = path_string(request.path2, second);
+        return result ? result
+                      : lume_vfs_link_at(files, request.fd, first, request.fd2, second,
+                                         (request.flags & LUME_FILES_LINK_FOLLOW) != 0);
+    }
+    case LUME_FILES_MKFIFO:
+    {
+        if (request.path2 || request.fd2 || request.flags || request.descriptor_flags ||
+            request.buffer || request.count || (request.mode & ~0777u))
+            return -LUME_EINVAL;
+        int result = path_string(request.path, first);
+        return result ? result : lume_vfs_mkfifo_at(files, request.fd, first, request.mode);
+    }
+    case LUME_FILES_SYMLINK:
+    {
+        if (request.fd2 || request.flags || request.descriptor_flags || request.mode ||
+            request.buffer || request.count)
+            return -LUME_EINVAL;
+        int result = path_string(request.path, first);
+        if (!result)
+            result = path_string(request.path2, second);
+        return result ? result : lume_vfs_symlink_at(files, request.fd, first, second);
+    }
+    case LUME_FILES_TIMES:
+    {
+        struct lume_file_time times[2];
+        if (request.path2 || request.fd2 || request.mode || request.descriptor_flags ||
+            request.count != sizeof(times) ||
+            (request.flags & ~(uint64_t)(LUME_FILES_TIMES_FD | LUME_FILES_TIMES_NOFOLLOW)) ||
+            ((request.flags & LUME_FILES_TIMES_FD) &&
+             (request.path || (request.flags & LUME_FILES_TIMES_NOFOLLOW))))
+            return -LUME_EINVAL;
+        if (request.buffer > UINTPTR_MAX || sizeof(times) > UINTPTR_MAX - request.buffer ||
+            !lume_user_buffer(request.buffer, sizeof(times), false))
+            return -LUME_EFAULT;
+        memcpy(times, (const void *)(uintptr_t)request.buffer, sizeof(times));
+        for (unsigned i = 0; i < 2; ++i)
+            if (times[i].reserved ||
+                (times[i].nanoseconds >= 1000000000u && times[i].nanoseconds != LUME_FILE_TIME_NOW &&
+                 times[i].nanoseconds != LUME_FILE_TIME_OMIT))
+                return -LUME_EINVAL;
+        if (!(request.flags & LUME_FILES_TIMES_FD))
+        {
+            int result = path_string(request.path, first);
+            if (result)
+                return result;
+        }
+        return lume_vfs_set_times(files, request.fd,
+                                  request.flags & LUME_FILES_TIMES_FD ? NULL : first,
+                                  (unsigned)request.flags, times);
+    }
     case LUME_FILES_OPEN:
     case LUME_FILES_MKDIR:
     case LUME_FILES_MODE:
     {
+        unsigned mode_mask = operation == LUME_FILES_OPEN    ? 0777u
+                             : operation == LUME_FILES_MKDIR ? 01777u
+                                                             : 07777u;
         if (request.path2 || request.buffer || request.count || request.fd2 ||
-            (request.mode & ~0777u))
+            (request.mode & ~mode_mask))
             return -LUME_EINVAL;
         uint64_t flags = request.flags;
         if (operation != LUME_FILES_OPEN)
         {
-            if (flags || request.descriptor_flags)
+            uint64_t allowed = operation == LUME_FILES_MODE ? LUME_FILES_MODE_NOFOLLOW : 0;
+            if (flags & ~allowed || request.descriptor_flags)
                 return -LUME_EINVAL;
         }
         else
@@ -227,11 +323,11 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         }
         bool nofollow =
             operation == LUME_FILES_MKDIR ||
+            (operation == LUME_FILES_MODE && (flags & LUME_FILES_MODE_NOFOLLOW)) ||
             (operation == LUME_FILES_OPEN &&
              ((flags & LUME_FILES_OPEN_NOFOLLOW) ||
               ((flags & (LUME_O_CREAT | LUME_O_EXCL)) == (LUME_O_CREAT | LUME_O_EXCL))));
-        int result = path_at(files, request.path, request.fd, first,
-                             operation == LUME_FILES_MKDIR || operation == LUME_FILES_OPEN, false,
+        int result = path_at(files, request.path, request.fd, first, true, false,
                              nofollow ? PATH_NOFOLLOW : PATH_FOLLOW);
         if (result)
             return result;
@@ -258,7 +354,7 @@ int64_t lume_files_call(struct lume_files *files, uint64_t operation, uint64_t a
         unsigned action = operation == LUME_FILES_OPEN    ? LUME_FILE_MODE_OPEN
                           : operation == LUME_FILES_MKDIR ? LUME_FILE_MODE_MKDIR
                                                           : LUME_FILE_MODE_PATH;
-        return lume_vfs_file_mode_long(files, action, &mode, first);
+        return lume_vfs_file_mode_wait(files, action, &mode, first, false, pending);
     }
     default:
     {

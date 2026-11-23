@@ -34,7 +34,7 @@ bool lume_vm_thread_region(unsigned, unsigned, uint64_t, uint64_t, uint64_t *, u
 void lume_vm_thread_release(unsigned, unsigned);
 bool lume_vm_thread_bounds(unsigned, unsigned, uint64_t *, uint64_t *);
 int64_t lume_vm_call(struct lume_files *, unsigned, unsigned, struct lume_vm_request *);
-bool lume_vm_clone(unsigned, unsigned);
+bool lume_vm_clone(unsigned source, unsigned target, unsigned caller);
 void lume_vm_swap(unsigned, unsigned);
 void lume_vm_release(unsigned);
 void lume_vm_poll_background(void);

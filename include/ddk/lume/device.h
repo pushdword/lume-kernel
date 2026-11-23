@@ -2,9 +2,9 @@
 #define LUME_DEVICE_H
 #include <stddef.h>
 #include <stdint.h>
+#include "lume/ddk_version.h"
 #include "resource.h"
 
-#define LUME_DDK_VERSION 7u
 #define LUME_DEVICE_LIMIT 32u
 
 enum lume_device_state

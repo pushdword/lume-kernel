@@ -7,12 +7,15 @@
 #include "lume/pci.h"
 #include "lume/storage.h"
 #include "lume/boot_mode.h"
+#include "lume/boot.h"
 #include "lume/serial.h"
+#include "lume/net.h"
 void lume_i686_context_start(void);
 int lume_pc_display_register(void);
 int lume_pc_keyboard_start(void);
 int lume_pc_ide_register(void);
 int lume_pc_virtio_block_start(bool *present);
+int lume_pc_virtio_net_start(void);
 static uint64_t program_memory;
 static unsigned program_pages;
 
@@ -105,6 +108,13 @@ _Noreturn void lume_main(uint64_t info, uint64_t magic)
 #else
     lume_value("PC_ENTROPY_READY", lume_pc_entropy_start() == 0);
 #endif
+    if (!installer && LUME_BOOT_PROFILE != LUME_BOOT_RECOVERY)
+    {
+        int net_result = lume_pc_virtio_net_start();
+        if (net_result && net_result != -LUME_ENOENT)
+            lume_value("VIRTIO_NET_ERROR", (uint64_t)(int64_t)net_result);
+        lume_value("NETWORK_READY", !net_result && lume_net_start());
+    }
     lume_puts("LUME i686 INTERACTIVE CONSOLE READY\n");
     static const char greeting[] = "Lume i686 interactive console ready.\n";
     lume_display_write(greeting, sizeof(greeting) - 1);

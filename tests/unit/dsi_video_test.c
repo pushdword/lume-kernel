@@ -44,12 +44,30 @@ void lume_uart_poll_input(void)
     ++polls;
 }
 
+void lume_worker_compute(void (*run)(void *), void *context)
+{
+    run(context);
+}
+
+void lume_worker_checkpoint(unsigned bytes)
+{
+    assert(bytes <= LUME_WORKER_SLICE_BYTES);
+}
+
 bool lume_dma_sync_for_device(const void *p, size_t bytes, enum lume_dma_direction direction)
 {
     assert(direction == LUME_DMA_TO_DEVICE);
     assert((uintptr_t)p >= (uintptr_t)fb && (uintptr_t)p + bytes <= (uintptr_t)fb + FRAME_BYTES);
     ++clean_calls;
     return true;
+}
+
+bool lume_dma_sync_rect_for_device(const void *p, size_t row_bytes, size_t pitch, unsigned rows,
+                                   enum lume_dma_direction direction)
+{
+    size_t bytes = 0;
+    assert(lume_dma_rect_bytes(row_bytes, pitch, rows, &bytes));
+    return lume_dma_sync_for_device(p, bytes, direction);
 }
 
 _Noreturn void lume_fail(const char *why)

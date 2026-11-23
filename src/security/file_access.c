@@ -11,6 +11,16 @@ static bool valid(const struct lume_identity *id, const struct lume_inode_access
     return id && inode && id->groups_count <= LUME_GROUP_MAX && !(flags & ~ACCESS_FLAGS);
 }
 
+bool lume_file_group_member(const struct lume_identity *id, uint32_t gid, bool real_ids)
+{
+    if (gid == (real_ids ? id->gid : id->egid))
+        return true;
+    for (unsigned i = 0; i < id->groups_count && i < LUME_GROUP_MAX; ++i)
+        if (gid == id->groups[i])
+            return true;
+    return false;
+}
+
 int lume_file_access(const struct lume_identity *id, const struct lume_inode_access *inode,
                      unsigned requested, unsigned flags)
 {
@@ -19,18 +29,11 @@ int lume_file_access(const struct lume_identity *id, const struct lume_inode_acc
     if (!requested)
         return 0;
     uint32_t uid = flags & LUME_ACCESS_REAL_IDS ? id->uid : id->euid;
-    uint32_t gid = flags & LUME_ACCESS_REAL_IDS ? id->gid : id->egid;
     unsigned shift = 0;
     if (uid == inode->uid)
         shift = 6;
-    else
-    {
-        bool member = gid == inode->gid;
-        for (unsigned i = 0; !member && i < id->groups_count; ++i)
-            member = id->groups[i] == inode->gid;
-        if (member)
-            shift = 3;
-    }
+    else if (lume_file_group_member(id, inode->gid, flags & LUME_ACCESS_REAL_IDS))
+        shift = 3;
     unsigned missing = requested & ~(inode->mode >> shift & 7u);
     if (!missing)
         return 0;

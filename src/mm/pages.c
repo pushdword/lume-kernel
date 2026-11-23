@@ -56,7 +56,7 @@ static uint64_t region_cursor[16], region_pages;
 static unsigned region_count, next_region;
 
 #define PAGE_PIN_BUCKETS 1024u
-#define PAGE_PIN_LIMIT 256u
+#define PAGE_PIN_LIMIT (LUME_WORKER_LIMIT > 14u ? 384u : 256u)
 _Static_assert(PAGE_PIN_LIMIT >= LUME_WORKER_LIMIT * 17u, "concurrent user copy page capacity");
 
 static struct page_pin

@@ -2,6 +2,7 @@
 #include "lume/pci.h"
 #include "lume/acpi.h"
 #include "lume/hardware.h"
+#include "lume/irq.h"
 #include "lume/abi.h"
 #include <assert.h>
 #include <stdio.h>
@@ -50,6 +51,18 @@ uint32_t lume_in32(uint16_t port)
     return UINT32_MAX;
 }
 
+uint8_t lume_in8(uint16_t port)
+{
+    assert(port >= 0xcfc && port <= 0xcff);
+    return (uint8_t)(lume_in32(0xcfc) >> (8 * (port - 0xcfc)));
+}
+
+uint16_t lume_in16(uint16_t port)
+{
+    assert(port == 0xcfc || port == 0xcfe);
+    return (uint16_t)(lume_in32(0xcfc) >> (8 * (port - 0xcfc)));
+}
+
 void lume_out32(uint16_t port, uint32_t value)
 {
     if (port == 0xcf8)
@@ -84,6 +97,31 @@ void lume_out32(uint16_t port, uint32_t value)
                 devices[i].registers[n] = value;
             return;
         }
+}
+
+static void write_lane(uint16_t port, uint32_t mask, uint32_t value)
+{
+    unsigned shift = 8 * (port - 0xcfc);
+    for (unsigned i = 0; i < 8; ++i)
+        if (devices[i].present && devices[i].address == (selected & 0xffff00))
+        {
+            unsigned n = (selected & 252) / 4;
+            devices[i].registers[n] =
+                (devices[i].registers[n] & ~(mask << shift)) | (value << shift);
+            return;
+        }
+}
+
+void lume_out8(uint16_t port, uint8_t value)
+{
+    assert(port >= 0xcfc && port <= 0xcff);
+    write_lane(port, UINT8_MAX, value);
+}
+
+void lume_out16(uint16_t port, uint16_t value)
+{
+    assert(port == 0xcfc || port == 0xcfe);
+    write_lane(port, UINT16_MAX, value);
 }
 
 static int validate(const struct lume_resource *r)
@@ -149,11 +187,21 @@ int main(void)
     devices[0].registers[21] = 0x42;
     devices[0].registers[22] = 0x40u << 16;
     endpoint(1, 0x10000);
+    devices[1].registers[0x3c / 4] = 0x010b;
     assert(!lume_q35_pci_start(root));
     uint32_t bridge = find("/q35/pci/00:01.0"), first = find("/q35/pci/01:00.0");
     assert(bridge && first && devices[1].registers[4] == 0xc1000004);
     struct lume_hardware_info info;
     assert(!lume_hardware_get(first, &info) && info.parent == bridge);
+    assert(info.resource_count == 2 && info.resources[1].kind == LUME_RESOURCE_IRQ &&
+           info.resources[1].base == LUME_PIC_FIRST_VECTOR + 11 &&
+           info.resources[1].flags == LUME_IRQ_LEVEL);
+    struct lume_property bar;
+    assert(!lume_hardware_property_id(first, "pci-bar", LUME_PROPERTY_U64, 0, &bar));
+    assert(bar.count == 5 && bar.values[0] == 0xc1000000 && bar.values[1] == 0x4000 &&
+           bar.values[2] == LUME_RESOURCE_MMIO && !bar.values[3] && bar.values[4]);
+    assert(lume_hardware_property_id(first, "pci-bar", LUME_PROPERTY_U64, 1, &bar) ==
+           -LUME_ENOENT);
     const struct lume_hardware_identity match = {LUME_HARDWARE_ID_PCI, 0, "pci,1b36:000d"};
     const struct lume_hardware_ops ops = {.start = start, .stop = stop};
     const struct lume_driver driver = {.version = LUME_DRIVER_VERSION,
@@ -164,10 +212,14 @@ int main(void)
     assert(!lume_driver_register(&driver) && !lume_hardware_bind(first, &driver));
     unsigned previous = probes;
     assert(!lume_q35_pci_rescan() && probes == previous && starts == 1);
+    assert(!lume_hardware_property_id(first, "pci-bar", LUME_PROPERTY_U64, 0, &bar) &&
+           bar.values[0] == 0xc1000000 && probes == previous);
     endpoint(2, 0x4000);
+    devices[2].registers[0x3c / 4] = 0x01ff;
     assert(!lume_q35_pci_rescan());
     uint32_t second = find("/q35/pci/00:08.0");
     assert(second && starts == 2 && devices[2].registers[4] == 0xc0000004);
+    assert(!lume_hardware_get(second, &info) && info.resource_count == 1);
     struct lume_hardware_description usb = {.name = "usb",
                                             .path = "/usb/test",
                                             .parent = second,

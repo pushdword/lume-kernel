@@ -36,7 +36,16 @@ static void mask(unsigned irq, bool enable)
 
 static int configure(unsigned irq, unsigned trigger)
 {
-    return irq >= 32 && irq < 48 && trigger == LUME_IRQ_EDGE ? 0 : -LUME_ENOSYS;
+    if (irq < LUME_PIC_FIRST_VECTOR || irq >= LUME_PIC_FIRST_VECTOR + LUME_PIC_LINES)
+        return -LUME_ENOSYS;
+    if (trigger == LUME_IRQ_EDGE)
+        return 0;
+    /* The firmware configures PCI INTx routing and the edge/level control registers. */
+    unsigned line = irq - LUME_PIC_FIRST_VECTOR;
+    if (!(LUME_PIC_LEVEL_LINES & (1u << line)))
+        return -LUME_ENOSYS;
+    uint8_t levels = lume_in8((uint16_t)(0x4d0 + line / 8));
+    return levels & (1u << (line % 8)) ? 0 : -LUME_ENOSYS;
 }
 
 static void eoi(unsigned irq)

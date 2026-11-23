@@ -12,6 +12,10 @@
 #include "lume/counter.h"
 #include "lume/cpu.h"
 #include <string.h>
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+#include <lume/linux_compat.h>
+#include <linux/err.h>
+#endif
 static struct lume_virtio device;
 static struct lume_virtqueue queue;
 static uint64_t capacity, allowed_first, allowed_count;
@@ -51,11 +55,138 @@ static unsigned request_sectors;
 static bool transferring, dirty;
 static uint64_t submitted_requests;
 
-static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count,
+static void finish(struct block_request *request, unsigned written)
+{
+    request->done = true;
+    request->success = !request->status && written == request->expected;
+}
+
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+static struct virtio_device linux_device;
+
+static int linux_queue_create(void *context)
+{
+    (void)context;
+    return lume_virtio_queue(&device, 0, &queue) ? 0 : -EIO;
+}
+
+static int linux_queue_submit(void *context, unsigned slot, struct scatterlist *const *lists,
+                              unsigned out, unsigned in, unsigned segments, gfp_t flags)
+{
+    (void)context;
+    (void)flags;
+    unsigned head = slot * 3u;
+    if (head >= queue.count || segments > queue.count - head)
+        return -ENOSPC;
+    unsigned index = head;
+    for (unsigned i = 0; i < out + in; ++i)
+    {
+        for (struct scatterlist *segment = lists[i]; segment; segment = sg_next(segment))
+        {
+            /* Request storage is preallocated and identity mapped for DMA. */
+            uint16_t next = index + 1 < head + segments ? (uint16_t)(index + 1) : 0;
+            uint16_t access = i >= out ? 2 : 0;
+            queue.descriptors[index++] = (struct lume_virtio_desc){
+                (uintptr_t)segment->buffer, segment->length, access | (next ? 1u : 0u), next};
+        }
+    }
+    return 0;
+}
+
+static void linux_queue_notify(void *context, uint32_t slots)
+{
+    (void)context;
+    unsigned heads[BLOCK_REQUESTS], count = 0;
+    for (unsigned slot = 0; slot < BLOCK_REQUESTS; ++slot)
+        if (slots & (UINT32_C(1) << slot))
+            heads[count++] = slot * 3u;
+    lume_virtio_submit_batch(&queue, heads, count);
+}
+
+static int linux_queue_take(void *context, unsigned *slot, unsigned *written)
+{
+    (void)context;
+    if ((uint16_t)(queue.used[1] - queue.consumed) > linux_device.queue.pending)
+        return -EIO;
+    unsigned id;
+    if (!lume_virtio_take(&queue, &id, written))
+        return 0;
+    if (id % 3u || id >= request_limit * 3u)
+        return -EIO;
+    *slot = id / 3u;
+    return 1;
+}
+
+static void linux_queue_ready(void *context)
+{
+    (void)context;
+    lume_virtio_ready(&device);
+}
+
+static int linux_queue_reset(void *context)
+{
+    (void)context;
+    return lume_virtio_reset(&device) ? 0 : -EIO;
+}
+
+static void linux_queue_destroy(void *context)
+{
+    (void)context;
+    lume_virtio_queue_release(&queue);
+}
+
+static const struct lume_linux_virtio_ops linux_queue_ops = {
+    .create = linux_queue_create,
+    .submit = linux_queue_submit,
+    .notify = linux_queue_notify,
+    .take = linux_queue_take,
+    .ready = linux_queue_ready,
+    .reset = linux_queue_reset,
+    .destroy = linux_queue_destroy,
+    .max_segments = 3,
+    .max_pending = BLOCK_REQUESTS,
+    .atomic_submit = true,
+};
+
+static void linux_complete(struct virtqueue *completed_queue)
+{
+    unsigned written;
+    struct block_request *request = virtqueue_get_buf(completed_queue, &written);
+    if (request)
+    {
+        finish(request, written);
+        if (request->success && submitted_requests == 1)
+            lume_puts("LUME PC VIRTIO BLOCK SCATTERLIST ACTIVE\n");
+    }
+}
+
+static int linux_submit_request(struct block_request *request, unsigned bytes, unsigned type)
+{
+    struct scatterlist header, data, status;
+    struct scatterlist *lists[3];
+    sg_init_one(&header, &request->header, sizeof(request->header));
+    sg_init_one(&status, (const void *)&request->status, 1);
+    unsigned out = 1, in = 0;
+    lists[0] = &header;
+    if (bytes)
+    {
+        sg_init_one(&data, request->data, bytes);
+        lists[1] = &data;
+        if (type == 0)
+            ++in;
+        else
+            ++out;
+    }
+    lists[out + in++] = &status;
+    return virtqueue_add_sgs(&linux_device.queue, lists, out, in, request, GFP_ATOMIC);
+}
+#endif
+
+static bool submit(unsigned slot, unsigned type, uint64_t sector, unsigned count,
                    const void *buffer)
 {
     struct block_request *request = requests + slot;
-    unsigned head = slot * 3u, bytes = count * 512u;
+    unsigned bytes = count * 512u;
     request->header.type = type;
     request->header.sector = sector;
     request->data = request_data + (size_t)slot * request_sectors * 512u;
@@ -65,22 +196,46 @@ static void submit(unsigned slot, unsigned type, uint64_t sector, unsigned count
     request->done = request->success = false;
     if (type == 1)
         lume_worker_copy(request->data, buffer, bytes);
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+    if (linux_submit_request(request, bytes, type))
+    {
+        request->active = false;
+        return false;
+    }
+#else
+    unsigned head = slot * 3u;
     queue.descriptors[head] = (struct lume_virtio_desc){(uintptr_t)&request->header, 16, 1,
                                                         (uint16_t)(head + (type == 4 ? 2 : 1))};
     queue.descriptors[head + 1] = (struct lume_virtio_desc){
         (uintptr_t)request->data, bytes, type == 0 ? 3 : 1, (uint16_t)(head + 2)};
     queue.descriptors[head + 2] = (struct lume_virtio_desc){(uintptr_t)&request->status, 1, 2, 0};
+#endif
     ++submitted_requests;
+    return true;
 }
 
-static bool complete(unsigned count)
+static bool wait_requests(unsigned count)
 {
     unsigned remaining = count;
     uint64_t start = lume_counter_read(), frequency = lume_counter_frequency();
     uint64_t pause = frequency / 1000u + (frequency % 1000u != 0);
+#if !defined(LUME_LINUX_VIRTIO_BLOCK)
     bool success = true;
+#endif
     while (remaining && !device.failed)
     {
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+        int progress = lume_linux_virtio_poll(&linux_device);
+        if (progress < 0)
+            break;
+        if (progress && !--remaining)
+        {
+            for (unsigned i = 0; i < count; ++i)
+                if (!requests[i].success)
+                    return false;
+            return true;
+        }
+#else
         unsigned id, written;
         while (lume_virtio_take(&queue, &id, &written))
         {
@@ -90,13 +245,13 @@ static bool complete(unsigned count)
                 return false;
             }
             struct block_request *request = requests + id / 3u;
-            request->done = true;
-            request->success = !request->status && written == request->expected;
+            finish(request, written);
             success &= request->success;
             --remaining;
         }
         if (!remaining)
             return success;
+#endif
         uint64_t at = lume_counter_read();
         if (at - start >= frequency * 5u)
             break;
@@ -123,19 +278,40 @@ static bool transfer(unsigned type, uint64_t sector, unsigned count, void *buffe
     do
     {
         unsigned pending = 0, submitted = first;
+#if !defined(LUME_LINUX_VIRTIO_BLOCK)
         unsigned heads[BLOCK_REQUESTS];
+#endif
         do
         {
             unsigned part = count - submitted;
             if (part > request_sectors)
                 part = request_sectors;
+#if !defined(LUME_LINUX_VIRTIO_BLOCK)
             heads[pending] = pending * 3u;
-            submit(pending++, type, sector + submitted, part,
-                   buffer ? (const unsigned char *)buffer + (size_t)submitted * 512u : NULL);
+#endif
+            success =
+                submit(pending, type, sector + submitted, part,
+                       buffer ? (const unsigned char *)buffer + (size_t)submitted * 512u : NULL);
+            if (!success)
+                break;
+            ++pending;
             submitted += part;
         } while (pending < request_limit && submitted < count);
+        if (!pending)
+            break;
+        bool all_submitted = success;
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+        if (virtqueue_kick(&linux_device.queue))
+            success = wait_requests(pending) && all_submitted;
+        else
+        {
+            lume_virtio_fail(&device);
+            success = false;
+        }
+#else
         lume_virtio_submit_batch(&queue, heads, pending);
-        success = complete(pending);
+        success = wait_requests(pending) && all_submitted;
+#endif
         for (unsigned i = 0; i < pending; ++i)
         {
             unsigned part = count - first;
@@ -299,9 +475,21 @@ static bool configure(uint64_t base, uint64_t size, uint32_t irq)
     return false;
 }
 
+static bool reset_transport(void)
+{
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+    if (linux_device.queue.vdev)
+    {
+        virtio_reset_device(&linux_device);
+        return linux_device.reset;
+    }
+#endif
+    return lume_virtio_reset(&device);
+}
+
 static bool stop(void)
 {
-    return (!dirty || flush()) && lume_virtio_reset(&device);
+    return (!dirty || flush()) && reset_transport();
 }
 
 static void stats(void)
@@ -347,8 +535,20 @@ static int module_start(struct lume_hardware *hardware, void *context)
     int result = q35_module_pci(hardware, 0x1af4, 0x1001, &pci);
     if (result)
         return result;
-    if (!lume_virtio_open(&device, pci, 0x1001, (1u << 1) | (1u << 2) | (1u << 5) | (1u << 9)) ||
-        !lume_virtio_queue(&device, 0, &queue) || queue.count < 3)
+    if (!lume_virtio_open(&device, pci, 0x1001, (1u << 1) | (1u << 2) | (1u << 5) | (1u << 9)))
+        return -LUME_EIO;
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+    result = lume_linux_virtio_attach(&linux_device, &linux_queue_ops, NULL);
+    if (result)
+        return result;
+    struct virtqueue *linux_queue = virtio_find_single_vq(&linux_device, linux_complete, "request");
+    if (IS_ERR(linux_queue))
+        return (int)PTR_ERR(linux_queue);
+#else
+    if (!lume_virtio_queue(&device, 0, &queue))
+        return -LUME_EIO;
+#endif
+    if (queue.count < 3)
         return -LUME_EIO;
     request_limit = queue.count / 3u;
     if (request_limit > BLOCK_REQUESTS)
@@ -368,7 +568,11 @@ static int module_start(struct lume_hardware *hardware, void *context)
     capacity = (uint64_t)lume_in32(device.port + 20) | (uint64_t)lume_in32(device.port + 24) << 32;
     if (!capacity)
         return -LUME_EIO;
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+    virtio_device_ready(&linux_device);
+#else
     lume_virtio_ready(&device);
+#endif
     if (lume_storage_is_installer())
     {
         bool read_only = (device.features & (1u << 5)) || !(device.features & (1u << 9));
@@ -394,7 +598,7 @@ static int module_stop(struct lume_hardware *hardware, void *context)
     int raw_result = lume_pc_disk_unregister(&raw_disk);
     if (raw_result)
         return raw_result;
-    if ((dirty && !flush()) || !lume_virtio_reset(&device))
+    if ((dirty && !flush()) || !reset_transport())
         return -LUME_EIO;
     if (binding->registered)
     {
@@ -403,7 +607,16 @@ static int module_stop(struct lume_hardware *hardware, void *context)
             return result;
         binding->registered = false;
     }
+#if defined(LUME_LINUX_VIRTIO_BLOCK)
+    if (linux_device.transport)
+    {
+        int result = lume_linux_virtio_detach(&linux_device);
+        if (result)
+            return result;
+    }
+#else
     lume_virtio_queue_release(&queue);
+#endif
     memset(&device, 0, sizeof(device));
     capacity = allowed_first = allowed_count = 0;
     journal_volume = (struct lume_volume){0};

@@ -2,6 +2,7 @@
 #include "lume/pci.h"
 #include "lume/acpi.h"
 #include "lume/hardware.h"
+#include "lume/irq.h"
 #include "lume/abi.h"
 #include "lume/worker.h"
 #include <string.h>
@@ -39,11 +40,28 @@ uint64_t lume_q35_pci_ecam(uint32_t address, unsigned offset)
 static int property(const void *context, uint64_t node, const char *name, unsigned kind,
                     unsigned index, struct lume_property *out)
 {
-    (void)context;
-    if (strcmp(name, "pci-address") || kind != LUME_PROPERTY_U32 || index)
+    if (!strcmp(name, "pci-address") && kind == LUME_PROPERTY_U32 && !index)
+    {
+        *out = (struct lume_property){.kind = kind, .count = 1, .values = {node}};
+        return 0;
+    }
+    if (strcmp(name, "pci-bar") || kind != LUME_PROPERTY_U64 || index >= 6)
         return -LUME_ENOENT;
-    *out = (struct lume_property){.kind = kind, .count = 1, .values = {node}};
-    return 0;
+    const struct entry *entry = context;
+    for (unsigned i = 0; i < entry->count; ++i)
+    {
+        const struct lume_pci_bar *bar = &entry->bars[i];
+        if (bar->offset != 16 + index * 4)
+            continue;
+        /* Report the assigned range, resource kind, prefetch bit and address width. */
+        *out = (struct lume_property){
+            .kind = kind,
+            .count = 5,
+            .values = {bar->resource.base, bar->resource.size, bar->resource.kind,
+                       (bar->low & 8) != 0, bar->wide}};
+        return 0;
+    }
+    return -LUME_ENOENT;
 }
 
 static void hex(char *out, uint32_t value, unsigned digits)
@@ -282,6 +300,14 @@ static int publish(struct entry *e)
     unsigned count = e->count;
     for (unsigned i = 0; i < count; ++i)
         resources[i] = e->bars[i].resource;
+    unsigned interrupt = lume_q35_pci_read(e->address, 0x3c);
+    unsigned pin = (interrupt >> 8) & 255u;
+    unsigned line = interrupt & 255u;
+    if (pin >= 1 && pin <= 4 && line < LUME_PIC_LINES && (LUME_PIC_LEVEL_LINES & (1u << line)))
+        resources[count++] = (struct lume_resource){.base = LUME_PIC_FIRST_VECTOR + line,
+                                                    .size = 1,
+                                                    .kind = LUME_RESOURCE_IRQ,
+                                                    .flags = LUME_IRQ_LEVEL};
     if (e->identity == UINT32_C(0x11111234))
         resources[count++] =
             (struct lume_resource){.base = 0x1ce, .size = 4, .kind = LUME_RESOURCE_IOPORT};
@@ -307,6 +333,7 @@ static int publish(struct entry *e)
                                           .resources = resources,
                                           .resource_count = count,
                                           .firmware = &firmware,
+                                          .firmware_context = e,
                                           .firmware_node = e->address};
     int result = lume_hardware_add(&d, &e->id);
     if (result)

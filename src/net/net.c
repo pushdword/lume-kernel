@@ -526,7 +526,8 @@ static struct dns_lookup
 {
     ip_addr_t address;
     uintptr_t generation;
-    bool active, finished, ok;
+    int result;
+    bool active, finished;
 } dns_lookups[LUME_TASK_LIMIT + 1];
 
 static uintptr_t dns_generation;
@@ -553,7 +554,7 @@ static void dns_collect_retired(void)
     }
 }
 
-static void resolved(const char *name, const ip_addr_t *ip, void *arg)
+static void resolved(const char *name, const ip_addr_t *ip, enum dns_result result, void *arg)
 {
     (void)name;
     uintptr_t generation = (uintptr_t)arg;
@@ -563,9 +564,10 @@ static void resolved(const char *name, const ip_addr_t *ip, void *arg)
         if (!lookup->active || lookup->generation != generation ||
             lume_owner_retired(&retired_dns, owner))
             continue;
-        lookup->ok = ip != 0;
         if (ip)
             lookup->address = *ip;
+        else
+            lookup->result = result == DNS_RESULT_NOT_FOUND ? -LUME_ENOENT : -LUME_EIO;
         lookup->finished = true;
         if (owner)
             lume_worker_scheduler(dns_notify, &owner);
@@ -604,9 +606,9 @@ int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char ou
             return -LUME_ENOSPC;
         *lookup = (struct dns_lookup){.generation = ++dns_generation, .active = true};
         err_t result =
-            dns_gethostbyname(name, &lookup->address, resolved, (void *)lookup->generation);
+            dns_gethostbyname_result(name, &lookup->address, resolved, (void *)lookup->generation);
         if (result == ERR_OK)
-            lookup->finished = lookup->ok = true;
+            lookup->finished = true;
         else if (result != ERR_INPROGRESS)
         {
             lume_net_resolve_cancel(owner);
@@ -623,11 +625,11 @@ int lume_net_resolve_progress(unsigned owner, const char *name, unsigned char ou
         *pending = true;
         return -LUME_EAGAIN;
     }
-    bool ok = lookup->ok;
-    if (ok)
+    int result = lookup->result;
+    if (!result)
         memcpy(out, &ip_2_ip4(&lookup->address)->addr, 4);
     lume_net_resolve_cancel(owner);
-    return ok ? 0 : -LUME_EIO;
+    return result;
 }
 
 static bool resolve(const char *name, ip_addr_t *out)

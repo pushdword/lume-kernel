@@ -2139,21 +2139,25 @@ void lume_vm_swap(unsigned a, unsigned b)
     }
 }
 
-bool lume_vm_clone(unsigned source, unsigned target)
+bool lume_vm_clone(unsigned source, unsigned target, unsigned caller)
 {
-    if (source >= LUME_TASK_LIMIT || target >= LUME_TASK_LIMIT || source == target ||
-        spaces[target])
+    if (source >= LUME_TASK_LIMIT || target >= LUME_TASK_LIMIT || caller >= LUME_TASK_LIMIT ||
+        source == target || spaces[target] || changing[source])
         return false;
+    /* Keep demand faults from changing the private page lists while they are copied. */
+    changing[source] = true;
     struct vm_area **tail = &spaces[target];
     for (struct vm_area *area = spaces[source]; area; area = area->next)
     {
-        if (area->retiring)
+        if (area->retiring || (area->thread && area->thread != caller + 1))
             continue;
         struct vm_area *copy = allocate(sizeof(*copy));
         if (!copy)
             goto fail;
         *copy = *area;
         copy->next = NULL;
+        if (copy->thread)
+            copy->thread = target + 1;
         if (area->shared)
         {
             if (copy->object->changing)
@@ -2202,8 +2206,10 @@ bool lume_vm_clone(unsigned source, unsigned target)
         tail = &copy->next;
         lume_worker_checkpoint(8192);
     }
+    changing[source] = false;
     return true;
 fail:
+    changing[source] = false;
     lume_vm_release(target);
     return false;
 }
@@ -2215,7 +2221,6 @@ bool lume_vm_thread_region(unsigned owner, unsigned task, uint64_t tls_bytes, ui
     if (owner >= LUME_TASK_LIMIT || task >= LUME_TASK_LIMIT || !tls || !stack || tls > 17 * PAGE ||
         stack > LUME_THREAD_STACK_MAX || tls + PAGE + stack > LUME_THREAD_STRIDE - PAGE)
         return false;
-#if defined(LUME_ARCH_I686)
     uint64_t base = LUME_THREAD_VM_BASE + PAGE;
     uint64_t span = tls + PAGE + stack;
     for (struct vm_area *area = spaces[owner]; area; area = area->next)
@@ -2229,9 +2234,6 @@ bool lume_vm_thread_region(unsigned owner, unsigned task, uint64_t tls_bytes, ui
     }
     if (base >= LUME_THREAD_VM_LIMIT || span + PAGE > LUME_THREAD_VM_LIMIT - base)
         return false;
-#else
-    uint64_t base = LUME_THREAD_VM_BASE + (uint64_t)task * LUME_THREAD_STRIDE + PAGE;
-#endif
     struct vm_area *a = allocate(sizeof(*a)), *b = allocate(sizeof(*b));
     struct vm_object *ta = new_object(tls, false), *sa = new_object(stack, false);
     if (!a || !b || !ta || !sa || !free_range(owner, base, base + tls + PAGE + stack))

@@ -198,7 +198,7 @@ $(OUT)/tests/ext4$(HOSTEXE): tests/unit/ext4_test.c src/fs/ext4/ext4.c src/fs/ex
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iinclude/kernel $(filter %.c,$^) -o "$@"
 
-EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/htree.c src/fs/ext4/jbd2.c src/fs/ext4/write.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+EXT4_VFS_TEST_SOURCES := tests/unit/vfs_ext4_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/ext4/ext4.c src/fs/ext4/htree.c src/fs/ext4/jbd2.c src/fs/ext4/write.c src/fs/ext4/storage.c src/fs/vfs/vfs.c src/fs/path.c src/syscall/files.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
 EXT4_WRITE_VFS_SOURCES := tests/unit/vfs_ext4_write_test.c $(filter-out tests/unit/vfs_ext4_test.c src/syscall/files.c,$(EXT4_VFS_TEST_SOURCES))
 check-ext4-write: $(OUT)/tests/vfs-ext4-write$(HOSTEXE)
 $(OUT)/tests/vfs-ext4-write$(HOSTEXE): $(EXT4_WRITE_VFS_SOURCES) tests/unit/ext4_write_test.c include/kernel/lume/ext4_write.h src/fs/ext4/checksum.h src/fs/ext4/htree.h src/fs/ext4/jbd2.h
@@ -219,7 +219,7 @@ $(OUT)/tests/vfs$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOSTEXE): tests/fixtures/vf
 check: check-file-locks
 check-file-locks: $(OUT)/tests/vfs-file-lock$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h src/security/sandbox.c
+$(OUT)/tests/vfs-file-lock$(HOSTEXE): tests/unit/vfs_file_lock_test.c src/fs/vfs/vfs.c src/fs/vfs/file_locks.h src/syscall/file_io.c src/syscall/file_lock.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c include/abi/native/lume/file_lock.h include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h src/security/sandbox.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out src/security/sandbox.c $(FILE_IO_HOST_FIXTURE),$(filter %.c,$^)) -o "$@"
 check: check-file-io
@@ -229,7 +229,7 @@ check-file-io: $(OUT)/tests/file-io-call$(HOSTEXE) $(OUT)/tests/vfs-file-io$(HOS
 $(OUT)/tests/file-io-call$(HOSTEXE): tests/unit/file_io_call_test.c src/syscall/file_io.c include/abi/native/lume/file_io.h include/kernel/lume/user_buffer.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
-$(OUT)/tests/vfs-file-io$(HOSTEXE): tests/unit/vfs_file_io_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs-file-io$(HOSTEXE): tests/unit/vfs_file_io_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $^ -o "$@"
 check: check-console-calls
@@ -320,7 +320,7 @@ check-storage-cache: $(OUT)/tests/storage-cache$(HOSTEXE)
 check: check-storage-cache
 .PHONY: check-storage-replace
 $(OUT)/tests/storage-replace$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_MAX_ALLOCATION=131072
-$(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c $(FILE_IO_HOST_FIXTURE)
+$(OUT)/tests/storage-replace$(HOSTEXE): tests/unit/storage_replace_test.c tests/unit/storage_handles_test.c src/storage/storage.c src/storage/volume.c vendor/fatfs/ff.c vendor/fatfs/ffunicode.c tests/unit/sd_blocks_mock.h src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c $(FILE_IO_HOST_FIXTURE)
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter-out tests/unit/storage_handles_test.c,$(filter %.c,$^)) -o "$@"
 check-storage-replace: $(OUT)/tests/storage-replace$(HOSTEXE)
@@ -342,7 +342,7 @@ check-sd-provider: $(OUT)/tests/sd-provider$(HOSTEXE)
 check: check-sd-provider
 check-image: $(OUT)/tests/root-image$(HOSTEXE)
 	env "$(OUT)/tests/root-image$(HOSTEXE)" "$(ROOT_IMAGE)"
-$(OUT)/tests/root-image$(HOSTEXE): tests/unit/root_image_test.c src/fs/vfs/vfs.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/root-image$(HOSTEXE): tests/unit/root_image_test.c src/fs/vfs/vfs.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $^ -o "$@"
 check: check-scheduler $(addprefix $(OUT)/tests/,$(addsuffix $(HOSTEXE),$(TEST_NAMES)))
@@ -446,16 +446,16 @@ $(OUT)/tests/ip4-route$(HOSTEXE): tests/unit/ip4_route_test.c src/net/route.c in
 .PHONY: check-ip4-route
 check-ip4-route: $(OUT)/tests/ip4-route$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs$(HOSTEXE): tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/vfs$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATION_LIMIT=2048
 .PHONY: check-fd-parallel
 check-fd-parallel: $(OUT)/tests/fd-parallel$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/fd-parallel$(HOSTEXE): HOSTCFLAGS += -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1
-$(OUT)/tests/fd-parallel$(HOSTEXE): tests/unit/fd_parallel_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/fs/vfs/fd_publication.h src/fs/vfs/open_files.h tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/fd-parallel$(HOSTEXE): tests/unit/fd_parallel_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/fs/vfs/fd_publication.h src/fs/vfs/open_files.h tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter-out tests/unit/vfs_test.c,$(filter %.c,$^)) -o "$@"
-$(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/vfs-storage-handles$(HOSTEXE): tests/unit/vfs_storage_handles_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1
 $(OUT)/tests/vfs-storage-handles$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c vendor/fatfs/ffunicode.c
 $(OUT)/tests/io-queue$(HOSTEXE): tests/unit/io_queue_test.c src/core/io_queue.h
@@ -530,11 +530,11 @@ $(OUT)/tests/i686-query$(HOSTEXE): tests/arch/i686/query_test.c arch/i686/contex
 $(OUT)/tests/i686-context$(HOSTEXE): tests/arch/i686/context_test.c arch/i686/include/kernel/lume/context.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -Iarch/i686/include/kernel "$<" -o "$@"
-$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
+$(OUT)/tests/poll$(HOSTEXE): tests/unit/poll_test.c src/fs/vfs/vfs.c src/net/socket.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 $(OUT)/tests/poll$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
-$(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c
+$(OUT)/tests/devfs$(HOSTEXE): tests/unit/devfs_test.c examples/ddk/ram_block.c src/device/resource.c src/device/device.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c
 $(OUT)/tests/heap$(HOSTEXE): tests/unit/heap_test.c src/mm/heap.c
 $(OUT)/tests/heap$(HOSTEXE): override HOSTCFLAGS += -UNDEBUG
 $(OUT)/tests/stream$(HOSTEXE): TEST_CPPFLAGS := -Itests/fixtures/counter $(TEST_CPPFLAGS) -Ivendor/lwip/src/include
@@ -566,9 +566,9 @@ clean:
 check: check-fat-cursor
 check-fat-cursor: $(OUT)/tests/fat-cursor$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/fat-cursor$(HOSTEXE): tests/unit/fat_cursor_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/kernel/lume/fat.h
+$(OUT)/tests/fat-cursor$(HOSTEXE): tests/unit/fat_cursor_test.c tests/unit/vfs_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c include/kernel/lume/fat.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/fat_cursor_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) tests/unit/fat_cursor_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c -o "$@"
 -include $(OBJECTS:=.d)
 
 .PHONY: FORCE
@@ -642,7 +642,10 @@ $(OUT)/tests/module-fixture.o: tests/integration/module_fixture.c
 ifneq ($(filter aarch64 amd64,$(ARCH)),)
 headers: module-sdk
 .PHONY: module-sdk
-module-sdk: $(OUT)/ddk/include/lume/module_build.h
+module-sdk: $(OUT)/ddk/include/lume/module_build.h $(OUT)/ddk/driver.mk
+$(OUT)/ddk/driver.mk: mk/driver.mk
+	mkdir -p "$(@D)"
+	cp "$<" "$@"
 $(OUT)/module-sdk$(HOSTEXE): tools/module_sdk.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) "$<" -o "$@"
@@ -653,7 +656,6 @@ $(OUT)/ddk/include/lume/module_build.h: $(OUT)/lume.elf $(OUT)/module-sdk$(HOSTE
 	cp -Rp include/abi/native/. "$(OUT)/ddk/include/"
 	cp -Rp include/freestanding/. "$(OUT)/ddk/include/"
 	cp arch/$(ARCH)/include/kernel/lume/mmio.h "$(OUT)/ddk/include/lume/mmio.h"
-	cp mk/driver.mk "$(OUT)/ddk/driver.mk"
 	printf 'ARCH := $(ARCH)\n' > "$(OUT)/ddk/arch.mk"
 	env "$(OUT)/module-sdk$(HOSTEXE)" "$(OUT)/lume.elf" "$@"
 endif
@@ -821,9 +823,9 @@ check: check-kernel-concurrency
 .PHONY: check-tty
 check-tty: $(OUT)/tests/tty$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/tty$(HOSTEXE): tests/unit/tty_test.c src/device/tty.c include/kernel/lume/worker.h
+$(OUT)/tests/tty$(HOSTEXE): tests/unit/tty_test.c src/device/tty.c src/security/file_access.c include/kernel/lume/worker.h
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $< src/security/file_access.c -o "$@"
 check: check-tty
 
 .PHONY: check-scheduler-ready
@@ -1019,7 +1021,7 @@ USER_IO_HOST_CPPFLAGS := -Iarch/amd64/include/kernel -Iplatform/q35/include $(fi
 check-user-io-lifetime: $(OUT)/tests/user-io-lifetime$(HOSTEXE)
 	env "$<"
 $(OUT)/tests/user-io-lifetime$(HOSTEXE): HOSTCFLAGS += $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1
-$(OUT)/tests/user-io-lifetime$(HOSTEXE): tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
+$(OUT)/tests/user-io-lifetime$(HOSTEXE): tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
 check: check-user-io-lifetime
@@ -1030,7 +1032,7 @@ $(OUT)/tests/small-io$(HOSTEXE) $(OUT)/tests/user-io-lifetime$(HOSTEXE): include
 check: check-small-io
 check-small-io: $(OUT)/tests/small-io$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/small-io$(HOSTEXE): tests/unit/small_io_test.c tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
+$(OUT)/tests/small-io$(HOSTEXE): tests/unit/small_io_test.c tests/unit/user_io_lifetime_test.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/user_io.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out tests/unit/user_io_lifetime_test.c src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
 
@@ -1044,11 +1046,11 @@ $(OUT)/tests/acpi-high-memory$(HOSTEXE): tests/platform/q35/acpi_high_memory_tes
 check: check-graphics-lifetime
 check-graphics-lifetime: $(OUT)/tests/graphics-lifetime$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/graphics-lifetime$(HOSTEXE): tests/unit/graphics_lifetime_test.c tests/unit/user_io_lifetime_test.c src/device/graphics.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/graphics_device.h include/kernel/lume/vm.h
+$(OUT)/tests/graphics-lifetime$(HOSTEXE): tests/unit/graphics_lifetime_test.c tests/unit/user_io_lifetime_test.c src/device/graphics.c src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/core/work.c $(FILE_IO_HOST_FIXTURE) src/mm/vm.c src/core/worker.c src/core/activity.c vendor/fatfs/ffunicode.c include/kernel/lume/user_buffer.h include/kernel/lume/graphics_device.h include/kernel/lume/vm.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) $(FILE_IO_HOST_FLAGS) -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 -UNDEBUG $(USER_IO_HOST_CPPFLAGS) $(filter-out tests/unit/user_io_lifetime_test.c src/device/graphics.c src/mm/vm.c src/core/worker.c src/core/activity.c,$(filter %.c,$^)) -o "$@"
 
-SOCKET_LIFETIME_HOST_C := src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/core/work.c vendor/fatfs/ffunicode.c src/net/socket.c src/net/datagram.c
+SOCKET_LIFETIME_HOST_C := src/mm/user_buffer.c src/syscall/user_io.c src/syscall/file_io.c src/syscall/file_lock.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/core/work.c vendor/fatfs/ffunicode.c src/net/socket.c src/net/datagram.c
 .PHONY: check-socket-network-lifetime
 check-socket-network-lifetime: $(OUT)/tests/socket-network-lifetime$(HOSTEXE)
 	env "$<"
@@ -1070,7 +1072,7 @@ check: check-socket-scm-lifetime
 .PHONY: check-vfs-append
 check-vfs-append: $(OUT)/tests/vfs-append$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-append$(HOSTEXE): tests/unit/vfs_external_append_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/vfs/file_locks.h
+$(OUT)/tests/vfs-append$(HOSTEXE): tests/unit/vfs_external_append_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/fs/vfs/file_locks.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AARCH64=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 check: check-vfs-append
@@ -1086,7 +1088,7 @@ $(OUT)/tests/signal-wait$(HOSTEXE): tests/unit/signal_wait_test.c src/core/signa
 .PHONY: check-vfs-mapping
 check-vfs-mapping: $(OUT)/tests/vfs-mapping$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-mapping$(HOSTEXE): tests/unit/vfs_mapping_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/vfs-mapping$(HOSTEXE): tests/unit/vfs_mapping_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) $^ -o "$@"
 
@@ -1098,7 +1100,7 @@ $(OUT)/tests/net-tools$(HOSTEXE): tests/unit/net_tools_test.c src/net/net_tools.
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) -Ivendor/lwip/src/include $^ -o "$@"
 
-$(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c include/ddk/lume/devfs.h include/kernel/lume/devfs_character.h include/kernel/lume/external_file.h
+$(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c include/ddk/lume/devfs.h include/kernel/lume/devfs_character.h include/kernel/lume/external_file.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 .PHONY: check-devfs-group
@@ -1168,20 +1170,20 @@ $(OUT)/tests/io-calls$(HOSTEXE) $(OUT)/tests/worker-slices$(HOSTEXE): include/dd
 check: check-vfs-sandbox-stat
 check-vfs-sandbox-stat: $(OUT)/tests/vfs-sandbox-stat$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-sandbox-stat$(HOSTEXE): tests/unit/vfs_sandbox_stat_test.c tests/unit/vfs_test.c tests/fixtures/vfs_unrestricted_services.c tests/fixtures/vfs_memory_host.c src/fs/vfs/vfs.c src/security/sandbox.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/vfs-sandbox-stat$(HOSTEXE): tests/unit/vfs_sandbox_stat_test.c tests/unit/vfs_test.c tests/fixtures/vfs_unrestricted_services.c tests/fixtures/vfs_memory_host.c src/fs/vfs/vfs.c src/security/sandbox.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c
 	mkdir -p "$(@D)"
-	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_MAX_ALLOCATION=65536 $(TEST_CPPFLAGS) tests/unit/vfs_sandbox_stat_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c -o "$@"
+	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_MAX_ALLOCATION=65536 $(TEST_CPPFLAGS) tests/unit/vfs_sandbox_stat_test.c src/fs/vfs/vfs.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c src/fs/path.c vendor/fatfs/ffunicode.c -o "$@"
 
 .PHONY: check-desktop-limits
 check-desktop-limits: $(OUT)/tests/desktop-limits$(HOSTEXE) $(OUT)/tests/desktop-storage$(HOSTEXE)
 	env "$(OUT)/tests/desktop-limits$(HOSTEXE)"
 	env "$(OUT)/tests/desktop-storage$(HOSTEXE)"
-$(OUT)/tests/desktop-limits$(HOSTEXE): tests/unit/desktop_limits_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
+$(OUT)/tests/desktop-limits$(HOSTEXE): tests/unit/desktop_limits_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 
 $(OUT)/tests/desktop-storage$(HOSTEXE): HOSTCFLAGS += -DLUME_VFS_HOST_CHECKPOINT_PROVIDED=1
-$(OUT)/tests/desktop-storage$(HOSTEXE): tests/unit/vfs_storage_handles_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
+$(OUT)/tests/desktop-storage$(HOSTEXE): tests/unit/vfs_storage_handles_test.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c src/fs/vfs/vfs.c src/fs/path.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c vendor/fatfs/ffunicode.c src/fs/vfs/open_files.h src/fs/vfs/resource_limits.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_EXTERNAL_ALLOCATOR=1 $(TEST_CPPFLAGS) -Ivendor/fatfs $(filter %.c,$^) -o "$@"
 
@@ -1230,7 +1232,7 @@ $(OUT)/tests/descriptor-calls$(HOSTEXE): tests/unit/descriptor_calls_test.c src/
 .PHONY: check-vfs-metadata
 check-vfs-metadata: $(OUT)/tests/vfs-metadata$(HOSTEXE)
 	env "$<"
-$(OUT)/tests/vfs-metadata$(HOSTEXE): tests/unit/vfs_metadata_test.c src/fs/vfs/vfs.c tests/fixtures/vfs_unrestricted_services.c src/security/file_modes.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
+$(OUT)/tests/vfs-metadata$(HOSTEXE): tests/unit/vfs_metadata_test.c src/fs/vfs/vfs.c tests/fixtures/vfs_unrestricted_services.c src/security/file_modes.c src/security/file_access.c src/fs/fat/fat.c src/storage/block.c tests/fixtures/vfs_memory_host.c src/fs/path.c vendor/fatfs/ffunicode.c src/fs/vfs/process_locks.h
 	mkdir -p "$(@D)"
 	$(HOSTCC) $(HOSTCFLAGS) -UNDEBUG -DLUME_ARCH_AMD64=1 -DLUME_VFS_HOST_COMPUTE_PROVIDED=1 -DLUME_VFS_HOST_ALLOCATOR_PROVIDED=1 $(TEST_CPPFLAGS) $(filter %.c,$^) -o "$@"
 

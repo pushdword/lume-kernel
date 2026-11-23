@@ -24,6 +24,8 @@ struct lume_file_ops
     const struct lume_vm_dma_pin *(*memory)(void *);
     /* The open description stays retained while the callback admits and copies user data. */
     int64_t (*write_user)(void *, unsigned, uint64_t, uint64_t);
+    int64_t (*stat_access)(void *, struct lume_stat *, struct lume_inode_access *);
+    int (*set_access)(void *, const struct lume_identity *, const struct lume_inode_access *);
 };
 
 int lume_vfs_attach(struct lume_files *, const struct lume_file_ops *, void *, unsigned);

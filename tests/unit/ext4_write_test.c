@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lume/ext4_write.h"
+#include "lume/file_access.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,7 +169,7 @@ static void unwritten_write(void)
 
 static void journal_seed(void)
 {
-    assert(writer.journal.count);
+    assert(writer.journal.blocks);
     uint32_t number;
     assert(!lume_ext4_create(&writer, 2, "seed", false, &number));
     assert(!lume_ext4_write(&writer, number, 0, "before\n", 7));
@@ -177,7 +178,7 @@ static void journal_seed(void)
 
 static void journal_io(struct disk *disk, bool cut)
 {
-    assert(writer.journal.count);
+    assert(writer.journal.blocks);
     unsigned char data[12 * 1024];
     memset(data, 0xa2, sizeof data);
     uint32_t seed = lookup(2, "seed");
@@ -566,6 +567,52 @@ static void extent_redistribution(struct disk *disk, bool leave_room)
            disk->writes);
 }
 
+static void imported_extent_tree(struct disk *disk, bool keep)
+{
+    uint32_t number = lookup(2, "deep-tree");
+    const uint64_t block_bytes = filesystem.block_bytes;
+    const uint64_t middle = 36000 * block_bytes, last = 71998 * block_bytes;
+    assert(block_bytes == 1024 && extent_depth(number) == 3);
+    check(number, 0, "E", 1);
+    check(number, middle, "E", 1);
+    check(number, last, "E", 1);
+    struct lume_ext4_inode file = fetch(number);
+    const unsigned char *node = file.block;
+    while (node[6])
+    {
+        unsigned count = node[2] | (unsigned)node[3] << 8;
+        unsigned capacity = node[4] | (unsigned)node[5] << 8;
+        assert(count && count <= capacity);
+        const unsigned char *index = node + 12 * count;
+        uint64_t next = little(index + 4) | (uint64_t)(index[8] | (unsigned)index[9] << 8) << 32;
+        assert(!read_disk(disk, next * block_bytes, contents, block_bytes));
+        disk->corrupt_offset = next * block_bytes;
+        node = contents;
+    }
+    disk->corrupt_offset += 12 * (1 + (block_bytes - 16) / 12);
+    disk->corrupt = true;
+    unsigned writes = disk->writes;
+    assert(lume_ext4_write(&writer, number, 5, "W", 1) == LUME_EXT4_INVALID);
+    assert(disk->writes == writes && !writer.faulted);
+    disk->corrupt = false;
+    assert(!lume_ext4_write(&writer, number, middle + 5, "X", 1));
+    assert(!lume_ext4_write(&writer, number, middle + block_bytes + 8, "Y", 1));
+    assert(!lume_ext4_write(&writer, number, last + 2 * block_bytes, "Z", 1));
+    check(number, middle + 4, "EXE", 3);
+    check(number, middle + block_bytes + 7, "\0Y\0", 3);
+    check(number, last + 2 * block_bytes, "Z", 1);
+    assert(extent_depth(number) == 3);
+    if (!keep)
+    {
+        assert(!lume_ext4_resize(&writer, number, block_bytes) && !extent_depth(number));
+        check(number, 0, "E", 1);
+        assert(!lume_ext4_remove(&writer, 2, "deep-tree"));
+    }
+    assert(!lume_ext4_writer_close(&writer));
+    printf("PASS imported depth-three tree overwrite, hole allocation, append and %s\n",
+           keep ? "retention" : "reclaim");
+}
+
 static void corruption(struct disk *disk, const char *kind)
 {
     unsigned char descriptor[64];
@@ -600,6 +647,49 @@ static void corruption(struct disk *disk, const char *kind)
     puts("PASS ext4 metadata/read preflight rejected without writes");
 }
 
+static void check_recovered_fifo(const char *expected)
+{
+    bool created = !strcmp(expected, "fifo-created");
+    bool renamed = !strcmp(expected, "fifo-renamed");
+    bool unlinked = !strcmp(expected, "fifo-unlinked");
+    assert(created || renamed || unlinked || !strcmp(expected, "fifo-mixed"));
+    uint32_t number = lookup(2, created ? "linux-fifo" : "linux-moved");
+    struct lume_ext4_inode fifo = fetch(number);
+    assert(fifo.mode == 0010640 && fifo.uid == 70001 && fifo.gid == 80002);
+    assert(!fifo.bytes && !fifo.flags && fifo.links == (renamed ? 2 : 1));
+    struct lume_ext4_inode root = fetch(2), other;
+    assert(lume_ext4_lookup(&filesystem, &root, created ? "linux-moved" : "linux-fifo", &other,
+                            scratch, sizeof scratch) == LUME_EXT4_NOT_FOUND);
+    int alias = lume_ext4_lookup(&filesystem, &root, "linux-alias", &other, scratch, sizeof scratch);
+    assert(alias == (renamed ? 0 : LUME_EXT4_NOT_FOUND));
+    if (renamed)
+        assert(other.number == number);
+    const char content[] = "ready\n0ABCD";
+    size_t bytes = created ? 8 : renamed ? 9 : unlinked ? 10 : 11;
+    uint32_t anchor = lookup(2, "anchor");
+    assert(fetch(anchor).bytes == bytes);
+    check(anchor, 0, content, bytes);
+    puts("PASS ext4 recovered FIFO metadata and regular file data");
+}
+
+static void check_symlink(bool present)
+{
+    struct lume_ext4_inode root = fetch(2), link;
+    int result = lume_ext4_lookup(&filesystem, &root, "symlink-crash", &link, scratch,
+                                  sizeof scratch);
+    if (!present)
+    {
+        assert(result == LUME_EXT4_NOT_FOUND);
+        return;
+    }
+    char target[60], data[60];
+    memset(target, 'x', sizeof target);
+    assert(!result && link.mode == 0120777u && link.bytes == sizeof target && !link.inline_bytes);
+    assert(lume_ext4_readlink(&filesystem, &link, data, sizeof data, scratch, sizeof scratch) ==
+           sizeof data);
+    assert(!memcmp(data, target, sizeof data));
+}
+
 static void journal_recover_test(struct disk *disk, uint64_t length, const char *expected)
 {
     assert(lume_ext4_open(&filesystem, read_disk, disk, length, scratch, sizeof scratch) ==
@@ -621,8 +711,51 @@ static void journal_recover_test(struct disk *disk, uint64_t length, const char 
         assert(result == LUME_EXT4_INVALID && !disk->writes);
         return;
     }
+    if (!strcmp(expected, "orphan-cycle"))
+    {
+        assert(result == LUME_EXT4_INVALID);
+        puts("PASS ext4 rejected an orphan chain cycle");
+        return;
+    }
+    if (result)
+        fprintf(stderr, "Journal recovery returned %d after %u writes and %u flushes\n", result,
+                disk->writes, disk->flushes);
     assert(!result);
     assert(!lume_ext4_open(&filesystem, read_disk, disk, length, scratch, sizeof scratch));
+    if (!strncmp(expected, "fifo-", 5))
+    {
+        check_recovered_fifo(expected);
+        return;
+    }
+    if (!strcmp(expected, "orphan-deleted"))
+    {
+        uint32_t anchor = lookup(2, "anchor");
+        const char content[] = "ready\nafter unlink\n";
+        assert(fetch(anchor).bytes == sizeof content - 1);
+        check(anchor, 0, content, sizeof content - 1);
+        struct lume_ext4_inode dir = fetch(2), entry;
+        assert(lume_ext4_lookup(&filesystem, &dir, "open-file", &entry, scratch,
+                                sizeof scratch) == LUME_EXT4_NOT_FOUND);
+        printf("PASS ext4 orphan removal. Barriers=%u\n", disk->flushes);
+        return;
+    }
+    if (!strcmp(expected, "lazy-inode-before") || !strcmp(expected, "lazy-inode-after"))
+    {
+        struct lume_ext4_inode dir = fetch(2), entry;
+        int found = lume_ext4_lookup(&filesystem, &dir, "lazy-inode", &entry, scratch,
+                                     sizeof scratch);
+        if (!strcmp(expected, "lazy-inode-after"))
+            assert(!found && entry.number > filesystem.inodes_per_group && !entry.bytes);
+        else
+            assert(found == LUME_EXT4_NOT_FOUND);
+        printf("PASS ext4 lazy inode recovery. Barriers=%u\n", disk->flushes);
+        return;
+    }
+    if (!strcmp(expected, "symlink-before") || !strcmp(expected, "symlink-after"))
+    {
+        check_symlink(!strcmp(expected, "symlink-after"));
+        return;
+    }
     uint32_t number = lookup(2, "seed");
     const char original[] = "before\n";
     size_t original_bytes = sizeof original - 1;
@@ -679,6 +812,25 @@ static void fast_recover_test(struct disk *disk, uint64_t length, const char *sc
         puts("PASS ext4 recovered an emitted inode fast commit");
         return;
     }
+    bool xattr_fast = !strcmp(scenario, "fast-xattr-linux");
+    if (xattr_fast || !strcmp(scenario, "full-xattr-lume"))
+    {
+        uint32_t number = lookup(2, "keep-attrs");
+        const char *prefix = xattr_fast ? "FASTr fast baseline\n" : "LUMEr fast baseline\n";
+        size_t bytes = strlen(prefix);
+        const char tail[] = "fast-range\n";
+        size_t expected = xattr_fast ? 4096 + sizeof tail - 1 : bytes;
+        assert(fetch(number).bytes == expected);
+        check(number, 0, prefix, bytes);
+        if (xattr_fast)
+        {
+            unsigned char gap[4096] = {0};
+            check(number, bytes, gap, 4096 - bytes);
+            check(number, 4096, tail, sizeof tail - 1);
+        }
+        printf("PASS ext4 replay preserved file contents. Barriers=%u\n", disk->flushes);
+        return;
+    }
     if (!strcmp(scenario, "fast-prefix"))
     {
         uint32_t number = lookup(2, "fc-one");
@@ -715,6 +867,16 @@ static void fast_recover_test(struct disk *disk, uint64_t length, const char *sc
     printf("PASS ext4 Linux fast commit recovery. Barriers=%u\n", disk->flushes);
 }
 
+static void check_published_commit(struct disk *disk, bool fast)
+{
+    assert(writer.faulted);
+    unsigned char super[48];
+    assert(
+        !read_disk(disk, writer.journal.superblock * filesystem.block_bytes, super, sizeof super));
+    assert((super[0x2b] & 32) == (fast ? 32 : 0));
+    assert(super[0x1c] || super[0x1d] || super[0x1e] || super[0x1f]);
+}
+
 static void fast_emit_test(struct disk *disk, bool full)
 {
     assert(writer.journal.fast_first);
@@ -731,29 +893,121 @@ static void fast_emit_test(struct disk *disk, bool full)
         disk->cut_after_flush = disk->flushes + 2;
         assert(lume_ext4_mode(&writer, number, 0600) == LUME_EXT4_IO);
     }
-    assert(writer.faulted);
-    unsigned char super[48];
-    assert(
-        !read_disk(disk, writer.journal.superblock * filesystem.block_bytes, super, sizeof super));
-    assert((super[0x2b] & 32) == (full ? 0 : 32));
-    assert(super[0x1c] || super[0x1d] || super[0x1e] || super[0x1f]);
+    check_published_commit(disk, !full);
     puts(full ? "PASS ext4 emitted a full commit for allocation"
               : "PASS ext4 emitted and published an inode fast commit");
 }
 
+static void xattr_commit_test(struct disk *disk)
+{
+    assert(writer.journal.fast_first);
+    uint32_t number = lookup(2, "keep-attrs");
+    disk->cut_after_flush = 4;
+    assert(lume_ext4_write(&writer, number, 0, "LUME", 4) == LUME_EXT4_IO);
+    check_published_commit(disk, false);
+    puts("PASS ext4 emitted a full commit for an inode with external attributes");
+}
+
+static void orphan_emit(struct disk *disk, bool cut, bool fast_cut)
+{
+    uint32_t anchor, number;
+    const char durable[] = "ready\nafter unlink\n";
+    assert(!lume_ext4_create(&writer, 2, "anchor", false, &anchor));
+    assert(!lume_ext4_write(&writer, anchor, 0, durable, sizeof durable - 1));
+    assert(!lume_ext4_create(&writer, 2, "open-file", false, &number));
+    assert(!lume_ext4_write(&writer, number, 0, "retained", 8));
+    struct lume_ext4_inode open_file = fetch(number);
+    if (cut)
+    {
+        disk->cut_after_flush = disk->flushes + 2;
+        assert(lume_ext4_unlink_open(&writer, 2, "open-file") == LUME_EXT4_IO);
+        check_published_commit(disk, false);
+        assert(lookup(2, "open-file") == number);
+        puts("PASS ext4 orphan unlink published before checkpoint");
+        return;
+    }
+    assert(!lume_ext4_unlink_open(&writer, 2, "open-file"));
+    assert(!fetch(number).links);
+    size_t committed;
+    assert(!lume_ext4_write_inode(&writer, &open_file, 8, " data", 5, &committed) && committed == 5);
+    check(number, 0, "retained data", 13);
+    if (fast_cut)
+    {
+        assert(writer.journal.fast_first);
+        disk->cut_after_flush = disk->flushes + 3;
+        assert(lume_ext4_write(&writer, anchor, 0, durable, sizeof durable - 1) == LUME_EXT4_IO);
+        check_published_commit(disk, true);
+        puts("PASS ext4 fast commit published with an orphan pending");
+        return;
+    }
+    puts("PASS ext4 orphan inode retained after checkpoint");
+}
+
+static void fifo_test(struct disk *disk, uint64_t length, void *memory, bool cut)
+{
+    const struct lume_inode_access access = {.uid = 70001, .gid = 80002, .mode = 0640};
+    uint64_t blocks = filesystem.free_blocks;
+    uint32_t number;
+    if (cut)
+    {
+        assert(writer.journal.fast_first);
+        disk->cut_after_flush = disk->flushes + 3;
+        assert(lume_ext4_create_fifo(&writer, 2, "fifo", &access, &number) == LUME_EXT4_IO);
+        assert(writer.faulted && lume_ext4_writer_close(&writer) == LUME_EXT4_IO);
+        disk->cut_after_flush = 0;
+        assert(!lume_ext4_open_pending(&filesystem, read_disk, disk, length, scratch,
+                                       sizeof scratch));
+        struct lume_ext4_inode root = fetch(2), fifo;
+        assert(lume_ext4_lookup(&filesystem, &root, "fifo", &fifo, scratch, sizeof scratch) ==
+               LUME_EXT4_NOT_FOUND);
+        size_t bytes = lume_ext4_writer_bytes(&filesystem);
+        assert(!lume_ext4_recover(&writer, &filesystem, write_disk, flush_disk, memory, bytes, NULL));
+        assert(!lume_ext4_open(&filesystem, read_disk, disk, length, scratch, sizeof scratch));
+        assert(!lume_ext4_writer_open(&writer, &filesystem, write_disk, flush_disk, memory, bytes,
+                                      NULL));
+        number = lookup(2, "fifo");
+    }
+    else
+        assert(!lume_ext4_create_fifo(&writer, 2, "fifo", &access, &number));
+    struct lume_ext4_inode fifo = fetch(number);
+    assert(lookup(2, "fifo") == number && fifo.mode == 0010640 && fifo.links == 1);
+    assert(fifo.uid == access.uid && fifo.gid == access.gid && !fifo.bytes && !fifo.flags);
+    assert(filesystem.free_blocks == blocks);
+    assert(!lume_ext4_link(&writer, number, 2, "fifo-link"));
+    assert(fetch(number).links == 2 && lookup(2, "fifo-link") == number);
+    assert(!lume_ext4_rename(&writer, 2, "fifo-link", 2, "fifo-moved"));
+    assert(!lume_ext4_remove(&writer, 2, "fifo"));
+    assert(lookup(2, "fifo-moved") == number && fetch(number).links == 1);
+    uint32_t replaced;
+    assert(!lume_ext4_create_fifo(&writer, 2, "fifo-final", &access, &replaced));
+    assert(!lume_ext4_replace(&writer, 2, "fifo-moved", 2, "fifo-final"));
+    assert(lookup(2, "fifo-final") == number && filesystem.free_blocks == blocks);
+    assert(!lume_ext4_mode(&writer, number, 0600) && fetch(number).mode == 0010600);
+    assert(!lume_ext4_writer_close(&writer));
+    puts(cut ? "PASS ext4 FIFO recovered before home writeback"
+             : "PASS ext4 FIFO metadata and namespace operations");
+}
+
 static void external_journal_interruption(struct disk *disk, uint64_t length,
                                           const struct lume_ext4_journal_io *io, void *memory,
-                                          size_t bytes, bool committed)
+                                          size_t bytes, bool committed, bool recover)
 {
     struct disk *journal = io->context;
     if (committed)
         disk->cut_after_flush = 1;
     else
         journal->fail_flush = 1;
+    const struct lume_inode_access access = {.uid = 70001, .gid = 80002, .mode = 0660};
     uint32_t number;
-    assert(lume_ext4_create(&writer, 2, "interrupted", false, &number) == LUME_EXT4_IO);
+    assert(lume_ext4_create_owned(&writer, 2, "interrupted", false, &access, &number) ==
+           LUME_EXT4_IO);
     assert(writer.faulted && lume_ext4_writer_close(&writer) == LUME_EXT4_IO);
     assert(journal->flushes == (committed ? 2u : 1u));
+    if (!recover)
+    {
+        puts("PASS ext4 external commit published before checkpoint");
+        return;
+    }
     disk->cut_after_flush = journal->fail_flush = 0;
     assert(!lume_ext4_open_pending(&filesystem, read_disk, disk, length, scratch, sizeof scratch));
     assert(!lume_ext4_recover(&writer, &filesystem, write_disk, flush_disk, memory, bytes, io));
@@ -762,6 +1016,8 @@ static void external_journal_interruption(struct disk *disk, uint64_t length,
     int result =
         lume_ext4_lookup(&filesystem, &root, "interrupted", &file, scratch, sizeof scratch);
     assert(result == (committed ? 0 : LUME_EXT4_NOT_FOUND));
+    if (committed)
+        assert(file.uid == access.uid && file.gid == access.gid && file.mode == 0100660);
     puts("PASS ext4 external journal interruption and recovery");
 }
 
@@ -819,10 +1075,11 @@ static void external_journal_test(struct disk *disk, uint64_t length, const char
     assert(
         !lume_ext4_writer_open(&writer, &filesystem, write_disk, flush_disk, memory, bytes, &io));
     assert(writer.journal.external);
-    if (!strcmp(scenario, "external-before") || !strcmp(scenario, "external-after"))
+    bool published = !strcmp(scenario, "external-publish");
+    bool before = !strcmp(scenario, "external-before");
+    if (published || before || !strcmp(scenario, "external-after"))
     {
-        external_journal_interruption(disk, length, &io, memory, bytes,
-                                      !strcmp(scenario, "external-after"));
+        external_journal_interruption(disk, length, &io, memory, bytes, !before, !published);
         free(memory);
         assert(!fclose(journal.file));
         return;
@@ -1044,6 +1301,62 @@ static void indexed_collision(char **numbers)
     puts("PASS HTree lookup and duplicate detection across a collision split");
 }
 
+static void lazy_inode_test(struct disk *disk, unsigned cut)
+{
+    disk->cut_after_flush = cut;
+    uint32_t number;
+    int result = lume_ext4_create(&writer, 2, "lazy-inode", false, &number);
+    if (cut)
+    {
+        assert(result == LUME_EXT4_IO);
+        return;
+    }
+    assert(!result && number > filesystem.inodes_per_group && !fetch(number).bytes);
+    unsigned barriers = disk->flushes;
+    assert(!lume_ext4_writer_close(&writer));
+    printf("PASS ext4 lazy inode table. Inode=%u Barriers=%u\n", number, barriers);
+}
+
+static void xattr_unlink_test(struct disk *disk, bool invalid)
+{
+    if (invalid)
+    {
+        assert(lume_ext4_remove(&writer, 2, "open-file") == LUME_EXT4_INVALID && !disk->writes);
+        puts("PASS ext4 rejected an invalid attribute block without writes");
+        return;
+    }
+    uint32_t number = lookup(2, "open-file");
+    assert(!lume_ext4_link(&writer, number, 2, "attribute-alias"));
+    assert(!lume_ext4_remove(&writer, 2, "open-file"));
+    assert(lookup(2, "attribute-alias") == number && fetch(number).links == 1);
+    assert(!lume_ext4_remove(&writer, 2, "attribute-alias"));
+    assert(!lume_ext4_remove(&writer, 2, "only-attrs"));
+    assert(lookup(2, "keep-attrs"));
+    assert(!lume_ext4_writer_close(&writer));
+    puts("PASS ext4 unlink with shared and unique attribute blocks");
+}
+
+static void symlink_write_test(struct disk *disk, unsigned cut)
+{
+    char target[61];
+    memset(target, 'x', sizeof target - 1);
+    target[sizeof target - 1] = 0;
+    const struct lume_inode_access access = {.mode = 0777};
+    uint32_t inode;
+    disk->cut_after_flush = cut;
+    int result = lume_ext4_symlink(&writer, 2, "symlink-crash", target, &access, &inode);
+    if (cut)
+    {
+        assert(result == LUME_EXT4_IO);
+        return;
+    }
+    assert(!result);
+    check_symlink(true);
+    unsigned barriers = disk->flushes;
+    assert(!lume_ext4_writer_close(&writer));
+    printf("PASS ext4 block-backed symlink. Barriers=%u\n", barriers);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc >= 3);
@@ -1053,7 +1366,8 @@ int main(int argc, char **argv)
     assert(length > 0);
     if (!strcmp(argv[2], "fast-replay") || !strcmp(argv[2], "fast-corrupt") ||
         !strcmp(argv[2], "fast-prefix") || !strcmp(argv[2], "fast-verify-emitted") ||
-        !strcmp(argv[2], "fast-directory"))
+        !strcmp(argv[2], "fast-directory") || !strcmp(argv[2], "fast-xattr-linux") ||
+        !strcmp(argv[2], "full-xattr-lume"))
     {
         assert(argc == 3 || argc == 4);
         if (argc == 4)
@@ -1097,8 +1411,21 @@ int main(int argc, char **argv)
         writer.timestamp = 1794900000;
         if (!strcmp(argv[2], "normal"))
             normal(&disk);
+        else if (!strcmp(argv[2], "orphan-emit") || !strcmp(argv[2], "orphan-cut") ||
+                 !strcmp(argv[2], "orphan-fast-cut"))
+            orphan_emit(&disk, !strcmp(argv[2], "orphan-cut"), !strcmp(argv[2], "orphan-fast-cut"));
+        else if (!strcmp(argv[2], "fifo") || !strcmp(argv[2], "fifo-cut"))
+            fifo_test(&disk, (uint64_t)length, memory, !strcmp(argv[2], "fifo-cut"));
         else if (!strcmp(argv[2], "fast-emit") || !strcmp(argv[2], "fast-fallback"))
             fast_emit_test(&disk, !strcmp(argv[2], "fast-fallback"));
+        else if (!strcmp(argv[2], "full-xattr-emit"))
+            xattr_commit_test(&disk);
+        else if (!strcmp(argv[2], "lazy-inode"))
+            lazy_inode_test(&disk, argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 0);
+        else if (!strcmp(argv[2], "xattr-unlink") || !strcmp(argv[2], "xattr-invalid"))
+            xattr_unlink_test(&disk, !strcmp(argv[2], "xattr-invalid"));
+        else if (!strcmp(argv[2], "symlink-write"))
+            symlink_write_test(&disk, argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 0);
         else if (!strcmp(argv[2], "journal-seed"))
             journal_seed();
         else if (!strcmp(argv[2], "journal"))
@@ -1139,6 +1466,8 @@ int main(int argc, char **argv)
             extent_redistribution(&disk, false);
         else if (!strcmp(argv[2], "extent-guest"))
             extent_redistribution(&disk, true);
+        else if (!strcmp(argv[2], "extent-imported") || !strcmp(argv[2], "extent-imported-keep"))
+            imported_extent_tree(&disk, !strcmp(argv[2], "extent-imported-keep"));
         else if (!strncmp(argv[2], "corrupt-", 8))
             corruption(&disk, argv[2]);
         else if (!strcmp(argv[2], "indexed-convert"))

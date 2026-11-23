@@ -11,6 +11,7 @@
 #define ENODEV 19
 #define EINVAL 22
 #define ENOSPC 28
+#define ENOSYS 38
 #ifdef EOPNOTSUPP
 #undef EOPNOTSUPP
 #endif

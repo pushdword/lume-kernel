@@ -20,11 +20,23 @@ enum lume_work_domain
     LUME_WORK_LOCAL1,
     LUME_WORK_LOCAL2,
     LUME_WORK_LOCAL3,
+#if defined(__aarch64__) || defined(__x86_64__) || defined(LUME_ARCH_AMD64) ||                   \
+    defined(LUME_ARCH_I686)
+    LUME_WORK_KTHREAD0,
+    LUME_WORK_KTHREAD1,
+#endif
     LUME_WORK_DOMAINS
 };
 
 #define LUME_WORK_LOCAL_FIRST LUME_WORK_LOCAL0
 #define LUME_WORK_LOCAL_COUNT 4u
+#if defined(__aarch64__) || defined(__x86_64__) || defined(LUME_ARCH_AMD64) ||                   \
+    defined(LUME_ARCH_I686)
+#define LUME_WORK_KTHREAD_FIRST LUME_WORK_KTHREAD0
+#define LUME_WORK_KTHREAD_COUNT 2u
+#else
+#define LUME_WORK_KTHREAD_COUNT 0u
+#endif
 
 struct lume_work
 {

@@ -3,12 +3,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "lume/work.h"
 
 /* Workers preserve synchronous call stacks across device waits. Entry and resume require
  * the scheduler lock and masked subsystem IRQs. Resident raw RX may remain enabled.
  * Resource queues own subsystem
  * admission until the submitted function returns. Wait storage must outlive the function. */
-#define LUME_WORKER_LIMIT 14u
+#define LUME_WORKER_LIMIT LUME_WORK_DOMAINS
 #define LUME_WORKER_SLICE_BYTES (64u * 1024u)
 
 void lume_worker_start(void);

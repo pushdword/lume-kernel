@@ -13,6 +13,24 @@
 #include "lume/dma.h"
 #include "lume/worker.h"
 #include "lume/work.h"
+#if defined(LUME_LINUX_USB_HID)
+#include "lume/linux_usb_hid.h"
+#endif
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+#include <linux/usb.h>
+#endif
+#if defined(LUME_LINUX_USB_STORAGE)
+struct lume_linux_usb_storage;
+struct lume_linux_usb_storage *lume_linux_usb_storage_attach(struct usb_device *, unsigned,
+                                                             unsigned);
+void lume_linux_usb_storage_detach(struct lume_linux_usb_storage *);
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+struct lume_linux_usb_audio;
+struct lume_linux_usb_audio *lume_linux_usb_audio_attach(struct usb_device *, unsigned, unsigned,
+                                                         unsigned);
+void lume_linux_usb_audio_detach(struct lume_linux_usb_audio *);
+#endif
 #if defined(LUME_ARCH_AMD64)
 #include "lume/usb_inventory.h"
 #include "lume/hardware_abi.h"
@@ -33,6 +51,7 @@ enum host_operation
     HOST_IDLE,
     HOST_START,
     HOST_SCAN,
+    HOST_CONTROL,
     HOST_STOP,
 };
 
@@ -42,6 +61,14 @@ enum completion
     TRANSFER_READY = 2,
 };
 
+#if defined(LUME_LINUX_USB_HID)
+struct control_context
+{
+    struct host *host;
+    struct device *device;
+};
+#endif
+
 struct input
 {
     unsigned endpoint, packet;
@@ -50,7 +77,21 @@ struct input
     uint64_t trb;
     bool keyboard, mouse, pending;
     struct lume_hid hid;
+#if defined(LUME_LINUX_USB_HID)
+    struct control_context control;
+    struct lume_linux_usb_hid *linux_hid;
+#endif
 };
+
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+struct linux_endpoint
+{
+    unsigned address, id, packet, type, active_bytes;
+    struct lume_xhci_ring ring;
+    uint64_t trb;
+    struct urb *active;
+};
+#endif
 
 struct device
 {
@@ -61,7 +102,22 @@ struct device
     uint32_t *input, *output;
     unsigned char *buffer;
     struct lume_xhci_ring ep0;
-    bool hub, disconnected;
+    bool hub, disconnected, control_blocked;
+#if defined(LUME_LINUX_USB_HID)
+    uint16_t vendor, product;
+#endif
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+    struct control_context linux_control;
+    struct usb_device linux_device;
+    struct linux_endpoint linux_endpoints[LUME_USB_ENDPOINTS];
+    unsigned linux_endpoint_count;
+#endif
+#if defined(LUME_LINUX_USB_STORAGE)
+    struct lume_linux_usb_storage *storage;
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+    struct lume_linux_usb_audio *audio;
+#endif
     struct input channels[LUME_USB_INPUTS];
 };
 
@@ -73,8 +129,10 @@ struct host
     struct lume_xhci_trb *events;
     struct lume_xhci_ring command;
     struct device devices[MAX_SLOTS + 1];
-    uint64_t waiting_command, waiting_transfer;
+    uint64_t waiting_command, waiting_transfer, waiting_data;
     unsigned command_code, command_slot, transfer_code, transfer_slot;
+    unsigned transfer_bytes, transfer_actual;
+    bool transfer_invalid;
     volatile uint32_t completion;
     bool running, valid;
     unsigned errors, completions;
@@ -273,12 +331,78 @@ static void arm_input(struct host *h, struct device *d, struct input *input)
 {
     if (input->pending || d->disconnected)
         return;
+#if defined(LUME_LINUX_USB_HID)
+    if (!lume_linux_usb_hid_pending(input->linux_hid))
+        return;
+#endif
     if (!lume_dma_sync_for_device(input->report, 64, LUME_DMA_FROM_DEVICE))
         lume_fail("USB HID DMA buffer");
     input->trb = enqueue(&input->ring, dma(input->report), input->packet, (1u << 10) | 32 | 4);
     input->pending = true;
     lume_mmio_write32(h->doorbells + d->slot * 4, input->endpoint);
 }
+
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+static struct linux_endpoint *linux_endpoint_for(struct device *device, unsigned pipe)
+{
+    unsigned address = usb_pipeendpoint(pipe) | (usb_pipein(pipe) ? USB_DIR_IN : 0);
+    for (unsigned index = 0; index < device->linux_endpoint_count; ++index)
+        if (device->linux_endpoints[index].address == address)
+            return &device->linux_endpoints[index];
+    return NULL;
+}
+
+static int arm_linux_endpoint(struct host *host, struct device *device,
+                              struct linux_endpoint *endpoint)
+{
+    if (endpoint->active || device->disconnected)
+        return 0;
+    struct urb *urb = device->linux_device.pending;
+    while (urb && linux_endpoint_for(device, urb->pipe) != endpoint)
+        urb = urb->pending_next;
+    if (!urb)
+        return 0;
+    bool input = endpoint->address & USB_DIR_IN;
+    enum lume_dma_direction direction = input ? LUME_DMA_FROM_DEVICE : LUME_DMA_TO_DEVICE;
+    if (!lume_dma_sync_for_device(urb->transfer_buffer, (size_t)urb->transfer_buffer_length,
+                                  direction))
+        return -LUME_EIO;
+    void *buffer = urb->transfer_buffer;
+    unsigned bytes = (unsigned)urb->transfer_buffer_length;
+    uint32_t control = (1u << 10) | 32u | (input ? 4u : 0);
+    if (endpoint->type == USB_ENDPOINT_XFER_ISOC)
+    {
+        buffer = (unsigned char *)buffer + urb->iso_frame_desc[0].offset;
+        bytes = urb->iso_frame_desc[0].length;
+        control = (5u << 10) | 32u | (1u << 31) | (input ? 4u : 0);
+    }
+    endpoint->active_bytes = bytes;
+    endpoint->trb = enqueue(&endpoint->ring, dma(buffer), bytes, control);
+    endpoint->active = urb;
+    lume_mmio_write32(host->doorbells + device->slot * 4, endpoint->id);
+    return 0;
+}
+
+static int linux_submit(void *context, struct urb *urb)
+{
+    struct control_context *wire = context;
+    struct host *host = wire->host;
+    struct device *device = wire->device;
+    if (!urb || urb->dev != &device->linux_device || urb->transfer_buffer_length > 65536)
+        return -LUME_EINVAL;
+    struct linux_endpoint *endpoint = linux_endpoint_for(device, urb->pipe);
+    if (!endpoint)
+        return -LUME_ENXIO;
+    unsigned pipe_type = usb_pipetype(urb->pipe);
+    if ((endpoint->type == USB_ENDPOINT_XFER_BULK && pipe_type != PIPE_BULK) ||
+        (endpoint->type == USB_ENDPOINT_XFER_ISOC &&
+         (pipe_type != PIPE_ISOCHRONOUS || urb->number_of_packets != 1)) ||
+        (endpoint->type != USB_ENDPOINT_XFER_BULK &&
+         endpoint->type != USB_ENDPOINT_XFER_ISOC))
+        return -LUME_EINVAL;
+    return arm_linux_endpoint(host, device, endpoint);
+}
+#endif
 
 static bool events(struct host *h)
 {
@@ -308,14 +432,75 @@ static bool events(struct host *h)
         else if (type == 32 && slot && slot <= MAX_SLOTS)
         {
             struct device *d = &h->devices[slot];
-            if (ep == 1 && h->waiting_transfer && slot == h->transfer_slot &&
-                (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13)))
+            if (ep == 1 && h->waiting_transfer && slot == h->transfer_slot)
             {
-                h->transfer_code = cc;
-                h->completion |= TRANSFER_READY;
+                if (h->waiting_data && e.parameter == h->waiting_data && cc == 13)
+                {
+                    /* A short data stage still needs an acknowledged status stage. */
+                    unsigned remaining = e.status & 0xffffffu;
+                    if (remaining > h->transfer_bytes)
+                        h->transfer_invalid = true;
+                    else
+                        h->transfer_actual = h->transfer_bytes - remaining;
+                    h->waiting_data = 0;
+                }
+                else if (e.parameter == h->waiting_transfer || (cc != 1 && cc != 13))
+                {
+                    h->transfer_code = cc;
+                    h->completion |= TRANSFER_READY;
+                }
             }
             else if (!d->disconnected)
             {
+                bool handled = false;
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+                for (unsigned n = 0; n < d->linux_endpoint_count; ++n)
+                {
+                    struct linux_endpoint *endpoint = &d->linux_endpoints[n];
+                    struct urb *urb = endpoint->active;
+                    if (!urb || ep != endpoint->id || e.parameter != endpoint->trb)
+                        continue;
+                    handled = true;
+                    endpoint->active = NULL;
+                    unsigned remaining = e.status & 0xffffffu;
+                    int status = 0;
+                    unsigned bytes = 0;
+                    bool isochronous_underrun =
+                        endpoint->type == USB_ENDPOINT_XFER_ISOC &&
+                        !(endpoint->address & USB_DIR_IN) && cc == 14;
+                    if ((cc == 1 || cc == 13 || isochronous_underrun) &&
+                        remaining <= endpoint->active_bytes)
+                    {
+                        bytes = endpoint->active_bytes - remaining;
+                        if ((endpoint->address & USB_DIR_IN) &&
+                            !lume_dma_sync_for_cpu(urb->transfer_buffer,
+                                                   (size_t)urb->transfer_buffer_length,
+                                                   LUME_DMA_FROM_DEVICE))
+                            status = -LUME_EIO;
+                    }
+                    else
+                        status = -LUME_EIO;
+                    if (status)
+                    {
+                        ++h->errors;
+                        lume_value("USB_LINUX_ENDPOINT_ERROR", endpoint->id);
+                        lume_value("USB_LINUX_COMPLETION_ERROR", cc);
+                        lume_value("USB_LINUX_REMAINING_BYTES", remaining);
+                    }
+                    lume_linux_usb_complete_urb(
+                        urb, endpoint->address & USB_DIR_IN ? urb->transfer_buffer : NULL, bytes,
+                        status);
+                    int armed = arm_linux_endpoint(h, d, endpoint);
+                    if (armed)
+                    {
+                        ++h->errors;
+                        lume_value("USB_LINUX_ARM_ERROR", (unsigned)-armed);
+                    }
+                    break;
+                }
+#endif
+                if (handled)
+                    goto transfer_handled;
                 for (unsigned n = 0; n < d->inputs; ++n)
                 {
                     struct input *input = d->channels + n;
@@ -327,6 +512,10 @@ static bool events(struct host *h)
                     {
                         unsigned bytes = input->packet - remaining;
                         cache(input->report, 64, true);
+#if defined(LUME_LINUX_USB_HID)
+                        lume_linux_usb_hid_complete(input->linux_hid, input->report, bytes, 0,
+                                                    milliseconds(h));
+#else
                         if (input->mouse)
                         {
                             ++input->hid.reports;
@@ -334,17 +523,24 @@ static bool events(struct host *h)
                         }
                         else
                             lume_hid_report(&input->hid, input->report, bytes, milliseconds(h));
+#endif
                     }
                     else
                     {
                         ++h->errors;
                         d->disconnected = true;
                         input->hid.repeat_key = 0;
+#if defined(LUME_LINUX_USB_HID)
+                        lume_linux_usb_hid_complete(input->linux_hid, NULL, 0, -LUME_EIO,
+                                                    milliseconds(h));
+#endif
                         lume_value("USB_HID_COMPLETION_ENDPOINT", ep);
                         lume_value("USB_HID_COMPLETION_ERROR", cc);
                     }
                     break;
                 }
+            transfer_handled:
+                ;
             }
         }
         else if (type == 37)
@@ -398,16 +594,21 @@ static bool command(struct host *h, unsigned type, uint64_t parameter, unsigned 
     return true;
 }
 
-static bool control(struct host *h, struct device *d, uint8_t request_type, uint8_t request,
-                    uint16_t value, uint16_t index, uint16_t bytes)
+static bool control_timed(struct host *h, struct device *d, uint8_t request_type, uint8_t request,
+                          uint16_t value, uint16_t index, uint16_t bytes, unsigned timeout_ms,
+                          unsigned *actual)
 {
-    if (bytes > 512 || h->operation == HOST_IDLE || h->waiting_command || h->waiting_transfer)
+    if (bytes > 512 || d->control_blocked || h->operation == HOST_IDLE || h->waiting_command ||
+        h->waiting_transfer)
         return false;
     bool input = (request_type & 0x80) != 0;
     uint64_t setup = request_type | ((uint64_t)request << 8) | ((uint64_t)value << 16) |
                      ((uint64_t)index << 32) | ((uint64_t)bytes << 48);
     h->transfer_code = 0;
     h->transfer_slot = d->slot;
+    h->transfer_actual = h->transfer_bytes = bytes;
+    h->transfer_invalid = false;
+    h->waiting_data = 0;
     h->completion &= ~TRANSFER_READY;
     if (bytes)
     {
@@ -416,11 +617,14 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
     }
     enqueue(&d->ep0, setup, 8, (2u << 10) | 64 | (bytes ? ((input ? 3u : 2u) << 16) : 0));
     if (bytes)
-        enqueue(&d->ep0, dma(d->buffer), bytes, (3u << 10) | (input ? 1u << 16 : 0));
+        h->waiting_data =
+            enqueue(&d->ep0, dma(d->buffer), bytes, (3u << 10) | (input ? (1u << 16) | 4u : 0));
     h->waiting_transfer =
         enqueue(&d->ep0, 0, 0, (4u << 10) | 32 | ((!bytes || !input) ? 1u << 16 : 0));
     lume_mmio_write32(h->doorbells + d->slot * 4, 1);
-    uint64_t deadline = lume_counter_read() + h->frequency / 2;
+    uint64_t ticks =
+        (h->frequency / 1000) * timeout_ms + ((h->frequency % 1000) * timeout_ms + 999) / 1000;
+    uint64_t deadline = lume_counter_read() + ticks;
     for (;;)
     {
         events(h);
@@ -431,9 +635,11 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
         wait_progress(h, TRANSFER_READY, deadline);
     }
     h->waiting_transfer = 0;
+    h->waiting_data = 0;
     h->transfer_slot = 0;
-    if (h->transfer_code != 1)
+    if (h->transfer_code != 1 || h->transfer_invalid)
     {
+        d->control_blocked = true;
         ++h->errors;
         lume_value("USB_CONTROL_SLOT", d->slot);
         lume_value("USB_CONTROL_REQUEST", ((unsigned)request_type << 8) | request);
@@ -442,8 +648,57 @@ static bool control(struct host *h, struct device *d, uint8_t request_type, uint
     }
     if (bytes && input)
         cache(d->buffer, 512, true);
+    *actual = h->transfer_actual;
     return true;
 }
+
+static bool control(struct host *h, struct device *d, uint8_t request_type, uint8_t request,
+                    uint16_t value, uint16_t index, uint16_t bytes)
+{
+    unsigned actual;
+    return control_timed(h, d, request_type, request, value, index, bytes, 500, &actual) &&
+           actual == bytes;
+}
+
+#if defined(LUME_LINUX_USB_HID)
+static int linux_control(void *context, uint8_t type, uint8_t request, uint16_t value,
+                         uint16_t index, void *data, uint16_t bytes, unsigned timeout_ms)
+{
+    struct control_context *wire = context;
+    struct host *host = wire->host;
+    struct device *device = wire->device;
+    if (device->disconnected)
+        return -LUME_ENXIO;
+    if (device->control_blocked)
+        return -LUME_EIO;
+    if (bytes > 512 || (bytes && !data))
+        return -LUME_EINVAL;
+    if (host->operation == HOST_STOP || host->operation == HOST_CONTROL || host->waiting_command ||
+        host->waiting_transfer || host->event_polling)
+        return -LUME_EBUSY;
+    if (timeout_ms > 500)
+        timeout_ms = 500;
+    bool input = type & 0x80u;
+    if (bytes && !input && data != device->buffer)
+        copy(device->buffer, data, bytes);
+    bool runtime = host->operation == HOST_IDLE;
+    /* Keep topology and shutdown from releasing this slot while EP0 is active. */
+    if (runtime)
+        host->operation = HOST_CONTROL;
+    unsigned actual;
+    bool done =
+        control_timed(host, device, type, request, value, index, bytes, timeout_ms, &actual);
+    if (runtime)
+        host->operation = HOST_IDLE;
+    if (!done)
+        return host->transfer_code ? -LUME_EIO : -LUME_ETIMEDOUT;
+    if (actual && input && data != device->buffer)
+        copy(data, device->buffer, actual);
+    if (input && actual < bytes)
+        lume_value("USB_LINUX_CONTROL_SHORT_BYTES", actual);
+    return (int)actual;
+}
+#endif
 
 static uint32_t *context(struct host *h, struct device *d, unsigned index)
 {
@@ -521,8 +776,10 @@ static bool input_device(struct host *h, struct device *d, const struct lume_usb
 {
     if (d->inputs == LUME_USB_INPUTS)
         return false;
+#if !defined(LUME_LINUX_USB_HID)
     if (!control(h, d, 0x21, 11, 0, i->interface, 0))
         return false; /* SET_PROTOCOL(BOOT) */
+#endif
     struct input *input = d->channels + d->inputs;
     input->endpoint = (i->endpoint & 15) * 2 + 1;
     input->packet = i->packet;
@@ -555,6 +812,13 @@ static bool input_device(struct host *h, struct device *d, const struct lume_usb
     cache(d->input, 4096, false);
     if (!command(h, 12, dma(d->input), d->slot << 24, 0))
         return false;
+#if defined(LUME_LINUX_USB_HID)
+    input->control = (struct control_context){h, d};
+    input->linux_hid = lume_linux_usb_hid_attach(i, d->vendor, d->product, (uint8_t)d->slot,
+                                                 &input->hid, &input->control, linux_control);
+    if (!input->linux_hid)
+        return false;
+#endif
     input->keyboard = i->keyboard;
     input->mouse = i->mouse;
     ++d->inputs;
@@ -576,6 +840,164 @@ static bool input_device(struct host *h, struct device *d, const struct lume_usb
     arm_input(h, d, input);
     return true;
 }
+
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+static bool configure_linux_endpoints(struct host *host, struct device *device,
+                                      const struct lume_usb_endpoint *const *descriptors,
+                                      unsigned count)
+{
+    cache(device->output, 4096, true);
+    zero(device->input, 4096);
+    context(host, device, 0)[1] = 1;
+    copy(context(host, device, 1), device->output, host->context_bytes);
+    uint32_t *slot = context(host, device, 1);
+    unsigned entries = slot[0] >> 27;
+    device->linux_endpoint_count = 0;
+    for (unsigned index = 0; index < count; ++index)
+    {
+        const struct lume_usb_endpoint *descriptor = descriptors[index];
+        struct linux_endpoint *endpoint =
+            &device->linux_endpoints[device->linux_endpoint_count++];
+        endpoint->address = descriptor->address;
+        endpoint->id = (descriptor->address & USB_ENDPOINT_NUMBER_MASK) * 2 +
+                       ((descriptor->address & USB_DIR_IN) ? 1u : 0u);
+        endpoint->packet = descriptor->packet;
+        endpoint->type = descriptor->attributes & USB_ENDPOINT_XFERTYPE_MASK;
+        if (!ring_init(host, &endpoint->ring))
+            return false;
+        context(host, device, 0)[1] |= 1u << endpoint->id;
+        if (entries < endpoint->id)
+            entries = endpoint->id;
+        unsigned interval = descriptor->interval;
+        if (endpoint->type == USB_ENDPOINT_XFER_ISOC)
+        {
+            if (device->speed >= 3)
+                interval = interval > 16 ? 15 : interval - 1;
+            else
+            {
+                unsigned log = 0;
+                while ((1u << log) < interval && log < 8)
+                    ++log;
+                interval = log + 3;
+            }
+        }
+        uint32_t *ep = context(host, device, endpoint->id + 1);
+        bool input = descriptor->address & USB_DIR_IN;
+        unsigned type = endpoint->type == USB_ENDPOINT_XFER_ISOC ? (input ? 5u : 1u)
+                                                                 : (input ? 6u : 2u);
+        unsigned errors = endpoint->type == USB_ENDPOINT_XFER_ISOC ? 0 : 3;
+        ep[0] = interval << 16;
+        ep[1] = (descriptor->packet << 16) | (type << 3) | (errors << 1);
+        ep[2] = (uint32_t)endpoint->ring.dma | 1;
+        ep[3] = (uint32_t)(endpoint->ring.dma >> 32);
+        ep[4] = descriptor->packet |
+                (endpoint->type == USB_ENDPOINT_XFER_ISOC ? descriptor->packet << 16 : 0);
+    }
+    slot[0] = (slot[0] & 0x07ffffff) | (entries << 27);
+    cache(device->input, 4096, false);
+    if (!command(host, 12, dma(device->input), device->slot << 24, NULL))
+        return false;
+    device->linux_control = (struct control_context){host, device};
+    device->linux_device = (struct usb_device){.vendor = device->vendor,
+                                                .product = device->product,
+                                                .address = (u8)device->slot,
+                                                .online = true,
+                                                .transport_context = &device->linux_control,
+                                                .control = linux_control,
+                                                .submit = linux_submit};
+    return true;
+}
+#endif
+
+#if defined(LUME_LINUX_USB_STORAGE)
+static bool linux_bulk_pair(const struct lume_usb_configuration *configuration,
+                            const struct lume_usb_endpoint **input,
+                            const struct lume_usb_endpoint **output)
+{
+    *input = NULL;
+    *output = NULL;
+    unsigned interface = UINT32_MAX;
+    for (unsigned index = 0; index < configuration->endpoints; ++index)
+    {
+        const struct lume_usb_endpoint *endpoint = &configuration->endpoint[index];
+        if (endpoint->alternate || endpoint->interface_class != 8 ||
+            endpoint->interface_subclass != 6 ||
+            endpoint->interface_protocol != 0x50 || (endpoint->attributes & 3) != 2)
+            continue;
+        if (interface == UINT32_MAX)
+            interface = endpoint->interface;
+        if (interface != endpoint->interface)
+            continue;
+        if (endpoint->address & USB_DIR_IN)
+            *input = endpoint;
+        else
+            *output = endpoint;
+    }
+    return *input && *output;
+}
+
+static bool linux_bulk_device(struct host *host, struct device *device,
+                              const struct lume_usb_configuration *configuration)
+{
+    const struct lume_usb_endpoint *input, *output;
+    if (!linux_bulk_pair(configuration, &input, &output))
+        return false;
+    const struct lume_usb_endpoint *descriptors[] = {output, input};
+    if (!configure_linux_endpoints(host, device, descriptors, 2))
+        return false;
+    device->storage = lume_linux_usb_storage_attach(
+        &device->linux_device, input->address & USB_ENDPOINT_NUMBER_MASK,
+        output->address & USB_ENDPOINT_NUMBER_MASK);
+    if (!device->storage)
+    {
+        device->linux_device.online = false;
+        return false;
+    }
+    lume_value("USB_LINUX_BULK_IN_ENDPOINT", input->address);
+    lume_value("USB_LINUX_BULK_OUT_ENDPOINT", output->address);
+    return true;
+}
+#endif
+
+#if defined(LUME_LINUX_USB_AUDIO)
+static const struct lume_usb_endpoint *linux_audio_endpoint(
+    const struct lume_usb_configuration *configuration)
+{
+    for (unsigned index = 0; index < configuration->endpoints; ++index)
+    {
+        const struct lume_usb_endpoint *endpoint = &configuration->endpoint[index];
+        if (endpoint->alternate && endpoint->interface_class == 1 &&
+            endpoint->interface_subclass == 2 &&
+            (endpoint->attributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_ISOC &&
+            !(endpoint->address & USB_DIR_IN) && endpoint->interval)
+            return endpoint;
+    }
+    return NULL;
+}
+
+static bool linux_audio_device(struct host *host, struct device *device,
+                               const struct lume_usb_configuration *configuration)
+{
+    const struct lume_usb_endpoint *endpoint = linux_audio_endpoint(configuration);
+    if (!endpoint ||
+        !control(host, device, 1, 11, endpoint->alternate, endpoint->interface, 0))
+        return false;
+    const struct lume_usb_endpoint *descriptors[] = {endpoint};
+    if (!configure_linux_endpoints(host, device, descriptors, 1))
+        return false;
+    device->audio = lume_linux_usb_audio_attach(
+        &device->linux_device, endpoint->address & USB_ENDPOINT_NUMBER_MASK, endpoint->packet,
+        endpoint->interval);
+    if (!device->audio)
+    {
+        device->linux_device.online = false;
+        return false;
+    }
+    lume_value("USB_LINUX_AUDIO_ENDPOINT", endpoint->address);
+    lume_value("USB_LINUX_AUDIO_PACKET", endpoint->packet);
+    return true;
+}
+#endif
 
 static bool enumerate(struct host *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                       unsigned);
@@ -685,9 +1107,23 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
         return false;
     if (!update_ep0(h, d, d->buffer[7]))
         return false;
+#if defined(LUME_LINUX_USB_HID)
+    struct control_context wire = {h, d};
+    if (!lume_linux_usb_device_descriptor((uint8_t)d->slot, &wire, linux_control, d->buffer, 64))
+        return false;
+#else
     if (!control(h, d, 0x80, 6, 0x100, 0, 18))
         return false;
+#endif
     unsigned device_class = d->buffer[4], protocol = d->buffer[6];
+#if defined(LUME_ARCH_AMD64) || defined(LUME_LINUX_USB_HID)
+    uint16_t vendor = d->buffer[8] | (uint16_t)d->buffer[9] << 8;
+    uint16_t product = d->buffer[10] | (uint16_t)d->buffer[11] << 8;
+#endif
+#if defined(LUME_LINUX_USB_HID)
+    d->vendor = vendor;
+    d->product = product;
+#endif
 #if defined(LUME_ARCH_AMD64)
     uint32_t parent = pci_hosts[h->index].parent;
     if (depth)
@@ -698,8 +1134,6 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
             if (p->hub && p->root == root && p->depth + 1 == depth && p->route == (route & mask))
                 parent = p->inventory;
         }
-    uint16_t vendor = d->buffer[8] | (uint16_t)d->buffer[9] << 8;
-    uint16_t product = d->buffer[10] | (uint16_t)d->buffer[11] << 8;
     if (lume_usb_inventory_add(parent, root, route, slot, vendor, product, device_class,
                                &d->inventory))
         return false;
@@ -717,7 +1151,15 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
     if (!lume_usb_configuration_inputs(d->buffer, bytes, &selected))
         return false;
     lume_value("USB_HID_INTERFACES", selected.inputs);
-    if (!selected.inputs && !selected.hub && device_class != 9)
+    bool bulk = false, audio = false;
+#if defined(LUME_LINUX_USB_STORAGE)
+    const struct lume_usb_endpoint *bulk_input, *bulk_output;
+    bulk = linux_bulk_pair(&selected, &bulk_input, &bulk_output);
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+    audio = linux_audio_endpoint(&selected) != NULL;
+#endif
+    if (!selected.inputs && !selected.hub && device_class != 9 && !bulk && !audio)
     {
 #if defined(LUME_ARCH_AMD64)
         (void)lume_usb_inventory_state(d->inventory, LUME_HARDWARE_UNSUPPORTED, -LUME_ENOSYS);
@@ -731,6 +1173,14 @@ static bool enumerate(struct host *h, unsigned root, unsigned speed, unsigned de
     bool ready = true;
     if (selected.hub || device_class == 9)
         ready = hub(h, d, protocol);
+#if defined(LUME_LINUX_USB_STORAGE)
+    else if (bulk)
+        ready = linux_bulk_device(h, d, &selected);
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+    else if (audio)
+        ready = linux_audio_device(h, d, &selected);
+#endif
     else
         for (unsigned n = 0; n < selected.inputs; ++n)
             if (!input_device(h, d, selected.input + n))
@@ -762,9 +1212,27 @@ static bool remove_root(struct host *h, unsigned root)
 #endif
             h->dcbaa[slot] = 0;
             cache(h->dcbaa, 4096, false);
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+            d->linux_device.online = false;
+#endif
+#if defined(LUME_LINUX_USB_STORAGE)
+            lume_linux_usb_storage_detach(d->storage);
+            d->storage = NULL;
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+            lume_linux_usb_audio_detach(d->audio);
+            d->audio = NULL;
+#endif
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+            for (unsigned n = 0; n < d->linux_endpoint_count; ++n)
+                release_page(h, d->linux_endpoints[n].ring.trbs);
+#endif
             for (unsigned n = 0; n < LUME_USB_INPUTS; ++n)
             {
                 struct input *input = d->channels + n;
+#if defined(LUME_LINUX_USB_HID)
+                lume_linux_usb_hid_detach(input->linux_hid);
+#endif
                 const uint8_t released[8] = {0};
                 if (input->keyboard)
                 {
@@ -1089,6 +1557,10 @@ void lume_usb_poll(void)
                 if (input->keyboard)
                     lume_hid_repeat(&input->hid, milliseconds(h));
                 arm_input(h, d, input);
+#if defined(LUME_LINUX_USB_HID)
+                if (input->keyboard && h->operation == HOST_IDLE && !d->control_blocked)
+                    lume_linux_usb_hid_sync_caps(input->linux_hid);
+#endif
             }
         }
     }
@@ -1190,6 +1662,21 @@ bool lume_usb_stop_host(unsigned index)
             }
         }
 #endif
+#if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
+    for (unsigned slot = 1; slot <= MAX_SLOTS; ++slot)
+    {
+        struct device *device = &h->devices[slot];
+        device->linux_device.online = false;
+#if defined(LUME_LINUX_USB_STORAGE)
+        lume_linux_usb_storage_detach(device->storage);
+        device->storage = NULL;
+#endif
+#if defined(LUME_LINUX_USB_AUDIO)
+        lume_linux_usb_audio_detach(device->audio);
+        device->audio = NULL;
+#endif
+    }
+#endif
     bool ok = true;
     for (unsigned n = 0; n < h->allocated; ++n)
         if (h->pages[n])
@@ -1208,6 +1695,9 @@ bool lume_usb_stop_host(unsigned index)
     {
         for (unsigned n = 0; n < h->devices[slot].inputs; ++n)
         {
+#if defined(LUME_LINUX_USB_HID)
+            lume_linux_usb_hid_detach(h->devices[slot].channels[n].linux_hid);
+#endif
             if (h->devices[slot].channels[n].keyboard && keyboard_count)
                 --keyboard_count;
             if (h->devices[slot].channels[n].mouse && mouse_count)

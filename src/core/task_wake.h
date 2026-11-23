@@ -14,6 +14,20 @@ static void wake_tasks(void)
         {
             if (kernel_wait[i])
                 continue;
+            if (fifo_opens[i].object)
+            {
+                if (lume_wait_take(lume_vfs_fifo_open_queue(&fifo_opens[i]), i))
+                {
+                    int64_t result = LUME_IO_WAIT_FIFO;
+                    if (!kernel_fifo_block(i, &result))
+                    {
+                        LUME_CONTEXT_REG(&tasks[i].context, 0) = (uint64_t)result;
+                        task_state_set(i, 1);
+                        sched_wake(&policy, i, unit, 0);
+                    }
+                }
+                continue;
+            }
             if (vm_fault_wait[i])
             {
                 if (!vm_fault_ready[i] && !thread_deadline_expired(i, at))

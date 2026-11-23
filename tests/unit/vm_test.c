@@ -725,7 +725,7 @@ static void stable_size_cases(void)
     CHECK(call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd) == -LUME_EBUSY);
     CHECK(!call(0, LUME_VM_UNMAP, base + 2 * PAGE, PAGE, 0, 0, -1));
     CHECK(!call(0, LUME_VM_RESIZE, 0, 2 * PAGE, 0, 0, fd));
-    CHECK(lume_vm_clone(0, 1));
+    CHECK(lume_vm_clone(0, 1, 0));
     lume_vm_release(0);
     CHECK(call(0, LUME_VM_RESIZE, 0, PAGE, 0, 0, fd) == -LUME_EBUSY);
     lume_vm_release(1);
@@ -927,7 +927,7 @@ int main(void)
     base = call(0, LUME_VM_MAP, 0, span, 3, anonymous, -1);
     a = physical(0, base, true, false);
     *(unsigned char *)(uintptr_t)a = 0xa6;
-    CHECK(lume_vm_clone(0, 1));
+    CHECK(lume_vm_clone(0, 1, 0));
     b = physical(1, base, true, false);
     CHECK(b != a && *(unsigned char *)(uintptr_t)b == 0xa6 && physical_live == 2);
     *(unsigned char *)(uintptr_t)b = 0x12;
@@ -1449,6 +1449,19 @@ static void thread_region_cases(void)
         CHECK(!spaces[0] && !physical_live && !mappings_live);
         clean();
     }
+    uint64_t other_tls, other_stack, base, bytes;
+    CHECK(lume_vm_thread_region(0, 3, 64, 32768, &tls, &stack));
+    CHECK(lume_vm_thread_region(0, 4, 64, 32768, &other_tls, &other_stack));
+    CHECK(lume_vm_fault(0, tls, true, false) == 1);
+    CHECK(lume_vm_fault(0, other_stack, true, false) == 1);
+    CHECK(lume_vm_clone(0, 1, 3));
+    CHECK(lume_vm_thread_bounds(1, 1, &base, &bytes) && base == stack && bytes == 32768);
+    CHECK(!lume_vm_thread_bounds(1, 3, &base, &bytes));
+    CHECK(lume_vm_fault(1, tls, false, false) == 1);
+    CHECK(lume_vm_fault(1, other_stack, false, false) == 0);
+    CHECK(lume_vm_thread_region(1, 3, 64, 32768, &other_tls, &other_stack));
+    CHECK(other_stack != stack);
+    clean();
 }
 
 static unsigned char file_data[2 * 1024 * 1024 + 12288];
@@ -1609,7 +1622,7 @@ static void file_mapping_cases(void)
     }
     CHECK(regular_file.maximum == 65536);
     CHECK(lume_vm_fault(0, base + rounded(available), false, false) == -1);
-    CHECK(lume_vm_clone(0, 2));
+    CHECK(lume_vm_clone(0, 2, 0));
     CHECK(physical(2, base, false, false) != dirty);
     CHECK(*(unsigned char *)(uintptr_t)physical(2, base, false, false) ==
           *(unsigned char *)(uintptr_t)dirty);
@@ -1655,7 +1668,7 @@ static void file_mapping_cases(void)
     CHECK(!lume_vm_fault(0, plan.entry, false, false));
     CHECK(!lume_vm_image_protect(0, plan.entry, PAGE, LUME_PROT_READ | LUME_PROT_EXEC));
     CHECK(physical(0, plan.entry, false, true) == text);
-    CHECK(lume_vm_clone(0, 1));
+    CHECK(lume_vm_clone(0, 1, 0));
     CHECK(physical(1, plan.entry, false, true) == text);
     CHECK(physical(1, UINT64_C(0x10240000), true, false) != data);
     lume_vm_image_release(0);

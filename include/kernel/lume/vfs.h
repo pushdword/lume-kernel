@@ -9,6 +9,10 @@
 #include <fd.h>
 #include "lume/credential.h"
 
+struct lume_files_stat;
+struct lume_files_stat_times;
+struct lume_files_stat_allocation;
+
 struct lume_identity
 {
     uint32_t uid, euid, suid, gid, egid, sgid, groups_count;
@@ -44,6 +48,12 @@ struct lume_file_identity
     uint64_t key, version, bytes;
 };
 
+struct lume_fifo_open
+{
+    uint64_t peer_epoch;
+    unsigned object, fd, flags;
+};
+
 struct lume_files
 {
     char cwd[LUME_PATH_MAX];
@@ -76,13 +86,22 @@ bool lume_vfs_exec_callbacks(const struct lume_files *);
 void lume_files_release(struct lume_files *);
 uint64_t lume_files_pages(const struct lume_files *);
 int64_t lume_vfs_open(struct lume_files *, const char *, uint64_t flags);
+int64_t lume_vfs_open_wait(struct lume_files *, const char *, uint64_t flags, bool compat,
+                           struct lume_fifo_open *);
+int64_t lume_vfs_fifo_open_resume(struct lume_files *, struct lume_fifo_open *);
+void lume_vfs_fifo_open_cancel(struct lume_files *, struct lume_fifo_open *);
+struct lume_wait_queue *lume_vfs_fifo_open_queue(const struct lume_fifo_open *);
 int lume_vfs_sandbox_access(struct lume_files *, uint64_t, bool);
 int lume_vfs_directory_authority(struct lume_files *, unsigned, uint64_t);
 bool lume_vfs_sandbox_directory(struct lume_files *, const char *, bool);
 int lume_vfs_x11_authority(struct lume_files *, uint64_t);
 bool lume_vfs_sandbox_x11_authority(struct lume_files *, const char *);
 void lume_vfs_terminal_open(int (*)(struct lume_files *, const char *, uint64_t));
-void lume_vfs_terminal_stat(int64_t (*)(struct lume_files *, const char *, struct lume_stat *));
+struct lume_inode_access;
+void lume_vfs_terminal_stat(int64_t (*)(struct lume_files *, const char *, uint32_t,
+                                        struct lume_stat *, struct lume_inode_access *));
+void lume_vfs_terminal_set_access(int (*)(struct lume_files *, const char *,
+                                          const struct lume_inode_access *));
 int64_t lume_vfs_open_compat(struct lume_files *, const char *, uint64_t flags);
 int64_t lume_vfs_remove_compat(struct lume_files *, const char *, bool);
 int64_t lume_vfs_stat_inode(uint64_t, struct lume_stat *);
@@ -117,7 +136,19 @@ int64_t lume_vfs_stat_mode(struct lume_files *, uint64_t, struct lume_stat *);
 int64_t lume_vfs_stat_path(struct lume_files *, const char *, struct lume_stat *);
 int64_t lume_vfs_stat_at(struct lume_files *, int64_t, const char *, struct lume_stat *);
 int64_t lume_vfs_lstat_at(struct lume_files *, int64_t, const char *, struct lume_stat *);
+int lume_vfs_access_at(struct lume_files *, int64_t, const char *, unsigned mode, unsigned flags);
+int64_t lume_vfs_stat_extended(struct lume_files *, int64_t directory, const char *, unsigned flags,
+                               struct lume_files_stat *);
 int64_t lume_vfs_readlink_at(struct lume_files *, int64_t, const char *, void *, size_t);
+int64_t lume_vfs_mkfifo_at(struct lume_files *, int64_t, const char *, unsigned mode);
+int64_t lume_vfs_symlink_at(struct lume_files *, int64_t, const char *path, const char *target);
+int64_t lume_vfs_link_at(struct lume_files *, int64_t, const char *, int64_t, const char *, bool);
+int64_t lume_vfs_stat_times(struct lume_files *, int64_t, const char *, unsigned,
+                            struct lume_files_stat_times *);
+int64_t lume_vfs_stat_allocation(struct lume_files *, int64_t, const char *, unsigned,
+                                 struct lume_files_stat_allocation *);
+int64_t lume_vfs_set_times(struct lume_files *, int64_t, const char *, unsigned,
+                           const struct lume_file_time *);
 int lume_vfs_volume_path(struct lume_files *, const char *, struct lume_files_volume *);
 int lume_vfs_volume_fd(struct lume_files *, uint64_t, struct lume_files_volume *);
 int64_t lume_vfs_truncate(struct lume_files *, uint64_t);
@@ -126,16 +157,31 @@ int64_t lume_vfs_rename(struct lume_files *, const char *, const char *);
 int64_t lume_vfs_replace(struct lume_files *, const char *, const char *);
 int64_t lume_vfs_getdents(struct lume_files *, uint64_t fd, void *, uint64_t bytes);
 int64_t lume_vfs_chdir(struct lume_files *, const char *);
+int64_t lume_vfs_fchdir(struct lume_files *, uint64_t);
 int64_t lume_vfs_chroot(struct lume_files *, const char *);
 struct lume_file_mode_request;
 int64_t lume_vfs_file_mode(struct lume_files *, unsigned, struct lume_file_mode_request *,
                            const char *);
+int64_t lume_vfs_file_mode_wait(struct lume_files *, unsigned, struct lume_file_mode_request *,
+                                const char *, bool compat, struct lume_fifo_open *);
 bool lume_vfs_image(const char *path, const void **data, size_t *bytes);
 bool lume_vfs_mount_fat(const void *, size_t);
+
+enum
+{
+    LUME_VFS_MOUNT_NOSUID = 1u << 0,
+    LUME_VFS_MOUNT_NOEXEC = 1u << 1,
+    LUME_VFS_MOUNT_NODEV = 1u << 2,
+    LUME_VFS_MOUNT_FLAGS =
+        LUME_VFS_MOUNT_NOSUID | LUME_VFS_MOUNT_NOEXEC | LUME_VFS_MOUNT_NODEV
+};
+
 bool lume_vfs_mount_storage(const struct lume_storage_ops *);
+bool lume_vfs_mount_storage_flags(const struct lume_storage_ops *, unsigned);
 int lume_vfs_program(struct lume_files *, const char *, const void **, size_t *);
 /* A program reference owns an open description without consuming a user descriptor. */
 int lume_vfs_program_hold(struct lume_files *, const char *, size_t *);
+bool lume_vfs_exec_access(int, const char *, struct lume_inode_access *);
 int lume_vfs_object_identity(int, struct lume_file_identity *);
 int lume_vfs_object_retain(int);
 int lume_vfs_exec_pin(int);
@@ -153,6 +199,7 @@ bool lume_vfs_memory_io(struct lume_files *, uint64_t);
  * separates unrelated queues from storage and limits concurrent staging memory. */
 unsigned lume_vfs_memory_lane(struct lume_files *, uint64_t);
 bool lume_vfs_console_io(struct lume_files *, uint64_t);
+bool lume_vfs_console_terminal(struct lume_files *, uint64_t);
 bool lume_vfs_storage_io(struct lume_files *, uint64_t);
 struct lume_wait_queue;
 struct lume_wait_queue *lume_vfs_pipe_queue(struct lume_files *, uint64_t, bool writing);

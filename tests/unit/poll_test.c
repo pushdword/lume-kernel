@@ -4,9 +4,15 @@
 #include "lume/datagram.h"
 #include "lume/io.h"
 #include "lume/wait.h"
+#include "lume/worker.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+void lume_worker_scheduler(void (*run)(void *), void *context)
+{
+    run(context);
+}
 
 int lume_sandbox_open(struct lume_files *files, const char *path, uint64_t flags)
 {

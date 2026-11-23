@@ -1,5 +1,6 @@
 #include "lume/vfs.h"
 #include "lume/credentials.h"
+#include "lume/file_access.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -258,7 +259,7 @@ static void execution(void)
     files.identity.egid = 50;
     files.identity.sgid = 0;
     struct lume_identity before = files.identity;
-    lume_credential_exec(&files.identity);
+    lume_credential_exec(&files.identity, NULL);
     ids(false, 1000, 2000, 2000);
     ids(true, 40, 50, 50);
     T(files.identity.groups_count == before.groups_count);
@@ -268,6 +269,23 @@ static void execution(void)
     T(call(LUME_CREDENTIAL_SETEUID) == -LUME_EPERM);
     request.gid = 0;
     T(call(LUME_CREDENTIAL_SETEGID) == -LUME_EPERM);
+
+    reset(1000, 1000, 1000);
+    files.identity.gid = files.identity.egid = files.identity.sgid = 40;
+    const struct lume_inode_access setid = {.uid = 0, .gid = 80, .mode = 0106755};
+    files.identity.jailed = true;
+    T(!lume_credential_exec(&files.identity, &setid));
+    ids(false, 1000, 1000, 1000);
+    ids(true, 40, 40, 40);
+    files.identity.jailed = false;
+    files.identity.sandbox_profile = 1;
+    T(!lume_credential_exec(&files.identity, &setid));
+    ids(false, 1000, 1000, 1000);
+    ids(true, 40, 40, 40);
+    files.identity.sandbox_profile = 0;
+    T(lume_credential_exec(&files.identity, &setid));
+    ids(false, 1000, 0, 0);
+    ids(true, 40, 80, 80);
 }
 
 int main(void)

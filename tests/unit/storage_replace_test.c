@@ -10,6 +10,11 @@ void lume_smp_wake(void)
 {
 }
 
+void lume_worker_copy(void *destination, const void *source, size_t bytes)
+{
+    memcpy(destination, source, bytes);
+}
+
 int lume_console_getc(void)
 {
     return -LUME_EAGAIN;

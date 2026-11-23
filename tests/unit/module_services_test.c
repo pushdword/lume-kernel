@@ -10,6 +10,7 @@ static bool network_busy, repeat;
 static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
 static bool async_probe;
+static bool interrupt_enabled;
 
 #ifndef MODULE_WORK_PARALLEL
 void lume_worker_scheduler(void (*run)(void *), void *context)
@@ -74,8 +75,8 @@ static int configure(unsigned irq, unsigned trigger)
 
 static void enable(unsigned irq, bool enabled)
 {
-    (void)irq;
-    (void)enabled;
+    if (irq == 42)
+        interrupt_enabled = enabled;
 }
 
 static void eoi(unsigned irq)
@@ -318,6 +319,53 @@ int lume_netif_unregister(uint32_t index)
     return 0;
 }
 
+struct shared_device
+{
+    struct lume_irq_action action;
+    unsigned calls;
+    bool asserted;
+};
+
+static bool shared_interrupt(unsigned irq, void *context)
+{
+    struct shared_device *device = context;
+    assert(irq == 42 && references && interrupt_enabled);
+    assert(lume_module_irq_release_shared(irq, &device->action) == -LUME_EBUSY);
+    ++device->calls;
+    bool asserted = device->asserted;
+    device->asserted = false;
+    return asserted;
+}
+
+static void shared_interrupts(void)
+{
+    struct shared_device first = {0}, second = {0};
+    struct lume_irq_info before, after;
+    assert(!lume_irq_info(42, &before));
+    assert(!lume_module_irq_request_shared(42, &first.action, shared_interrupt, &first));
+    assert(interrupt_enabled && references == 1);
+    assert(lume_module_irq_request_shared(43, &first.action, shared_interrupt, &first) ==
+           -LUME_EBUSY);
+    assert(lume_module_irq_register(42, LUME_IRQ_LEVEL, interrupt, &references) == -LUME_EBUSY);
+    assert(!lume_module_irq_request_shared(42, &second.action, shared_interrupt, &second));
+    assert(lume_module_irq_release_shared(43, &second.action) == -LUME_ENOENT);
+    assert(references == 2 && interrupt_enabled);
+    assert(!lume_irq_dispatch_async(42));
+    second.asserted = true;
+    assert(lume_irq_dispatch(42) && first.calls == 1 && second.calls == 1);
+    assert(!lume_irq_dispatch(42) && first.calls == 2 && second.calls == 2);
+    assert(!lume_irq_info(42, &after) && after.handled == before.handled + 1 &&
+           after.stray == before.stray + 1 && after.registered && after.enabled);
+    assert(!lume_module_irq_release_shared(42, &second.action) && references == 1 &&
+           interrupt_enabled);
+    first.asserted = true;
+    assert(lume_irq_dispatch(42) && first.calls == 3 && second.calls == 2);
+    assert(!lume_module_irq_release_shared(42, &first.action) && !references && !interrupt_enabled);
+    assert(!lume_irq_info(42, &after) && !after.registered && !after.enabled);
+    assert(!lume_module_irq_request_shared(42, &first.action, shared_interrupt, &first));
+    assert(!lume_module_irq_release_shared(42, &first.action) && !references);
+}
+
 int main(void)
 {
     group_services();
@@ -348,6 +396,7 @@ int main(void)
     assert(lume_irq_dispatch_async(42) && references == 1 && callbacks == 2);
     assert(!lume_module_irq_unregister(42, &references) && !references);
     async_probe = false;
+    shared_interrupts();
     work = (struct lume_work){.run = run, .context = &work};
     assert(!lume_module_work_submit(&work) && references == 1);
     assert(!lume_module_work_submit(&work) && references == 1);
@@ -364,6 +413,6 @@ int main(void)
     network_busy = false;
     assert(!lume_module_netif_unregister(5) && !references);
     domain_services();
-    puts("PASS_MODULE_SERVICES block=8 IRQ=retained work=cancel,resubmit network=busy");
+    puts("PASS_MODULE_SERVICES block=8 IRQ=retained,shared work=cancel,resubmit network=busy");
     return 0;
 }

@@ -37,6 +37,22 @@ int main(void)
     assert(!thread_slot_reserve(slots, states, thread, 0));
     states[3] = 0;
     assert(thread_slot_available(slots, states, 3));
+
+    memset(slots, 0, sizeof(slots));
+    memset(states, 0, sizeof(states));
+    unsigned cursor = 3;
+    unsigned first = thread_slot_reserve_next(slots, states, 8, 2, 0, &cursor);
+    assert(first == 3 && cursor == 4);
+    slots[first].reservation = 0;
+    unsigned second = thread_slot_reserve_next(slots, states, 8, 2, 0, &cursor);
+    assert(second == 4 && cursor == 5);
+    slots[second].reservation = 0;
+    cursor = 7;
+    assert(thread_slot_reserve_next(slots, states, 8, 2, 0, &cursor) == 7 && cursor == 1);
+    slots[7].reservation = 0;
+    assert(thread_slot_reserve_next(slots, states, 8, 2, 0, &cursor) == 1 && cursor == 2);
+    slots[1].reservation = 0;
+    assert(thread_slot_reserve_next(slots, states, 8, 2, 0, &cursor) == 3 && cursor == 4);
     puts("PASS fork reservation, interleaved thread allocation and failed launch release");
     return 0;
 }

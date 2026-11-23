@@ -56,7 +56,9 @@ bool lume_task_pipe_try(unsigned task, uint64_t fd, uint64_t address, uint64_t b
             !lume_sandbox_io(files, fd, writing) &&
             lume_user_io_pipe_try(files, process + 1, fd, address, bytes, writing, result))
         {
-            handled = *result != -LUME_EAGAIN || !lume_vfs_pipe_wait(files, fd);
+            /* Signal delivery runs on the normal syscall return path. */
+            handled = *result != LUME_IO_PIPE_NO_READERS &&
+                      (*result != -LUME_EAGAIN || !lume_vfs_pipe_wait(files, fd));
             if (handled)
             {
                 (void)kernel_claim(task);

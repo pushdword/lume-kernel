@@ -270,7 +270,9 @@ int main(void)
     files.identity.euid = 123;
     assert(lume_vfs_write(&files, fd, "50\n", 3) == -LUME_EACCES);
     assert(lume_vfs_open(&files, "/dev/cpufan/pct", LUME_O_WRONLY) == -LUME_EACCES);
-    assert(lume_vfs_open(&files, "/bin/sh", LUME_O_RDONLY) == -LUME_EACCES);
+    int shell = (int)lume_vfs_open(&files, "/bin/sh", LUME_O_RDONLY);
+    assert(shell >= 0 && !lume_vfs_close(&files, shell));
+    assert(lume_vfs_open(&files, "/dev/console", LUME_O_WRONLY) == -LUME_EACCES);
     struct lume_file_mode_request request = {.version = LUME_FILE_MODE_VERSION,
                                              .bytes = sizeof(request),
                                              .flags = LUME_O_RDONLY,

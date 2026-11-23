@@ -12,6 +12,7 @@ static unsigned allocations, opens, loads, errors, stopped[8], stop_count;
 static int stop_error;
 static const struct lume_driver critical = {.name = "critical"};
 static const struct lume_driver regular = {.name = "regular"};
+static const struct lume_driver rtl8168h = {.name = "rtl8168h"};
 static struct lume_hardware_info devices[5];
 
 void *lume_kernel_allocate(size_t bytes)
@@ -46,9 +47,11 @@ int64_t lume_vfs_open(struct lume_files *files, const char *path, uint64_t flags
 {
     (void)files;
     assert(flags == LUME_O_RDONLY);
-    unsigned fd = !strcmp(path, "/etc/modules")            ? 1
-                  : !strcmp(path, "/lib/modules/test.lkm") ? 2
-                                                           : 0;
+    unsigned fd = 0;
+    if (!strcmp(path, "/etc/modules"))
+        fd = 1;
+    else if (!strcmp(path, "/lib/modules/test.lkm") || !strcmp(path, "/lib/modules/rtl8168h.lkm"))
+        fd = 2;
     if (!fd)
         return -LUME_ENOENT;
     positions[fd] = 0;
@@ -95,6 +98,8 @@ int lume_module_load(const void *file, size_t bytes, struct lume_module_info *in
 
 const struct lume_driver *lume_driver_find(const char *name)
 {
+    if (!strcmp(name, rtl8168h.name))
+        return loads > 1 ? &rtl8168h : NULL;
     return !strcmp(name, "critical") ? &critical : !strcmp(name, "regular") ? &regular : NULL;
 }
 
@@ -174,7 +179,15 @@ int main(void)
     assert(entry(&files, invalid) == -LUME_EINVAL);
     char relative[] = "load relative.lkm";
     assert(entry(&files, relative) == -LUME_EINVAL);
-    puts(
-        "MODULE_BOOT_PASS FDT probing, disabled devices, deferred probes, retained services and reverse shutdown");
+    char absent[] = "autoload-pci pci,10ec:8168 /lib/modules/rtl8168h.lkm rtl8168h";
+    assert(!entry(&files, absent) && loads == 1);
+    devices[1].origin = LUME_HARDWARE_PCI;
+    devices[1].identities[0] =
+        (struct lume_hardware_identity){LUME_HARDWARE_ID_PCI, 0, "pci,10ec:8168"};
+    devices[1].identity_count = 1;
+    char present[] = "autoload-pci pci,10ec:8168 /lib/modules/rtl8168h.lkm rtl8168h";
+    assert(!entry(&files, present) && loads == 2 && !strcmp(devices[1].driver, rtl8168h.name));
+    assert(!opens && !allocations);
+    puts("MODULE_BOOT_PASS Device probing, PCI autoload, retained services and reverse shutdown");
     return 0;
 }

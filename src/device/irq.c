@@ -8,9 +8,10 @@ static struct irq_slot
 {
     lume_irq_handler handler;
     void *context;
+    struct lume_irq_action *shared;
     _Alignas(8) struct lume_irq_info info;
     uint32_t access;
-    bool asynchronous;
+    bool asynchronous, dispatching_shared;
 } slots[LUME_IRQ_LIMIT];
 
 #define IRQ_MASKED (UINT32_C(1) << 31)
@@ -43,7 +44,7 @@ static int register_handler(unsigned irq, unsigned trigger, lume_irq_handler han
         return -LUME_EINVAL;
     uint64_t flags = controller->save();
     struct irq_slot *s = &slots[irq];
-    int result = s->handler ? -LUME_EBUSY : controller->configure(irq, trigger);
+    int result = s->handler || s->shared ? -LUME_EBUSY : controller->configure(irq, trigger);
     if (!result)
     {
         __atomic_store_n(&s->access, IRQ_MASKED | (asynchronous ? IRQ_ASYNC : 0), __ATOMIC_RELEASE);
@@ -64,6 +65,63 @@ int lume_irq_register(unsigned irq, unsigned trigger, lume_irq_handler handler, 
 int lume_irq_register_async(unsigned irq, unsigned trigger, lume_irq_handler handler, void *context)
 {
     return register_handler(irq, trigger, handler, context, true);
+}
+
+int lume_irq_request_shared(unsigned irq, struct lume_irq_action *action,
+                            lume_irq_shared_handler handler, void *context)
+{
+    if (!controller || irq < 16 || irq >= line_count || !action || !handler)
+        return -LUME_EINVAL;
+    uint64_t flags = controller->save();
+    struct irq_slot *s = &slots[irq];
+    int result = 0;
+    if (s->handler || s->dispatching_shared || action->handler)
+        result = -LUME_EBUSY;
+    else if (!s->shared)
+        result = controller->configure(irq, LUME_IRQ_LEVEL);
+    if (!result)
+    {
+        bool first = !s->shared;
+        *action =
+            (struct lume_irq_action){.next = s->shared, .handler = handler, .context = context};
+        s->shared = action;
+        if (first)
+        {
+            s->info.registered = true;
+            s->info.enabled = true;
+            controller->enable(irq, true);
+        }
+    }
+    controller->restore(flags);
+    return result;
+}
+
+int lume_irq_release_shared(unsigned irq, struct lume_irq_action *action)
+{
+    if (!controller || irq >= line_count || !action)
+        return -LUME_EINVAL;
+    uint64_t flags = controller->save();
+    struct irq_slot *s = &slots[irq];
+    int result = -LUME_ENOENT;
+    if (s->dispatching_shared)
+        result = -LUME_EBUSY;
+    else
+        for (struct lume_irq_action **entry = &s->shared; *entry; entry = &(*entry)->next)
+            if (*entry == action)
+            {
+                *entry = action->next;
+                *action = (struct lume_irq_action){0};
+                if (!s->shared)
+                {
+                    controller->enable(irq, false);
+                    s->info.enabled = false;
+                    s->info.registered = false;
+                }
+                result = 0;
+                break;
+            }
+    controller->restore(flags);
+    return result;
 }
 
 int lume_irq_enable(unsigned irq, bool enable)
@@ -141,9 +199,23 @@ bool lume_irq_dispatch(unsigned token)
     if (!controller || irq >= LUME_IRQ_LIMIT)
         return false;
     struct irq_slot *s = &slots[irq];
-    bool handled = irq < line_count && s->handler && s->info.enabled;
-    if (handled)
+    if (s->dispatching_shared)
+        return false;
+    bool handled = false;
+    if (irq < line_count && s->shared)
     {
+        s->dispatching_shared = true;
+        for (struct lume_irq_action *entry = s->shared; entry; entry = entry->next)
+            handled |= entry->handler(irq, entry->context);
+        s->dispatching_shared = false;
+        if (handled)
+            ++s->info.handled;
+        else
+            ++s->info.stray;
+    }
+    else if (irq < line_count && s->handler && s->info.enabled)
+    {
+        handled = true;
         if (s->asynchronous)
             __atomic_fetch_add(&s->info.handled, 1, __ATOMIC_RELAXED);
         else

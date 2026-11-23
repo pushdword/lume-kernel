@@ -1,4 +1,6 @@
+#include "fd.h"
 #include "lume/external_file.h"
+#include "lume/file_access.h"
 #include "lume/tty_device.h"
 #include "lume/worker.h"
 #include <string.h>
@@ -32,7 +34,7 @@ static struct pseudo_terminal
     unsigned char line[LINE_BYTES];
     unsigned line_bytes, record_first, record_count, records[RECORDS];
     unsigned session, group, rows, columns, xpixel, ypixel;
-    unsigned uid, references[2];
+    unsigned uid, gid, mode, references[2];
 } terminals[TERMINALS];
 
 static void tty_notify(struct pseudo_terminal *terminal)
@@ -384,6 +386,37 @@ static int64_t tty_stat(void *context, struct lume_stat *out)
     return 0;
 }
 
+static int64_t tty_stat_access(void *context, struct lume_stat *out,
+                               struct lume_inode_access *access)
+{
+    const struct tty_end *end = context;
+    const struct pseudo_terminal *terminal = end->terminal;
+    (void)tty_stat(context, out);
+    *access = (struct lume_inode_access){terminal->uid, terminal->gid, 0020000u | terminal->mode};
+    return access->mode;
+}
+
+static int tty_set_access(void *context, const struct lume_identity *identity,
+                          const struct lume_inode_access *change)
+{
+    struct tty_end *end = context;
+    struct pseudo_terminal *terminal = end->terminal;
+    if (!end->side || identity->jailed || identity->sandbox_profile)
+        return -LUME_EPERM;
+    if (identity->euid &&
+        (identity->euid != terminal->uid || change->uid != UINT32_MAX || change->gid != UINT32_MAX))
+        return -LUME_EPERM;
+    if (change->mode != UINT32_MAX && change->mode & ~0777u)
+        return -LUME_EINVAL;
+    if (change->uid != UINT32_MAX)
+        terminal->uid = change->uid;
+    if (change->gid != UINT32_MAX)
+        terminal->gid = change->gid;
+    if (change->mode != UINT32_MAX)
+        terminal->mode = change->mode;
+    return 0;
+}
+
 static const struct lume_file_ops tty_ops = {.kind = LUME_NODE_CHAR,
                                              .close = tty_close,
                                              .read = tty_read,
@@ -391,26 +424,11 @@ static const struct lume_file_ops tty_ops = {.kind = LUME_NODE_CHAR,
                                              .poll = tty_poll,
                                              .source = tty_source,
                                              .memory_io = true,
-                                             .stat = tty_stat};
+                                             .stat = tty_stat,
+                                             .stat_access = tty_stat_access,
+                                             .set_access = tty_set_access};
 
-static int64_t tty_stat_path(struct lume_files *files, const char *path, struct lume_stat *out)
-{
-    const char prefix[] = "/dev/pts/";
-    if (strncmp(path, prefix, sizeof(prefix) - 1))
-        return -LUME_ENOSYS;
-    const char *number = path + sizeof(prefix) - 1;
-    if (number[0] < '0' || (unsigned)(number[0] - '0') >= TERMINALS || number[1])
-        return -LUME_ENOENT;
-    struct pseudo_terminal *terminal = terminals + (number[0] - '0');
-    if (!terminal->open[0] || files->identity.jailed)
-        return -LUME_ENOENT;
-    if (files->identity.euid && files->identity.euid != terminal->uid)
-        return -LUME_EACCES;
-    (void)tty_stat(&terminal->ends[1], out);
-    return 0020600;
-}
-
-static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
+static int tty_lookup_path(const char *path, struct pseudo_terminal **result)
 {
     const char prefix[] = "/dev/pts/";
     if (strncmp(path, prefix, sizeof(prefix) - 1))
@@ -421,13 +439,58 @@ static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
     struct pseudo_terminal *terminal = terminals + (number[0] - '0');
     if (!terminal->open[0])
         return -LUME_ENOENT;
-    if (files->identity.euid && files->identity.euid != terminal->uid)
+    *result = terminal;
+    return 0;
+}
+
+static int64_t tty_stat_path(struct lume_files *files, const char *path, uint32_t uid,
+                             struct lume_stat *out, struct lume_inode_access *access)
+{
+    struct pseudo_terminal *terminal;
+    int result = tty_lookup_path(path, &terminal);
+    if (result)
+        return result;
+    if (files->identity.jailed)
+        return -LUME_ENOENT;
+    if (uid && uid != terminal->uid)
         return -LUME_EACCES;
-    if ((flags & 3) != LUME_O_RDWR || flags & ~UINT64_C(3))
+    return tty_stat_access(&terminal->ends[1], out, access);
+}
+
+static int tty_set_access_path(struct lume_files *files, const char *path,
+                               const struct lume_inode_access *change)
+{
+    struct pseudo_terminal *terminal;
+    int result = tty_lookup_path(path, &terminal);
+    return result ? result : tty_set_access(&terminal->ends[1], &files->identity, change);
+}
+
+static int tty_open(struct lume_files *files, const char *path, uint64_t flags)
+{
+    struct pseudo_terminal *terminal;
+    int result = tty_lookup_path(path, &terminal);
+    if (result)
+        return result;
+    if (files->identity.jailed)
+        return -LUME_ENOENT;
+    unsigned mode = flags & 3u;
+    if (mode == 3 || flags & ~UINT64_C(3))
         return -LUME_EINVAL;
+    if (files->identity.euid)
+    {
+        const struct lume_inode_access access = {terminal->uid, terminal->gid,
+                                                 0020000u | terminal->mode};
+        unsigned requested = mode == LUME_O_RDONLY   ? LUME_ACCESS_READ
+                             : mode == LUME_O_WRONLY ? LUME_ACCESS_WRITE
+                                                     : LUME_ACCESS_READ | LUME_ACCESS_WRITE;
+        result = lume_file_access(&files->identity, &access, requested, 0);
+        if (result)
+            return result;
+    }
     int fd = lume_vfs_attach(files, &tty_ops, &terminal->ends[1], 0);
     if (fd >= 0)
     {
+        lume_vfs_access_mode(files, (unsigned)fd, mode);
         ++terminal->references[1];
         terminal->open[1] = true;
         tty_notify(terminal);
@@ -469,7 +532,7 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
                   struct lume_tty_request *r)
 {
     if (r->version != LUME_TTY_VERSION || r->bytes != sizeof(*r) || r->reserved ||
-        action > LUME_TTY_OPEN)
+        action > LUME_TTY_ISATTY)
         return -LUME_EINVAL;
     if (action == LUME_TTY_OPEN)
     {
@@ -495,12 +558,13 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
     {
         lume_vfs_terminal_open(tty_open);
         lume_vfs_terminal_stat(tty_stat_path);
+        lume_vfs_terminal_set_access(tty_set_access_path);
         for (unsigned i = 0; i < TERMINALS; ++i)
         {
             struct pseudo_terminal *terminal = terminals + i;
             if (terminal->open[0] || terminal->open[1] || terminal->copying)
                 continue;
-            *terminal = (struct pseudo_terminal){.rows = 24, .columns = 80};
+            *terminal = (struct pseudo_terminal){.rows = 24, .columns = 80, .mode = 0600};
             terminal->termios =
                 (struct lume_termios){.input = LUME_TTY_ICRNL | LUME_TTY_IXON,
                                       .output = LUME_TTY_OPOST | LUME_TTY_ONLCR,
@@ -537,6 +601,7 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
             terminal->open[1] = true;
             terminal->references[1] = 1;
             terminal->uid = files->identity.euid;
+            terminal->gid = files->identity.egid;
             r->fd = master;
             r->other = slave;
             return 0;
@@ -545,7 +610,16 @@ int lume_tty_call(struct lume_files *files, unsigned owner, unsigned action,
     }
     struct tty_end *end = lume_vfs_external(files, (unsigned)r->fd, &tty_ops);
     if (!end)
-        return -25;
+    {
+        if (action == LUME_TTY_ISATTY && lume_vfs_console_terminal(files, (unsigned)r->fd))
+            return 0;
+        struct lume_fd_request request = {
+            .version = LUME_FD_VERSION, .bytes = sizeof(request), .fd = r->fd};
+        int64_t result = lume_vfs_fd_call(files, LUME_FD_GETFD, &request);
+        return result < 0 ? (int)result : -LUME_ENOTTY;
+    }
+    if (action == LUME_TTY_ISATTY)
+        return 0;
     struct pseudo_terminal *terminal = end->terminal;
     if (terminal->copying && (action == LUME_TTY_SET || action == LUME_TTY_FLUSH))
         return -LUME_EAGAIN;

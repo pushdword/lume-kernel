@@ -72,7 +72,8 @@ static int string(uint64_t p, char out[LUME_PATH_MAX])
     return -LUME_ENAMETOOLONG;
 }
 
-int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsigned pid)
+int64_t lume_public_call_wait(struct lume_files *files, struct lume_context *c, unsigned pid,
+                              struct lume_fifo_open *pending)
 {
     int permission = lume_sandbox_check(files, pid, c);
     if (permission)
@@ -107,19 +108,21 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
                                             : lume_credential_call(files, pid, (unsigned)a, b, n);
     case LUME_SYS_FILE_MODE:
     {
-        if (a > LUME_FILE_MODE_MKDIR || n != sizeof(struct lume_file_mode_request))
+        if (a > LUME_FILE_MODE_OWNER_LINK || n != sizeof(struct lume_file_mode_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false))
             return -LUME_EFAULT;
         struct lume_file_mode_request request =
             *(const struct lume_file_mode_request *)(uintptr_t)b;
-        r = a == LUME_FILE_MODE_FD ? 0 : string(request.path, p);
-        return r ? r : lume_vfs_file_mode(files, (unsigned)a, &request, p);
+        r = (a == LUME_FILE_MODE_FD || a == LUME_FILE_MODE_OWNER_FD)
+                ? 0
+                : string(request.path, p);
+        return r ? r : lume_vfs_file_mode_wait(files, (unsigned)a, &request, p, true, pending);
     }
     case LUME_SYS_FILE_IO:
         return process_file_io_call(files, pid, a, b, n);
     case LUME_SYS_FILES:
-        return lume_files_call(files, a, b, n);
+        return lume_files_call(files, a, b, n, pending);
     case LUME_SYS_RANDOM:
     {
         if (n || b > 256)
@@ -336,7 +339,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_TTY:
     {
-        if (a > LUME_TTY_OPEN || n != sizeof(struct lume_tty_request))
+        if (a > LUME_TTY_ISATTY || n != sizeof(struct lume_tty_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -364,7 +367,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     {
         if (a > LUME_TASK_LIMIT || !n)
             return -LUME_EINVAL;
-        size_t capacity = n > LUME_PATH_MAX ? LUME_PATH_MAX : (size_t)n;
+        size_t capacity = n > LUME_FILES_PATH_MAX ? LUME_FILES_PATH_MAX : (size_t)n;
         if (!lume_user_buffer(b, capacity, true))
             return -LUME_EFAULT;
         return lume_task_executable(a ? (unsigned)a : pid, (void *)(uintptr_t)b, capacity);
@@ -439,7 +442,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
             r = string(b, p);
             if (r)
                 return r;
-            return a == LUME_FS_COMPAT_OPEN ? lume_vfs_open_compat(files, p, n)
+            return a == LUME_FS_COMPAT_OPEN ? lume_vfs_open_wait(files, p, n, true, pending)
                                             : lume_vfs_remove_compat(files, p, n != 0);
         }
         if (a == LUME_FS_SYNC)
@@ -533,7 +536,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     }
     case LUME_SYS_OPEN:
         r = string(a, p);
-        return r ? r : lume_vfs_open(files, p, b);
+        return r ? r : lume_vfs_open_wait(files, p, b, false, pending);
     case LUME_SYS_CHDIR:
         r = string(a, p);
         return r ? r : lume_vfs_chdir(files, p);
@@ -543,7 +546,7 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
         return lume_vfs_process_dup2(files, a, b, pid);
     case LUME_SYS_FD:
     {
-        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_BLOCK_SECTOR_SIZE)
+        if (n != sizeof(struct lume_fd_request) || a > LUME_FD_AVAILABLE)
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, false) || !lume_user_buffer(b, n, true))
             return -LUME_EFAULT;
@@ -688,4 +691,9 @@ int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsig
     default:
         return -LUME_ENOSYS;
     }
+}
+
+int64_t lume_public_call(struct lume_files *files, struct lume_context *c, unsigned pid)
+{
+    return lume_public_call_wait(files, c, pid, NULL);
 }

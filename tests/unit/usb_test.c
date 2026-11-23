@@ -79,13 +79,18 @@ int main(void)
     const uint8_t rpi_hub[] = {9, 2, 41, 0, 1, 1, 0,    0xe0, 50,   9, 4,  0, 0, 1,
                                9, 0, 1,  0, 7, 5, 0x81, 3,    1,    0, 12, 9, 4, 0,
                                1, 1, 9,  0, 2, 0, 7,    5,    0x81, 3, 1,  0, 12};
+    struct lume_usb_configuration inputs;
     T(lume_usb_configuration(rpi_hub, sizeof(rpi_hub), &i) && i.hub && !i.keyboard);
+    T(lume_usb_configuration_inputs(rpi_hub, sizeof(rpi_hub), &inputs) &&
+      inputs.endpoints == 2 && inputs.endpoint[0].alternate == 0 &&
+      inputs.endpoint[1].alternate == 1);
     uint8_t composite[] = {9, 2, 41, 0, 2, 1, 0,    0x80, 50,   9, 4,  0, 0, 1,
                            3, 1, 1,  0, 7, 5, 0x83, 3,    8,    0, 10, 9, 4, 1,
                            0, 1, 3,  1, 2, 0, 7,    5,    0x81, 3, 8,  0, 1};
-    struct lume_usb_configuration inputs;
     T(lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
     T(inputs.inputs == 2 && inputs.value == 1 && !inputs.hub);
+    T(inputs.endpoints == 2 && inputs.endpoint[0].address == 0x83 &&
+      inputs.endpoint[1].address == 0x81);
     T(inputs.input[0].keyboard && inputs.input[0].interface == 0 &&
       inputs.input[0].endpoint == 0x83);
     T(inputs.input[1].mouse && inputs.input[1].interface == 1 && inputs.input[1].endpoint == 0x81 &&
@@ -101,6 +106,21 @@ int main(void)
     composite[28] = 0;
     composite[34] = 8;
     T(!lume_usb_configuration_inputs(composite, sizeof(composite), &inputs));
+    const uint8_t storage[] = {9, 2, 32,   0, 1, 1, 0, 0x80, 50,  9, 4, 0, 0, 2, 8, 6,
+                               0x50, 0, 7, 5, 1, 2, 64,   0,    0, 7, 5, 0x82, 2, 64, 0, 0};
+    T(lume_usb_configuration_inputs(storage, sizeof(storage), &inputs));
+    T(!inputs.inputs && !inputs.hub && inputs.endpoints == 2);
+    T(inputs.endpoint[0].interface_class == 8 && inputs.endpoint[0].interface_subclass == 6 &&
+      inputs.endpoint[0].interface_protocol == 0x50 && inputs.endpoint[0].address == 1 &&
+      (inputs.endpoint[0].attributes & 3) == 2 && inputs.endpoint[0].packet == 64);
+    T(inputs.endpoint[1].address == 0x82 && (inputs.endpoint[1].attributes & 3) == 2);
+    const uint8_t isochronous[] = {9, 2, 34, 0, 1, 1, 0, 0x80, 50, 9, 4, 0,
+                                   0, 0, 1,  2, 0, 0, 9, 4,    0, 1, 1, 1,
+                                   2, 0, 0,  7, 5, 1, 1, 192, 0, 1};
+    T(lume_usb_configuration_inputs(isochronous, sizeof(isochronous), &inputs));
+    T(!inputs.inputs && inputs.endpoints == 1 && inputs.endpoint[0].alternate == 1 &&
+      inputs.endpoint[0].interface_class == 1 && inputs.endpoint[0].address == 1 &&
+      (inputs.endpoint[0].attributes & 3) == 1 && inputs.endpoint[0].packet == 192);
     uint8_t many[9 + 16 * (LUME_USB_INPUTS + 1)] = {9, 2, sizeof(many), 0, LUME_USB_INPUTS + 1,
                                                     1, 0, 0x80,         50};
     for (unsigned n = 0; n <= LUME_USB_INPUTS; ++n)

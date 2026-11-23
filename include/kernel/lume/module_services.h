@@ -13,6 +13,9 @@ int lume_module_unregister_block(struct lume_block *);
 int lume_module_irq_register(unsigned, unsigned, lume_irq_handler, void *);
 int lume_module_irq_register_async(unsigned, unsigned, lume_irq_handler, void *);
 int lume_module_irq_unregister(unsigned, void *);
+int lume_module_irq_request_shared(unsigned, struct lume_irq_action *, lume_irq_shared_handler,
+                                   void *);
+int lume_module_irq_release_shared(unsigned, struct lume_irq_action *);
 int lume_module_irq_domain_register(uint32_t, unsigned, const struct lume_irq_domain_ops *, void *);
 int lume_module_irq_domain_register_async(uint32_t, unsigned, const struct lume_irq_domain_ops *,
                                           void *);

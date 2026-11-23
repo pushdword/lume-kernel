@@ -23,7 +23,8 @@ enum
     LUME_SPAWN_SIGMASK = 2u,
     LUME_SPAWN_SETSID = 4u,
     LUME_SPAWN_CLOEXEC_DEFAULT = 8u,
-    LUME_SPAWN_DRIVER_ADMIN = 16u
+    LUME_SPAWN_DRIVER_ADMIN = 16u,
+    LUME_SPAWN_SETPGROUP = 32u
 };
 
 /* Pointer fields contain unsigned virtual addresses. OPEN uses native Lume open flags.
@@ -45,7 +46,12 @@ struct lume_spawn_actions_request
 struct lume_spawn_options_request
 {
     struct lume_spawn_actions_request base;
-    uint32_t flags, signal_default, signal_mask, reserved;
+    uint32_t flags, signal_default, signal_mask;
+    union
+    {
+        int32_t process_group;
+        uint32_t reserved;
+    };
 };
 
 _Static_assert(sizeof(struct lume_spawn_action) == 24, "spawn action ABI");

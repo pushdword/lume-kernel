@@ -7,4 +7,6 @@
 int lume_linux_memory_start(void *(*allocate)(size_t), void (*release)(void *));
 int lume_linux_memory_stop(void);
 unsigned lume_linux_memory_allocations(void);
+void *lume_linux_memory_dma_hold(const void *, size_t);
+void lume_linux_memory_dma_release(void *);
 #endif

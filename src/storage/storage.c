@@ -1020,14 +1020,16 @@ static int ext4_flush(void *context)
     return disk_ioctl(drive, CTRL_SYNC, NULL) == RES_OK ? 0 : -1;
 }
 
-static uint32_t ext4_timestamp(void *context)
+static int ext4_timestamp(void *context, struct lume_file_time *out)
 {
     (void)context;
     uint64_t milliseconds;
-    if (lume_clock_realtime_ms(lume_clock_monotonic(), &milliseconds))
-        return 0;
-    uint64_t seconds = milliseconds / 1000;
-    return seconds <= UINT32_MAX ? (uint32_t)seconds : 0;
+    int result = lume_clock_realtime_ms(lume_clock_monotonic(), &milliseconds);
+    if (result)
+        return result;
+    *out = (struct lume_file_time){.seconds = (int64_t)(milliseconds / 1000),
+                                  .nanoseconds = (uint32_t)(milliseconds % 1000) * 1000000u};
+    return 0;
 }
 
 static const struct lume_storage_ops *start_ext4(const unsigned char mbr[512])

@@ -4,7 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 struct lume_files_volume;
+struct lume_file_time;
+struct lume_file_times;
+struct lume_file_allocation;
 struct lume_stat;
+struct lume_inode_access;
 
 typedef bool (*lume_storage_visit)(const char *, bool, uint64_t, void *);
 
@@ -26,9 +30,18 @@ struct lume_storage_snapshot
     uint64_t mount, object, generation, bytes;
 };
 
+struct lume_storage_dirent
+{
+    uint64_t inode;
+    uint32_t kind;
+    char name[256];
+};
+
 struct lume_storage_ops
 {
     bool (*walk)(lume_storage_visit, void *);
+    /* A provider with next supports directory enumeration without importing every entry. */
+    int (*next)(const char *, uint64_t *, struct lume_storage_dirent *);
     int (*create)(const char *, bool);
     int (*truncate)(const char *);
     int (*read)(const char *, uint64_t, void *, size_t);
@@ -60,14 +73,22 @@ struct lume_storage_ops
     int (*snapshot_handle)(void *, struct lume_storage_snapshot *);
     /* Release cached handles before resetting or remounting the backend. */
     void (*program_cache_owner)(int (*release)(void));
-    /* Providers can retain native inode identities and permission bits.
-     * Inode keys exceed UINT32_MAX to separate them from RAM node identities. */
-    int (*metadata)(const char *, struct lume_stat *, unsigned *mode);
+    /* Native inode keys exceed UINT32_MAX to separate them from RAM node identities. */
+    int (*metadata)(const char *, struct lume_stat *, struct lume_inode_access *,
+                    struct lume_file_times *);
     bool read_only;
     /* Return target bytes without a terminator. The final component remains a link. */
     int (*readlink)(const char *, void *, size_t);
     /* Native permission metadata bypasses the permission sidecar. */
     int (*set_mode)(const char *, unsigned);
+    int (*set_owner)(const char *, uint32_t uid, uint32_t gid);
+    /* Commit the directory entry and its access metadata together. */
+    int (*create_owned)(const char *, unsigned kind, const struct lume_inode_access *, uint64_t *inode);
+    int (*link)(const char *source, const char *target);
+    int (*set_times)(const char *, const struct lume_file_time *);
+    int (*symlink)(const char *path, const char *target, const struct lume_inode_access *,
+                   uint64_t *inode);
+    int (*allocation)(uint64_t inode, struct lume_file_allocation *);
 };
 
 struct lume_volume

@@ -1,6 +1,7 @@
 #include "lume/q35.h"
 #include "lume/resource.h"
 #include "lume/pci.h"
+#include "lume/abi.h"
 #include "lume/irq.h"
 #include "lume/ticket_lock.h"
 
@@ -14,42 +15,80 @@ static uint32_t configuration_enter(void)
     return ticket;
 }
 
-uint32_t lume_q35_pci_read(uint32_t device, unsigned offset)
+static bool valid_config_access(uint32_t device, unsigned offset, unsigned width)
 {
-    if ((device & ~UINT32_C(0x00ffff00)) || (offset & 3) || offset >= 4096)
-        return UINT32_MAX;
+    return (width == 1 || width == 2 || width == 4) && !(device & ~UINT32_C(0x00ffff00)) &&
+           !(offset & (width - 1)) && offset <= 4096 - width;
+}
+
+int lume_q35_pci_config_read(uint32_t device, unsigned offset, unsigned width, uint32_t *value)
+{
+    if (!value || !valid_config_access(device, offset, width))
+        return -LUME_EINVAL;
     uint64_t ecam = lume_q35_pci_ecam(device, offset);
     if (ecam)
-        return *(const volatile uint32_t *)(uintptr_t)ecam;
+    {
+        uintptr_t address = (uintptr_t)ecam;
+        *value = width == 1   ? *(const volatile uint8_t *)address
+                 : width == 2 ? *(const volatile uint16_t *)address
+                              : *(const volatile uint32_t *)address;
+        return 0;
+    }
     if (offset >= 256)
-        return UINT32_MAX;
+        return -LUME_EOPNOTSUPP;
     uint64_t flags = lume_irq_save();
     uint32_t ticket = configuration_enter();
     lume_out32(0xcf8, 0x80000000u | device | (offset & 252));
-    uint32_t value = lume_in32(0xcfc);
+    uint16_t port = 0xcfc + (uint16_t)(offset & 3);
+    *value = width == 1 ? lume_in8(port) : width == 2 ? lume_in16(port) : lume_in32(port);
     lume_ticket_release(&configuration_lock, ticket);
     lume_irq_restore(flags);
-    return value;
+    return 0;
+}
+
+int lume_q35_pci_config_write(uint32_t device, unsigned offset, unsigned width, uint32_t value)
+{
+    if (!valid_config_access(device, offset, width))
+        return -LUME_EINVAL;
+    /* Use the requested width to preserve adjacent status fields with write-one-to-clear bits. */
+    uint64_t ecam = lume_q35_pci_ecam(device, offset);
+    if (ecam)
+    {
+        uintptr_t address = (uintptr_t)ecam;
+        if (width == 1)
+            *(volatile uint8_t *)address = (uint8_t)value;
+        else if (width == 2)
+            *(volatile uint16_t *)address = (uint16_t)value;
+        else
+            *(volatile uint32_t *)address = value;
+        return 0;
+    }
+    if (offset >= 256)
+        return -LUME_EOPNOTSUPP;
+    uint64_t flags = lume_irq_save();
+    uint32_t ticket = configuration_enter();
+    lume_out32(0xcf8, 0x80000000u | device | (offset & 252));
+    uint16_t port = 0xcfc + (uint16_t)(offset & 3);
+    if (width == 1)
+        lume_out8(port, (uint8_t)value);
+    else if (width == 2)
+        lume_out16(port, (uint16_t)value);
+    else
+        lume_out32(port, value);
+    lume_ticket_release(&configuration_lock, ticket);
+    lume_irq_restore(flags);
+    return 0;
+}
+
+uint32_t lume_q35_pci_read(uint32_t device, unsigned offset)
+{
+    uint32_t value;
+    return lume_q35_pci_config_read(device, offset, 4, &value) ? UINT32_MAX : value;
 }
 
 void lume_q35_pci_write(uint32_t device, unsigned offset, uint32_t value)
 {
-    if ((device & ~UINT32_C(0x00ffff00)) || (offset & 3) || offset >= 4096)
-        return;
-    uint64_t ecam = lume_q35_pci_ecam(device, offset);
-    if (ecam)
-    {
-        *(volatile uint32_t *)(uintptr_t)ecam = value;
-        return;
-    }
-    if (offset >= 256)
-        return;
-    uint64_t flags = lume_irq_save();
-    uint32_t ticket = configuration_enter();
-    lume_out32(0xcf8, 0x80000000u | device | (offset & 252));
-    lume_out32(0xcfc, value);
-    lume_ticket_release(&configuration_lock, ticket);
-    lume_irq_restore(flags);
+    (void)lume_q35_pci_config_write(device, offset, 4, value);
 }
 
 int lume_q35_pci_find(uint16_t vendor, uint16_t product, uint32_t *device)
@@ -76,9 +115,11 @@ unsigned lume_q35_pci_bars(uint32_t address, struct lume_pci_bar out[6])
 {
     unsigned type = (lume_q35_pci_read(address, 12) >> 16) & 127;
     unsigned bars = type == 0 ? 6 : type == 1 ? 2 : 0;
-    uint32_t command = lume_q35_pci_read(address, 4) & 0xffff;
+    uint32_t command;
+    if (lume_q35_pci_config_read(address, 4, 2, &command))
+        return 0;
     unsigned count = 0;
-    lume_q35_pci_write(address, 4, command & ~3u);
+    (void)lume_q35_pci_config_write(address, 4, 2, command & ~3u);
     for (unsigned bar = 0; bar < bars; ++bar)
     {
         unsigned offset = 16 + bar * 4;
@@ -109,7 +150,7 @@ unsigned lume_q35_pci_bars(uint32_t address, struct lume_pci_bar out[6])
         if (wide)
             ++bar;
     }
-    lume_q35_pci_write(address, 4, command);
+    (void)lume_q35_pci_config_write(address, 4, 2, command);
     return count;
 }
 
