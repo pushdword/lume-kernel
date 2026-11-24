@@ -16,6 +16,7 @@ struct lume_ext4_storage_io
     lume_ext4_write_bytes write;
     lume_ext4_flush flush;
     int (*timestamp)(void *, struct lume_file_time *);
+    void (*report_fault)(const char *, uint64_t);
     void *context;
     uint64_t bytes;
     const struct lume_ext4_journal_io *journal;
@@ -23,6 +24,7 @@ struct lume_ext4_storage_io
 
 /* Writable opening requires exclusive access. The optional clock returns a Unix
  * timestamp on success or a negative error when the clock is unavailable.
+ * The optional fault callback receives the first writer failure and its positive ext4 error number.
  * Closing requires an unmounted VFS and releases the provider even on an I/O error. */
 int lume_ext4_storage_open_write(const struct lume_ext4_storage_io *,
                                  const struct lume_storage_ops **);

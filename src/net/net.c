@@ -67,13 +67,14 @@ struct network_transmit
     struct lume_netif *device;
     const void *data;
     size_t bytes;
-    bool sent;
+    int status;
 };
 
 static void transmit_frame(void *context)
 {
     struct network_transmit *transmit = context;
-    transmit->sent = lume_netif_transmit(transmit->device, transmit->data, transmit->bytes);
+    transmit->status =
+        lume_netif_transmit_status(transmit->device, transmit->data, transmit->bytes);
 }
 
 static err_t output(struct netif *n, struct pbuf *p)
@@ -82,9 +83,19 @@ static err_t output(struct netif *n, struct pbuf *p)
         return ERR_BUF;
     if (pbuf_copy_partial(p, ethernet, p->tot_len, 0) != p->tot_len)
         return ERR_BUF;
-    struct network_transmit transmit = {n->state, ethernet, p->tot_len, false};
+    struct network_transmit transmit = {n->state, ethernet, p->tot_len, 0};
     lume_worker_scheduler(transmit_frame, &transmit);
-    return transmit.sent ? ERR_OK : ERR_IF;
+    switch (transmit.status)
+    {
+    case 0:
+        return ERR_OK;
+    case -LUME_EAGAIN:
+        return ERR_WOULDBLOCK;
+    case -LUME_EINVAL:
+        return ERR_VAL;
+    default:
+        return ERR_IF;
+    }
 }
 
 static err_t initialize(struct netif *n)

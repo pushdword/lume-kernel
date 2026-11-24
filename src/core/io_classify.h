@@ -151,6 +151,9 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_VM:
         return action == LUME_VM_MAP && kernel_vm_storage[task] ? LUME_WORK_STORAGE
                                                                 : LUME_WORK_GENERAL;
+    case LUME_SYS_CREDENTIAL:
+        /* Changing the root opens and walks the target directory. */
+        return action == LUME_CREDENTIAL_CHROOT ? LUME_WORK_STORAGE : LUME_WORK_GENERAL;
     case LUME_SYS_BRK:
     case LUME_SYS_MEMORY:
     case LUME_SYS_TELEMETRY:
@@ -159,7 +162,6 @@ static unsigned kernel_call_domain(unsigned task, const struct lume_context *fra
     case LUME_SYS_PROCESS:
     case LUME_SYS_EXEPATH:
     case LUME_SYS_SIGNAL:
-    case LUME_SYS_CREDENTIAL:
     case LUME_SYS_REALTIME:
     case LUME_SYS_CAP_DROP:
     case LUME_SYS_SANDBOX:

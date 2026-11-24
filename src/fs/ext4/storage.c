@@ -13,6 +13,7 @@ static bool active;
 static struct lume_ext4_writer *writer;
 static uint64_t mount_id, content_generation;
 static int (*timestamp)(void *, struct lume_file_time *);
+static void (*fault_reporter)(const char *, uint64_t);
 static int (*cache_owner)(void);
 
 struct ext4_handle
@@ -46,8 +47,28 @@ static bool writer_faulted(void)
     return writer && writer->faulted;
 }
 
+static void report_fault(const char *operation, int error)
+{
+    if (fault_reporter)
+    {
+        fault_reporter(operation, (uint64_t)-(int64_t)error);
+        fault_reporter = NULL;
+    }
+}
+
+static void fault_writer(const char *operation, int error)
+{
+    if (writer && !writer->faulted)
+    {
+        writer->faulted = true;
+        report_fault(operation, error);
+    }
+}
+
 static int error_code(int error)
 {
+    if (error && writer_faulted())
+        report_fault("EXT4_FAULT_WRITER", error);
     switch (error)
     {
     case 0:
@@ -73,7 +94,13 @@ static int error_code(int error)
     }
 }
 
-static int resolve(const char *path, struct lume_ext4_inode *inode)
+struct resolve_diagnostic
+{
+    int error;
+    struct lume_ext4_metadata_error metadata;
+};
+
+static int resolve(const char *path, struct lume_ext4_inode *inode, struct resolve_diagnostic *diag)
 {
     if (!active || !path || strncmp(path, "/data", 5) || (path[5] && path[5] != '/'))
         return -LUME_ENOENT;
@@ -84,9 +111,21 @@ static int resolve(const char *path, struct lume_ext4_inode *inode)
         ++length;
     if (length == LUME_FILES_PATH_MAX)
         return -LUME_ENAMETOOLONG;
-    int result = lume_ext4_inode_get(&filesystem, 2, inode, scratch, sizeof scratch);
+    const struct lume_ext4 *fs = &filesystem;
+    struct lume_ext4 diagnostic_fs;
+    if (diag && fault_reporter)
+    {
+        diagnostic_fs = filesystem;
+        diagnostic_fs.metadata_error = &diag->metadata;
+        fs = &diagnostic_fs;
+    }
+    int result = lume_ext4_inode_get(fs, 2, inode, scratch, sizeof scratch);
     if (result)
+    {
+        if (diag)
+            diag->error = result;
         return error_code(result);
+    }
     for (size_t at = 5; at < length;)
     {
         if (path[at++] != '/' || at == length)
@@ -104,9 +143,18 @@ static int resolve(const char *path, struct lume_ext4_inode *inode)
             return -LUME_EINVAL;
         if ((inode->mode & 0xf000) != 0x4000)
             return -LUME_ENOTDIR;
-        result = lume_ext4_lookup(&filesystem, inode, name, inode, scratch, sizeof scratch);
+        result = lume_ext4_lookup(fs, inode, name, inode, scratch, sizeof scratch);
         if (result)
+        {
+            if (diag)
+            {
+                diag->error = result;
+                if (result == LUME_EXT4_INVALID && !diag->metadata.operation)
+                    diag->metadata =
+                        (struct lume_ext4_metadata_error){"EXT4_META_LOOKUP_DIR_INODE", inode->number};
+            }
             return error_code(result);
+        }
     }
     return 0;
 }
@@ -125,8 +173,8 @@ static int allocation(uint64_t key, struct lume_file_allocation *out)
                                     &inode, scratch, sizeof scratch);
     if (result)
     {
-        if (writer && result == LUME_EXT4_IO)
-            writer->faulted = true;
+        if (result == LUME_EXT4_IO)
+            fault_writer("EXT4_FAULT_ALLOCATION", result);
         return error_code(result);
     }
     *out = (struct lume_file_allocation){.sectors = inode.sectors,
@@ -138,11 +186,16 @@ static int metadata(const char *path, struct lume_stat *out, struct lume_inode_a
                     struct lume_file_times *times)
 {
     struct lume_ext4_inode inode;
-    int result = resolve(path, &inode);
+    struct resolve_diagnostic diag = {.error = LUME_EXT4_IO};
+    int result = resolve(path, &inode, &diag);
     if (result)
     {
-        if (writer && result == -LUME_EIO)
-            writer->faulted = true;
+        if (result == -LUME_EIO)
+        {
+            if (fault_reporter && !writer_faulted() && diag.metadata.operation)
+                fault_reporter(diag.metadata.operation, diag.metadata.location);
+            fault_writer("EXT4_FAULT_METADATA", diag.error);
+        }
         return result;
     }
     unsigned mode = inode.mode & 0xf000;
@@ -174,7 +227,7 @@ struct walk_frame
 static int readlink_path(const char *path, void *out, size_t bytes)
 {
     struct lume_ext4_inode inode;
-    int result = resolve(path, &inode);
+    int result = resolve(path, &inode, NULL);
     if (result)
         return result;
     if ((inode.mode & 0xf000) != 0xa000 || !bytes || !out)
@@ -188,7 +241,7 @@ static int next_entry(const char *path, uint64_t *cursor, struct lume_storage_di
     if (!cursor || !out)
         return -LUME_EINVAL;
     struct lume_ext4_inode directory;
-    int result = resolve(path, &directory);
+    int result = resolve(path, &directory, NULL);
     if (result)
         return result;
     if ((directory.mode & 0xf000) != 0x4000)
@@ -205,8 +258,8 @@ static int next_entry(const char *path, uint64_t *cursor, struct lume_storage_di
         result = lume_ext4_inode_get(&filesystem, entry.inode, &inode, scratch, sizeof scratch);
         if (result)
         {
-            if (writer && result == LUME_EXT4_IO)
-                writer->faulted = true;
+            if (result == LUME_EXT4_IO)
+                fault_writer("EXT4_FAULT_READDIR", result);
             return error_code(result);
         }
         unsigned mode = inode.mode & 0xf000;
@@ -307,7 +360,7 @@ static int open_handle(const char *path, unsigned flags, void **out)
     if (!writer && flags != LUME_O_RDONLY)
         return -LUME_EROFS;
     struct lume_ext4_inode inode;
-    int result = resolve(path, &inode);
+    int result = resolve(path, &inode, NULL);
     if (result)
         return result;
     if ((inode.mode & 0xf000) != 0x8000)
@@ -471,7 +524,7 @@ static int parent(const char *path, struct lume_ext4_inode *inode, const char **
     char prefix[LUME_FILES_PATH_MAX];
     memcpy(prefix, path, (size_t)(last - path));
     prefix[last - path] = 0;
-    int result = resolve(prefix, inode);
+    int result = resolve(prefix, inode, NULL);
     if (result)
         return result;
     if ((inode->mode & 0xf000) != 0x4000)
@@ -535,7 +588,7 @@ static int remove_path(const char *path)
     const char *name;
     result = parent(path, &inode, &name);
     if (!result)
-        result = resolve(path, &target);
+        result = resolve(path, &target, NULL);
     if (result)
         return result;
     bool keep = target.links == 1 && (target.mode & 0xf000) == 0x8000 &&
@@ -563,7 +616,7 @@ static int link_path(const char *from, const char *to)
         return result;
     struct lume_ext4_inode source, destination;
     const char *name;
-    result = resolve(from, &source);
+    result = resolve(from, &source, NULL);
     if (!result)
         result = parent(to, &destination, &name);
     return result ? result : error_code(lume_ext4_link(writer, source.number, destination.number, name));
@@ -607,14 +660,14 @@ static int replace_path(const char *from, const char *to, unsigned *state)
     bool keep = false;
     if (!result)
     {
-        int found = resolve(to, &previous);
+        int found = resolve(to, &previous, NULL);
         if (found && found != -LUME_ENOENT)
             result = found;
         if (!found && previous.links == 1 && (previous.mode & 0xf000) == 0x8000 &&
             inode_is_open(previous.number))
         {
             struct lume_ext4_inode incoming;
-            result = resolve(from, &incoming);
+            result = resolve(from, &incoming, NULL);
             keep = !result && incoming.number != previous.number;
         }
     }
@@ -637,7 +690,7 @@ static int set_mode(const char *path, unsigned mode)
     if (result)
         return result;
     struct lume_ext4_inode inode;
-    result = resolve(path, &inode);
+    result = resolve(path, &inode, NULL);
     return result ? result : error_code(lume_ext4_mode(writer, inode.number, mode));
 }
 
@@ -647,7 +700,7 @@ static int set_owner(const char *path, uint32_t uid, uint32_t gid)
     if (result)
         return result;
     struct lume_ext4_inode inode;
-    result = resolve(path, &inode);
+    result = resolve(path, &inode, NULL);
     return result ? result : error_code(lume_ext4_owner(writer, inode.number, uid, gid));
 }
 
@@ -657,7 +710,7 @@ static int set_times(const char *path, const struct lume_file_time times[2])
     if (result)
         return result;
     struct lume_ext4_inode inode;
-    result = resolve(path, &inode);
+    result = resolve(path, &inode, NULL);
     if (result)
         return result;
     struct lume_file_time clock;
@@ -688,7 +741,7 @@ static int sync_handle(void *handle)
         return -LUME_EIO;
     if (writer && writer->flush(filesystem.context))
     {
-        writer->faulted = true;
+        fault_writer("EXT4_FAULT_SYNC", LUME_EXT4_IO);
         return -LUME_EIO;
     }
     return 0;
@@ -766,6 +819,7 @@ int lume_ext4_storage_open(lume_ext4_read_bytes read, void *context, uint64_t by
     if (mount_id == UINT64_MAX)
         return -LUME_EOVERFLOW;
     timestamp = NULL;
+    fault_reporter = NULL;
     int result = lume_ext4_open(&filesystem, read, context, bytes, scratch, sizeof scratch);
     if (result)
         return error_code(result);
@@ -826,6 +880,7 @@ int lume_ext4_storage_open_write(const struct lume_ext4_storage_io *io,
     }
     writer = mounted;
     timestamp = io->timestamp;
+    fault_reporter = io->report_fault;
     static struct lume_storage_ops mutable_operations;
     mutable_operations = operations;
     mutable_operations.read_only = false;
@@ -857,6 +912,7 @@ int lume_ext4_storage_close(void)
     int result = writer ? error_code(lume_ext4_writer_close(writer)) : 0;
     active = false;
     cache_owner = NULL;
+    fault_reporter = NULL;
     lume_kernel_free(writer);
     writer = NULL;
     return result;

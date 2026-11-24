@@ -405,6 +405,11 @@ void lume_worker_stats(void)
 {
 }
 
+unsigned lume_worker_current(void)
+{
+    return LUME_WORKER_LIMIT;
+}
+
 static void setup(bool use_interrupts)
 {
     ++cases;
@@ -665,6 +670,14 @@ static void buffer_levels(void)
     late_buffer_ready = true;
     CHECK(event(32u, 1000));
     CHECK(wait_calls && ticks < frequency / 10 && !errors && ready);
+    for (uint32_t mask = 16u; mask <= 32u; mask <<= 1)
+    {
+        setup(true);
+        pending = mask;
+        late_buffer_ready = true;
+        CHECK(event(mask, 1000));
+        CHECK(wait_calls && !late_buffer_ready && (registers[0x24 / 4] & (mask << 6)));
+    }
 }
 
 static void uhs_bus(void)

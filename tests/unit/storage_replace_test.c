@@ -4,6 +4,8 @@
 #include "lume/vfs.h"
 #include "lume/file_modes.h"
 #include "lume/file_mode.h"
+#include "lume/file_access.h"
+#include "lume/files.h"
 #include <stdlib.h>
 
 void lume_smp_wake(void)
@@ -405,8 +407,15 @@ static bool vfs_program_cache(void)
     lume_vfs_init(NULL, 0);
     T(lume_vfs_mount_storage(&ops));
     T(lume_files_init(&files));
-    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 && bytes == 10 &&
-      !memcmp(data, "new-object", bytes) && program_reads == 8);
+    /* Load persisted permissions before counting executable reads. */
+    T(lume_vfs_access_at(&files, LUME_FILES_AT_CWD, "/data/chrome", LUME_ACCESS_EXECUTE,
+                         LUME_FILES_ACCESS_EFFECTIVE) == 0);
+    unsigned remount_reads = program_reads;
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0);
+    T(bytes == 10 && !memcmp(data, "new-object", bytes));
+    T(program_reads == remount_reads + 1);
+    T(lume_vfs_program(&files, "/data/chrome", &data, &bytes) == 0 &&
+      program_reads == remount_reads + 1);
     lume_files_release(&files);
     lume_vfs_init(NULL, 0);
     return true;

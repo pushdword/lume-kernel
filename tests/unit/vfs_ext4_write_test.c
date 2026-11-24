@@ -38,6 +38,48 @@ void lume_console_write(const char *text, size_t bytes)
     (void)bytes;
 }
 
+static const char *expected_fault;
+static uint64_t expected_metadata_offset;
+static int expected_ext4_error;
+static unsigned fault_reports;
+
+static void record_fault(const char *operation, uint64_t error)
+{
+    if (!strcmp(operation, "EXT4_META_GROUP_CHECKSUM_OFFSET"))
+    {
+        assert(expected_metadata_offset && error == expected_metadata_offset);
+        expected_metadata_offset = 0;
+        return;
+    }
+    assert(expected_fault && !strcmp(operation, expected_fault));
+    assert(error == (uint64_t)-expected_ext4_error);
+    ++fault_reports;
+}
+
+static void check_metadata_fault(struct disk *disk, const struct lume_ext4_storage_io *io,
+                                 bool read_error)
+{
+    const struct lume_storage_ops *ops;
+    assert(!lume_ext4_open(&filesystem, read_disk, disk, io->bytes, scratch, sizeof scratch));
+    assert(!lume_ext4_storage_open_write(io, &ops));
+    unsigned writes = disk->writes;
+    unsigned reports = fault_reports;
+    expected_fault = "EXT4_FAULT_METADATA";
+    expected_ext4_error = read_error ? LUME_EXT4_IO : LUME_EXT4_INVALID;
+    disk->corrupt_offset = ((uint64_t)filesystem.first_data_block + 1) * filesystem.block_bytes;
+    expected_metadata_offset = read_error ? 0 : disk->corrupt_offset;
+    disk->read_error = read_error;
+    disk->corrupt = true;
+    struct lume_stat stat;
+    struct lume_inode_access access;
+    assert(ops->metadata("/data/seed", &stat, &access, NULL) == -LUME_EIO);
+    disk->corrupt = false;
+    assert(ops->metadata("/data/seed", &stat, &access, NULL) == -LUME_EIO);
+    assert(lume_ext4_storage_close() == -LUME_EIO);
+    assert(disk->writes == writes && fault_reports == reports + 1);
+    assert(!expected_metadata_offset);
+}
+
 static int timestamp(void *context, struct lume_file_time *out)
 {
     (void)context;
@@ -298,8 +340,16 @@ int main(int argc, char **argv)
                                       .write = write_disk,
                                       .flush = flush_disk,
                                       .timestamp = timestamp,
+                                      .report_fault = record_fault,
                                       .context = &disk,
                                       .bytes = (uint64_t)length};
+    if (argc == 3)
+    {
+        check_metadata_fault(&disk, &io, true);
+        check_metadata_fault(&disk, &io, false);
+        expected_fault = "EXT4_FAULT_WRITER";
+        expected_ext4_error = LUME_EXT4_IO;
+    }
     const struct lume_storage_ops *ops;
     assert(!lume_ext4_storage_open_write(&io, &ops));
     assert(!ops->read_only && ops->metadata && ops->set_mode && ops->set_owner);
@@ -325,10 +375,11 @@ int main(int argc, char **argv)
         lume_files_release(&files);
         lume_vfs_init(NULL, 0);
         assert(lume_ext4_storage_close() == -LUME_EIO);
+        assert(fault_reports == 3);
         assert(lume_ext4_open(&filesystem, read_disk, &disk, (uint64_t)length, scratch,
                               sizeof scratch) == LUME_EXT4_UNSUPPORTED);
         assert(!fclose(disk.file));
-        puts("PASS ext4 VFS I/O failure blocks access, releases handles and retains unclean state");
+        puts("PASS ext4 VFS reports the first metadata or writer error and retains unclean state");
         return 0;
     }
     struct lume_files_volume volume;

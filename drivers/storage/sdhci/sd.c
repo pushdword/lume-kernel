@@ -30,6 +30,8 @@ static struct lume_volume journal_volume;
 static uint32_t rca;
 static uint64_t reads, writes, errors, rejected;
 static bool ready, transferring;
+static unsigned transfer_worker;
+static uint64_t transfer_sector;
 static unsigned bus_width = 1;
 static uint32_t maximum_hz = 50000000;
 static uint64_t configuration_base, gpio_base;
@@ -117,6 +119,7 @@ static bool event(uint32_t mask, unsigned ms)
     uint64_t start = lume_counter_read();
     uint64_t flags = lume_irq_save();
     uint32_t status = 0;
+    const bool fifo = !tuning_active && (mask == 16u || mask == 32u);
     do
     {
         if (interrupt_mode)
@@ -133,14 +136,13 @@ static bool event(uint32_t mask, unsigned ms)
         status = interrupt_mode ? __atomic_load_n(&pending, __ATOMIC_ACQUIRE) : rd(0x30);
         if (status & 0xffff8000u)
             break;
-        /* Buffer readiness is a level. Its interrupt notifications can coalesce between blocks. */
-        bool buffer_ready =
-            !tuning_active && (mask == 16u || mask == 32u) && (rd(0x24) & (mask << 6));
-        if ((status & mask) || buffer_ready)
+        /* A latched FIFO interrupt can outlive the block that raised it. */
+        bool available = fifo ? (rd(0x24) & (mask << 6)) != 0 : (status & mask) != 0;
+        if (interrupt_mode && (status & mask))
+            __atomic_fetch_and(&pending, ~mask, __ATOMIC_ACQ_REL);
+        if (available)
         {
-            if (interrupt_mode)
-                __atomic_fetch_and(&pending, ~mask, __ATOMIC_ACQ_REL);
-            if (!interrupt_mode || buffer_ready)
+            if (!interrupt_mode || fifo)
                 wr(0x30, mask);
             lume_irq_restore(flags);
             return true;
@@ -665,7 +667,15 @@ static void abort_transfer(void)
 
 static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
 {
-    if (!ready || transferring || !data || !count || count > LUME_SD_MAX_SECTORS ||
+    if (transferring)
+    {
+        lume_value("SD_TRANSFER_BUSY_SECTOR", sector);
+        lume_value("SD_TRANSFER_BUSY_WORKER", lume_worker_current());
+        lume_value("SD_TRANSFER_OWNER_SECTOR", transfer_sector);
+        lume_value("SD_TRANSFER_OWNER_WORKER", transfer_worker);
+        return false;
+    }
+    if (!ready || !data || !count || count > LUME_SD_MAX_SECTORS ||
         sector >= capacity || count > capacity - sector || sector > UINT32_MAX ||
         count - 1 > UINT32_MAX - sector)
         return false;
@@ -680,6 +690,8 @@ static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
         ++rejected;
         return false;
     }
+    transfer_worker = lume_worker_current();
+    transfer_sector = sector;
     transferring = true;
     bool requested =
         __atomic_exchange_n(&retune_requested, false, __ATOMIC_ACQ_REL) || (rd(0x30) & 4096u);
@@ -735,6 +747,7 @@ static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
                 goto failed;
             if (response & 0xfdffe008u)
             {
+                lume_value("SD_CARD_ERROR", response);
                 ++errors;
                 goto failed;
             }
@@ -744,6 +757,7 @@ static bool transfer(uint64_t sector, unsigned count, void *data, bool write)
             }
             if (lume_counter_read() - start >= frequency * 2)
             {
+                lume_value("SD_CARD_BUSY_TIMEOUT_SECTOR", sector);
                 ++errors;
                 goto failed;
             }

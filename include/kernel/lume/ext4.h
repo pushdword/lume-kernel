@@ -25,6 +25,12 @@ enum
 /* The reader addresses bytes relative to one filesystem image. */
 typedef int (*lume_ext4_read_bytes)(void *, uint64_t, void *, size_t);
 
+struct lume_ext4_metadata_error
+{
+    const char *operation;
+    uint64_t location;
+};
+
 struct lume_ext4
 {
     lume_ext4_read_bytes read;
@@ -37,6 +43,7 @@ struct lume_ext4
     uint8_t dir_hash_version;
     bool journal_indexed;
     uint32_t first_data_block;
+    struct lume_ext4_metadata_error *metadata_error;
 };
 
 struct lume_ext4_time

@@ -1,4 +1,4 @@
-#include "lume/netif.h"
+#include "lume/net.h"
 #include "lume/activity.h"
 #include <string.h>
 #define HISTORY 32u
@@ -235,20 +235,33 @@ int lume_netif_receive(struct lume_netif *p, void *out, size_t cap)
     return n;
 }
 
-bool lume_netif_transmit(struct lume_netif *p, const void *data, size_t n)
+int lume_netif_transmit_status(struct lume_netif *p, const void *data, size_t n)
 {
     if (!p)
-        return false;
-    if (!data || n < 14 || n > p->info.mtu + 14 ||
-        (p->info.flags & (LUME_IF_UP | LUME_IF_LINK)) != (LUME_IF_UP | LUME_IF_LINK) ||
-        !p->ops.transmit(p->context, data, n))
+        return -LUME_ENOENT;
+    int status = 0;
+    if (!data || n < 14 || n > p->info.mtu + 14)
+        status = -LUME_EINVAL;
+    else if ((p->info.flags & (LUME_IF_UP | LUME_IF_LINK)) != (LUME_IF_UP | LUME_IF_LINK))
+        status = -LUME_ENETDOWN;
+    else if (!p->ops.transmit(p->context, data, n))
     {
-        ++p->info.tx_errors;
-        return false;
+        lume_netif_sync(p);
+        status = (p->info.flags & LUME_IF_LINK) ? -LUME_EAGAIN : -LUME_ENETDOWN;
     }
-    ++p->info.tx_packets;
-    p->statistics.tx_bytes += n;
-    return true;
+    if (status)
+        ++p->info.tx_errors;
+    else
+    {
+        ++p->info.tx_packets;
+        p->statistics.tx_bytes += n;
+    }
+    return status;
+}
+
+bool lume_netif_transmit(struct lume_netif *p, const void *data, size_t n)
+{
+    return lume_netif_transmit_status(p, data, n) == 0;
 }
 
 void lume_netif_tx_error(struct lume_netif *p)

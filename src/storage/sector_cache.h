@@ -123,6 +123,7 @@ static bool cache_barrier(void)
 {
     if (!lume_sd_sync())
     {
+        lume_value("STORAGE_CACHE_BARRIER_FAILED", 1);
         cache_retry_submitted();
         return false;
     }
@@ -140,6 +141,7 @@ static bool cache_write_line(struct sector_cache_line *line)
         unsigned end = cache_next_sector(line->dirty, first, SECTOR_CACHE_SECTORS, false);
         if (!lume_sd_write_deferred(line->first + first, end - first, line->data + first * 512u))
         {
+            lume_value("STORAGE_CACHE_WRITE_FAILED_SECTOR", line->first + first);
             cache_retry_submitted();
             return false;
         }

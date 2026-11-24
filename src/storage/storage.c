@@ -46,6 +46,7 @@ static struct lume_volume journal_volume;
 static FATFS filesystem;
 static bool mounted;
 static const struct lume_storage_ops *ext4_ops;
+static bool ext4_io_reported;
 static bool data_faulted;
 static bool replacing, replacement_io_failed;
 static struct lume_volume boot_volume;
@@ -967,6 +968,16 @@ static bool ext4_range(const struct lume_volume *partition, uint64_t offset, siz
     return offset <= capacity && bytes <= capacity - offset;
 }
 
+static int ext4_io_error(const char *operation, uint64_t sector)
+{
+    if (!ext4_io_reported)
+    {
+        ext4_io_reported = true;
+        lume_value(operation, sector);
+    }
+    return -1;
+}
+
 static int ext4_read(void *context, uint64_t offset, void *out, size_t bytes)
 {
     if ((context != &volume && context != &journal_volume) || !ext4_range(context, offset, bytes))
@@ -981,7 +992,8 @@ static int ext4_read(void *context, uint64_t offset, void *out, size_t bytes)
         if (within || bytes < sizeof sector)
         {
             if (disk_read(drive, sector, offset / sizeof sector, 1) != RES_OK)
-                return -1;
+                return ext4_io_error("EXT4_IO_READ_SECTOR",
+                                     drive_volume(drive)->first + offset / sizeof sector);
             count = sizeof sector - within;
             if (count > bytes)
                 count = bytes;
@@ -993,7 +1005,8 @@ static int ext4_read(void *context, uint64_t offset, void *out, size_t bytes)
             if (sectors > UINT_MAX)
                 sectors = UINT_MAX;
             if (disk_read(drive, target, offset / sizeof sector, (UINT)sectors) != RES_OK)
-                return -1;
+                return ext4_io_error("EXT4_IO_READ_SECTOR",
+                                     drive_volume(drive)->first + offset / sizeof sector);
             count = sectors * sizeof sector;
         }
         offset += count;
@@ -1011,13 +1024,17 @@ static int ext4_write(void *context, uint64_t offset, const void *data, size_t b
     if (!bytes)
         return 0;
     BYTE drive = context == &volume ? 0 : JOURNAL_DRIVE;
-    return write_volume(drive, data, offset / 512, (UINT)(bytes / 512), true) == RES_OK ? 0 : -1;
+    if (write_volume(drive, data, offset / 512, (UINT)(bytes / 512), true) != RES_OK)
+        return ext4_io_error("EXT4_IO_WRITE_SECTOR", drive_volume(drive)->first + offset / 512);
+    return 0;
 }
 
 static int ext4_flush(void *context)
 {
     BYTE drive = context == &volume ? 0 : JOURNAL_DRIVE;
-    return disk_ioctl(drive, CTRL_SYNC, NULL) == RES_OK ? 0 : -1;
+    if (disk_ioctl(drive, CTRL_SYNC, NULL) != RES_OK)
+        return ext4_io_error("EXT4_IO_FLUSH_PARTITION", drive_volume(drive)->first);
+    return 0;
 }
 
 static int ext4_timestamp(void *context, struct lume_file_time *out)
@@ -1058,10 +1075,12 @@ static const struct lume_storage_ops *start_ext4(const unsigned char mbr[512])
                                             .write = ext4_write,
                                             .flush = ext4_flush,
                                             .timestamp = ext4_timestamp,
+                                            .report_fault = lume_value,
                                             .context = &volume,
                                             .bytes = volume.count * 512,
                                             .journal = external};
     const struct lume_storage_ops *ops;
+    ext4_io_reported = false;
     int result = lume_ext4_storage_open_write(&io, &ops);
     if (result == -LUME_EOPNOTSUPP)
         result = lume_ext4_storage_open(io.read, io.context, io.bytes, &ops);
@@ -1085,8 +1104,12 @@ bool lume_storage_finish(void)
 {
     if (!ext4_ops)
         return true;
-    if (lume_ext4_storage_close())
+    int result = lume_ext4_storage_close();
+    if (result)
+    {
+        lume_value("EXT4_CLOSE_ERROR", (uint64_t)(int64_t)result);
         return false;
+    }
     ext4_ops = NULL;
     journal_volume = (struct lume_volume){0};
     return true;

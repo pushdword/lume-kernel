@@ -1,6 +1,7 @@
 #ifndef LUME_NET_H
 #define LUME_NET_H
 #include "lume/netif.h"
+int lume_netif_transmit_status(struct lume_netif *, const void *, size_t);
 bool lume_net_start(void);
 int lume_net_detach(uint32_t);
 bool lume_stream_busy(void);

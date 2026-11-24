@@ -358,6 +358,13 @@ static struct lume_ext4_time inode_time(const unsigned char *raw, unsigned low, 
     return (struct lume_ext4_time){.seconds = seconds, .nanoseconds = high >> 2};
 }
 
+static int invalid_metadata(const struct lume_ext4 *fs, const char *operation, uint64_t location)
+{
+    if (fs->metadata_error && !fs->metadata_error->operation)
+        *fs->metadata_error = (struct lume_ext4_metadata_error){operation, location};
+    return LUME_EXT4_INVALID;
+}
+
 int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume_ext4_inode *inode,
                         void *scratch, size_t scratch_bytes)
 {
@@ -377,14 +384,14 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
         s[0x1e] = s[0x1f] = 0;
         if ((uint16_t)lume_ext4_crc32c(crc_number(fs->checksum_seed, group), s,
                                        fs->descriptor_bytes) != expected)
-            return LUME_EXT4_INVALID;
+            return invalid_metadata(fs, "EXT4_META_GROUP_CHECKSUM_OFFSET", descriptor);
     }
     uint64_t table = le32(s + 8);
     if (fs->incompat & BIT64)
         table |= (uint64_t)le32(s + 0x28) << 32;
     uint64_t table_bytes = (uint64_t)fs->inodes_per_group * fs->inode_bytes;
     if (!table || table >= fs->blocks || table_bytes > (fs->blocks - table) * fs->block_bytes)
-        return LUME_EXT4_INVALID;
+        return invalid_metadata(fs, "EXT4_META_INODE_TABLE_OFFSET", descriptor);
     uint64_t offset =
         table * fs->block_bytes + (uint64_t)((number - 1) % fs->inodes_per_group) * fs->inode_bytes;
     error = read_bytes(fs, offset, s, fs->inode_bytes);
@@ -392,7 +399,7 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
         return error;
     uint16_t extra = fs->inode_bytes > 128 ? le16(s + 0x80) : 0;
     if ((extra & 3) || extra > fs->inode_bytes - 128)
-        return LUME_EXT4_INVALID;
+        return invalid_metadata(fs, "EXT4_META_INODE_SIZE_OFFSET", offset);
     uint32_t generation = le32(s + 0x64);
     if (fs->ro_compat & METADATA_CSUM)
     {
@@ -406,7 +413,7 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
         uint32_t actual = lume_ext4_crc32c(
             crc_number(crc_number(fs->checksum_seed, number), generation), s, fs->inode_bytes);
         if ((extra >= 4 ? actual : (uint16_t)actual) != expected)
-            return LUME_EXT4_INVALID;
+            return invalid_metadata(fs, "EXT4_META_INODE_CHECKSUM_OFFSET", offset);
     }
     uint16_t mode = le16(s);
     unsigned type = mode & 0xf000;
@@ -417,7 +424,7 @@ int lume_ext4_inode_get(const struct lume_ext4 *fs, uint32_t number, struct lume
     if (((flags & EXTENTS) && !(fs->incompat & 0x40)) ||
         ((flags & EXT4_INDEX_INODE) && (type != 0x4000 || !(fs->compat & 0x20))) ||
         (type == LUME_EXT4_MODE_FIFO && (flags || le32(s + 4) || le32(s + 0x6c))))
-        return LUME_EXT4_INVALID;
+        return invalid_metadata(fs, "EXT4_META_INODE_LAYOUT_OFFSET", offset);
     uint64_t sectors = le32(s + 0x1c);
     if (fs->ro_compat & HUGE_FILE)
         sectors |= (uint64_t)le16(s + 0x74) << 32;
@@ -737,7 +744,7 @@ static int check_dirents(const struct lume_ext4 *fs, const struct lume_ext4_inod
         *end -= 12;
         if (le32(s + *end) || le16(s + *end + 4) != 12 || s[*end + 6] || s[*end + 7] != 0xde ||
             lume_ext4_crc32c(inode_seed(fs, directory), s, *end) != le32(s + *end + 8))
-            return LUME_EXT4_INVALID;
+            return invalid_metadata(fs, "EXT4_META_DIRECTORY_TAIL_INODE", directory->number);
     }
     for (size_t at = 0; at < *end;)
     {

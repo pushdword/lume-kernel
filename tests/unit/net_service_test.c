@@ -12,6 +12,9 @@ static unsigned available, received_frames, checkpoints;
 static bool active_stream, active_datagram, nested_notification;
 static unsigned dns_notifications;
 static bool independent_network;
+static bool transmit_full;
+static bool carrier = true;
+static unsigned transmitted_frames;
 
 void lume_worker_scheduler(void (*run)(void *), void *context)
 {
@@ -184,7 +187,7 @@ static bool link(void *context)
 {
     assert(!independent_network);
     (void)context;
-    return true;
+    return carrier;
 }
 
 static bool admin(void *context, bool up)
@@ -201,6 +204,9 @@ static bool transmit(void *context, const void *data, size_t bytes)
     (void)context;
     (void)data;
     (void)bytes;
+    if (transmit_full)
+        return false;
+    ++transmitted_frames;
     return true;
 }
 
@@ -285,6 +291,27 @@ int main(void)
     assert(lume_work_drain_on(LUME_WORK_NETWORK, 1) == 1);
     assert(lume_work_pending_on(LUME_WORK_GENERAL) && !lume_work_pending_on(LUME_WORK_NETWORK));
     assert(lume_work_drain(LUME_WORK_LIMIT) == LUME_WORK_LIMIT && !lume_work_pending());
-    puts("PASS network deferred service, RX budget, rearming, serialization and queue pressure");
+
+    assert(netif_default && netif_is_link_up(netif_default));
+    struct pbuf *frame = pbuf_alloc(PBUF_RAW, 60, PBUF_RAM);
+    assert(frame);
+    memset(frame->payload, 0, frame->len);
+    unsigned sent = transmitted_frames;
+    transmit_full = true;
+    assert(netif_default->linkoutput(netif_default, frame) == ERR_WOULDBLOCK);
+    assert(transmitted_frames == sent);
+    transmit_full = false;
+    assert(netif_default->linkoutput(netif_default, frame) == ERR_OK);
+    assert(transmitted_frames == sent + 1);
+    carrier = false;
+    transmit_full = true;
+    assert(netif_default->linkoutput(netif_default, frame) == ERR_IF);
+    assert(transmitted_frames == sent + 1);
+    transmit_full = false;
+    carrier = true;
+    lume_netif_sync(interface);
+    pbuf_free(frame);
+
+    puts("PASS network deferred service, RX budget, serialization and TX backpressure");
     return 0;
 }
