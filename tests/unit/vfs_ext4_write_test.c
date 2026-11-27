@@ -87,6 +87,22 @@ static int timestamp(void *context, struct lume_file_time *out)
     return 0;
 }
 
+static void check_empty_directory(struct lume_files *files, const char *path)
+{
+    int64_t directory = lume_vfs_open(files, path, LUME_O_RDONLY);
+    assert(directory >= 0);
+    struct lume_files_dirent_posix entries[3];
+    assert(lume_vfs_getdents_posix(files, directory, entries, sizeof entries) ==
+           2 * sizeof entries[0]);
+    assert(!strcmp(entries[0].name, ".") && !strcmp(entries[1].name, ".."));
+    uint64_t after_dotdot = entries[1].position;
+    assert(!lume_vfs_getdents_posix(files, directory, entries, sizeof entries));
+    assert(!lume_vfs_getdents_posix(files, directory, entries, sizeof entries));
+    assert(lume_vfs_seek(files, directory, after_dotdot, LUME_SEEK_SET) == (int64_t)after_dotdot);
+    assert(!lume_vfs_getdents_posix(files, directory, entries, sizeof entries));
+    assert(!lume_vfs_close(files, directory));
+}
+
 static int create_file(struct lume_files *files, const char *path, unsigned mode)
 {
     struct lume_file_mode_request request = {.version = LUME_FILE_MODE_VERSION,
@@ -438,6 +454,7 @@ int main(int argc, char **argv)
     assert(renamed.inode == first.inode);
     assert(!lume_vfs_mkdir(&files, "/data/a"));
     assert(!lume_vfs_mkdir(&files, "/data/b"));
+    check_empty_directory(&files, "/data/b");
     fd = create_file(&files, "/data/a/child", 0640);
     assert(fd >= 0 && lume_vfs_write(&files, (uint64_t)fd, "nested", 6) == 6);
     assert(!lume_vfs_close(&files, (uint64_t)fd));
@@ -474,6 +491,7 @@ int main(int argc, char **argv)
     check_native(&files, "/data/b/a/child", 0100640, 6);
     assert(lume_vfs_rename(&files, "/data/b", "/data/b/a/loop") == -LUME_EINVAL);
     assert(!lume_vfs_remove(&files, "/data/b/a/child", false));
+    check_empty_directory(&files, "/data/b/a");
     assert(!lume_vfs_remove(&files, "/data/b/a", true));
     assert(!lume_vfs_remove(&files, "/data/b", true));
     fd = create_file(&files, "/data/source", 0644);

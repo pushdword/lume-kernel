@@ -3407,16 +3407,17 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
             directory_posix_entry((unsigned char *)out + used, parent, d->offset, "..", 2);
             used += record_bytes;
         }
-        if (d->offset == LUME_FILES_DIR_AFTER_DOTDOT && bytes - used >= record_bytes)
-            d->offset = 0;
     }
+    bool after_dotdot = format == DIRECTORY_ENTRY_POSIX && d->offset == LUME_FILES_DIR_AFTER_DOTDOT;
     if (n->persistent && storage && storage->next)
     {
-        while (d->offset != LUME_FILES_DIR_AFTER_DOT &&
-               d->offset != LUME_FILES_DIR_AFTER_DOTDOT && bytes - used >= record_bytes)
+        /* Preserve the position after ".." until a child advances the storage cursor. */
+        uint64_t cursor = after_dotdot ? 0 : d->offset;
+        while (cursor != LUME_FILES_DIR_AFTER_DOT && cursor != LUME_FILES_DIR_AFTER_DOTDOT &&
+               bytes - used >= record_bytes)
         {
             struct lume_storage_dirent found;
-            uint64_t next = d->offset;
+            uint64_t next = cursor;
             int result = storage->next(n->path, &next, &found);
             if (result <= 0)
                 return result < 0 && !used ? result : (int64_t)used;
@@ -3427,13 +3428,14 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
                 format == DIRECTORY_ENTRY_SHORT ? sizeof(((struct lume_dirent *)0)->name)
                                                  : LUME_FILES_NAME_MAX + 1;
             if (!name_bytes || name_bytes == sizeof(found.name) || !found.inode ||
-                next <= d->offset)
+                next <= cursor)
                 return used ? (int64_t)used : -LUME_EIO;
             if (name_bytes >= name_capacity)
                 return used ? (int64_t)used : -LUME_ENAMETOOLONG;
             if (next >= LUME_FILES_DIR_AFTER_DOT)
                 return used ? (int64_t)used : -LUME_EOVERFLOW;
             d->offset = next;
+            cursor = next;
             if (format == DIRECTORY_ENTRY_POSIX)
             {
                 struct lume_files_dirent_posix entry = {.inode = storage_inode_number(found.inode),
@@ -3461,6 +3463,8 @@ static int64_t directory_entries(struct lume_files *f, uint64_t fd, void *out, u
         }
         return (int64_t)used;
     }
+    if (after_dotdot && bytes - used >= record_bytes)
+        d->offset = 0;
     while (d->offset < count && bytes - used >= record_bytes)
     {
         unsigned i = (unsigned)d->offset++;
