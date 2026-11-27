@@ -232,6 +232,7 @@ struct dns_table_entry
 {
     u32_t ttl;
     ip_addr_t ipaddr;
+    ip_addr_t early_backup;
     u16_t txid;
     u8_t state;
     u8_t server_idx;
@@ -822,7 +823,7 @@ static u16_t dns_skip_name(struct pbuf *p, u16_t query_idx)
  * @param idx the DNS table entry index for which to send a request
  * @return ERR_OK if packet is sent; an err_t indicating the problem otherwise
  */
-static err_t dns_send(u8_t idx)
+static err_t dns_send(u8_t idx, u8_t server_idx)
 {
     err_t err;
     struct dns_hdr hdr;
@@ -835,9 +836,9 @@ static err_t dns_send(u8_t idx)
     struct dns_table_entry *entry = &dns_table[idx];
 
     LWIP_DEBUGF(DNS_DEBUG, ("dns_send: dns_servers[%" U16_F "] \"%s\": request\n",
-                            (u16_t)(entry->server_idx), entry->name));
-    LWIP_ASSERT("dns server out of array", entry->server_idx < DNS_MAX_SERVERS);
-    if (ip_addr_isany_val(dns_servers[entry->server_idx])
+                            (u16_t)(server_idx), entry->name));
+    LWIP_ASSERT("dns server out of array", server_idx < DNS_MAX_SERVERS);
+    if (ip_addr_isany_val(dns_servers[server_idx])
 #if LWIP_DNS_SUPPORT_MDNS_QUERIES
         && !entry->is_mdns
 #endif
@@ -909,7 +910,7 @@ static err_t dns_send(u8_t idx)
 #endif
         /* send dns packet */
         LWIP_DEBUGF(DNS_DEBUG, ("sending DNS request ID %d for name \"%s\" to server %d\r\n",
-                                entry->txid, entry->name, entry->server_idx));
+                                entry->txid, entry->name, server_idx));
 #if LWIP_DNS_SUPPORT_MDNS_QUERIES
         if (entry->is_mdns)
         {
@@ -933,7 +934,7 @@ static err_t dns_send(u8_t idx)
 #endif /* LWIP_DNS_SUPPORT_MDNS_QUERIES */
         {
             dst_port = DNS_SERVER_PORT;
-            dst = &dns_servers[entry->server_idx];
+            dst = &dns_servers[server_idx];
         }
         err = udp_sendto(dns_pcbs[pcb_idx], p, dst, dst_port);
 
@@ -1178,11 +1179,12 @@ static void dns_check_entry(u8_t i)
         entry->txid = dns_create_txid();
         entry->state = DNS_STATE_ASKING;
         entry->server_idx = 0;
+        ip_addr_set_zero(&entry->early_backup);
         entry->tmr = 1;
         entry->retries = 0;
 
         /* send DNS packet for this entry */
-        err = dns_send(i);
+        err = dns_send(i, entry->server_idx);
         if (err != ERR_OK)
         {
             LWIP_DEBUGF(DNS_DEBUG | LWIP_DBG_LEVEL_WARNING,
@@ -1202,6 +1204,7 @@ static void dns_check_entry(u8_t i)
                 {
                     /* change of server */
                     entry->server_idx++;
+                    ip_addr_set_zero(&entry->early_backup);
                     entry->tmr = 1;
                     entry->retries = 0;
                 }
@@ -1221,8 +1224,20 @@ static void dns_check_entry(u8_t i)
                 entry->tmr = entry->retries;
             }
 
+            if (entry->retries == 1 && dns_backupserver_available(entry)
+#if LWIP_DNS_SUPPORT_MDNS_QUERIES
+                && !entry->is_mdns
+#endif
+            )
+            {
+                u8_t backup = entry->server_idx + 1;
+                if (!ip_addr_eq(&dns_servers[entry->server_idx], &dns_servers[backup]) &&
+                    dns_send(i, backup) == ERR_OK)
+                    entry->early_backup = dns_servers[backup];
+            }
+
             /* send DNS packet for this entry */
-            err = dns_send(i);
+            err = dns_send(i, entry->server_idx);
             if (err != ERR_OK)
             {
                 LWIP_DEBUGF(DNS_DEBUG | LWIP_DBG_LEVEL_WARNING,
@@ -1312,7 +1327,6 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
 
     LWIP_UNUSED_ARG(arg);
     LWIP_UNUSED_ARG(pcb);
-    LWIP_UNUSED_ARG(port);
 
     /* is the dns message big enough ? */
     if (p->tot_len < (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY))
@@ -1351,6 +1365,7 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
                     goto ignore_packet; /* ignore this packet */
                 }
 
+                bool early_response = false;
 #if LWIP_DNS_SUPPORT_MDNS_QUERIES
                 if (!entry->is_mdns)
 #endif /* LWIP_DNS_SUPPORT_MDNS_QUERIES */
@@ -1359,7 +1374,12 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
              question was sent. (RFC 5452) */
                     if (!ip_addr_eq(addr, &dns_servers[entry->server_idx]))
                     {
-                        goto ignore_packet; /* ignore this packet */
+                        if (port != DNS_SERVER_PORT || (hdr.flags1 & DNS_FLAG1_TRUNC) ||
+                            !dns_backupserver_available(entry) ||
+                            !ip_addr_eq(addr, &entry->early_backup) ||
+                            !ip_addr_eq(addr, &dns_servers[entry->server_idx + 1]))
+                            goto ignore_packet;
+                        early_response = true;
                     }
                 }
 
@@ -1403,7 +1423,7 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
                     /* if there is another backup DNS server to try
            * then don't stop the DNS request
            */
-                    if (dns_backupserver_available(entry))
+                    if (!early_response && dns_backupserver_available(entry))
                     {
                         /* avoid retrying the same server */
                         entry->retries = DNS_MAX_RETRIES - 1;
@@ -1496,6 +1516,8 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
                         res_idx = (u16_t)(res_idx + lwip_htons(ans.len));
                         --nanswers;
                     }
+                    if (early_response)
+                        goto ignore_packet;
 #if LWIP_IPV4 && LWIP_IPV6
                     if ((entry->reqaddrtype == LWIP_DNS_ADDRTYPE_IPV4_IPV6) ||
                         (entry->reqaddrtype == LWIP_DNS_ADDRTYPE_IPV6_IPV4))
@@ -1519,11 +1541,13 @@ static void dns_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_ad
                     LWIP_DEBUGF(DNS_DEBUG, ("dns_recv: \"%s\": error in response\n", entry->name));
                 }
                 /* call callback to indicate error, clean up memory and return */
-                pbuf_free(p);
                 enum dns_result result = DNS_RESULT_RETRY;
                 if ((hdr.flags2 & DNS_FLAG2_ERR_MASK) == DNS_FLAG2_ERR_NAME &&
                     !(hdr.flags1 & DNS_FLAG1_TRUNC))
                     result = DNS_RESULT_NOT_FOUND;
+                if (early_response && result == DNS_RESULT_RETRY)
+                    goto ignore_packet;
+                pbuf_free(p);
                 dns_call_found(i, NULL, result);
                 dns_table[i].state = DNS_STATE_UNUSED;
                 return;
