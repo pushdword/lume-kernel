@@ -561,6 +561,9 @@ _Static_assert(offsetof(struct gem_dma_descriptor, address_high) == 8, "GEM high
 #define GEM_DMA_PAGE_BYTES 4096u
 /* Retain a burst while the polling caller is servicing another device. */
 #define GEM_RX_RING_ENTRIES 64u
+#define GEM_RP1_RX_RING_ENTRIES 256u
+#define GEM_TX_RING_ENTRIES 8u
+#define GEM_TX_BATCH_MAX (GEM_TX_RING_ENTRIES - 1u)
 
 _Static_assert(GEM_FRAME_BUFFER_BYTES <= GEM_DMA_PAGE_BYTES, "GEM frame buffer allocation");
 _Static_assert(GEM_FRAME_BUFFER_BYTES % GEM_DMA_RX_BUFFER_UNIT_BYTES == 0,
@@ -593,7 +596,7 @@ _Static_assert(sizeof(struct gem_ethernet_header) == 14, "Ethernet header size")
 
 /* CPU pointers identify identity-mapped kernel RAM. DMA addresses use the RP1
  * inbound aperture. Frames reside in tx_frame_cpu/rx_frame_cpu, not in MMIO.
- * Each descriptor and buffer occupies its own page to isolate cache lines. */
+ * Descriptor rings start on separate pages. Buffers are aligned to their capacity. */
 /* Return a description of the allocated memory. This structure contains addresses and
  * configuration metadata. It is not itself a hardware descriptor or an Ethernet frame.
  */
@@ -654,15 +657,21 @@ bool lume_example_gem_link(void);
  * output pointer.
  */
 int lume_example_gem_phy_read(unsigned reg, uint16_t *);
-/* TX copies the caller's bytes. Zero means accepted, not transmitted.
- * EAGAIN means the single descriptor is still owned by DMA. */
-/* Copy a complete Ethernet frame from the caller and submit it to DMA. const void * accepts
- * read-only bytes of any C object type.
- */
+struct lume_example_gem_frame
+{
+    const void *data;
+    size_t bytes;
+};
+
+/* Copy one frame and submit it to DMA. Zero reports acceptance. */
 int lume_example_gem_transmit(const void *, size_t);
-/* Check the outstanding TX operation without waiting. Return zero after completion or when there
- * is no pending operation, and negative EAGAIN while DMA still owns it.
- */
+/* Return the maximum number of frames accepted in one idle-ring submission. */
+unsigned lume_example_gem_tx_capacity(void);
+/* Copy a batch and submit it to DMA. EAGAIN leaves the pending batch untouched. */
+int lume_example_gem_transmit_batch(const struct lume_example_gem_frame *, unsigned);
+/* Report the number of frames sent when the pending batch finishes or fails. */
+int lume_example_gem_tx_result(unsigned *completed);
+/* Poll the pending batch. EAGAIN means DMA still owns it. */
 int lume_example_gem_tx_complete(void);
 
 enum

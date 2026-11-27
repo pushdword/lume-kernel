@@ -128,19 +128,31 @@ bool lume_dma_map(const struct lume_dma_domain *domain, uint64_t physical, size_
                   uint64_t *bus)
 {
     T(domain == &lume_rp1_dma_domain &&
-      bytes == (physical == (uintptr_t)rx_frame ? sizeof(rx_frame) : GEM_DMA_PAGE_BYTES));
+      bytes == (physical == (uintptr_t)rx_frame ? sizeof(rx_frame) :
+                physical == (uintptr_t)tx_frame ? sizeof(tx_frame) : GEM_DMA_PAGE_BYTES));
     T(!(physical & (GEM_DMA_PAGE_BYTES - 1)));
     ++map_calls;
     if (map_calls == fail_map)
         return false;
     *bus = UINT64_C(0x1000400000) + ((map_calls - 1) % 4) * GEM_DMA_PAGE_BYTES;
+    if (physical == (uintptr_t)rx_frame)
+        *bus += sizeof(tx_frame) - GEM_DMA_PAGE_BYTES;
     return true;
 }
 
 bool lume_dma_sync_for_cpu(const void *p, size_t bytes, enum lume_dma_direction direction)
 {
-    T(p && bytes == GEM_DMA_PAGE_BYTES);
-    T(direction == LUME_DMA_FROM_DEVICE || direction == LUME_DMA_BIDIRECTIONAL);
+    T(p && bytes);
+    if (p == &tx)
+        T(bytes == GEM_DMA_PAGE_BYTES && direction == LUME_DMA_BIDIRECTIONAL);
+    else if (direction == LUME_DMA_BIDIRECTIONAL)
+    {
+        uintptr_t offset = (uintptr_t)p - (uintptr_t)&rx;
+        T(bytes == rx_group_entries * sizeof(rx.descriptors[0]));
+        T(offset < sizeof(rx.descriptors) && offset % bytes == 0);
+    }
+    else
+        T(direction == LUME_DMA_FROM_DEVICE && bytes <= GEM_FRAME_MAX_BYTES);
     if (p == &tx && tx_complete_after && !--tx_complete_after)
     {
         tx.descriptors[tx_index].control |= GEM_TX_USED;
@@ -151,8 +163,30 @@ bool lume_dma_sync_for_cpu(const void *p, size_t bytes, enum lume_dma_direction 
 
 bool lume_dma_sync_for_device(const void *p, size_t bytes, enum lume_dma_direction direction)
 {
-    T(p && bytes == GEM_DMA_PAGE_BYTES);
+    T(p && bytes);
     T(direction >= LUME_DMA_TO_DEVICE && direction <= LUME_DMA_BIDIRECTIONAL);
+    uintptr_t offset = (uintptr_t)p - (uintptr_t)&rx;
+    if (offset < sizeof(rx.descriptors))
+    {
+        T(direction == LUME_DMA_BIDIRECTIONAL);
+        T(bytes == (running ? rx_group_entries : rx_count) * sizeof(rx.descriptors[0]));
+        T(offset % bytes == 0);
+    }
+    else
+        T(bytes == (direction == LUME_DMA_FROM_DEVICE ? GEM_FRAME_BUFFER_BYTES : GEM_DMA_PAGE_BYTES));
+    if (physical_rp1 && p == &tx)
+        T(!(registers[GEM_TX_STATUS / 4] & GEM_TX_STATUS_ACTIVE));
+    return ++sync_calls != fail_sync;
+}
+
+bool lume_dma_sync_rect_for_device(const void *p, size_t row_bytes, size_t pitch, unsigned rows,
+                                   enum lume_dma_direction direction)
+{
+    uintptr_t offset = (uintptr_t)p - (uintptr_t)rx_frame;
+    T(physical_rp1 && direction == LUME_DMA_FROM_DEVICE);
+    T(row_bytes == GEM_FRAME_BUFFER_BYTES && pitch == sizeof(rx_frame[0]));
+    T(rows == (running ? rx_group_entries : rx_count));
+    T(offset < sizeof(rx_frame) && offset % (pitch * rows) == 0);
     return ++sync_calls != fail_sync;
 }
 
@@ -191,39 +225,53 @@ static void exercise_receive_bursts(void)
     T(rx_index == 0);
     for (unsigned round = 0; round < 3; ++round)
     {
-        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+        for (unsigned i = 0; i < rx_count; ++i)
         {
             T(!(rx.descriptors[i].address_low & GEM_RX_OWNED));
             T((rx.descriptors[i].address_low & ~3u) ==
-              (uint32_t)(layout.rx_frame_dma + i * GEM_DMA_PAGE_BYTES));
-            memset(rx_frame[i], (int)(round * GEM_RX_RING_ENTRIES + i), sizeof(out));
+              (uint32_t)(layout.rx_frame_dma + i * sizeof(rx_frame[0])));
+            memset(rx_frame[i], (int)(round * 17 + i), sizeof(out));
             rx.descriptors[i].control = sizeof(out) | GEM_RX_START | GEM_RX_END;
             rx.descriptors[i].address_low |= GEM_RX_OWNED;
         }
-        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+        for (unsigned i = 0; i < rx_count; ++i)
         {
             T(lume_example_gem_receive(out, sizeof(out)) == sizeof(out));
             for (unsigned n = 0; n < sizeof(out); ++n)
-                T(out[n] == (unsigned char)(round * GEM_RX_RING_ENTRIES + i));
-            if (i + 1 < GEM_RX_RING_ENTRIES)
-                T(rx.descriptors[0].address_low & GEM_RX_OWNED);
+                T(out[n] == (unsigned char)(round * 17 + i));
+            unsigned first = i - i % rx_group_entries;
+            if ((i + 1) % rx_group_entries)
+                T(rx.descriptors[first].address_low & GEM_RX_OWNED);
+            else
+            {
+                for (unsigned slot = first; slot <= i; ++slot)
+                    T(!(rx.descriptors[slot].address_low & GEM_RX_OWNED));
+                if (i + 1 < rx_count)
+                    T(rx.descriptors[i + 1].address_low & GEM_RX_OWNED);
+            }
         }
         T(rx_index == 0);
-        for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+        for (unsigned i = 0; i < rx_count; ++i)
             T(!(rx.descriptors[i].address_low & GEM_RX_OWNED));
         T(lume_example_gem_receive(out, sizeof(out)) == 0);
     }
-    for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+    for (unsigned i = 0; i < rx_count; ++i)
     {
         receive_frame(out, sizeof(out), GEM_RX_START | GEM_RX_END);
-        if (i + 1 == GEM_RX_RING_ENTRIES)
-            fail_sync = sync_calls + 3;
+        bool fail = i + 1 == rx_group_entries;
+        if (fail)
+            fail_sync = sync_calls + (physical_rp1 ? 4 : 3);
         int result = lume_example_gem_receive(out, sizeof(out));
-        T(result == (i + 1 == GEM_RX_RING_ENTRIES ? -LUME_EIO : (int)sizeof(out)));
+        T(result == (fail ? -LUME_EIO : (int)sizeof(out)));
+        if (fail)
+        {
+            T(rx_rearm_pending && rx_index == rx_group_entries);
+            fail_sync = 0;
+            T(lume_example_gem_receive(out, sizeof(out)) == 0 && !rx_rearm_pending);
+            T(rx_index == (physical_rp1 ? rx_group_entries : 0));
+        }
     }
-    T(rx_index == GEM_RX_RING_ENTRIES);
-    fail_sync = 0;
-    T(lume_example_gem_receive(out, sizeof(out)) == 0 && rx_index == 0);
+    T(rx_index == 0 && !rx_rearm_pending);
 }
 
 /* Exercise the real adapter and registry with the same MMIO and DMA model as the frame tests. */
@@ -252,7 +300,7 @@ static void exercise_netif(void)
 
     T(lume_netif_transmit(interface, frame, 60) && dma_submitted);
     frame[0] ^= 0xff;
-    T(tx_frame[0] != frame[0]);
+    T(tx_frame[0][0] != frame[0]);
     for (unsigned i = 0; i < GEM_TX_QUEUE; ++i)
     {
         frame[0] = (unsigned char)(i + 1);
@@ -270,7 +318,7 @@ static void exercise_netif(void)
     for (unsigned i = 0; i <= GEM_TX_QUEUE; ++i)
     {
         if (i)
-            T(tx_frame[0] == i);
+            T(tx_frame[0][0] == i);
         tx.descriptor.control |= GEM_TX_USED;
         registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
         ++milliseconds;
@@ -370,8 +418,87 @@ static void exercise_netif(void)
     T(!info.flags);
 }
 
+static void exercise_netif_batches(void)
+{
+    const unsigned char mac[6] = {0x52, 0x54, 0, 0x12, 0x34, 0x57};
+    const unsigned leds[2] = {2, 5};
+    unsigned char frame[60] = {0};
+    reset_model();
+    registers[GEM_MODULE_ID_REGISTER / 4] = GEM_RP1_MODULE_ID;
+    registers[GEM_DESIGN_CONFIG_1 / 4] = 4u << 25;
+    phy_registers[1] = 0x24;
+    phy_registers[5] = 0x01e1;
+    phy_registers[10] = 0x0800;
+    T(lume_example_gem_configure_rp1(mac, 1, leds) == 0);
+    T(lume_example_gem_eth_start() == 0);
+    T(lume_example_gem_tx_capacity() == GEM_TX_BATCH_MAX);
+    const struct lume_example_gem_frame invalid[] = {{frame, sizeof(frame)}, {NULL, 0}};
+    T(lume_example_gem_transmit_batch(invalid, 2) == -LUME_EINVAL && !tx_pending);
+    T(tx.descriptors[0].control == GEM_TX_USED);
+    T(lume_device_attach(&gem_netif_device) == 0);
+    struct lume_netif *interface = lume_netif_find(1);
+    struct lume_net_statistics before, after;
+    lume_netif_statistics(interface, &before);
+    const unsigned queued = 2 * GEM_TX_BATCH_MAX + 1;
+    for (unsigned i = 0; i <= queued; ++i)
+    {
+        frame[0] = (unsigned char)i;
+        T(lume_netif_transmit(interface, frame, sizeof(frame)));
+    }
+    T(gem_network.tx_pending == 1 && gem_network.tx_count == queued);
+    tx.descriptors[0].control |= GEM_TX_USED;
+    registers[GEM_TX_FRAMES / 4] = 1;
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_COMPLETE;
+    lume_netif_poll(interface);
+    T(tx_index == 1 && tx_pending == GEM_TX_BATCH_MAX);
+    T(gem_network.tx_pending == GEM_TX_BATCH_MAX && gem_network.tx_count == GEM_TX_BATCH_MAX + 1);
+    for (unsigned i = 1; i < GEM_TX_RING_ENTRIES; ++i)
+    {
+        uint64_t dma = (uint64_t)tx.descriptors[i].address_high << 32 | tx.descriptors[i].address_low;
+        T(dma == layout.tx_frame_dma + i * GEM_DMA_PAGE_BYTES);
+        T(tx_frame[i][0] == i && !(tx.descriptors[i].control & GEM_TX_USED));
+    }
+    T(tx.descriptors[GEM_TX_RING_ENTRIES - 1].control & GEM_TX_WRAP);
+    T(tx.descriptors[0].control & GEM_TX_USED);
+
+    registers[GEM_TX_FRAMES / 4] = 2;
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_ACTIVE;
+    tx.descriptors[1].control |= GEM_TX_USED;
+    lume_netif_poll(interface);
+    T(tx_index == 1 && gem_network.tx_pending == GEM_TX_BATCH_MAX);
+    T(tx_frame[1][0] == 1 && tx_frame[GEM_TX_RING_ENTRIES - 1][0] == GEM_TX_BATCH_MAX);
+    registers[GEM_TX_FRAMES / 4] = GEM_TX_BATCH_MAX - 2;
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ;
+    lume_netif_poll(interface);
+    T(tx_index == 0 && gem_network.tx_pending == GEM_TX_BATCH_MAX);
+    T(gem_network.tx_count == 1);
+    T(tx.descriptors[GEM_TX_RING_ENTRIES - 1].control == (GEM_TX_USED | GEM_TX_WRAP));
+    for (unsigned i = 0; i < GEM_TX_BATCH_MAX; ++i)
+        T(tx_frame[i][0] == GEM_TX_RING_ENTRIES + i);
+
+    registers[GEM_TX_FRAMES / 4] = 2;
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN | GEM_TX_STATUS_ACTIVE;
+    lume_netif_poll(interface);
+    T(gem_network.tx_pending == GEM_TX_BATCH_MAX && gem_network.tx_count == 1);
+    registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_UNDERRUN;
+    lume_netif_poll(interface);
+    T(gem_network.tx_pending == 1 && gem_network.tx_count == 0 && tx_frame[0][0] == queued);
+    lume_netif_statistics(interface, &after);
+    T(after.tx_completed - before.tx_completed == 1 + GEM_TX_BATCH_MAX + 2);
+    T(after.tx_dma_errors - before.tx_dma_errors == GEM_TX_BATCH_MAX - 2);
+    T(after.tx_depth == 1 && after.tx_submit_errors == before.tx_submit_errors);
+    T(lume_device_detach(&gem_netif_device) == 0);
+    lume_netif_statistics(interface, &after);
+    T(after.tx_cancelled == before.tx_cancelled + 1 && !after.tx_depth);
+    T(lume_device_count() == 0);
+}
+
 int main(void)
 {
+    T(receive_group(0, GEM_RP1_RX_RING_ENTRIES) == GEM_RP1_RX_RING_ENTRIES);
+    T(receive_group((UINT64_C(4) << 24) | (UINT64_C(5) << 16), GEM_RP1_RX_RING_ENTRIES) == 8);
+    T(receive_group((UINT64_C(5) << 24) | (UINT64_C(4) << 16), GEM_RP1_RX_RING_ENTRIES) == 8);
+    T(receive_group(UINT64_C(15) << 24, GEM_RX_RING_ENTRIES) == GEM_RX_RING_ENTRIES);
     unsigned char frame[GEM_FRAME_BUFFER_BYTES], out[GEM_FRAME_BUFFER_BYTES];
     struct lume_example_gem_layout info;
     reset_model();
@@ -421,9 +548,9 @@ int main(void)
     T(lume_example_gem_transmit(frame, 14) == 0 && dma_submitted);
     T(!memcmp(tx_frame, frame, 14));
     for (unsigned i = 14; i < 60; ++i)
-        T(tx_frame[i] == 0);
+        T(tx_frame[0][i] == 0);
     frame[0] ^= 0xff;
-    T(tx_frame[0] != frame[0]);
+    T(tx_frame[0][0] != frame[0]);
     T((tx.descriptor.control & GEM_DESCRIPTOR_LENGTH) == 60);
     T(lume_example_gem_transmit(frame, 60) == -LUME_EAGAIN);
     T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
@@ -485,21 +612,25 @@ int main(void)
     T(phy_expansion[0x0f04] == 0xa580);
     T(phy_expansion[0x0f05] == 0x5aa5);
     T(gem_device.resource_count == 2);
-    T(tx_count == 2 && tx_index == 0);
+    T(tx_count == GEM_TX_RING_ENTRIES && tx_index == 0);
+    T(rx_count == GEM_RP1_RX_RING_ENTRIES);
+    T(rx.descriptors[GEM_RP1_RX_RING_ENTRIES - 1].address_low & GEM_RX_WRAP);
     exercise_receive_bursts();
     T(tx.descriptors[0].control == GEM_TX_USED);
-    T(tx.descriptors[1].control == (GEM_TX_USED | GEM_TX_WRAP));
+    T(tx.descriptors[1].control == GEM_TX_USED);
+    T(tx.descriptors[GEM_TX_RING_ENTRIES - 1].control == (GEM_TX_USED | GEM_TX_WRAP));
     T(lume_example_gem_transmit(frame, 60) == 0);
     T(!(tx.descriptors[0].control & GEM_TX_WRAP));
-    T(tx.descriptors[1].control == (GEM_TX_USED | GEM_TX_WRAP));
+    T(tx.descriptors[1].control == GEM_TX_USED);
+    T(tx.descriptors[GEM_TX_RING_ENTRIES - 1].control == (GEM_TX_USED | GEM_TX_WRAP));
     tx.descriptors[0].control |= GEM_TX_USED;
     registers[GEM_TX_FRAMES / 4] = 1;
     T(!lume_example_gem_tx_complete() && tx_index == 1);
     T(lume_example_gem_transmit(frame, 60) == 0);
-    T(tx.descriptors[1].control & GEM_TX_WRAP);
+    T(!(tx.descriptors[1].control & GEM_TX_WRAP));
     tx.descriptors[1].control |= GEM_TX_USED;
     registers[GEM_TX_FRAMES / 4] = 1;
-    T(!lume_example_gem_tx_complete() && tx_index == 0);
+    T(!lume_example_gem_tx_complete() && tx_index == 2);
     registers[GEM_NETWORK_CONTROL / 4] = control | GEM_CONTROL_TX_START;
     receive_frame(frame, 60, GEM_RX_START | GEM_RX_END);
     T(lume_example_gem_receive(out, sizeof(out)) == 60);
@@ -507,15 +638,15 @@ int main(void)
     T(lume_example_gem_transmit(frame, 60) == 0);
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ;
     T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
-    T(!(tx.descriptors[0].control & GEM_TX_USED));
+    T(!(tx.descriptors[tx_index].control & GEM_TX_USED));
     T(registers[GEM_NETWORK_CONTROL / 4] & GEM_CONTROL_TX_START);
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ | GEM_TX_STATUS_ACTIVE;
     registers[GEM_TX_FRAMES / 4] = 1;
     T(lume_example_gem_tx_complete() == -LUME_EAGAIN);
-    T(!(tx.descriptors[0].control & GEM_TX_USED));
+    T(!(tx.descriptors[tx_index].control & GEM_TX_USED));
     registers[GEM_TX_STATUS / 4] = GEM_TX_STATUS_USED_BIT_READ;
     T(lume_example_gem_tx_complete() == 0);
-    T(tx_index == 1 && (tx.descriptors[0].control & GEM_TX_USED));
+    T(tx_index == 3 && (tx.descriptors[2].control & GEM_TX_USED));
     T(tx_observed == tx_expected && tx_expected == 3);
     unsigned rx_position = rx_index;
     uint32_t rx_address = rx.descriptors[rx_position].address_low;
@@ -678,6 +809,7 @@ int main(void)
     T(lume_example_gem_configure(0, false) == 0 && gem_device.resource_count == 3);
     printf("GEM RP1 identity, MDIO, DMA width and negotiated link: %u checks PASS\n", checks);
     exercise_netif();
+    exercise_netif_batches();
     printf("GEM netif lifecycle and frame path: %u total checks PASS\n", checks);
     return 0;
 }

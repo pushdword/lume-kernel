@@ -102,8 +102,8 @@ static struct lume_device gem_device = {
     .ops = &driver_ops,
 };
 
-/* Padding is outside the descriptor ring. Hardware wraps each ring
- * through WRAP. CPU-owned and DMA-owned objects never share a cache line. */
+/* Each descriptor ring occupies a page separate from the frame buffers.
+ * Hardware uses WRAP to identify the final descriptor. */
 /* A union overlays its members at the same starting address. The descriptor occupies the first
  * 16 bytes and the page member reserves a complete 4096-byte region.
  */
@@ -111,16 +111,14 @@ union descriptor_page
 {
     /* Provide named access to the descriptor words at the beginning of this allocation. */
     struct gem_dma_descriptor descriptor;
-    struct gem_dma_descriptor descriptors[GEM_RX_RING_ENTRIES];
+    struct gem_dma_descriptor descriptors[GEM_RP1_RX_RING_ENTRIES];
     /* Reserve padding so this allocation cannot share a page with the next DMA object. */
     unsigned char page[GEM_DMA_PAGE_BYTES];
 };
 
-_Static_assert(GEM_RX_RING_ENTRIES * sizeof(struct gem_dma_descriptor) <= GEM_DMA_PAGE_BYTES,
+_Static_assert(GEM_RP1_RX_RING_ENTRIES * sizeof(struct gem_dma_descriptor) <= GEM_DMA_PAGE_BYTES,
                "GEM receive descriptor allocation");
-/* Keep the TX descriptor alive for the kernel lifetime and start it on a 4096-byte boundary.
- * Static storage is initially zero.
- */
+/* The transmit ring occupies a separate page. */
 _Alignas(GEM_DMA_PAGE_BYTES) static union descriptor_page tx;
 /* Allocate a separately aligned RX descriptor ring. DMA can update RX without sharing a cache line
  * with TX.
@@ -129,12 +127,14 @@ _Alignas(GEM_DMA_PAGE_BYTES) static union descriptor_page rx;
 /* Allocate the RAM containing bytes to transmit. The CPU fills this buffer before handing its
  * descriptor to DMA.
  */
-_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char tx_frame[GEM_DMA_PAGE_BYTES];
+_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char tx_frame[GEM_TX_RING_ENTRIES][GEM_DMA_PAGE_BYTES];
 /* Allocate the RAM into which DMA writes received bytes. Software reads it only after RX
  * ownership returns to the CPU.
  */
-_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char rx_frame[GEM_RX_RING_ENTRIES][GEM_DMA_PAGE_BYTES];
-static unsigned rx_index;
+_Alignas(GEM_DMA_PAGE_BYTES) static unsigned char rx_frame[GEM_RP1_RX_RING_ENTRIES][GEM_FRAME_BUFFER_BYTES];
+static unsigned rx_index, rx_count;
+static unsigned rx_group_entries;
+static bool rx_rearm_pending;
 /* Remember both CPU and DMA addresses of the four allocations, together with the current station
  * and PHY identifiers.
  */
@@ -150,7 +150,7 @@ static uint32_t control;
 /* Remember whether hardware is enabled, whether a TX result is outstanding, and which
  * configuration choices were selected.
  */
-static bool running, tx_pending, custom_mac, loopback;
+static bool running, custom_mac, loopback;
 /* Keep a private copy of an optional station address supplied before attachment. */
 static unsigned char requested_mac[6];
 static bool physical_rp1;
@@ -158,7 +158,7 @@ static unsigned phy_address = GEM_PHY_MDIO_ADDRESS;
 static unsigned phy_led_modes[2];
 static uint32_t network_config;
 static bool phy_link_known;
-static unsigned tx_index, tx_count;
+static unsigned tx_index, tx_count, tx_pending;
 static uint64_t tx_expected, tx_observed;
 static uint32_t tx_started;
 static bool tx_recovering;
@@ -501,24 +501,69 @@ static bool sync_descriptor(union descriptor_page *p, bool cpu)
                : lume_dma_sync_for_device(p, sizeof(*p), LUME_DMA_BIDIRECTIONAL);
 }
 
-/* Recycle the ring only while every entry is CPU-owned, or before RX is enabled.
- * Descriptors share cache lines. Retaining ownership until the whole ring has been consumed
- * prevents a cache clean from overwriting a neighbouring DMA completion.
- */
-static bool receive_rearm(void)
+static unsigned receive_group(uint64_t cache_type, unsigned count)
 {
-    for (unsigned i = 0; i < GEM_RX_RING_ENTRIES; ++i)
+    unsigned writeback = (unsigned)(cache_type >> 24) & 15u;
+    if (!writeback)
+        return count;
+    unsigned line = (unsigned)(cache_type >> 16) & 15u;
+    unsigned bytes = 4u << (writeback > line ? writeback : line);
+    if (bytes >= count * sizeof(rx.descriptors[0]))
+        return count;
+    if (bytes < sizeof(rx.descriptors[0]))
+        return 1;
+    return bytes / sizeof(rx.descriptors[0]);
+}
+
+static unsigned receive_group_size(void)
+{
+    if (!physical_rp1)
+        return rx_count;
+#ifdef __aarch64__
+    uint64_t cache_type;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(cache_type));
+    return receive_group(cache_type, rx_count);
+#else
+    return receive_group((UINT64_C(4) << 24) | (UINT64_C(4) << 16), rx_count);
+#endif
+}
+
+/* Publish only descriptor groups entirely owned by the CPU. DMA updates to other cache lines
+ * can continue while the consumed buffers return to the ring. */
+static bool receive_rearm(unsigned first, unsigned count)
+{
+    if (physical_rp1)
     {
-        if (!lume_dma_sync_for_device(rx_frame[i], sizeof(rx_frame[i]), LUME_DMA_FROM_DEVICE))
+        if (!lume_dma_sync_rect_for_device(rx_frame[first], GEM_FRAME_BUFFER_BYTES,
+                                         sizeof(rx_frame[0]), count, LUME_DMA_FROM_DEVICE))
             return false;
-        uint64_t address = layout.rx_frame_dma + i * GEM_DMA_PAGE_BYTES;
+    }
+    else
+    {
+        for (unsigned i = first; i < first + count; ++i)
+            if (!lume_dma_sync_for_device(rx_frame[i], sizeof(rx_frame[i]), LUME_DMA_FROM_DEVICE))
+                return false;
+    }
+    for (unsigned i = first; i < first + count; ++i)
+    {
+        uint64_t address = layout.rx_frame_dma + i * sizeof(rx_frame[0]);
         rx.descriptors[i] = (struct gem_dma_descriptor){
-            .address_low = (uint32_t)address | (i + 1 == GEM_RX_RING_ENTRIES ? GEM_RX_WRAP : 0),
+            .address_low = (uint32_t)address | (i + 1 == rx_count ? GEM_RX_WRAP : 0),
             .address_high = (uint32_t)(address >> 32),
         };
     }
-    /* Make the completed descriptor visible to the device after its frame buffer is prepared. */
-    return sync_descriptor(&rx, false);
+    return lume_dma_sync_for_device(&rx.descriptors[first], count * sizeof(rx.descriptors[0]),
+                                    LUME_DMA_BIDIRECTIONAL);
+}
+
+static bool rearm_consumed(void)
+{
+    if (!receive_rearm(rx_index - rx_group_entries, rx_group_entries))
+        return false;
+    if (rx_index == rx_count)
+        rx_index = 0;
+    rx_rearm_pending = false;
+    return true;
 }
 
 /* Translate the buffer addresses, initialize descriptor ownership, configure the MAC and finally
@@ -671,27 +716,29 @@ static int start(struct lume_device *d)
     }
     if (physical_rp1 && (phy_write(4, 0x01e1) || phy_write(9, 0x0200) || phy_write(0, 0x1200)))
         return -LUME_EIO;
-    /* RP1 alternates entries so the next descriptor remains CPU-owned during transmission. */
     tx_index = 0;
-    tx_count = physical_rp1 ? 2 : 1;
+    tx_count = physical_rp1 ? GEM_TX_RING_ENTRIES : 1;
     tx_expected = tx_observed = 0;
     tx_recovering = false;
     if (physical_rp1)
         (void)read_mac_reg(GEM_TX_FRAMES);
     for (unsigned i = 0; i < tx_count; ++i)
+    {
+        uint64_t address = layout.tx_frame_dma + i * GEM_DMA_PAGE_BYTES;
         tx.descriptors[i] = (struct gem_dma_descriptor){
-            /* Store the low 32 bits of the private TX buffer DMA address. */
-            .address_low = (uint32_t)layout.tx_frame_dma,
-            /* Keep every entry CPU-owned and wrap only at the end of the ring. */
+            .address_low = (uint32_t)address,
             .control = GEM_TX_USED | (i + 1 == tx_count ? GEM_TX_WRAP : 0),
-            /* Store the upper 32 address bits of the RP1 DMA address. */
-            .address_high = (uint32_t)(layout.tx_frame_dma >> 32),
+            .address_high = (uint32_t)(address >> 32),
         };
+    }
     /* Publish the CPU-owned TX descriptor and initialize the RX descriptor as device-owned. Stop
      * initialization if either cache preparation fails.
      */
     rx_index = 0;
-    if (!sync_descriptor(&tx, false) || !receive_rearm())
+    rx_rearm_pending = false;
+    rx_count = physical_rp1 ? GEM_RP1_RX_RING_ENTRIES : GEM_RX_RING_ENTRIES;
+    rx_group_entries = receive_group_size();
+    if (!sync_descriptor(&tx, false) || !receive_rearm(0, rx_count))
         /* Report a failed hardware or cache preparation step. The DDK invokes stop to roll back
          * failed initialization.
          */
@@ -728,7 +775,7 @@ static int start(struct lume_device *d)
               /* Include the local-loopback bit only when that configuration was requested. */
               (loopback ? GEM_CONTROL_LOCAL_LOOPBACK : 0);
     /* No submitted frame is waiting for a completion result at initial startup. */
-    tx_pending = false;
+    tx_pending = 0;
     /* Allow the public polling functions to access the initialized controller state. */
     running = true;
     /* Enable the data engines only after addresses, descriptors and cache visibility are
@@ -739,7 +786,25 @@ static int start(struct lume_device *d)
     return 0;
 }
 
-static int recover_transmit(void)
+static unsigned observed_tx_frames(void)
+{
+    uint64_t before = tx_expected - tx_pending;
+    if (tx_observed <= before)
+        return 0;
+    uint64_t count = tx_observed - before;
+    return count > tx_pending ? tx_pending : (unsigned)count;
+}
+
+static void release_tx_descriptors(unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned slot = (tx_index + i) % tx_count;
+        tx.descriptors[slot].control = GEM_TX_USED | (slot + 1 == tx_count ? GEM_TX_WRAP : 0);
+    }
+}
+
+static int recover_transmit(unsigned *completed)
 {
     tx_recovering = true;
     write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_HALT);
@@ -747,111 +812,104 @@ static int recover_transmit(void)
     while (read_mac_reg(GEM_TX_STATUS) & GEM_TX_STATUS_ACTIVE)
         if (++polls == GEM_POLL_LIMIT)
             return -LUME_EAGAIN;
+
     /* DMA must stop before descriptors or the queue address change. RX remains enabled. */
     write_mac_reg(GEM_NETWORK_CONTROL, control & ~GEM_CONTROL_TX_ENABLE);
-    for (unsigned i = 0; i < tx_count; ++i)
-        tx.descriptors[i].control = GEM_TX_USED | (i + 1 == tx_count ? GEM_TX_WRAP : 0);
+    release_tx_descriptors(tx_count);
     if (!sync_descriptor(&tx, false))
         return -LUME_EAGAIN;
+    tx_observed += read_mac_reg(GEM_TX_FRAMES);
+    *completed = observed_tx_frames();
     tx_index = 0;
     tx_expected = tx_observed = 0;
-    (void)read_mac_reg(GEM_TX_FRAMES);
     write_mac_reg(GEM_TX_QUEUE_BASE_HIGH, (uint32_t)(layout.tx_descriptor_dma >> 32));
     write_mac_reg(GEM_TX_QUEUE_BASE, (uint32_t)layout.tx_descriptor_dma);
     write_mac_reg(GEM_TX_STATUS, UINT32_MAX);
-    tx_pending = tx_recovering = false;
+    tx_pending = 0;
+    tx_recovering = false;
     write_mac_reg(GEM_NETWORK_CONTROL, control);
     return -LUME_EIO;
 }
 
-/* Poll the single TX slot. EAGAIN retains DMA ownership. EIO reports a failed frame. */
-int lume_example_gem_tx_complete(void)
+static bool tx_descriptors_returned(void)
 {
-    /* Require an active controller and fetch the descriptor state written by DMA before testing
-     * its ownership flag.
-     */
-    if (!running || !sync_descriptor(&tx, true))
+    for (unsigned i = 0; i < tx_pending; ++i)
+        if (!(tx.descriptors[(tx_index + i) % tx_count].control & GEM_TX_USED))
+            return false;
+    return true;
+}
+
+int lume_example_gem_tx_result(unsigned *completed)
+{
+    *completed = 0;
+    if (!running)
     {
         tx_failure = GEM_TX_FAILURE_DMA;
-        /* Report that the device is unavailable or its descriptor cannot be synchronized. */
         return -LUME_EIO;
     }
+    if (!tx_pending)
+        return 0;
+    if (!sync_descriptor(&tx, true))
+        return -LUME_EAGAIN;
+
+    uint32_t status = read_mac_reg(GEM_TX_STATUS);
+    bool returned = tx_descriptors_returned();
     if (physical_rp1)
-        tx_observed += read_mac_reg(GEM_TX_FRAMES);
-    if (physical_rp1 && tx_pending)
     {
-        uint32_t status = read_mac_reg(GEM_TX_STATUS);
-        bool owned = (tx.descriptors[tx_index].control & GEM_TX_USED) != 0;
+        tx_observed += read_mac_reg(GEM_TX_FRAMES);
+        bool active = (status & GEM_TX_STATUS_ACTIVE) != 0;
+        uint32_t now = lume_clock_millis();
         if (tx_recovering || (status & GEM_TX_STATUS_ERRORS) ||
-            (!owned && (uint32_t)(lume_clock_millis() - tx_started) >= 1000))
+            ((active || (!returned && tx_observed != tx_expected)) &&
+             (uint32_t)(now - tx_started) >= 1000))
         {
             if (!tx_recovering)
                 tx_failure =
                     status & GEM_TX_STATUS_ERRORS ? GEM_TX_FAILURE_DMA : GEM_TX_FAILURE_TIMEOUT;
-            return recover_transmit();
+            return recover_transmit(completed);
         }
-    }
-    /* A clear USED bit means DMA still owns the descriptor. The CPU must not overwrite its frame
-     * buffer yet.
-     */
-    if (!(tx.descriptors[tx_index].control & GEM_TX_USED))
-    {
-        uint32_t status = physical_rp1 ? read_mac_reg(GEM_TX_STATUS) : 0;
-        if (physical_rp1 && tx_pending && !(status & (GEM_TX_STATUS_ACTIVE | GEM_TX_STATUS_ERRORS)))
-        {
-            /* One frame is outstanding. The counter proves egress before CPU reuse. */
-            if (tx_observed == tx_expected)
-            {
-                tx.descriptors[tx_index].control |= GEM_TX_USED;
-                if (!sync_descriptor(&tx, false))
-                    return -LUME_EIO;
-            }
-            else
-            {
-                /* RP1 can miss a start request. Retry an idle, uncompleted frame at 10 ms intervals. */
-                uint32_t now = lume_clock_millis();
-                if ((status & GEM_TX_STATUS_USED_BIT_READ) || (uint32_t)(now - tx_last_kick) >= 10)
-                {
-                    write_mac_reg(GEM_TX_STATUS, GEM_TX_STATUS_USED_BIT_READ);
-                    write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
-                    tx_last_kick = now;
-                    ++tx_restarts;
-                }
-                return -LUME_EAGAIN;
-            }
-        }
-        else
-            /* Tell the caller to try again later without blocking the kernel. */
+        if (active)
             return -LUME_EAGAIN;
+        if (!returned && tx_observed != tx_expected)
+        {
+            /* Retry an idle ring when the controller has not sent the remaining frames. */
+            if ((status & GEM_TX_STATUS_USED_BIT_READ) || (uint32_t)(now - tx_last_kick) >= 10)
+            {
+                write_mac_reg(GEM_TX_STATUS, GEM_TX_STATUS_USED_BIT_READ);
+                write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
+                tx_last_kick = now;
+                ++tx_restarts;
+            }
+            return -LUME_EAGAIN;
+        }
+        if (!returned)
+        {
+            /* RP1 can finish a batch without writing every ownership bit back. */
+            release_tx_descriptors(tx_pending);
+            if (!sync_descriptor(&tx, false))
+                return -LUME_EAGAIN;
+        }
     }
-    /* A CPU-owned descriptor can also be the empty descriptor prepared at startup, with no
-     * result to collect.
-     */
-    if (!tx_pending)
-        /* The TX slot is free and there is no outstanding result. */
-        return 0;
-    /* Read controller completion and error flags for the submitted frame. */
-    uint32_t status = read_mac_reg(GEM_TX_STATUS);
-    if (physical_rp1 && (status & GEM_TX_STATUS_ERRORS))
-        --tx_expected;
-    /* Mark this completion as collected so a later poll does not report the same operation
-     * again.
-     */
-    tx_pending = false;
-    tx_index = (tx_index + 1) % tx_count;
-    /* Acknowledge the status bits that were observed. Writable flags use write-one-to-clear
-     * behavior.
-     */
+    else if (!returned)
+        return -LUME_EAGAIN;
+
+    unsigned sent = tx_pending;
+    tx_index = (tx_index + tx_pending) % tx_count;
+    tx_pending = 0;
     write_mac_reg(GEM_TX_STATUS, status);
-    /* Return an error when any selected TX error bit is set. Normal completion and reaching a
-     * CPU-owned ring end are accepted.
-     */
     if (status & GEM_TX_STATUS_ERRORS)
     {
         tx_failure = GEM_TX_FAILURE_DMA;
         return -LUME_EIO;
     }
+    *completed = sent;
     return 0;
+}
+
+int lume_example_gem_tx_complete(void)
+{
+    unsigned completed;
+    return lume_example_gem_tx_result(&completed);
 }
 
 unsigned lume_example_gem_tx_failure(void)
@@ -864,71 +922,75 @@ uint32_t lume_example_gem_tx_restarts(void)
     return tx_restarts;
 }
 
-/* Submit an entire Ethernet frame. data points to caller bytes and bytes is their count. Copying
- * into private RAM lets the caller reuse its buffer after this function returns.
- */
-int lume_example_gem_transmit(const void *data, size_t bytes)
+unsigned lume_example_gem_tx_capacity(void)
 {
-    /* Do not submit work before attachment or after shutdown. */
+    return physical_rp1 ? GEM_TX_BATCH_MAX : 1;
+}
+
+static bool valid_tx_frame(const struct lume_example_gem_frame *frame)
+{
+    return frame->data && frame->bytes >= GEM_FRAME_HEADER_BYTES &&
+           frame->bytes <= GEM_FRAME_MAX_BYTES;
+}
+
+int lume_example_gem_transmit_batch(const struct lume_example_gem_frame *frames, unsigned count)
+{
     if (!running)
-        /* Report unavailable hardware or failed DMA cache preparation. */
         return -LUME_EIO;
-    /* Require a source pointer and a complete supported Ethernet frame between 14 and 1514
-     * bytes, without FCS.
-     */
-    if (!data || bytes < GEM_FRAME_HEADER_BYTES || bytes > GEM_FRAME_MAX_BYTES)
-        /* Reject the frame before reading any caller bytes. */
+    if (!frames || !count || count > lume_example_gem_tx_capacity())
         return -LUME_EINVAL;
-    /* Collect the previous completion or find out that the sole TX descriptor is still busy. */
-    int result = lume_example_gem_tx_complete();
-    /* Preserve busy/error results rather than overwriting a descriptor that is not available. */
-    if (result)
-        /* Pass the previous completion error or EAGAIN to the caller. */
-        return result;
-    /* View the untyped source pointer as individual read-only bytes. Indexing this pointer
-     * advances one byte at a time.
-     */
-    const unsigned char *source = data;
-    /* Increase a short frame to 60 bytes while leaving longer supported frames unchanged. */
-    size_t padded = bytes < GEM_FRAME_MIN_BYTES ? GEM_FRAME_MIN_BYTES : bytes;
-    /* Fill every byte that the controller will transmit, including padding. */
-    for (size_t i = 0; i < padded; ++i)
-        /* Copy caller bytes first and write zero for padding. DMA never receives a pointer into
-         * temporary caller storage.
-         */
-        tx_frame[i] = i < bytes ? source[i] : 0;
-    /* Clean CPU cache data to RAM before DMA reads the TX frame. Synchronizing the isolated
-     * allocation cannot affect an RX-owned cache line.
-     */
-    if (!lume_dma_sync_for_device(tx_frame, sizeof(tx_frame), LUME_DMA_TO_DEVICE))
-        /* Report unavailable hardware or failed DMA cache preparation. */
-        return -LUME_EIO;
-    /* Describe a complete frame of the padded length and clear USED to hand this descriptor to
-     * DMA. The buffer address words remain unchanged.
-     */
-    tx.descriptors[tx_index].control =
-        GEM_TX_LAST | (uint32_t)padded | (tx_index + 1 == tx_count ? GEM_TX_WRAP : 0);
-    /* Publish the descriptor only after the frame bytes have been made visible to DMA. */
+    for (unsigned i = 0; i < count; ++i)
+        if (!valid_tx_frame(frames + i))
+            return -LUME_EINVAL;
+    if (tx_pending)
+        return -LUME_EAGAIN;
+
+    unsigned lengths[GEM_TX_BATCH_MAX];
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned slot = (tx_index + i) % tx_count;
+        const unsigned char *source = frames[i].data;
+        size_t bytes = frames[i].bytes;
+        size_t padded = bytes < GEM_FRAME_MIN_BYTES ? GEM_FRAME_MIN_BYTES : bytes;
+        for (size_t j = 0; j < padded; ++j)
+            tx_frame[slot][j] = j < bytes ? source[j] : 0;
+        if (!lume_dma_sync_for_device(tx_frame[slot], sizeof(tx_frame[slot]), LUME_DMA_TO_DEVICE))
+            return -LUME_EIO;
+        lengths[i] = (unsigned)padded;
+    }
+    /* The idle ring is published as a unit. The next entry remains CPU-owned on RP1. */
+    for (unsigned i = 0; i < count; ++i)
+    {
+        unsigned slot = (tx_index + i) % tx_count;
+        tx.descriptors[slot].control =
+            GEM_TX_LAST | lengths[i] | (slot + 1 == tx_count ? GEM_TX_WRAP : 0);
+    }
     if (!sync_descriptor(&tx, false))
-        /* Report unavailable hardware or failed DMA cache preparation. */
+    {
+        release_tx_descriptors(count);
         return -LUME_EIO;
-    /* Remember that a completion must be collected before the next reuse of this TX slot. */
-    tx_pending = true;
+    }
+    tx_pending = count;
     tx_failure = 0;
     if (physical_rp1)
     {
         tx_started = lume_clock_millis();
         tx_last_kick = tx_started;
-        ++tx_expected;
+        tx_expected += count;
     }
-    /* Add the one-shot transmit-start request to the persistent enable bits and notify the
-     * controller to start processing the TX queue.
-     */
     write_mac_reg(GEM_NETWORK_CONTROL, control | GEM_CONTROL_TX_START);
-    /* The frame has been accepted and copied. Completion is checked separately because real
-     * device work can finish later.
-     */
     return 0;
+}
+
+int lume_example_gem_transmit(const void *data, size_t bytes)
+{
+    if (!running)
+        return -LUME_EIO;
+    const struct lume_example_gem_frame frame = {data, bytes};
+    if (!valid_tx_frame(&frame))
+        return -LUME_EINVAL;
+    int result = lume_example_gem_tx_complete();
+    return result ? result : lume_example_gem_transmit_batch(&frame, 1);
 }
 
 /* Consume one received frame. data is a writable caller buffer and capacity is the maximum
@@ -944,15 +1006,11 @@ int lume_example_gem_receive(void *data, size_t capacity)
     if (!data || capacity < GEM_FRAME_HEADER_BYTES)
         /* Reject the caller buffer without consuming a received frame. */
         return -LUME_EINVAL;
-    if (rx_index == GEM_RX_RING_ENTRIES)
-    {
-        if (!receive_rearm())
-            return -LUME_EIO;
-        rx_index = 0;
-    }
-    /* Fetch the descriptor contents written by DMA before inspecting its RX ownership bit. */
-    if (!sync_descriptor(&rx, true))
-        /* Report inactive hardware or a failed descriptor/cache synchronization step. */
+    if (rx_rearm_pending && !rearm_consumed())
+        return -LUME_EIO;
+    unsigned first = rx_index - rx_index % rx_group_entries;
+    if (!lume_dma_sync_for_cpu(&rx.descriptors[first], rx_group_entries * sizeof(rx.descriptors[0]),
+                              LUME_DMA_BIDIRECTIONAL))
         return -LUME_EIO;
     /* A clear OWNED bit means the receive engine still owns this slot. No completed frame is
      * available for the CPU.
@@ -991,8 +1049,7 @@ int lume_example_gem_receive(void *data, size_t capacity)
     /* Invalidate stale cached RX bytes so the CPU sees the frame that the controller wrote into
      * RAM.
      */
-    else if (!lume_dma_sync_for_cpu(rx_frame[rx_index], sizeof(rx_frame[rx_index]),
-                                    LUME_DMA_FROM_DEVICE))
+    else if (!lume_dma_sync_for_cpu(rx_frame[rx_index], bytes, LUME_DMA_FROM_DEVICE))
         /* Record a receive-format or cache-access error. The completed slot will still be
          * consumed and rearmed.
          */
@@ -1010,12 +1067,11 @@ int lume_example_gem_receive(void *data, size_t capacity)
         /* Record the complete received frame length as a positive result. */
         result = (int)bytes;
     }
-    /* Retain consumed entries until the ring is entirely CPU-owned. */
-    if (++rx_index == GEM_RX_RING_ENTRIES)
+    if (++rx_index % rx_group_entries == 0)
     {
-        if (!receive_rearm())
+        rx_rearm_pending = true;
+        if (!rearm_consumed())
             return -LUME_EIO;
-        rx_index = 0;
     }
     /* Clear writable receive-status flags after consuming this completion. */
     write_mac_reg(GEM_RX_STATUS, UINT32_MAX);
@@ -1088,7 +1144,7 @@ static int stop(struct lume_device *d)
             /* Leave every data/management enable bit clear. */
             write_mac_reg(GEM_NETWORK_CONTROL, 0);
             /* Discard the software record of any prior transmission after stopping the engine. */
-            tx_pending = false;
+            tx_pending = 0;
             /* Report that the controller needs no further stopping or that it has become
              * inactive.
              */
