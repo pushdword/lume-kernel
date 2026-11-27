@@ -406,7 +406,12 @@ static unsigned free_nodes;
 static unsigned namespace_generation;
 static uint64_t fifo_sequence;
 static void (*mapping_changed)(uint64_t, uint64_t, uint64_t);
-static struct lume_block *block_devices[LUME_DEVICE_LIMIT];
+
+static struct block_registration
+{
+    struct lume_block *block;
+    lume_devfs_block_release release;
+} block_devices[LUME_DEVICE_LIMIT];
 static struct lume_devfs_group resource_group;
 static struct lume_devfs_group *attribute_groups[LUME_DEVICE_LIMIT] = {&resource_group};
 
@@ -642,10 +647,30 @@ static void release_node_memory(struct node *n)
     n->path = NULL;
 }
 
+static struct block_registration *find_block(struct lume_block *block)
+{
+    if (block)
+        for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+            if (block_devices[i].block == block)
+                return &block_devices[i];
+    return NULL;
+}
+
+static void complete_block_removal(struct block_registration *registration)
+{
+    struct block_registration removed = *registration;
+    *registration = (struct block_registration){0};
+    removed.release(removed.block);
+}
+
 static void release_ram(struct node *n)
 {
     if (n->linked || n->references)
         return;
+    struct block_registration *registration = find_block(n->block);
+    bool removed = registration && registration->release;
+    if (removed)
+        n->block = NULL;
     release_node_memory(n);
     if (!n->block && !n->free_queued)
     {
@@ -653,6 +678,8 @@ static void release_ram(struct node *n)
         free_nodes = (unsigned)(n - nodes) + 1;
         n->free_queued = true;
     }
+    if (removed)
+        complete_block_removal(registration);
 }
 
 static size_t length(const char *s)
@@ -1061,25 +1088,18 @@ static int add_block(struct lume_block *b)
     block_path(b, p);
     if (find(p) >= 0)
         return -LUME_EEXIST;
-    unsigned slot;
-    for (slot = 8; slot < count; ++slot)
-        if (!nodes[slot].linked && !nodes[slot].references && nodes[slot].block)
-            break;
-    if (slot == count)
-    {
-        if (count == node_capacity)
-            return -LUME_ENOSPC;
-        if (!add(p, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes), !b->read_only))
-            return -LUME_ENOMEM;
-    }
+    unsigned slot = available_node();
+    if (slot == node_capacity)
+        return -LUME_ENOSPC;
+    char *owned = lume_path_duplicate(p);
+    if (!owned)
+        return -LUME_ENOMEM;
+    if (free_nodes)
+        free_nodes = nodes[slot].path_next;
     else
-    {
-        char *owned = lume_path_duplicate(p);
-        if (!owned)
-            return -LUME_ENOMEM;
-        set_node(slot, owned, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes),
-                 !b->read_only);
-    }
+        ++count;
+    set_node(slot, owned, LUME_NODE_BLOCK, 0, (size_t)(b->sectors * b->sector_bytes),
+             !b->read_only);
     nodes[slot].block = b;
     return 0;
 }
@@ -1089,7 +1109,7 @@ static size_t initial_device_nodes(void)
     size_t total = 11;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
     {
-        total += block_devices[i] != NULL;
+        total += block_devices[i].block && !block_devices[i].release;
         if (attribute_groups[i])
             total += attribute_groups[i]->count + 1;
         struct lume_devfs_character *device = character_devices[i].device;
@@ -1136,9 +1156,13 @@ int lume_devfs_register_block(struct lume_block *b)
     unsigned slot = LUME_DEVICE_LIMIT;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
     {
-        if (block_devices[i] && equal(block_devices[i]->device->name, name))
+        const struct block_registration *registration = &block_devices[i];
+        if (registration->block == b && registration->release)
+            return -LUME_EBUSY;
+        if (registration->block && !registration->release &&
+            equal(registration->block->device->name, name))
             return -LUME_EEXIST;
-        if (!block_devices[i] && slot == LUME_DEVICE_LIMIT)
+        if (!registration->block && slot == LUME_DEVICE_LIMIT)
             slot = i;
     }
     if (slot == LUME_DEVICE_LIMIT || (!count && initial_device_nodes() + 1 > node_capacity))
@@ -1146,29 +1170,53 @@ int lume_devfs_register_block(struct lume_block *b)
     int error = count ? add_block(b) : 0;
     if (error)
         return error;
-    block_devices[slot] = b;
+    block_devices[slot].block = b;
     return 0;
 }
 
 int lume_devfs_unregister_block(struct lume_block *b)
 {
-    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
-        if (b && block_devices[i] == b)
+    struct block_registration *registration = find_block(b);
+    if (!registration)
+        return b ? 0 : -LUME_EINVAL;
+    if (registration->release)
+        return -LUME_EBUSY;
+    for (unsigned j = 0; j < count; ++j)
+        if (nodes[j].linked && nodes[j].block == b && nodes[j].references)
+            return -LUME_EBUSY;
+    for (unsigned j = 0; j < count; ++j)
+        if (nodes[j].linked && nodes[j].block == b)
         {
-            for (unsigned j = 0; j < count; ++j)
-                if (nodes[j].linked && nodes[j].block == b && nodes[j].references)
-                    return -LUME_EBUSY;
-            for (unsigned j = 0; j < count; ++j)
-                if (nodes[j].linked && nodes[j].block == b)
-                {
-                    index_remove(j);
-                    nodes[j].linked = false;
-                    release_ram(&nodes[j]);
-                }
-            block_devices[i] = 0;
+            index_remove(j);
+            nodes[j].linked = false;
+            nodes[j].block = NULL;
+            release_ram(&nodes[j]);
+        }
+    *registration = (struct block_registration){0};
+    return 0;
+}
+
+int lume_devfs_remove_block(struct lume_block *block, lume_devfs_block_release release)
+{
+    if (!block || !release)
+        return -LUME_EINVAL;
+    struct block_registration *registration = find_block(block);
+    if (!registration)
+        return -LUME_ENOENT;
+    if (registration->release)
+        return -LUME_EBUSY;
+    block->device->state = LUME_DEVICE_FAILED;
+    registration->release = release;
+    for (unsigned i = 0; i < count; ++i)
+        if (nodes[i].linked && nodes[i].block == block)
+        {
+            index_remove(i);
+            nodes[i].linked = false;
+            release_ram(&nodes[i]);
             return 0;
         }
-    return b ? 0 : -LUME_EINVAL;
+    complete_block_removal(registration);
+    return 0;
 }
 
 static bool attribute_name(const char *name)
@@ -1243,7 +1291,8 @@ int lume_devfs_register_character(struct lume_devfs_character *device)
     bool existing_directory = false;
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
     {
-        if ((block_devices[i] && equal(block_devices[i]->device->name, device->directory)) ||
+        if ((block_devices[i].block && !block_devices[i].release &&
+             equal(block_devices[i].block->device->name, device->directory)) ||
             (attribute_groups[i] && equal(attribute_groups[i]->name, device->directory)))
             return -LUME_EEXIST;
         struct lume_devfs_character *other = character_devices[i].device;
@@ -1360,7 +1409,8 @@ int lume_devfs_register_group(struct lume_devfs_group *group)
         if (character_devices[i].device &&
             equal(character_devices[i].device->directory, group->name))
             return -LUME_EEXIST;
-        if (block_devices[i] && equal(block_devices[i]->device->name, group->name))
+        if (block_devices[i].block && !block_devices[i].release &&
+            equal(block_devices[i].block->device->name, group->name))
             return -LUME_EEXIST;
         if (attribute_groups[i])
         {
@@ -1500,8 +1550,8 @@ void lume_vfs_init(const void *shell, size_t bytes)
     add_required("/etc/motd", LUME_NODE_FILE, motd, sizeof(motd) - 1, false);
     add_required("/dev/pts", LUME_NODE_DIR, 0, 0, false);
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
-        if (block_devices[i])
-            (void)add_block(block_devices[i]);
+        if (block_devices[i].block && !block_devices[i].release)
+            (void)add_block(block_devices[i].block);
     for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
         if (attribute_groups[i] && add_group(attribute_groups[i]))
             lume_fail("device attribute namespace allocation");
@@ -1509,6 +1559,9 @@ void lume_vfs_init(const void *shell, size_t bytes)
         if (character_devices[i].device && add_character(character_devices[i].device))
             lume_fail("character device namespace allocation");
     resource_limits_start();
+    for (unsigned i = 0; i < LUME_DEVICE_LIMIT; ++i)
+        if (block_devices[i].release)
+            complete_block_removal(&block_devices[i]);
 }
 
 static int new_object(int node, int pipe, uint32_t flags)

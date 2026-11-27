@@ -16,6 +16,7 @@ enum storage_operation
 {
     STORAGE_INQUIRY = 1,
     STORAGE_CAPACITY,
+    STORAGE_SENSE,
     STORAGE_READ,
     STORAGE_WRITE,
     STORAGE_SYNC
@@ -29,13 +30,14 @@ struct lume_linux_usb_storage
     struct lume_device block_device;
     struct lume_block block;
     struct lume_work registration;
-    unsigned char command_bytes[31], inquiry_bytes[36], capacity_bytes[8], status_bytes[13];
+    unsigned char command_bytes[31], inquiry_bytes[36], capacity_bytes[8], sense_bytes[18];
+    unsigned char status_bytes[13];
     unsigned char *transfer;
     uint64_t sectors;
-    unsigned input_endpoint, output_endpoint, operation, transfer_bytes, tag, slot;
+    unsigned input_endpoint, output_endpoint, operation, transfer_bytes, data_bytes, tag, slot;
     volatile uint32_t completed, busy;
     int result;
-    bool input, active, registered, disconnected, failed;
+    bool input, active, registered, disconnected, failed, capacity_retried;
 };
 
 static bool slots[STORAGE_SLOTS];
@@ -84,6 +86,11 @@ static void release_storage(struct lume_linux_usb_storage *storage)
     lume_kernel_free(storage);
 }
 
+static void release_block(struct lume_block *block)
+{
+    release_storage(block->context);
+}
+
 static void fail_probe(struct lume_linux_usb_storage *storage, unsigned error)
 {
     if (storage->failed)
@@ -98,6 +105,24 @@ static void fail_probe(struct lume_linux_usb_storage *storage, unsigned error)
 static int start_transaction(struct lume_linux_usb_storage *storage, unsigned operation,
                              const unsigned char *cdb, unsigned cdb_bytes, void *buffer,
                              unsigned bytes, bool input);
+
+static void read_capacity(struct lume_linux_usb_storage *storage)
+{
+    const unsigned char cdb[10] = {0x25};
+    if (start_transaction(storage, STORAGE_CAPACITY, cdb, sizeof(cdb), storage->capacity_bytes,
+                          sizeof(storage->capacity_bytes), true))
+        fail_probe(storage, 7);
+}
+
+static bool unit_attention(const struct lume_linux_usb_storage *storage)
+{
+    unsigned format = storage->sense_bytes[0] & 0x7fu;
+    if (format == 0x70 || format == 0x71)
+        return storage->data_bytes >= 3 && (storage->sense_bytes[2] & 0x0fu) == 6;
+    if (format == 0x72 || format == 0x73)
+        return storage->data_bytes >= 2 && (storage->sense_bytes[1] & 0x0fu) == 6;
+    return false;
+}
 
 static int raw_read(struct lume_block *, uint64_t, unsigned, void *);
 static int raw_write(struct lume_block *, uint64_t, unsigned, const void *);
@@ -139,7 +164,8 @@ static void finish_transaction(struct lume_linux_usb_storage *storage, int resul
     storage->active = false;
     if (result)
     {
-        if (operation == STORAGE_INQUIRY || operation == STORAGE_CAPACITY)
+        if (operation == STORAGE_INQUIRY || operation == STORAGE_CAPACITY ||
+            operation == STORAGE_SENSE)
             fail_probe(storage, 6);
         else
         {
@@ -156,10 +182,18 @@ static void finish_transaction(struct lume_linux_usb_storage *storage, int resul
             return;
         }
         lume_puts("LUME USB LINUX BULK STORAGE INQUIRY PASS\n");
-        unsigned char cdb[10] = {0x25};
-        if (start_transaction(storage, STORAGE_CAPACITY, cdb, sizeof(cdb),
-                              storage->capacity_bytes, sizeof(storage->capacity_bytes), true))
-            fail_probe(storage, 7);
+        read_capacity(storage);
+        return;
+    }
+    if (operation == STORAGE_SENSE)
+    {
+        if (!unit_attention(storage))
+            fail_probe(storage, 6);
+        else
+        {
+            lume_puts("LUME USB STORAGE CAPACITY RETRY\n");
+            read_capacity(storage);
+        }
         return;
     }
     if (operation == STORAGE_CAPACITY)
@@ -196,24 +230,45 @@ static int submit_urb(struct lume_linux_usb_storage *storage, struct urb *urb)
 static void status_complete(struct urb *urb)
 {
     struct lume_linux_usb_storage *storage = urb->context;
-    int result = urb->status;
-    if (!result &&
-        (urb->actual_length != (int)sizeof(storage->status_bytes) ||
-         get32(storage->status_bytes) != UINT32_C(0x53425355) ||
-         get32(storage->status_bytes + 4) != storage->tag ||
-         get32(storage->status_bytes + 8) || storage->status_bytes[12]))
-        result = -EIO;
-    finish_transaction(storage, result);
+    unsigned residue = get32(storage->status_bytes + 8);
+    if (urb->status || urb->actual_length != (int)sizeof(storage->status_bytes) ||
+        get32(storage->status_bytes) != UINT32_C(0x53425355) ||
+        get32(storage->status_bytes + 4) != storage->tag || residue > storage->transfer_bytes)
+    {
+        finish_transaction(storage, urb->status ? urb->status : -EIO);
+        return;
+    }
+    unsigned status = storage->status_bytes[12];
+    if (status == 1 && storage->operation == STORAGE_CAPACITY && !storage->capacity_retried)
+    {
+        const unsigned char cdb[6] = {0x03, 0, 0, 0, sizeof(storage->sense_bytes), 0};
+        storage->active = false;
+        storage->capacity_retried = true;
+        if (start_transaction(storage, STORAGE_SENSE, cdb, sizeof(cdb), storage->sense_bytes,
+                              sizeof(storage->sense_bytes), true))
+            fail_probe(storage, 6);
+        return;
+    }
+    unsigned transferred = storage->transfer_bytes - residue;
+    if (status || transferred > storage->data_bytes ||
+        (storage->operation != STORAGE_SENSE && (residue || transferred != storage->data_bytes)))
+    {
+        finish_transaction(storage, -EIO);
+        return;
+    }
+    storage->data_bytes = transferred;
+    finish_transaction(storage, 0);
 }
 
 static void data_complete(struct urb *urb)
 {
     struct lume_linux_usb_storage *storage = urb->context;
-    if (urb->status || urb->actual_length != (int)storage->transfer_bytes)
+    if (urb->status)
     {
-        finish_transaction(storage, urb->status ? urb->status : -EIO);
+        finish_transaction(storage, urb->status);
         return;
     }
+    storage->data_bytes = (unsigned)urb->actual_length;
     if (submit_urb(storage, storage->status))
         finish_transaction(storage, -EIO);
 }
@@ -240,6 +295,7 @@ static int start_transaction(struct lume_linux_usb_storage *storage, unsigned op
         return -EINVAL;
     storage->operation = operation;
     storage->transfer_bytes = bytes;
+    storage->data_bytes = 0;
     storage->input = input;
     storage->result = -EIO;
     ++storage->tag;
@@ -383,11 +439,13 @@ void lume_linux_usb_storage_detach(struct lume_linux_usb_storage *storage)
         return;
     storage->disconnected = true;
     storage->active = false;
+    storage->result = -ENODEV;
+    __atomic_store_n(&storage->completed, 1, __ATOMIC_RELEASE);
     usb_kill_anchored_urbs(&storage->anchor);
     (void)lume_work_cancel(&storage->registration);
     if (storage->registered)
     {
-        int result = lume_devfs_unregister_block(&storage->block);
+        int result = lume_devfs_remove_block(&storage->block, release_block);
         if (result)
         {
             storage->failed = true;
@@ -395,7 +453,7 @@ void lume_linux_usb_storage_detach(struct lume_linux_usb_storage *storage)
             lume_value("USB_LINUX_BLOCK_DETACH_ERROR", (unsigned)-result);
             return;
         }
-        storage->registered = false;
+        return;
     }
     release_storage(storage);
 }

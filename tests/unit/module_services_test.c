@@ -6,6 +6,8 @@
 #include <stdio.h>
 
 static unsigned references, callbacks, opens;
+static unsigned block_releases;
+static lume_devfs_block_release deferred_block_release;
 static bool network_busy, repeat;
 static uintptr_t rejected_callback, foreign_callback;
 static unsigned foreign_references;
@@ -205,6 +207,16 @@ int lume_devfs_unregister_block(struct lume_block *b)
     return opens ? -LUME_EBUSY : 0;
 }
 
+int lume_devfs_remove_block(struct lume_block *b, lume_devfs_block_release release)
+{
+    assert(b == &block && references && release && !deferred_block_release);
+    if (opens)
+        deferred_block_release = release;
+    else
+        release(b);
+    return 0;
+}
+
 int lume_devfs_register_group(struct lume_devfs_group *group)
 {
     assert(group == &attribute_group && references);
@@ -263,6 +275,34 @@ static int read_block(struct lume_block *b, uint64_t first, unsigned count, void
     return 0;
 }
 static const struct lume_block_ops block_ops = {.read = read_block};
+
+static void block_released(struct lume_block *b)
+{
+    assert(b == &block && references == 1);
+    ++block_releases;
+}
+
+static void removed_block_service(void)
+{
+    block.ops = &block_ops;
+    assert(!lume_module_register_block(&block) && references == 1);
+    foreign_callback = (uintptr_t)block_released;
+    assert(lume_module_remove_block(&block, block_released) == -LUME_EINVAL);
+    assert(references == 1 && !foreign_references && !deferred_block_release);
+    foreign_callback = 0;
+    opens = 1;
+    assert(!lume_module_remove_block(&block, block_released));
+    assert(deferred_block_release && !block_releases && references == 1);
+    assert(lume_module_unregister_block(&block) == -LUME_EBUSY);
+    assert(lume_module_remove_block(&block, block_released) == -LUME_EBUSY);
+    opens = 0;
+    deferred_block_release(&block);
+    deferred_block_release = NULL;
+    assert(block_releases == 1 && !references);
+    assert(!lume_module_register_block(&block));
+    assert(!lume_module_remove_block(&block, block_released));
+    assert(block_releases == 2 && !references);
+}
 
 static int start(struct lume_device *device)
 {
@@ -382,6 +422,7 @@ int main(void)
     device.state = LUME_DEVICE_FAILED;
     assert(lume_module_device_attach(&device) == -LUME_EINVAL && !references);
     device.state = LUME_DEVICE_OFF;
+    removed_block_service();
     const struct lume_irq_controller controller = {configure, enable, eoi, lume_irq_save,
                                                    lume_irq_restore};
     assert(!lume_irq_controller_start(&controller, 64));

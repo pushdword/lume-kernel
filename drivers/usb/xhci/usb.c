@@ -18,6 +18,7 @@
 #endif
 #if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
 #include <linux/usb.h>
+#include "lume/kernel_memory.h"
 #endif
 #if defined(LUME_LINUX_USB_STORAGE)
 struct lume_linux_usb_storage;
@@ -90,6 +91,7 @@ struct linux_endpoint
     struct lume_xhci_ring ring;
     uint64_t trb;
     struct urb *active;
+    void *cancelled_sg;
 };
 #endif
 
@@ -355,7 +357,7 @@ static struct linux_endpoint *linux_endpoint_for(struct device *device, unsigned
 static int arm_linux_endpoint(struct host *host, struct device *device,
                               struct linux_endpoint *endpoint)
 {
-    if (endpoint->active || device->disconnected)
+    if (endpoint->active || endpoint->cancelled_sg || device->disconnected)
         return 0;
     struct urb *urb = device->linux_device.pending;
     while (urb && linux_endpoint_for(device, urb->pipe) != endpoint)
@@ -364,11 +366,10 @@ static int arm_linux_endpoint(struct host *host, struct device *device,
         return 0;
     bool input = endpoint->address & USB_DIR_IN;
     enum lume_dma_direction direction = input ? LUME_DMA_FROM_DEVICE : LUME_DMA_TO_DEVICE;
-    if (!lume_dma_sync_for_device(urb->transfer_buffer, (size_t)urb->transfer_buffer_length,
-                                  direction))
-        return -LUME_EIO;
-    void *buffer = urb->transfer_buffer;
+    void *buffer = lume_linux_usb_transfer_buffer(urb);
     unsigned bytes = (unsigned)urb->transfer_buffer_length;
+    if (!lume_dma_sync_for_device(buffer, bytes, direction))
+        return -LUME_EIO;
     uint32_t control = (1u << 10) | 32u | (input ? 4u : 0);
     if (endpoint->type == USB_ENDPOINT_XFER_ISOC)
     {
@@ -388,7 +389,8 @@ static int linux_submit(void *context, struct urb *urb)
     struct control_context *wire = context;
     struct host *host = wire->host;
     struct device *device = wire->device;
-    if (!urb || urb->dev != &device->linux_device || urb->transfer_buffer_length > 65536)
+    if (!urb || urb->dev != &device->linux_device ||
+        (unsigned)urb->transfer_buffer_length > LUME_USB_LINEAR_TRANSFER_MAX)
         return -LUME_EINVAL;
     struct linux_endpoint *endpoint = linux_endpoint_for(device, urb->pipe);
     if (!endpoint)
@@ -401,6 +403,56 @@ static int linux_submit(void *context, struct urb *urb)
          endpoint->type != USB_ENDPOINT_XFER_ISOC))
         return -LUME_EINVAL;
     return arm_linux_endpoint(host, device, endpoint);
+}
+
+static void linux_unlink(void *context, struct urb *urb)
+{
+    struct control_context *wire = context;
+    struct linux_endpoint *endpoint = linux_endpoint_for(wire->device, urb->pipe);
+    if (!urb->sg_allocation || !endpoint || endpoint->active != urb)
+        return;
+    endpoint->active = NULL;
+    if (urb->dev->online)
+    {
+        /* Retain the DMA buffer until the controller retires the transfer. */
+        endpoint->cancelled_sg = urb->sg_allocation;
+        urb->sg_allocation = NULL;
+        urb->sg_buffer = NULL;
+    }
+}
+
+static void release_cancelled_sg(struct linux_endpoint *endpoint)
+{
+    lume_kernel_free(endpoint->cancelled_sg);
+    endpoint->cancelled_sg = NULL;
+}
+
+static void complete_linux_endpoint(struct host *host, struct linux_endpoint *endpoint,
+                                    struct urb *urb, unsigned code, unsigned remaining)
+{
+    endpoint->active = NULL;
+    bool input = endpoint->address & USB_DIR_IN;
+    bool isochronous_underrun = endpoint->type == USB_ENDPOINT_XFER_ISOC && !input && code == 14;
+    unsigned bytes = 0;
+    int status = 0;
+    void *buffer = lume_linux_usb_transfer_buffer(urb);
+    if ((code == 1 || code == 13 || isochronous_underrun) && remaining <= endpoint->active_bytes)
+    {
+        bytes = endpoint->active_bytes - remaining;
+        if (input && !lume_dma_sync_for_cpu(buffer, (size_t)urb->transfer_buffer_length,
+                                            LUME_DMA_FROM_DEVICE))
+            status = -LUME_EIO;
+    }
+    else
+        status = -LUME_EIO;
+    if (status)
+    {
+        ++host->errors;
+        lume_value("USB_LINUX_ENDPOINT_ERROR", endpoint->id);
+        lume_value("USB_LINUX_COMPLETION_ERROR", code);
+        lume_value("USB_LINUX_REMAINING_BYTES", remaining);
+    }
+    lume_linux_usb_complete_urb(urb, input ? buffer : NULL, bytes, status);
 }
 #endif
 
@@ -458,38 +510,14 @@ static bool events(struct host *h)
                 {
                     struct linux_endpoint *endpoint = &d->linux_endpoints[n];
                     struct urb *urb = endpoint->active;
-                    if (!urb || ep != endpoint->id || e.parameter != endpoint->trb)
+                    if ((!urb && !endpoint->cancelled_sg) || ep != endpoint->id ||
+                        e.parameter != endpoint->trb)
                         continue;
                     handled = true;
-                    endpoint->active = NULL;
-                    unsigned remaining = e.status & 0xffffffu;
-                    int status = 0;
-                    unsigned bytes = 0;
-                    bool isochronous_underrun =
-                        endpoint->type == USB_ENDPOINT_XFER_ISOC &&
-                        !(endpoint->address & USB_DIR_IN) && cc == 14;
-                    if ((cc == 1 || cc == 13 || isochronous_underrun) &&
-                        remaining <= endpoint->active_bytes)
-                    {
-                        bytes = endpoint->active_bytes - remaining;
-                        if ((endpoint->address & USB_DIR_IN) &&
-                            !lume_dma_sync_for_cpu(urb->transfer_buffer,
-                                                   (size_t)urb->transfer_buffer_length,
-                                                   LUME_DMA_FROM_DEVICE))
-                            status = -LUME_EIO;
-                    }
+                    if (urb)
+                        complete_linux_endpoint(h, endpoint, urb, cc, e.status & 0xffffffu);
                     else
-                        status = -LUME_EIO;
-                    if (status)
-                    {
-                        ++h->errors;
-                        lume_value("USB_LINUX_ENDPOINT_ERROR", endpoint->id);
-                        lume_value("USB_LINUX_COMPLETION_ERROR", cc);
-                        lume_value("USB_LINUX_REMAINING_BYTES", remaining);
-                    }
-                    lume_linux_usb_complete_urb(
-                        urb, endpoint->address & USB_DIR_IN ? urb->transfer_buffer : NULL, bytes,
-                        status);
+                        release_cancelled_sg(endpoint);
                     int armed = arm_linux_endpoint(h, d, endpoint);
                     if (armed)
                     {
@@ -899,12 +927,13 @@ static bool configure_linux_endpoints(struct host *host, struct device *device,
         return false;
     device->linux_control = (struct control_context){host, device};
     device->linux_device = (struct usb_device){.vendor = device->vendor,
-                                                .product = device->product,
-                                                .address = (u8)device->slot,
-                                                .online = true,
-                                                .transport_context = &device->linux_control,
-                                                .control = linux_control,
-                                                .submit = linux_submit};
+                                               .product = device->product,
+                                               .address = (u8)device->slot,
+                                               .online = true,
+                                               .transport_context = &device->linux_control,
+                                               .control = linux_control,
+                                               .submit = linux_submit,
+                                               .unlink = linux_unlink};
     return true;
 }
 #endif
@@ -1225,7 +1254,10 @@ static bool remove_root(struct host *h, unsigned root)
 #endif
 #if defined(LUME_LINUX_USB_STORAGE) || defined(LUME_LINUX_USB_AUDIO)
             for (unsigned n = 0; n < d->linux_endpoint_count; ++n)
+            {
+                release_cancelled_sg(&d->linux_endpoints[n]);
                 release_page(h, d->linux_endpoints[n].ring.trbs);
+            }
 #endif
             for (unsigned n = 0; n < LUME_USB_INPUTS; ++n)
             {
@@ -1667,6 +1699,8 @@ bool lume_usb_stop_host(unsigned index)
     {
         struct device *device = &h->devices[slot];
         device->linux_device.online = false;
+        for (unsigned n = 0; n < device->linux_endpoint_count; ++n)
+            release_cancelled_sg(&device->linux_endpoints[n]);
 #if defined(LUME_LINUX_USB_STORAGE)
         lume_linux_usb_storage_detach(device->storage);
         device->storage = NULL;

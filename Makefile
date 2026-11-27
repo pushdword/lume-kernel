@@ -1107,8 +1107,8 @@ $(OUT)/tests/devfs-group$(HOSTEXE): tests/unit/devfs_group_test.c src/fs/vfs/vfs
 check-devfs-group: $(OUT)/tests/devfs-group$(HOSTEXE)
 	env "$<"
 
-$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c
-$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/fatfs
+$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE) $(OUT)/tests/devfs$(HOSTEXE): src/fs/path.c tests/fixtures/vfs_memory_host.c tests/fixtures/vfs_unrestricted_services.c vendor/fatfs/ffunicode.c
+$(OUT)/tests/rp1-cpufan$(HOSTEXE) $(OUT)/tests/devfs-group$(HOSTEXE) $(OUT)/tests/devfs$(HOSTEXE): TEST_CPPFLAGS += -Ivendor/fatfs
 
 .PHONY: check-virtio-pci
 check-virtio-pci: $(OUT)/tests/virtio-pci$(HOSTEXE)

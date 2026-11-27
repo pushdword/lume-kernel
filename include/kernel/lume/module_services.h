@@ -10,6 +10,7 @@ int lume_module_device_attach(struct lume_device *);
 int lume_module_device_detach(struct lume_device *);
 int lume_module_register_block(struct lume_block *);
 int lume_module_unregister_block(struct lume_block *);
+int lume_module_remove_block(struct lume_block *, lume_devfs_block_release);
 int lume_module_irq_register(unsigned, unsigned, lume_irq_handler, void *);
 int lume_module_irq_register_async(unsigned, unsigned, lume_irq_handler, void *);
 int lume_module_irq_unregister(unsigned, void *);

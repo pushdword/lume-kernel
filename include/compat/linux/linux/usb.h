@@ -25,6 +25,7 @@
 #define PIPE_CONTROL 2u
 #define PIPE_BULK 3u
 #define URB_ISO_ASAP 0x0002u
+#define LUME_USB_LINEAR_TRANSFER_MAX 65536u
 #define USB_INTERFACE_INFO(cl, sub, proto)                                                         \
     .match_flags = USB_DEVICE_ID_MATCH_INT_CLASS | USB_DEVICE_ID_MATCH_INT_SUBCLASS |              \
                    USB_DEVICE_ID_MATCH_INT_PROTOCOL,                                               \
@@ -63,6 +64,7 @@ struct usb_host_interface
 
 struct urb;
 struct usb_anchor;
+struct scatterlist;
 
 struct usb_device
 {
@@ -111,6 +113,9 @@ struct urb
     struct usb_anchor *anchor;
     struct urb *anchor_next, *anchor_previous;
     bool cancelling, submitted;
+    struct scatterlist *sg;
+    int num_sgs;
+    void *sg_allocation, *sg_buffer;
     struct usb_iso_packet_descriptor iso_frame_desc[];
 };
 
@@ -191,6 +196,11 @@ static inline bool usb_pipein(unsigned pipe)
 static inline bool usb_pipeout(unsigned pipe)
 {
     return !usb_pipein(pipe);
+}
+
+static inline void *lume_linux_usb_transfer_buffer(const struct urb *urb)
+{
+    return urb->sg_buffer ? urb->sg_buffer : urb->transfer_buffer;
 }
 
 const struct usb_device_id *usb_match_id(struct usb_interface *, const struct usb_device_id *);

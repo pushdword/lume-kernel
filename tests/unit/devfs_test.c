@@ -8,6 +8,7 @@ extern struct lume_block lume_example_ram_block;
 int lume_example_ram_block_start(void);
 int lume_example_ram_block_stop(void);
 static unsigned checks, read_calls, write_calls, fail_read, fail_write, sync_calls;
+static unsigned removals;
 
 void lume_smp_wake(void)
 {
@@ -63,6 +64,12 @@ static int test_sync(struct lume_block *b)
     (void)b;
     ++sync_calls;
     return -LUME_EIO;
+}
+
+static void removed_block(struct lume_block *block)
+{
+    T(block->device->state == LUME_DEVICE_FAILED);
+    ++removals;
 }
 
 int main(void)
@@ -163,6 +170,40 @@ int main(void)
     T(lume_vfs_stat_path(&f, "/dev/testblk", &st) == 0060444);
     T(lume_vfs_open(&f, "/dev/testblk", LUME_O_WRONLY) == -LUME_EROFS);
     T(!lume_devfs_unregister_block(&b));
+    b.read_only = false;
+    T(!lume_devfs_register_block(&b));
+    int old = (int)lume_vfs_open(&f, "/dev/testblk", LUME_O_RDWR);
+    int other = (int)lume_vfs_open(&f, "/dev/testblk", LUME_O_RDONLY);
+    T(old >= 3 && other >= 3 && other != old);
+    T(lume_vfs_dup2(&f, old, 12) == 12);
+    T(!lume_devfs_remove_block(&b, removed_block) && !removals);
+    T(lume_vfs_stat_path(&f, "/dev/testblk", &st) == -LUME_ENOENT);
+    T(lume_vfs_open(&f, "/dev/testblk", LUME_O_RDONLY) == -LUME_ENOENT);
+    T(lume_devfs_unregister_block(&b) == -LUME_EBUSY);
+    T(lume_vfs_read(&f, old, output, 1) == -LUME_EIO);
+    T(lume_vfs_write(&f, old, input, 1) == -LUME_EIO);
+    T(lume_vfs_sync(&f, old) == -LUME_EIO);
+
+    struct lume_device replacement = {.name = device.name, .state = LUME_DEVICE_READY};
+    struct lume_block next = b;
+    next.device = &replacement;
+    T(!lume_devfs_register_block(&next));
+    fd = (int)lume_vfs_open(&f, "/dev/testblk", LUME_O_RDONLY);
+    T(fd >= 3 && lume_vfs_read(&f, fd, output, 1) == 1);
+    T(!lume_vfs_close(&f, old) && !removals);
+    T(!lume_vfs_close(&f, other) && !removals);
+    T(!lume_vfs_close(&f, 12) && removals == 1);
+    T(lume_vfs_read(&f, fd, output, 1) == 1);
+    T(!lume_vfs_close(&f, fd));
+    T(!lume_devfs_remove_block(&next, removed_block) && removals == 2);
+    for (unsigned i = 0; i < 256; ++i)
+    {
+        replacement.state = LUME_DEVICE_READY;
+        T(!lume_devfs_register_block(&next));
+        T(!lume_devfs_remove_block(&next, removed_block));
+    }
+    T(removals == 258);
+    device.state = LUME_DEVICE_READY;
     b.sector_bytes = 4097;
     T(lume_devfs_register_block(&b) == -LUME_EINVAL);
     b.sector_bytes = 512;

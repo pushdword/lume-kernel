@@ -8,6 +8,12 @@
  * in serialized task context. Sector sizes from 1 through 4096 bytes are supported. */
 int lume_devfs_register_block(struct lume_block *);
 int lume_devfs_unregister_block(struct lume_block *);
+
+typedef void (*lume_devfs_block_release)(struct lume_block *);
+/* Removal marks the device failed and unlinks its name immediately. The release
+ * callback runs once all open descriptions have retired. It may run before
+ * removal returns. The device and block must remain valid until that callback. */
+int lume_devfs_remove_block(struct lume_block *, lume_devfs_block_release);
 #define LUME_DEVFS_ATTRIBUTE_BYTES 64u
 #define LUME_DEVFS_ATTRIBUTES 16u
 

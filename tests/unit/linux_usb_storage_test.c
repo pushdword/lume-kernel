@@ -2,6 +2,7 @@
 #include <linux/err.h>
 #include <linux/usb.h>
 #include <lume/block.h>
+#include <lume/devfs.h>
 #include <lume/kernel_memory.h>
 #include <lume/work.h>
 #include <assert.h>
@@ -14,7 +15,11 @@ struct lume_linux_usb_storage *lume_linux_usb_storage_attach(struct usb_device *
 void lume_linux_usb_storage_detach(struct lume_linux_usb_storage *);
 
 static unsigned allocations, commands, reads, writes, synchronizations;
+static unsigned sense_requests;
 static struct lume_block *registered;
+static struct lume_block *removed;
+static struct lume_linux_usb_storage *disconnect_on_wait;
+static lume_devfs_block_release release_removed;
 
 struct transport
 {
@@ -22,6 +27,7 @@ struct transport
     uint32_t tag, lba;
     unsigned bytes, count;
     unsigned char command;
+    bool defer_read, attention;
 };
 
 void *lume_kernel_allocate(size_t bytes)
@@ -69,6 +75,12 @@ void lume_worker_copy(void *out, const void *in, size_t bytes)
 
 bool lume_worker_wait_bits(volatile uint32_t *value, uint32_t mask, uint64_t deadline)
 {
+    if (disconnect_on_wait)
+    {
+        assert(!(__atomic_load_n(value, __ATOMIC_ACQUIRE) & mask));
+        lume_linux_usb_storage_detach(disconnect_on_wait);
+        disconnect_on_wait = NULL;
+    }
     assert(deadline > 1 && (__atomic_load_n(value, __ATOMIC_ACQUIRE) & mask));
     return true;
 }
@@ -94,10 +106,13 @@ int lume_devfs_register_block(struct lume_block *block)
     return 0;
 }
 
-int lume_devfs_unregister_block(struct lume_block *block)
+int lume_devfs_remove_block(struct lume_block *block, lume_devfs_block_release release)
 {
-    assert(registered == block);
+    assert(registered == block && release && !removed);
     registered = NULL;
+    block->device->state = LUME_DEVICE_FAILED;
+    removed = block;
+    release_removed = release;
     return 0;
 }
 
@@ -130,6 +145,14 @@ static void complete_input(struct transport *transport, struct urb *urb)
     {
         put32(response, UINT32_C(0x53425355));
         put32(response + 4, transport->tag);
+        if (transport->command == 0x25 && transport->attention)
+        {
+            put32(response + 8, 8);
+            response[12] = 1;
+            transport->attention = false;
+        }
+        else if (transport->command == 0x03)
+            put32(response + 8, 10);
     }
     else if (transport->command == 0x12)
         response[4] = 31;
@@ -137,6 +160,13 @@ static void complete_input(struct transport *transport, struct urb *urb)
     {
         response[3] = 7;
         response[6] = 2;
+    }
+    else if (transport->command == 0x03)
+    {
+        response[0] = 0x72;
+        response[1] = 6;
+        bytes = 8;
+        ++sense_requests;
     }
     else
     {
@@ -154,6 +184,8 @@ static int submit(void *context, struct urb *urb)
     unsigned bytes = (unsigned)urb->transfer_buffer_length;
     if (usb_pipein(urb->pipe))
     {
+        if (transport->defer_read && transport->command == 0x28 && bytes != 13)
+            return 0;
         complete_input(transport, urb);
         return 0;
     }
@@ -204,8 +236,25 @@ int main(void)
     assert(!memcmp(replacement, observed, sizeof(observed)));
     assert(!registered->ops->sync(registered));
     assert(reads == 2 && writes == 1 && synchronizations == 1 && commands == 6);
+    struct lume_block *block = registered;
+    unsigned live_allocations = allocations;
+    transport.defer_read = true;
+    disconnect_on_wait = storage;
+    assert(block->ops->read(block, 2, 2, observed) == -ENODEV);
+    assert(!registered && !device.pending && allocations == live_allocations && removed == block);
+    assert(block->ops->sync(block) == -EIO);
+    assert(!strcmp(block->device->name, "usb-storage0"));
+    release_removed(removed);
+    release_removed = NULL;
+    removed = NULL;
+    assert(!allocations);
+    transport.attention = true;
+    storage = lume_linux_usb_storage_attach(&device, 1, 2);
+    assert(storage && registered && sense_requests == 1 &&
+           !strcmp(registered->device->name, "usb-storage0"));
     lume_linux_usb_storage_detach(storage);
+    release_removed(removed);
     assert(!registered && !device.pending && !allocations);
-    puts("Linux USB storage PASS: capacity, block read, write, sync and release");
+    puts("Linux USB storage PASS: I/O, disconnect during read, deferred release and slot reuse");
     return 0;
 }

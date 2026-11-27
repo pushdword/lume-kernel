@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/err.h>
+#include <linux/scatterlist.h>
 #include <linux/usb.h>
 #include <lume/kernel_memory.h>
 
@@ -142,13 +143,46 @@ void usb_fill_bulk_urb(struct urb *urb, struct usb_device *device, unsigned pipe
     urb->interval = 0;
 }
 
+static bool transfer_sg(const struct urb *urb, void *buffer, unsigned bytes, bool to_sg)
+{
+    struct scatterlist *segment = urb->sg;
+    unsigned char *linear = buffer;
+    for (int index = 0; bytes && index < urb->num_sgs; ++index)
+    {
+        if (!segment || (!segment->buffer && segment->length))
+            return false;
+        unsigned count = bytes < segment->length ? bytes : segment->length;
+        if (linear && count)
+        {
+            if (to_sg)
+                memcpy(segment->buffer, linear, count);
+            else
+                memcpy(linear, segment->buffer, count);
+            linear += count;
+        }
+        bytes -= count;
+        if (bytes && index + 1 < urb->num_sgs)
+            segment = sg_next(segment);
+    }
+    return !bytes;
+}
+
 static int validate_urb(const struct urb *urb)
 {
-    if (!urb || !urb->dev || !urb->complete || !urb->transfer_buffer ||
-        urb->transfer_buffer_length <= 0 || !usb_pipeendpoint(urb->pipe))
+    if (!urb || !urb->dev || !urb->complete || urb->transfer_buffer_length <= 0 ||
+        !usb_pipeendpoint(urb->pipe))
         return -EINVAL;
     unsigned type = usb_pipetype(urb->pipe);
     if (type == PIPE_CONTROL)
+        return -EINVAL;
+    if (urb->num_sgs)
+    {
+        unsigned bytes = (unsigned)urb->transfer_buffer_length;
+        if (urb->num_sgs < 0 || (type != PIPE_BULK && type != PIPE_INTERRUPT) ||
+            bytes > LUME_USB_LINEAR_TRANSFER_MAX || !transfer_sg(urb, NULL, bytes, false))
+            return -EINVAL;
+    }
+    else if (urb->sg || !urb->transfer_buffer)
         return -EINVAL;
     if (type == PIPE_INTERRUPT)
     {
@@ -179,6 +213,32 @@ static int validate_urb(const struct urb *urb)
         }
     }
     return 0;
+}
+
+static int prepare_sg(struct urb *urb)
+{
+    unsigned bytes = (unsigned)urb->transfer_buffer_length;
+    void *allocation = lume_kernel_allocate(2u * (bytes + SMP_CACHE_BYTES - 1u));
+    if (!allocation)
+        return -ENOMEM;
+    uintptr_t start =
+        ((uintptr_t)allocation + SMP_CACHE_BYTES - 1u) & ~(uintptr_t)(SMP_CACHE_BYTES - 1u);
+    uintptr_t offset = start & (LUME_USB_LINEAR_TRANSFER_MAX - 1u);
+    /* A controller transfer buffer must stay within one 64 KiB DMA region. */
+    if (offset + bytes > LUME_USB_LINEAR_TRANSFER_MAX)
+        start += LUME_USB_LINEAR_TRANSFER_MAX - offset;
+    urb->sg_allocation = allocation;
+    urb->sg_buffer = (void *)start;
+    if (usb_pipeout(urb->pipe))
+        (void)transfer_sg(urb, urb->sg_buffer, bytes, false);
+    return 0;
+}
+
+static void release_sg(struct urb *urb)
+{
+    lume_kernel_free(urb->sg_allocation);
+    urb->sg_allocation = NULL;
+    urb->sg_buffer = NULL;
 }
 
 static void remove_pending(struct urb *urb)
@@ -213,6 +273,12 @@ int usb_submit_urb(struct urb *urb, gfp_t flags)
         return -ENODEV;
     if (urb->submitted)
         return -EBUSY;
+    if (urb->num_sgs)
+    {
+        int result = prepare_sg(urb);
+        if (result)
+            return result;
+    }
     urb->actual_length = 0;
     urb->status = 0;
     urb->error_count = 0;
@@ -238,6 +304,8 @@ int usb_submit_urb(struct urb *urb, gfp_t flags)
             if (urb->submitted)
             {
                 remove_pending(urb);
+                if (urb->sg_buffer)
+                    release_sg(urb);
                 usb_free_urb(urb);
             }
             usb_free_urb(urb);
@@ -309,11 +377,21 @@ void lume_linux_usb_complete_urb(struct urb *urb, const void *data, unsigned byt
              (bytes > (unsigned)urb->transfer_buffer_length || bytes > (unsigned)INT32_MAX ||
               (usb_pipein(urb->pipe) && bytes && !data)))
         status = -EIO;
-    urb->status = status;
-    urb->actual_length = status ? 0 : (int)bytes;
     if (!status && bytes && usb_pipein(urb->pipe) &&
         usb_pipetype(urb->pipe) != PIPE_ISOCHRONOUS)
-        memmove(urb->transfer_buffer, data, bytes);
+    {
+        if (urb->sg_buffer)
+        {
+            if (!transfer_sg(urb, (void *)data, bytes, true))
+                status = -EIO;
+        }
+        else
+            memmove(urb->transfer_buffer, data, bytes);
+    }
+    if (urb->sg_buffer)
+        release_sg(urb);
+    urb->status = status;
+    urb->actual_length = status ? 0 : (int)bytes;
     urb->complete(urb);
     usb_free_urb(urb);
 }

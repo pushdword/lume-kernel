@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/err.h>
+#include <linux/scatterlist.h>
 #include <linux/usb.h>
 #include <lume/kernel_memory.h>
 #include <assert.h>
@@ -7,11 +8,14 @@
 #include <stdlib.h>
 
 static unsigned allocations, callbacks, controls;
+static bool fail_allocation;
 
 struct transport
 {
     unsigned submissions, unlinks;
     bool fail, complete_synchronously;
+    bool retain_cancelled_buffer;
+    void *cancelled_buffer;
 };
 
 struct completion_record
@@ -32,6 +36,8 @@ struct anchor_record
 
 void *lume_kernel_allocate(size_t bytes)
 {
+    if (fail_allocation)
+        return NULL;
     void *memory = malloc(bytes);
     if (memory)
         ++allocations;
@@ -95,6 +101,102 @@ static void unlink(void *context, struct urb *urb)
     struct transport *transport = context;
     assert(urb->submitted && urb->cancelling);
     ++transport->unlinks;
+    if (transport->retain_cancelled_buffer)
+    {
+        assert(urb->sg_allocation && !transport->cancelled_buffer);
+        transport->cancelled_buffer = urb->sg_allocation;
+        urb->sg_allocation = NULL;
+        urb->sg_buffer = NULL;
+    }
+}
+
+struct sg_completion
+{
+    unsigned count;
+    int status, bytes;
+};
+
+static void complete_sg(struct urb *urb)
+{
+    struct sg_completion *completion = urb->context;
+    assert(!urb->submitted && !urb->sg_buffer && !urb->sg_allocation && !urb->transfer_buffer);
+    assert(urb->status == completion->status && urb->actual_length == completion->bytes);
+    ++completion->count;
+}
+
+static void scatter_gather_urbs(void)
+{
+    struct transport transport = {0};
+    struct usb_device device = {.address = 3,
+                                .online = true,
+                                .transport_context = &transport,
+                                .submit = submit,
+                                .unlink = unlink};
+    struct sg_completion completion = {.bytes = 5};
+    struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
+    assert(urb);
+    unsigned baseline = allocations;
+    char first[] = "abc", second[] = "defg", third[] = "hijk";
+    struct scatterlist head[2], tail[2];
+    sg_init_table(head, 2);
+    sg_set_buf(head, first, sizeof(first) - 1);
+    sg_init_table(tail, 2);
+    sg_set_buf(tail, second, sizeof(second) - 1);
+    sg_set_buf(&tail[1], third, sizeof(third) - 1);
+    sg_chain(head, 2, tail);
+    urb->sg = head;
+    urb->num_sgs = 3;
+    usb_fill_bulk_urb(urb, &device, usb_rcvbulkpipe(&device, 1), NULL, 9, complete_sg, &completion);
+    urb->num_sgs = 2;
+    assert(usb_submit_urb(urb, GFP_KERNEL) == -EINVAL && !transport.submissions);
+    urb->num_sgs = 3;
+    fail_allocation = true;
+    assert(usb_submit_urb(urb, GFP_KERNEL) == -ENOMEM && !transport.submissions && !device.pending);
+    fail_allocation = false;
+    transport.fail = true;
+    assert(usb_submit_urb(urb, GFP_KERNEL) == -EIO && !urb->submitted && !device.pending &&
+           allocations == baseline);
+    transport.fail = false;
+    assert(!usb_submit_urb(urb, GFP_KERNEL) && allocations == baseline + 1);
+    void *linear = lume_linux_usb_transfer_buffer(urb);
+    assert(linear && !((uintptr_t)linear & (SMP_CACHE_BYTES - 1u)));
+    memcpy(linear, "12345", 5);
+    lume_linux_usb_complete_urb(urb, linear, 5, 0);
+    assert(!memcmp(first, "123", 4) && !memcmp(second, "45fg", 5) && !memcmp(third, "hijk", 5) &&
+           completion.count == 1 && allocations == baseline);
+
+    urb->pipe = usb_sndbulkpipe(&device, 2);
+    completion.bytes = 9;
+    assert(!usb_submit_urb(urb, GFP_KERNEL));
+    assert(!memcmp(lume_linux_usb_transfer_buffer(urb), "12345fghi", 9));
+    lume_linux_usb_complete_urb(urb, NULL, 9, 0);
+    assert(completion.count == 2 && allocations == baseline);
+
+    urb->pipe = usb_rcvbulkpipe(&device, 1);
+    completion.status = -ENOENT;
+    completion.bytes = 0;
+    transport.retain_cancelled_buffer = true;
+    assert(!usb_submit_urb(urb, GFP_KERNEL));
+    usb_kill_urb(urb);
+    assert(!device.pending && completion.count == 3 && allocations == baseline + 1);
+    lume_kernel_free(transport.cancelled_buffer);
+    transport.cancelled_buffer = NULL;
+    transport.retain_cancelled_buffer = false;
+
+    char *maximum = malloc(LUME_USB_LINEAR_TRANSFER_MAX);
+    assert(maximum);
+    struct scatterlist single;
+    sg_init_one(&single, maximum, LUME_USB_LINEAR_TRANSFER_MAX);
+    urb->sg = &single;
+    urb->num_sgs = 1;
+    urb->transfer_buffer_length = LUME_USB_LINEAR_TRANSFER_MAX;
+    assert(!usb_submit_urb(urb, GFP_KERNEL));
+    uintptr_t buffer = (uintptr_t)lume_linux_usb_transfer_buffer(urb);
+    assert(buffer && !(buffer & (LUME_USB_LINEAR_TRANSFER_MAX - 1u)));
+    usb_kill_urb(urb);
+    assert(completion.count == 4 && allocations == baseline);
+    free(maximum);
+    usb_free_urb(urb);
 }
 
 static void record_completion(struct urb *urb)
@@ -358,7 +460,8 @@ int main(void)
     bulk_and_concurrent_urbs();
     isochronous_urbs();
     anchored_urbs();
+    scatter_gather_urbs();
     assert(!allocations);
-    puts("Linux USB bridge PASS: control, bulk, isochronous, concurrent and anchored URBs");
+    puts("Linux USB bridge PASS: control, bulk, isochronous, scatter-gather and anchored URBs");
     return 0;
 }

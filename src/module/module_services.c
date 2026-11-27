@@ -25,6 +25,7 @@ static struct registration
     unsigned kind, irq;
     uint32_t domain;
     void *object, *owner;
+    lume_devfs_block_release block_release;
     struct lume_work work;
 } registrations[REGISTRATIONS];
 
@@ -118,9 +119,41 @@ int lume_module_unregister_block(struct lume_block *b)
     struct registration *r = find(BLOCK, b);
     if (!r)
         return -LUME_ENOENT;
+    if (r->block_release)
+        return -LUME_EBUSY;
     int result = lume_devfs_unregister_block(b);
     if (!result)
         release(r);
+    return result;
+}
+
+static void finish_block_removal(struct lume_block *block)
+{
+    struct registration *r = find(BLOCK, block);
+    r->block_release(block);
+    release(r);
+}
+
+int lume_module_remove_block(struct lume_block *block, lume_devfs_block_release callback)
+{
+    if (!block || !callback)
+        return -LUME_EINVAL;
+    struct registration *r = find(BLOCK, block);
+    if (!r)
+        return -LUME_ENOENT;
+    if (r->block_release)
+        return -LUME_EBUSY;
+    void *owner = NULL;
+    int result = lume_module_pin((uintptr_t)callback, &owner);
+    if (result)
+        return result;
+    lume_module_unpin(owner);
+    if (owner != r->owner)
+        return -LUME_EINVAL;
+    r->block_release = callback;
+    result = lume_devfs_remove_block(block, finish_block_removal);
+    if (result)
+        r->block_release = NULL;
     return result;
 }
 
