@@ -37,12 +37,14 @@ int lume_realtime_control(struct lume_realtime *clock, unsigned action,
 {
     if (!clock || !request || request->version != LUME_REALTIME_VERSION ||
         request->bytes != sizeof(*request) || request->flags || request->reserved ||
-        action > LUME_REALTIME_SET)
+        action > LUME_REALTIME_INITIALIZE)
         return -LUME_EINVAL;
-    if (action == LUME_REALTIME_SET)
+    if (action != LUME_REALTIME_GET)
     {
         if (!administrator)
             return -LUME_EACCES;
+        if (action == LUME_REALTIME_INITIALIZE && clock->valid)
+            return -LUME_EALREADY;
         return lume_realtime_set(clock, request->seconds, request->nanoseconds, monotonic)
                    ? 0
                    : -LUME_EINVAL;

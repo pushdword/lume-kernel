@@ -31,6 +31,7 @@ struct datagram_file
     struct lume_poll_source source;
     struct udp_pcb *pcb;
     struct datagram_packet *first, *last;
+    const struct netif *blocked_tx;
     unsigned packets, charged, receive_budget, send_budget;
     uint32_t readiness;
     bool used, connected, read_closed, write_closed, receive_tos, closing;
@@ -105,10 +106,24 @@ static void notify_datagram(void *context)
 
 static void publish_datagram(struct datagram_file *file)
 {
-    unsigned flags = (file->first || file->read_closed ? LUME_POLLIN : 0) | LUME_POLLOUT |
+    unsigned flags = (file->first || file->read_closed ? LUME_POLLIN : 0) |
+                     (file->blocked_tx ? 0 : LUME_POLLOUT) |
                      (file->read_closed && file->write_closed ? LUME_POLLHUP : 0);
     __atomic_store_n(&file->readiness, flags, __ATOMIC_RELEASE);
     lume_worker_scheduler(notify_datagram, file);
+}
+
+void lume_datagram_tx_ready(const struct netif *interface)
+{
+    for (unsigned i = 0; i < LUME_NET_UDP_SOCKET_LIMIT; ++i)
+    {
+        struct datagram_file *file = datagrams + i;
+        if (file->blocked_tx == interface && !datagram_closing(file))
+        {
+            file->blocked_tx = NULL;
+            publish_datagram(file);
+        }
+    }
 }
 
 static int datagram_error(err_t error)
@@ -319,8 +334,22 @@ static int datagram_send(struct datagram_file *file, const void *buffer, unsigne
     else if (bytes)
         error = pbuf_take(p, buffer, (u16_t)bytes);
     if (error == ERR_OK)
-        error = udp_sendto(file->pcb, p, &destination, (u16_t)port);
+        error = udp_sendto_if(file->pcb, p, &destination, (u16_t)port, netif);
     pbuf_free(p);
+    if (error == ERR_WOULDBLOCK)
+    {
+        if (file->blocked_tx != netif)
+        {
+            file->blocked_tx = netif;
+            publish_datagram(file);
+        }
+        return -LUME_EAGAIN;
+    }
+    if (error == ERR_OK && file->blocked_tx)
+    {
+        file->blocked_tx = NULL;
+        publish_datagram(file);
+    }
     return error == ERR_OK ? (int)bytes : datagram_error(error);
 }
 
@@ -588,6 +617,11 @@ static int64_t datagram_call_owned(struct lume_files *files, unsigned operation,
         {
             file->connected = true;
             r->type = 2;
+            if (file->blocked_tx)
+            {
+                file->blocked_tx = NULL;
+                publish_datagram(file);
+            }
         }
         return datagram_error(result);
     }
@@ -628,7 +662,10 @@ static int64_t datagram_call_owned(struct lume_files *files, unsigned operation,
             clear_packets(file);
         }
         if (r->other != 0)
+        {
             file->write_closed = true;
+            file->blocked_tx = NULL;
+        }
         publish_datagram(file);
         return 0;
     }

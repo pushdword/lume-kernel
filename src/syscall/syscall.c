@@ -480,17 +480,19 @@ int64_t lume_public_call_wait(struct lume_files *files, struct lume_context *c, 
     }
     case LUME_SYS_REALTIME:
     {
-        if (a > LUME_REALTIME_SET || n != sizeof(struct lume_realtime_request))
+        if (a > LUME_REALTIME_INITIALIZE || n != sizeof(struct lume_realtime_request))
             return -LUME_EINVAL;
         if (!lume_user_buffer(b, n, a == LUME_REALTIME_GET))
             return -LUME_EFAULT;
         struct lume_realtime_request request;
         memcpy(&request, (const void *)(uintptr_t)b, sizeof(request));
         extern uint64_t lume_clock_monotonic(void);
+        unsigned capability =
+            a == LUME_REALTIME_INITIALIZE ? LUME_CAP_SERVICE : LUME_CAP_CLOCK_ADMIN;
         int result = lume_realtime_control(&realtime, (unsigned)a, &request, lume_clock_monotonic(),
                                            !files->identity.euid &&
-                                               lume_task_capable(pid, LUME_CAP_CLOCK_ADMIN));
-        if (!result && a == LUME_REALTIME_SET)
+                                               lume_task_capable(pid, capability));
+        if (!result && a != LUME_REALTIME_GET)
             lume_smp_wake();
         if (!result && a == LUME_REALTIME_GET)
             memcpy((void *)(uintptr_t)b, &request, sizeof(request));

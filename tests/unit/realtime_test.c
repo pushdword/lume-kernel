@@ -40,7 +40,13 @@ int main(void)
     request.seconds = 1793628000;
     request.nanoseconds = 900000000;
     assert(lume_realtime_control(&clock, LUME_REALTIME_SET, &request, 20, false) == -LUME_EACCES);
+    assert(lume_realtime_control(&clock, LUME_REALTIME_INITIALIZE, &request, 20, false) ==
+           -LUME_EACCES);
     assert(!clock.valid);
+    assert(!lume_realtime_control(&clock, LUME_REALTIME_INITIALIZE, &request, 19, true));
+    assert(lume_realtime_control(&clock, LUME_REALTIME_INITIALIZE, &request, 20, true) ==
+           -LUME_EALREADY);
+    assert(clock.monotonic == 19);
     assert(!lume_realtime_control(&clock, LUME_REALTIME_SET, &request, 20, true));
     request.seconds = 0;
     request.nanoseconds = 0;

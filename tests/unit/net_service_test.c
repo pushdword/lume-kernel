@@ -15,6 +15,7 @@ static bool independent_network;
 static bool transmit_full;
 static bool carrier = true;
 static unsigned transmitted_frames;
+static unsigned datagram_tx_wakes;
 
 void lume_worker_scheduler(void (*run)(void *), void *context)
 {
@@ -91,6 +92,13 @@ void lume_socket_reap(void)
 
 void lume_datagram_reap(void)
 {
+}
+
+void lume_datagram_tx_ready(const struct netif *interface)
+{
+    assert(independent_network);
+    assert(interface == netif_default);
+    ++datagram_tx_wakes;
 }
 
 bool lume_stream_needs_poll(void)
@@ -297,9 +305,22 @@ int main(void)
     assert(frame);
     memset(frame->payload, 0, frame->len);
     unsigned sent = transmitted_frames;
+    lume_netif_account(interface, LUME_NET_TX_DEPTH, 17);
     transmit_full = true;
     assert(netif_default->linkoutput(netif_default, frame) == ERR_WOULDBLOCK);
     assert(transmitted_frames == sent);
+    lume_net_poll();
+    assert(!datagram_tx_wakes);
+    lume_netif_account(interface, LUME_NET_TX_DEPTH, 16);
+    lume_net_poll();
+    assert(datagram_tx_wakes == 1);
+    lume_net_poll();
+    assert(datagram_tx_wakes == 1);
+
+    lume_netif_account(interface, LUME_NET_TX_DEPTH, 0);
+    assert(netif_default->linkoutput(netif_default, frame) == ERR_WOULDBLOCK);
+    lume_net_poll();
+    assert(datagram_tx_wakes == 2);
     transmit_full = false;
     assert(netif_default->linkoutput(netif_default, frame) == ERR_OK);
     assert(transmitted_frames == sent + 1);

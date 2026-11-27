@@ -175,18 +175,21 @@ u8_t pbuf_free(struct pbuf *packet)
     return 1;
 }
 
-err_t udp_sendto(struct udp_pcb *pcb, struct pbuf *packet, const ip_addr_t *address, u16_t port)
+static err_t udp_send_error;
+
+err_t udp_sendto_if(struct udp_pcb *pcb, struct pbuf *packet, const ip_addr_t *address, u16_t port,
+                    struct netif *interface)
 {
     CHECK(lume_worker_independent());
     CHECK(pcb == &network_udp && packet == network_packets && packet_live);
-    CHECK(address && port == 9002);
+    CHECK(address && port == 9002 && interface == &network_interface);
     ++network_sends;
     transport_wait(PAUSE_UDP);
     CHECK(lume_worker_independent());
     CHECK(packet_live);
     for (unsigned i = 0; i < packet->tot_len; ++i)
         CHECK(network_data[i] == 0xa7);
-    return ERR_OK;
+    return udp_send_error;
 }
 
 int lume_stream_nowait(unsigned owner, unsigned op, struct lume_stream_request *request)
@@ -554,6 +557,39 @@ static void udp_cases(void)
         CHECK(!packet_live && packet_frees == freed_before + 1);
         shared_cleanup();
     }
+    shared_setup();
+    udp_send_error = ERR_WOULDBLOCK;
+    begin_network(PAUSE_NONE);
+    CHECK(network_result == -LUME_EAGAIN && !packet_live);
+    struct lume_poll_watch transmit = {
+        .count = 1, .records = {{.fd = network_fd, .events = LUME_POLLOUT}}};
+    lume_vfs_poll_prepare(&files[0], &transmit);
+    CHECK(!lume_vfs_poll_check(&files[0], &transmit));
+    CHECK(lume_vfs_poll_subscribe(&files[0], &transmit, 7));
+    queue_datagram(60);
+    CHECK(!lume_vfs_poll_check(&files[0], &transmit));
+    (void)lume_vfs_poll_take(7);
+    const struct netif unrelated = {0};
+    lume_datagram_tx_ready(&unrelated);
+    CHECK(!lume_vfs_poll_take(7) && !lume_vfs_poll_check(&files[0], &transmit));
+    lume_datagram_tx_ready(&network_interface);
+    CHECK(lume_vfs_poll_take(7));
+    CHECK(lume_vfs_poll_check(&files[0], &transmit) == 1);
+    CHECK(transmit.records[0].revents == LUME_POLLOUT);
+    lume_vfs_poll_release(7);
+    udp_send_error = ERR_MEM;
+    begin_network(PAUSE_NONE);
+    CHECK(network_result == -LUME_ENOBUFS && !packet_live);
+    CHECK(lume_vfs_poll_check(&files[0], &transmit) == 1);
+    udp_send_error = ERR_OK;
+    begin_network(PAUSE_NONE);
+    CHECK(network_result == 8192 && !packet_live);
+    output_operation = true;
+    network_operation = LUME_SOCKET_RECVFROM;
+    begin_network(PAUSE_NONE);
+    CHECK(network_result == 60);
+    shared_cleanup();
+
     shared_setup();
     queue_datagram(6000);
     output_operation = true;

@@ -240,6 +240,7 @@ void lume_net_release(uint32_t index)
     if (netif_default == &a->ip)
         for (unsigned i = 0; i < DNS_MAX_SERVERS; ++i)
             dns_setserver(i, IP_ADDR_ANY);
+    lume_datagram_tx_ready(&a->ip);
     changed(a);
 }
 
@@ -287,6 +288,7 @@ struct adapter_call
     struct lume_netif_info info;
     struct lume_net_statistics statistics;
     int received;
+    bool tx_ready;
 };
 
 static void adapter_service(void *context)
@@ -311,6 +313,7 @@ static void adapter_service(void *context)
     case ADAPTER_STATISTICS:
         lume_netif_poll(device);
         lume_netif_statistics(device, &call->statistics);
+        call->tx_ready = lume_netif_take_tx_ready(device);
         break;
     }
 }
@@ -417,6 +420,8 @@ static void poll_network(void *context)
             traffic_until = lume_clock_monotonic() + 20;
         service_adapter(&call, ADAPTER_STATISTICS);
         tx_waiting |= call.statistics.tx_depth != 0;
+        if (call.tx_ready)
+            lume_datagram_tx_ready(&a->ip);
     }
     if (!netif_default || !netif_is_link_up(netif_default))
         for (unsigned i = 0; i < adapter_count; ++i)

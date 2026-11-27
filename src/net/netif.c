@@ -10,6 +10,8 @@ struct lume_netif
     struct lume_netif_ops ops;
     void *context;
     unsigned references;
+    uint64_t blocked_tx_depth;
+    bool tx_blocked;
 };
 static struct lume_netif interfaces[LUME_NET_INTERFACES];
 static unsigned interface_count;
@@ -248,6 +250,11 @@ int lume_netif_transmit_status(struct lume_netif *p, const void *data, size_t n)
     {
         lume_netif_sync(p);
         status = (p->info.flags & LUME_IF_LINK) ? -LUME_EAGAIN : -LUME_ENETDOWN;
+        if (status == -LUME_EAGAIN)
+        {
+            p->tx_blocked = true;
+            p->blocked_tx_depth = p->statistics.tx_depth;
+        }
     }
     if (status)
         ++p->info.tx_errors;
@@ -257,6 +264,18 @@ int lume_netif_transmit_status(struct lume_netif *p, const void *data, size_t n)
         p->statistics.tx_bytes += n;
     }
     return status;
+}
+
+bool lume_netif_take_tx_ready(struct lume_netif *p)
+{
+    if (!p->tx_blocked)
+        return false;
+    /* Drivers without queue depth accounting can be retried after their next poll. */
+    if ((p->info.flags & LUME_IF_LINK) && p->blocked_tx_depth &&
+        p->statistics.tx_depth >= p->blocked_tx_depth)
+        return false;
+    p->tx_blocked = false;
+    return true;
 }
 
 bool lume_netif_transmit(struct lume_netif *p, const void *data, size_t n)

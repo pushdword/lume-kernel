@@ -8,6 +8,9 @@ bool lume_datagram_busy(void);
 bool lume_datagram_reap_pending(void);
 /* Reclaim closed endpoints with NETWORK ownership or after all workers stop. */
 void lume_datagram_reap(void);
+/* Wake transmit waiters for this interface with NETWORK ownership. */
+struct netif;
+void lume_datagram_tx_ready(const struct netif *);
 int64_t lume_datagram_call(struct lume_files *, unsigned, struct lume_socket_request *);
 int64_t lume_datagram_message(struct lume_files *, unsigned, int, struct lume_socket_message *,
                               struct lume_socket_request *);
