@@ -946,7 +946,8 @@ unsigned lume_stream_connections(struct lume_net_connection *rows, unsigned capa
                 memcpy(row->remote, &ip_2_ip4(&pcb->remote_ip)->addr, 4);
                 row->remote_port = pcb->remote_port;
                 row->receive_bytes = stream->count;
-                row->send_bytes = TCP_SND_BUF - tcp_sndbuf(pcb);
+                /* The lwIP send accessor clamps free space to 16 bits. */
+                row->send_bytes = TCP_SND_BUF - pcb->snd_buf;
             }
         }
     }

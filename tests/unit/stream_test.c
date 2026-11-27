@@ -487,6 +487,11 @@ int main(void)
     assert(lume_stream_connections(&connection, 1) == 1 && connection.protocol == 6 &&
            connection.owner == 2 && connection.handle == r.handle &&
            connection.receive_bytes == 6000 && connection.send_bytes == TCP_SND_BUF - pcb.snd_buf);
+    pcb.snd_buf = TCP_SND_BUF;
+    assert(lume_stream_connections(&connection, 1) == 1 && connection.send_bytes == 0);
+    pcb.snd_buf -= 1024;
+    assert(lume_stream_connections(&connection, 1) == 1 && connection.send_bytes == 1024);
+    pcb.snd_buf = 4096;
     r.count = 4096;
     assert(lume_stream_call(2, LUME_STREAM_RECEIVE, &r) == 4096);
     assert(!memcmp(r.data, data, 4096) && acknowledged == 4096);
